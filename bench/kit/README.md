@@ -66,6 +66,7 @@ Experiment keys (`RUNE_EXPERIMENT`, comma-separated `key=value`, values `on` or 
 | `question_nudge` | `on` | One note to an `ask` run whose reply ends on a question: decide and continue. |
 | `map` | unset | Forces the repository map on or off. |
 | `goal` | `off` | `judge` (the other value) makes an `ask` run without `--goal` work toward its prompt, with a judge. |
+| `prompt` | `v1` | `v2-min` or `v2-structured`: the system text with a final-answer contract and one guidance line per offered tool. |
 
 ## Adapters
 

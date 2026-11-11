@@ -1308,7 +1308,15 @@ impl SessionHost {
             return;
         };
         let workspace = self.context.workspace().to_owned();
-        let base = prompt::base_prompt(&workspace, &paths.config_root, &self.limits);
+        let base = prompt::base_prompt_with(
+            &workspace,
+            &paths.config_root,
+            &self.limits,
+            &prompt::PromptOptions {
+                variant: self.permission_settings.experiments.prompt,
+                tools: &tool_names(&self.tools),
+            },
+        );
         *lock_value(&self.instruction_sizes) = crate::ask::instruction_sizes(&base);
         *lock_value(&self.instructions) = base.instructions;
         self.stable_instructions_len
@@ -2543,9 +2551,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // is a guess, and deriving from it would shrink the catalog for every model
     // that states no window rather than keeping the documented fallback.
     adopt_skill_catalog_budget(&mut limits, config.settings.context_window);
-    let mut prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
-    let nested_rules = std::mem::take(&mut prompt.nested);
-    let instruction_sizes = crate::ask::instruction_sizes(&prompt);
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
     let (mcp, mcp_warnings) = match connection {
@@ -2565,6 +2570,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     if let Some(client) = &mcp {
         crate::mcp::append_tools(&mut tools, client)?;
     }
+    let mut prompt = build_prompt(
+        &config.workspace,
+        &config.paths.config_root,
+        &limits,
+        &tool_names(&tools),
+        config.settings.experiments.prompt,
+    );
+    let nested_rules = std::mem::take(&mut prompt.nested);
+    let instruction_sizes = crate::ask::instruction_sizes(&prompt);
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
@@ -7634,9 +7648,20 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
     rendered.lines().map(str::to_owned).collect()
 }
 
-/// Builds the prompt for a session.
-fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    prompt::base_prompt(workspace, config_root, limits)
+/// Builds the prompt for a session that offers `tools`.
+fn build_prompt(
+    workspace: &Utf8Path,
+    config_root: &Utf8Path,
+    limits: &BudgetSet,
+    tools: &[&str],
+    variant: rune_core::experiment::PromptVariant,
+) -> Prompt {
+    prompt::base_prompt_with(
+        workspace,
+        config_root,
+        limits,
+        &prompt::PromptOptions { variant, tools },
+    )
 }
 
 /// Builds the runtime configuration for an interactive session.
@@ -7692,6 +7717,11 @@ pub fn prepare(
         rules,
         questions,
     })
+}
+
+/// Returns the names of advertised tools, in order.
+pub fn tool_names(tools: &[ToolSpec]) -> Vec<&str> {
+    tools.iter().map(|tool| tool.name.as_str()).collect()
 }
 
 /// Returns the tool schemas an interactive session in `workspace` advertises.
@@ -7768,6 +7798,42 @@ mod tests {
     use rune_term::shell::{ScriptedSource, Shell};
 
     #[test]
+    fn a_rebuilt_prefix_keeps_the_tool_guidance_of_the_variant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut host = test_host();
+        host.usage_paths = Some(Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        });
+        host.context = ExecutionContext::new(workspace);
+        host.permission_settings.experiments.prompt = rune_core::experiment::PromptVariant::V2Min;
+        host.tools = ["read_file", "apply_patch"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            })
+            .collect();
+        host.rebuild_prefix();
+        let instructions = host.instructions();
+        let stable = &instructions[..host.stable_instructions_len()];
+        assert!(stable.starts_with(prompt::SYSTEM_PROMPT_V2_MIN), "{stable}");
+        assert!(
+            stable.contains("Using the tools:\n- Search and read with read_file,"),
+            "{stable}"
+        );
+        assert!(
+            stable.ends_with("- and + lines, *** End Patch."),
+            "{stable}"
+        );
+    }
+
+    #[test]
     fn the_active_objective_is_in_model_instructions_after_restart() {
         let root = tempfile::tempdir().expect("tempdir");
         let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
@@ -7816,7 +7882,13 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".git")).expect("workspace");
         std::fs::create_dir_all(base.join("config")).expect("config");
         std::fs::write(workspace.join("AGENTS.md"), "A project rule.\n").expect("rules");
-        let built = build_prompt(&workspace, &base.join("config"), &BudgetSet::new());
+        let built = build_prompt(
+            &workspace,
+            &base.join("config"),
+            &BudgetSet::new(),
+            &[],
+            rune_core::experiment::PromptVariant::default(),
+        );
         let mut host = test_host();
         host.instructions = Mutex::new(built.instructions.clone());
         host.instruction_sizes = Mutex::new(crate::ask::instruction_sizes(&built));
@@ -9267,7 +9339,13 @@ mod tests {
         )
         .expect("write");
 
-        let prompt = build_prompt(root, root, &BudgetSet::new());
+        let prompt = build_prompt(
+            root,
+            root,
+            &BudgetSet::new(),
+            &[],
+            rune_core::experiment::PromptVariant::V1,
+        );
         // The skills installed for this user may follow the override, so the
         // check is on what the prompt opens with rather than on all of it.
         assert!(
@@ -9286,7 +9364,13 @@ mod tests {
     fn no_override_leaves_the_built_in_text_alone() {
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
-        let prompt = build_prompt(root, root, &BudgetSet::new());
+        let prompt = build_prompt(
+            root,
+            root,
+            &BudgetSet::new(),
+            &[],
+            rune_core::experiment::PromptVariant::V1,
+        );
         assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
     }
 
@@ -9302,7 +9386,13 @@ mod tests {
         )
         .expect("write");
 
-        let prompt = build_prompt(root, root, &BudgetSet::new());
+        let prompt = build_prompt(
+            root,
+            root,
+            &BudgetSet::new(),
+            &[],
+            rune_core::experiment::PromptVariant::V1,
+        );
         assert!(prompt.instructions.starts_with(prompt::SYSTEM_PROMPT));
     }
 

@@ -1,0 +1,8 @@
+{
+  "description": "The final-answer contract and one guidance line per offered tool.",
+  "env": {
+    "RUNE_EXPERIMENT": "prompt=v2-min"
+  },
+  "flags": [],
+  "files": {}
+}

@@ -1875,10 +1875,15 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
     // text would hide every omission, which is the thing a reader needs to see.
     if launch.has_flag("--show") {
         let workspace = current_workspace()?;
-        let text = rune_context::prompt::instructions_for(
+        let tools = session::advertised_tools(settings, &paths, &workspace)?;
+        let text = rune_context::prompt::instructions_with(
             &workspace,
             &paths.config_root,
             &settings.limits,
+            &rune_context::prompt::PromptOptions {
+                variant: settings.experiments.prompt,
+                tools: &session::tool_names(&tools),
+            },
         );
         print!("{text}");
         if !text.ends_with('\n') {
@@ -1890,6 +1895,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
     let workspace = current_workspace()?;
     let tools = session::advertised_tools(settings, &paths, &workspace)?;
     let tool_bytes = advertised_tool_bytes(&tools);
+    let builtin_prompt = rune_context::prompt::system_prompt(settings.experiments.prompt);
 
     // `--tools` prints each advertised tool as one JSON line, so the schemas
     // sent with every request can be read and measured like the instructions.
@@ -1908,7 +1914,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
             "path": override_path,
             "bytes": override_text
                 .as_ref()
-                .map_or(rune_context::prompt::SYSTEM_PROMPT.len(), String::len),
+                .map_or(builtin_prompt.len(), String::len),
             "context": settings.context,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -1922,7 +1928,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         ),
         None => println!(
             "system prompt  built in, {} bytes (no override at {override_path})",
-            rune_context::prompt::SYSTEM_PROMPT.len()
+            builtin_prompt.len()
         ),
     }
     println!(

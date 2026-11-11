@@ -387,6 +387,35 @@ fn ask_adds_the_workspace_snapshot_only_when_switched_on() {
 }
 
 #[test]
+fn ask_sends_tool_guidance_under_the_v2_experiment() {
+    for switched_on in [true, false] {
+        let (output, _, requests) = run_responses_fixture_command(
+            vec![completion_response(&json!({"content": "ok"}), "stop")],
+            Some("--json"),
+            true,
+            None,
+            (&["ask"], &[]),
+            |_, command| {
+                if switched_on {
+                    command.env("RUNE_EXPERIMENT", "prompt=v2-min");
+                }
+            },
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests[0]["messages"][0]["role"], "system");
+        let system = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("system text");
+        assert_eq!(system.contains("Using the tools:"), switched_on, "{system}");
+        assert_eq!(
+            system.contains("edit_file needs old_string"),
+            switched_on,
+            "{system}"
+        );
+    }
+}
+
+#[test]
 fn ask_offers_the_subagent_tool() {
     let (output, _, requests) = run_responses_fixture_command(
         vec![completion_response(&json!({"content": "ok"}), "stop")],

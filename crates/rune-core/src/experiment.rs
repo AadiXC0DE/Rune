@@ -3,7 +3,38 @@
 use crate::error::{Result, RuneError};
 
 /// The keys `RUNE_EXPERIMENT` accepts.
-const KEYS: &[&str] = &["goal", "map", "question_nudge", "run_note", "snapshot"];
+const KEYS: &[&str] = &[
+    "goal",
+    "map",
+    "prompt",
+    "question_nudge",
+    "run_note",
+    "snapshot",
+];
+
+/// Which system prompt text is sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptVariant {
+    /// The shipped prompt, with no tool guidance.
+    #[default]
+    V1,
+    /// The shipped prompt with a final-answer contract and tool guidance.
+    V2Min,
+    /// The same rules under headings, with tool guidance.
+    V2Structured,
+}
+
+impl PromptVariant {
+    /// Returns the `RUNE_EXPERIMENT` spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2Min => "v2-min",
+            Self::V2Structured => "v2-structured",
+        }
+    }
+}
 
 /// Switches for behaviour under measurement. The default is the shipped behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +50,8 @@ pub struct Experiments {
     pub snapshot: bool,
     /// `goal=off|judge`: makes an `ask` run without `--goal` work toward its prompt, with a judge.
     pub goal_judge: bool,
+    /// `prompt=v1|v2-min|v2-structured`: the system prompt text and its tool guidance.
+    pub prompt: PromptVariant,
 }
 
 impl Default for Experiments {
@@ -29,6 +62,7 @@ impl Default for Experiments {
             question_nudge: true,
             snapshot: false,
             goal_judge: false,
+            prompt: PromptVariant::V1,
         }
     }
 }
@@ -71,6 +105,18 @@ impl Experiments {
                     _ => {
                         return Err(invalid(format!("`{value}` is not a value of `{key}`"))
                             .with_hint("use off or judge"));
+                    }
+                };
+                continue;
+            }
+            if key == "prompt" {
+                experiments.prompt = match value {
+                    "v1" => PromptVariant::V1,
+                    "v2-min" => PromptVariant::V2Min,
+                    "v2-structured" => PromptVariant::V2Structured,
+                    _ => {
+                        return Err(invalid(format!("`{value}` is not a value of `{key}`"))
+                            .with_hint("use v1, v2-min or v2-structured"));
                     }
                 };
                 continue;
@@ -125,6 +171,9 @@ impl Experiments {
         if self.goal_judge != default.goal_judge {
             parts.push("goal=judge".to_owned());
         }
+        if self.prompt != default.prompt {
+            parts.push(format!("prompt={}", self.prompt.as_str()));
+        }
         parts.sort();
         parts.join(",")
     }
@@ -170,7 +219,7 @@ mod tests {
         assert_eq!(error.message(), "unknown experiment key `unknown`");
         assert_eq!(
             error.hint(),
-            Some("known keys are goal, map, question_nudge, run_note, snapshot")
+            Some("known keys are goal, map, prompt, question_nudge, run_note, snapshot")
         );
         assert_eq!(error.field(), Some("RUNE_EXPERIMENT"));
         assert_eq!(message("map"), "`map` is not in key=value form");
@@ -200,6 +249,22 @@ mod tests {
         let error = Experiments::parse("goal=on").unwrap_err();
         assert_eq!(error.message(), "`on` is not a value of `goal`");
         assert_eq!(error.hint(), Some("use off or judge"));
+    }
+
+    #[test]
+    fn prompt_takes_one_of_three_variants() {
+        assert_eq!(Experiments::default().prompt, PromptVariant::V1);
+        assert_eq!(
+            Experiments::parse("prompt=v2-min").unwrap().prompt,
+            PromptVariant::V2Min
+        );
+        let structured = Experiments::parse("prompt=v2-structured").unwrap();
+        assert_eq!(structured.prompt, PromptVariant::V2Structured);
+        assert_eq!(structured.render(), "prompt=v2-structured");
+        assert_eq!(Experiments::parse("prompt=v1").unwrap().render(), "");
+        let error = Experiments::parse("prompt=v2").unwrap_err();
+        assert_eq!(error.message(), "`v2` is not a value of `prompt`");
+        assert_eq!(error.hint(), Some("use v1, v2-min or v2-structured"));
     }
 
     #[test]
