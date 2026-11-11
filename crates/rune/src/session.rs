@@ -391,6 +391,10 @@ struct SessionHost {
     running: Mutex<Vec<Running>>,
     /// When the live region was last redrawn by the turn's idle tick.
     last_tick: Mutex<Option<std::time::Instant>>,
+    /// Whether the stream changed since the last frame was written.
+    frame_dirty: std::sync::atomic::AtomicBool,
+    /// When the last stream frame was written.
+    last_frame: Mutex<Option<std::time::Instant>>,
     /// When the turn now running sent its first request.
     turn_started: Mutex<Option<std::time::Instant>>,
     /// Where the live region is written, so a delta can be shown as it lands.
@@ -827,7 +831,7 @@ impl Host for SessionHost {
                     max_attempts: *max_attempts,
                     delay: Some(*delay),
                 });
-                self.draw_stream();
+                self.request_frame();
             }
             Event::ProviderRetryFinished { .. }
             | Event::TurnStarted { .. }
@@ -838,7 +842,7 @@ impl Host for SessionHost {
                     started.get_or_insert_with(std::time::Instant::now);
                 }
                 if self.clear_provider_retry() {
-                    self.draw_stream();
+                    self.request_frame();
                 }
             }
             Event::TextDelta { delta } => {
@@ -849,13 +853,13 @@ impl Host for SessionHost {
                 if let Ok(mut streaming) = self.streaming.lock() {
                     streaming.answer.push_str(&delta);
                 }
-                self.draw_stream();
+                self.request_frame();
             }
             Event::ReasoningDelta { delta } => {
                 if let Ok(mut streaming) = self.streaming.lock() {
                     streaming.reasoning.push_str(&transcript::sanitize(delta));
                 }
-                self.draw_stream();
+                self.request_frame();
             }
             Event::StepRestarted { .. } => {
                 if !self.journal_text(None) {
@@ -870,7 +874,7 @@ impl Host for SessionHost {
                 {
                     retry.delay = None;
                 }
-                self.draw_stream();
+                self.request_frame();
             }
             Event::ToolStarted { call, activity } => {
                 // What the model said before calling a tool is finished, so it
@@ -896,7 +900,7 @@ impl Host for SessionHost {
                 }
                 // A plan change is reported by its own event.
                 if call.name == "update_plan" && !output.is_error {
-                    self.draw_stream();
+                    self.request_frame();
                 } else {
                     let row = self.finished_row(call, output, *elapsed);
                     if self.accessible {
@@ -1892,13 +1896,15 @@ impl SessionHost {
         arriving: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
-        self.paint_with_menu(settled, activity, prompt, arriving, &[], caret)
+        self.paint_with_menu(settled, activity, prompt, arriving, &[], caret, false)
     }
 
     /// Draws the live region with a list opened under the input.
     ///
     /// Separate from [`SessionHost::paint`] so the many callers that draw no
-    /// menu do not have to pass an empty slice for one.
+    /// menu do not have to pass an empty slice for one. A `paced` frame that
+    /// would change nothing on screen returns no bytes.
+    #[allow(clippy::too_many_arguments)]
     fn paint_with_menu(
         &self,
         settled: &[String],
@@ -1907,6 +1913,7 @@ impl SessionHost {
         arriving: &[String],
         menu: &[String],
         caret: (u16, u16),
+        paced: bool,
     ) -> Result<Vec<u8>> {
         if self.accessible {
             let mut lines: Vec<String> = settled
@@ -1924,7 +1931,7 @@ impl SessionHost {
             .inline
             .lock()
             .map_err(|_| RuneError::new(ErrorCode::Internal, "the renderer lock was poisoned"))?;
-        Ok(inline.frame(&rune_term::inline::Frame {
+        let frame = rune_term::inline::Frame {
             settled,
             arriving,
             activity,
@@ -1932,7 +1939,12 @@ impl SessionHost {
             prompt,
             menu,
             caret,
-        }))
+        };
+        Ok(if paced {
+            inline.frame_if_changed(&frame)
+        } else {
+            inline.frame(&frame)
+        })
     }
 
     /// Removes the live region, for a clean exit.
@@ -1998,8 +2010,9 @@ impl SessionHost {
     /// without the current line would put an empty prompt over the correction
     /// the user is halfway through typing.
     ///
-    /// `notice` is drawn as the activity line, above the input.
-    fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize) {
+    /// `notice` is drawn as the activity line, above the input. A `paced`
+    /// frame writes nothing when nothing on screen would change.
+    fn draw_frame(&self, notice: Option<&str>, line: &str, column: usize, paced: bool) {
         if self.accessible {
             if let Some(notice) = notice {
                 let _frame = self
@@ -2015,6 +2028,13 @@ impl SessionHost {
         if let Ok(mut typed) = self.typed.lock() {
             line.clone_into(&mut typed.0);
             typed.1 = column;
+        }
+        // Cleared before the rows are read, so a delta that lands while this
+        // frame is painted marks the next one dirty.
+        self.frame_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = self.last_frame.lock() {
+            *last = Some(std::time::Instant::now());
         }
         let mut rows = self.streaming_rows();
         rows.extend(self.live_rows());
@@ -2035,7 +2055,8 @@ impl SessionHost {
         let marker = rune_term::shell::prompt();
         let width = usize::from(self.width());
         let (prompt_rows, caret) = transcript::render_draft_at(marker, line, column, width);
-        let Ok(painted) = self.paint(&[], notice, &prompt_rows, &rows, caret) else {
+        let Ok(painted) = self.paint_with_menu(&[], notice, &prompt_rows, &rows, &[], caret, paced)
+        else {
             return;
         };
         self.show(&painted);
@@ -2043,24 +2064,59 @@ impl SessionHost {
 
     /// Draws the arriving text with the line being typed.
     fn draw_stream_with(&self, line: &str, column: usize) {
-        self.draw_frame(None, line, column);
+        self.draw_frame(None, line, column, false);
     }
 
     /// Draws the arriving text with the line the user has typed so far.
     fn draw_stream(&self) {
         let (line, column) = self.typed_line();
-        self.draw_frame(None, &line, column);
+        self.draw_frame(None, &line, column, false);
+    }
+
+    /// Draws the stream frame, at most once per [`FRAME_INTERVAL`].
+    ///
+    /// A request inside the interval only marks the frame dirty; the input
+    /// loop's next idle poll draws it through [`SessionHost::flush_frame`].
+    fn request_frame(&self) {
+        if self.accessible {
+            return;
+        }
+        if !self.frame_interval_passed() {
+            self.frame_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let (line, column) = self.typed_line();
+        self.draw_frame(None, &line, column, true);
+    }
+
+    /// Draws a frame left pending by [`SessionHost::request_frame`], once the
+    /// interval has passed.
+    fn flush_frame(&self) {
+        if self.frame_dirty.load(std::sync::atomic::Ordering::Relaxed)
+            && self.frame_interval_passed()
+        {
+            let (line, column) = self.typed_line();
+            self.draw_frame(None, &line, column, true);
+        }
+    }
+
+    /// Returns whether a stream frame may be written now.
+    fn frame_interval_passed(&self) -> bool {
+        self.last_frame.lock().map_or(true, |last| {
+            last.is_none_or(|last| last.elapsed() >= FRAME_INTERVAL)
+        })
     }
 
     /// Draws one notice above the input, keeping the line being typed.
     fn draw_notice(&self, notice: &str) {
         let (line, column) = self.typed_line();
-        self.draw_frame(Some(notice), &line, column);
+        self.draw_frame(Some(notice), &line, column, false);
     }
 
     /// Draws one notice, with the line being typed given explicitly.
     fn draw_notice_with(&self, notice: &str, line: &str, column: usize) {
-        self.draw_frame(Some(notice), line, column);
+        self.draw_frame(Some(notice), line, column, false);
     }
 
     /// Returns the empty input row, with the caret at its start.
@@ -2406,7 +2462,7 @@ impl SessionHost {
         }
         *last = Some(std::time::Instant::now());
         drop(last);
-        self.draw_stream();
+        self.request_frame();
     }
     /// Returns the scrollback row for a call that has finished.
     fn finished_row(
@@ -2686,6 +2742,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         streaming: Arc::new(Mutex::new(StreamingText::default())),
         running: Mutex::new(Vec::new()),
         last_tick: Mutex::new(None),
+        frame_dirty: std::sync::atomic::AtomicBool::new(false),
+        last_frame: Mutex::new(None),
         turn_started: Mutex::new(None),
         live_out: Arc::new(Mutex::new(None)),
         reasoning: Mutex::new(reasoning_escape),
@@ -2708,6 +2766,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
         questions: config.questions,
     };
+    if let Ok(mut inline) = host.inline.lock() {
+        inline.set_synchronized(host.caps.env.term.as_deref() != Some("dumb"));
+    }
     if context_source.is_none() {
         host.estimate_context(&history)?;
     }
@@ -3660,6 +3721,7 @@ fn run_turn_steerable(
                 return;
             }
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
+                host.flush_frame();
                 host.tick();
                 return;
             };
@@ -3791,20 +3853,22 @@ fn collect_approval(
     picker.to(choices.len().saturating_sub(1));
     host.refresh_size();
     let lines = approval_lines(request, usize::from(host.width()));
-    if draw_choice(host, &picker, &lines).is_err() {
+    if draw_choice(host, &picker, &lines, false).is_err() {
         return ApprovalOutcome::Deny;
     }
     loop {
         if host.cancellation.is_cancelled() {
             return ApprovalOutcome::Deny;
         }
-        if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL)
+        let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
+        let idle = key.is_none();
+        if let Some(key) = key
             && let Some(answer) = approval_key(key, &mut picker, &host.cancellation)
         {
             return answer;
         }
         // Also refreshes dimensions when no input arrives.
-        if draw_choice(host, &picker, &[]).is_err() {
+        if draw_choice(host, &picker, &[], idle).is_err() {
             return ApprovalOutcome::Deny;
         }
     }
@@ -3853,10 +3917,12 @@ fn collect_questions(
         );
         host.refresh_size();
         let lines = question_lines(question, usize::from(host.width()));
-        draw_choice(host, &picker, &lines)?;
+        draw_choice(host, &picker, &lines, false)?;
         loop {
             host.cancellation.check()?;
-            if let Some(key) = reader.poll_choice(rune_term::shell::POLL_INTERVAL) {
+            let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
+            let idle = key.is_none();
+            if let Some(key) = key {
                 let chosen = question_key(key, &mut picker, &host.cancellation);
                 host.cancellation.check()?;
                 if let Some(chosen) = chosen {
@@ -3864,7 +3930,7 @@ fn collect_questions(
                     break;
                 }
             }
-            draw_choice(host, &picker, &[])?;
+            draw_choice(host, &picker, &[], idle)?;
         }
     }
     Ok(Answer::Chosen(answers))
@@ -3956,10 +4022,13 @@ fn approval_key(
 }
 
 /// Uses the session renderer and reports if the choice cannot be displayed.
+///
+/// A `paced` redraw that would change nothing on screen writes nothing.
 fn draw_choice(
     host: &SessionHost,
     picker: &rune_term::picker::Picker,
     settled: &[String],
+    paced: bool,
 ) -> Result<()> {
     let _frame = host
         .frame
@@ -3975,7 +4044,18 @@ fn draw_choice(
         "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
     )];
     let menu = picker.rows(&host.theme(), host.depth);
-    let painted = host.paint_with_menu(settled, Some(picker.title()), &hint, &[], &menu, (0, 0))?;
+    let painted = host.paint_with_menu(
+        settled,
+        Some(picker.title()),
+        &hint,
+        &[],
+        &menu,
+        (0, 0),
+        paced,
+    )?;
+    if painted.is_empty() {
+        return Ok(());
+    }
     let mut sink = LockedSink { stream: out };
     sink.write_all(&painted)?;
     sink.flush()?;
@@ -4699,7 +4779,7 @@ fn draw_prompt(
         reader.column(),
         usize::from(host.width()),
     );
-    let painted = host.paint_with_menu(&[], None, &rows, &[], menu, caret)?;
+    let painted = host.paint_with_menu(&[], None, &rows, &[], menu, caret, false)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -7155,6 +7235,9 @@ enum RowGlyphs {
 /// Shortest pause between redraws of a running turn's live region.
 const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Shortest time between two stream frames, about sixty a second.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Changed lines drawn under an edit's tool row before the rest is counted.
 const EDIT_PREVIEW_LINES: usize = 8;
 
@@ -8069,6 +8152,12 @@ mod tests {
     /// actually wrote.
     struct SharedSink(Arc<Mutex<Vec<u8>>>);
 
+    /// Lets the next stream frame draw at once, as though the frame interval
+    /// had passed since the last one.
+    fn end_frame_interval(host: &SessionHost) {
+        *host.last_frame.lock().expect("last frame") = None;
+    }
+
     impl std::io::Write for SharedSink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().expect("lock").extend_from_slice(buf);
@@ -8265,6 +8354,84 @@ mod tests {
     }
 
     #[test]
+    fn deltas_inside_the_frame_interval_mark_the_frame_dirty() {
+        let host = test_host();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        let written = || {
+            String::from_utf8_lossy(&std::mem::take(&mut *bytes.lock().expect("bytes")))
+                .into_owned()
+        };
+        let set_last = |at: Option<std::time::Instant>| {
+            *host.last_frame.lock().expect("last frame") = at;
+        };
+        host.emit(Event::TextDelta {
+            delta: "first".to_owned(),
+        });
+        let first = written();
+        assert!(first.contains("first"), "{first:?}");
+        assert!(
+            first.starts_with(rune_term::inline::BEGIN_SYNC),
+            "{first:?}"
+        );
+        // Holds the interval open however slowly this test runs.
+        set_last(std::time::Instant::now().checked_add(std::time::Duration::from_secs(60)));
+        host.emit(Event::TextDelta {
+            delta: " second".to_owned(),
+        });
+        assert_eq!(written(), "");
+        assert!(host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+        host.flush_frame();
+        assert_eq!(written(), "");
+        set_last(std::time::Instant::now().checked_sub(FRAME_INTERVAL));
+        host.flush_frame();
+        let flushed = written();
+        assert!(flushed.contains("first second"), "{flushed:?}");
+        assert_eq!(flushed.matches(rune_term::inline::BEGIN_SYNC).count(), 1);
+        assert!(!host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+        set_last(std::time::Instant::now().checked_sub(FRAME_INTERVAL));
+        host.flush_frame();
+        assert_eq!(written(), "");
+        // A key draws at once, inside the interval, and clears a pending frame.
+        set_last(std::time::Instant::now().checked_add(std::time::Duration::from_secs(60)));
+        host.emit(Event::TextDelta {
+            delta: " third".to_owned(),
+        });
+        host.draw_stream_with("Z", 1);
+        let keyed = written();
+        assert!(keyed.contains("first second third"), "{keyed:?}");
+        assert!(keyed.contains("> Z"), "{keyed:?}");
+        assert!(!host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_idle_choice_redraw_that_changes_nothing_writes_nothing() {
+        let host = test_host();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        let written = || std::mem::take(&mut *bytes.lock().expect("bytes"));
+        let mut picker = rune_term::picker::Picker::new(
+            "permission required",
+            vec!["run once".to_owned(), "deny".to_owned()],
+            2,
+        );
+        draw_choice(&host, &picker, &["shell ls".to_owned()], false).expect("drawn");
+        assert!(String::from_utf8_lossy(&written()).contains("permission required"));
+        // The settled lines scrolled the region, so the first redraw repaints it.
+        draw_choice(&host, &picker, &[], true).expect("drawn");
+        assert!(!written().is_empty());
+        for _ in 0..3 {
+            draw_choice(&host, &picker, &[], true).expect("drawn");
+            assert!(written().is_empty());
+        }
+        assert!(picker.to(1));
+        draw_choice(&host, &picker, &[], true).expect("drawn");
+        assert!(!written().is_empty());
+    }
+
+    #[test]
     fn accessible_frames_append_settled_lines_and_ignore_live_regions() {
         let mut host = test_host();
         host.accessible = true;
@@ -8277,7 +8444,7 @@ mod tests {
                 delta: "streamed ".to_owned(),
             });
             assert!(
-                host.paint_with_menu(&[], None, &rows, &rows, &rows, (2, 5))
+                host.paint_with_menu(&[], None, &rows, &rows, &rows, (2, 5), false)
                     .expect("paint")
                     .is_empty()
             );
@@ -8310,6 +8477,7 @@ mod tests {
         };
         host.draw_stream_with(reader.line(), reader.column());
         check(&mut grid);
+        end_frame_interval(&host);
         host.emit(Event::TextDelta {
             delta: "answer".to_owned(),
         });
@@ -8395,6 +8563,7 @@ mod tests {
         for (line, column) in [("abcd", 1), ("書書", 4)] {
             host.draw_stream_with(line, column);
             sink.lock().expect("lock").clear();
+            end_frame_interval(&host);
             host.emit(Event::TextDelta {
                 delta: "token ".to_owned(),
             });
@@ -8464,6 +8633,7 @@ mod tests {
         };
         replay(&mut grid);
         for (attempt, delay) in [(2, 250), (3, 500)] {
+            end_frame_interval(&host);
             host.emit(Event::ProviderRetry {
                 step: 1,
                 next_attempt: attempt,
@@ -8478,6 +8648,7 @@ mod tests {
                 screen.contains(&format!("provider retry {attempt}/3 in {delay}ms")),
                 "{screen}"
             );
+            end_frame_interval(&host);
             host.emit(Event::StepRestarted { step: 1 });
             let screen = replay(&mut grid);
             assert!(
@@ -8499,8 +8670,10 @@ mod tests {
                 steps: 1,
             },
         ] {
+            end_frame_interval(&host);
             host.emit(event);
             assert!(!replay(&mut grid).contains("provider retry"));
+            end_frame_interval(&host);
             host.emit(Event::ProviderRetry {
                 step: 1,
                 next_attempt: 2,
@@ -13894,6 +14067,8 @@ mod tests {
             streaming: Arc::new(Mutex::new(StreamingText::default())),
             running: Mutex::new(Vec::new()),
             last_tick: Mutex::new(None),
+            frame_dirty: std::sync::atomic::AtomicBool::new(false),
+            last_frame: Mutex::new(None),
             turn_started: Mutex::new(None),
             live_out: Arc::new(Mutex::new(None)),
             reasoning: Mutex::new("\u{1b}[2m".to_owned()),
