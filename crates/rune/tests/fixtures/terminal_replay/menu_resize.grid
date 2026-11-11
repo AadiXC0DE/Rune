@@ -43,7 +43,7 @@ model-down: 32x8, caret 2,3
 07|type to narrow, up/down choose,|
 model-closed: 32x8, caret 2,3
 00|session ************|
-01|/ commands   ctrl-j newline|
+01|/ commands   shift-tab mode|
 02|replay-model-01 | auto|
 03|>|
 04||
@@ -52,7 +52,7 @@ model-closed: 32x8, caret 2,3
 07||
 closed-grown: 80x24, caret 2,3
 00|session ************|
-01|/ commands   ctrl-j newline|
+01|/ commands   shift-tab mode   ctrl-j newline|
 02|replay-model-01 | auto | ctx ~###k (request bytes)|
 03|>|
 04||

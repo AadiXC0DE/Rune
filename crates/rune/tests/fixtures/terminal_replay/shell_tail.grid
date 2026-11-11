@@ -8,8 +8,8 @@ shell-finished: 80x24, caret 2,12
 06|  ✓ shell for i in 1 2 3 4; d…-$i; sleep 0.3; done                exit 0 · <t>|
 07||
 08|SHELL-DONE|
-09|  1 call · <t>|
-10|/ commands   ctrl-j newline|
+09|  <t>|
+10|/ commands   shift-tab mode   ctrl-j newline|
 11|replay-fixture | full access | ctx ~###k (request bytes)|
 12|>|
 13||

@@ -13,8 +13,8 @@ edit-finished: 80x24, caret 2,17
 11|[files changed with no check since; asked for one before finishing]|
 12||
 13|EDIT-CHECKED|
-14|  1 call · 1 file changed · unverified · <t>|
-15|/ commands   ctrl-j newline|
+14|  1 file +2 -1 · unverified · <t>|
+15|/ commands   shift-tab mode   ctrl-j newline|
 16|replay-fixture | full access | ctx ~###k (request bytes)|
 17|>|
 18||

@@ -9,7 +9,7 @@ completion-last: 32x8, caret 3,3
 07|  26-28 of 28|
 completion-closed: 32x8, caret 2,3
 00|session ************|
-01|/ commands   ctrl-j newline|
+01|/ commands   shift-tab mode|
 02|menu-model-01 | auto|
 03|>|
 04||
@@ -27,7 +27,7 @@ model-last: 32x8, caret 2,3
 07|type to narrow, up/down choose,|
 model-closed: 32x8, caret 2,3
 00|session ************|
-01|/ commands   ctrl-j newline|
+01|/ commands   shift-tab mode|
 02|menu-model-01 | auto|
 03|>|
 04||

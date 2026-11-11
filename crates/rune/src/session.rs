@@ -11739,7 +11739,10 @@ mod tests {
         // told apart and Ctrl+J is the key to name.
         let host = test_host();
         let wide = host.status_line_in(120, Some(UiState::Idle));
-        assert!(wide.contains("/ commands   ctrl-j newline"), "{wide:?}");
+        assert!(
+            wide.contains("/ commands   shift-tab mode   ctrl-j newline"),
+            "{wide:?}"
+        );
         let narrow = host.status_line_in(20, Some(UiState::Idle));
         assert!(!narrow.contains("newline"), "{narrow:?}");
         let running = host.status_line_in(120, Some(UiState::Running));
