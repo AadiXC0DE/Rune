@@ -223,3 +223,170 @@ fn checkpoints_need_a_saved_session() {
         "{stderr}"
     );
 }
+
+/// Runs one saved `ask` turn whose shell call creates `made-by-command`.
+fn command_turn(root: &Path) -> (PathBuf, ScriptedProvider) {
+    let workspace = workspace(root);
+    let provider = ScriptedProvider::start(vec![
+        Turn::call(
+            "call_1",
+            "shell",
+            r#"{"action": "run", "command": "mkdir -p out && echo x > out/made-by-command"}"#,
+        ),
+        Turn::text("done"),
+    ]);
+    let output = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &[
+            "--permission-mode",
+            "full-access",
+            "--allow-unsandboxed",
+            "ask",
+            "--checkpoints",
+            "--",
+            "go",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workspace.join("out/made-by-command").exists());
+    (workspace, provider)
+}
+
+#[test]
+fn session_restore_dry_run_lists_changes() {
+    if !git_present() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let (workspace, provider) = command_turn(root);
+
+    let text = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &["session", "restore", "last", "--turn", "1", "--dry-run"],
+    );
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "undo preview: restoring to before turn 1 would change\nA out/made-by-command +1 -0\n"
+    );
+    let json = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &[
+            "session",
+            "restore",
+            "last",
+            "--turn",
+            "1",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "turn": 1,
+            "dry_run": true,
+            "changes": [{"path": "out/made-by-command", "kind": "added", "added": 1, "removed": 0}],
+        })
+    );
+    assert!(
+        workspace.join("out/made-by-command").exists(),
+        "a dry run changes nothing"
+    );
+}
+
+#[test]
+fn session_restore_puts_back_a_command_made_change() {
+    if !git_present() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let (workspace, provider) = command_turn(root);
+    let last = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &["session", "last", "--json"],
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&last.stdout).expect("summary");
+    let id = summary["id"].as_str().expect("session id").to_owned();
+
+    // Another directory is refused before anything is read from the store.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    let refused = rune(
+        root,
+        &elsewhere,
+        &provider.base_url(),
+        &["session", "restore", &id, "--turn", "1"],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "session {id} ran in {}; run this command there",
+            workspace.display()
+        )),
+        "{stderr}"
+    );
+
+    // A file edited outside the session refuses the restore without --force.
+    std::fs::write(workspace.join("a.txt"), "edited\n").expect("edit");
+    let outside = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &["session", "restore", "last", "--turn", "1"],
+    );
+    assert_eq!(outside.status.code(), Some(1), "{outside:?}");
+    assert!(
+        String::from_utf8_lossy(&outside.stdout).starts_with(
+            "these files changed outside this session since the last checkpoint:\nM a.txt +1 -1\n"
+        ),
+        "{outside:?}"
+    );
+    assert!(workspace.join("out/made-by-command").exists());
+    std::fs::write(workspace.join("a.txt"), "a\n").expect("edit back");
+
+    let restored = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &["session", "restore", "last", "--turn", "1"],
+    );
+    assert!(restored.status.success(), "{restored:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&restored.stdout),
+        "restored the workspace to before turn 1\nA out/made-by-command +1 -0\n"
+    );
+    assert!(
+        !workspace.join("out").exists(),
+        "the emptied directory is removed"
+    );
+    let log = std::fs::read_to_string(root.join("state/sessions").join(&id).join("events.jsonl"))
+        .expect("event log");
+    let restore: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("frame"))
+        .map(|frame| frame["event"].clone())
+        .filter(|event| event["kind"] == "restored")
+        .collect();
+    assert_eq!(restore.len(), 1, "{log}");
+    assert_eq!(restore[0]["direction"], "turn");
+    assert_eq!(restore[0]["turn"], 1);
+}

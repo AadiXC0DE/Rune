@@ -307,9 +307,12 @@ impl Recorder {
         self.turn
     }
 
-    /// Records a workspace snapshot taken at a turn boundary.
+    /// Records a workspace snapshot taken at a turn boundary, or a restore of one.
     pub fn workspace_checkpoint(&self, event: SessionEvent) -> Result<()> {
-        if !matches!(event, SessionEvent::WorkspaceCheckpoint { .. }) {
+        if !matches!(
+            event,
+            SessionEvent::WorkspaceCheckpoint { .. } | SessionEvent::Restored { .. }
+        ) {
             return Err(RuneError::new(
                 ErrorCode::Internal,
                 format!("expected a workspace checkpoint, got {}", event.kind()),
@@ -782,6 +785,7 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::WorkspaceCheckpoint { .. }
+            | SessionEvent::Restored { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::HarnessNote { .. }
@@ -1235,6 +1239,7 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::WorkspaceCheckpoint { .. }
+            | SessionEvent::Restored { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }

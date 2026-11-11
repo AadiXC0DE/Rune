@@ -14,7 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::{self, Paths};
 use rune_exec::session::{Input, POLL_INTERVAL, Process};
-use rune_session::event::{Boundary, SessionEvent};
+use rune_session::event::{Boundary, RestoreDirection, SessionEvent};
 use sha2::{Digest as _, Sha256};
 
 /// Directory under the state root that holds one shadow per workspace.
@@ -29,6 +29,8 @@ const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Largest a workspace's checkpoint store may grow before old sessions are removed.
 pub const STORE_CAP: u64 = 1_073_741_824;
+/// Longest a restore waits for queued snapshots.
+const RESTORE_WAIT: Duration = Duration::from_secs(60);
 /// Deadline of the garbage collection that follows a removed session.
 const GC_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -40,6 +42,56 @@ pub struct Shadow {
     exclude: Utf8PathBuf,
     /// Directory holding one folder per session, to tell which sessions still exist.
     sessions: Utf8PathBuf,
+}
+
+/// One file that differs between two trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: ChangeKind,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// How a file differs between two trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl FileChange {
+    /// The same change seen from the other side: an addition becomes a deletion.
+    fn reversed(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            kind: match self.kind {
+                ChangeKind::Added => ChangeKind::Deleted,
+                ChangeKind::Modified => ChangeKind::Modified,
+                ChangeKind::Deleted => ChangeKind::Added,
+            },
+            added: self.removed,
+            removed: self.added,
+        }
+    }
+
+    /// `{A|M|D} {path} +{added} -{removed}`; binary files and deletions have no counts.
+    pub fn line(&self) -> String {
+        let letter = match self.kind {
+            ChangeKind::Added => 'A',
+            ChangeKind::Modified => 'M',
+            ChangeKind::Deleted => 'D',
+        };
+        match (self.kind, self.added, self.removed) {
+            (ChangeKind::Deleted, _, _) | (_, None, _) | (_, _, None) => {
+                format!("{letter} {}", self.path)
+            }
+            (_, Some(added), Some(removed)) => {
+                format!("{letter} {} +{added} -{removed}", self.path)
+            }
+        }
+    }
 }
 
 /// What one snapshot recorded.
@@ -188,6 +240,186 @@ impl Shadow {
             parent,
             skipped,
         })
+    }
+
+    /// Files that differ from `from` to `to`; binary files have no line counts.
+    pub fn diff(&self, from: &str, to: &str) -> Result<Vec<FileChange>> {
+        let base = ["diff-tree", "-r", "-z", "--no-renames"];
+        let mut status_args = base.to_vec();
+        status_args.extend(["--name-status", from, to]);
+        let status = self.git(&status_args, DEFAULT_DEADLINE)?;
+        let mut numstat_args = base.to_vec();
+        numstat_args.extend(["--numstat", from, to]);
+        let numstat = self.git(&numstat_args, DEFAULT_DEADLINE)?;
+        let mut counts: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+        for record in numstat
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+        {
+            let text = String::from_utf8_lossy(record);
+            let mut parts = text.splitn(3, '\t');
+            if let (Some(added), Some(removed), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                counts.insert(path.to_owned(), (added.parse().ok(), removed.parse().ok()));
+            }
+        }
+        let mut fields = status
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty());
+        let mut changes = Vec::new();
+        while let (Some(code), Some(path)) = (fields.next(), fields.next()) {
+            let kind = match code.first() {
+                Some(b'A') => ChangeKind::Added,
+                Some(b'D') => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            let path = String::from_utf8_lossy(path).into_owned();
+            let (added, removed) = counts.get(&path).copied().unwrap_or((None, None));
+            changes.push(FileChange {
+                path,
+                kind,
+                added,
+                removed,
+            });
+        }
+        Ok(changes)
+    }
+
+    /// Makes the working tree match `target`, touching only paths that differ from
+    /// `current`. Returns the changes applied.
+    ///
+    /// Every path is checked before anything is written, so an unsafe entry
+    /// leaves the workspace as it was.
+    pub fn restore(&self, current: &str, target: &str) -> Result<Vec<FileChange>> {
+        let changes = self.diff(current, target)?;
+        for change in &changes {
+            self.check_safe(&change.path)?;
+        }
+        // Deletions go first, so a directory that becomes a file (or the other
+        // way round) is out of the way before the new entry is written.
+        for change in changes
+            .iter()
+            .filter(|change| change.kind == ChangeKind::Deleted)
+        {
+            self.remove_path(&change.path)?;
+        }
+        for change in changes
+            .iter()
+            .filter(|change| change.kind != ChangeKind::Deleted)
+        {
+            self.write_path(target, &change.path)?;
+        }
+        Ok(changes)
+    }
+
+    /// The tree a commit or tree id names.
+    pub fn tree_of(&self, object: &str) -> Result<String> {
+        let spec = format!("{object}^{{tree}}");
+        Ok(trimmed(&self.git(
+            &["rev-parse", "--verify", &spec],
+            DEFAULT_DEADLINE,
+        )?))
+    }
+
+    /// Refuses a path that could write outside the workspace or into a repository.
+    fn check_safe(&self, path: &str) -> Result<()> {
+        let refused = || {
+            RuneError::new(
+                ErrorCode::UnsafePath,
+                format!("checkpoint path {path} is not safe to restore"),
+            )
+        };
+        let relative = Utf8Path::new(path);
+        let components: Vec<camino::Utf8Component<'_>> = relative.components().collect();
+        if components.is_empty() {
+            return Err(refused());
+        }
+        let mut directory = self.workspace.clone();
+        for (index, component) in components.iter().enumerate() {
+            let camino::Utf8Component::Normal(name) = component else {
+                return Err(refused());
+            };
+            if name.eq_ignore_ascii_case(".git") {
+                return Err(refused());
+            }
+            if index.saturating_add(1) < components.len() {
+                directory.push(name);
+                let linked = std::fs::symlink_metadata(&directory)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+                if linked {
+                    return Err(refused());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one path from `target` through a temporary file and a rename.
+    fn write_path(&self, target: &str, path: &str) -> Result<()> {
+        let listed = self.git(&["ls-tree", "-z", target, "--", path], DEFAULT_DEADLINE)?;
+        let entry = listed.split(|byte| *byte == 0).next().unwrap_or_default();
+        let entry = String::from_utf8_lossy(entry);
+        let meta = entry.split('\t').next().unwrap_or_default();
+        let mut fields = meta.split(' ');
+        let (Some(mode), Some(_), Some(object)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(RuneError::new(
+                ErrorCode::Internal,
+                format!("checkpoint has no entry for {path}"),
+            ));
+        };
+        if mode == "160000" {
+            return Ok(());
+        }
+        let bytes = self.git(&["cat-file", "blob", object], DEFAULT_DEADLINE)?;
+        let destination = self.workspace.join(path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let name = destination.file_name().unwrap_or("file");
+        let temporary = destination.with_file_name(format!(".{name}.rune-restore"));
+        let _ = std::fs::remove_file(&temporary);
+        if mode == "120000" {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(String::from_utf8_lossy(&bytes).as_ref(), &temporary)?;
+            #[cfg(not(unix))]
+            std::fs::write(&temporary, &bytes)?;
+        } else {
+            std::fs::write(&temporary, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let bits = if mode == "100755" { 0o755 } else { 0o644 };
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(bits))?;
+            }
+        }
+        std::fs::rename(&temporary, &destination)?;
+        Ok(())
+    }
+
+    /// Removes one path, then the directories it leaves empty, up to the workspace.
+    fn remove_path(&self, path: &str) -> Result<()> {
+        let destination = self.workspace.join(path);
+        if std::fs::symlink_metadata(&destination).is_ok_and(|meta| meta.is_dir()) {
+            return Ok(());
+        }
+        match std::fs::remove_file(&destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut directory = destination.parent();
+        while let Some(current) = directory {
+            if current == self.workspace || !current.starts_with(&self.workspace) {
+                break;
+            }
+            if std::fs::remove_dir(current).is_err() {
+                break;
+            }
+            directory = current.parent();
+        }
+        Ok(())
     }
 
     /// Size in bytes of the shadow directory.
@@ -348,6 +580,244 @@ pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
 /// Appends a checkpoint event to the session log.
 pub type Record = Arc<dyn Fn(SessionEvent) -> Result<()> + Send + Sync>;
 
+/// The tree a turn started from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnStart {
+    pub tree: String,
+    /// False when the snapshot was not ready before the turn changed files.
+    pub complete: bool,
+}
+
+/// A session's checkpoints and restores, in the order they happened.
+#[derive(Clone, Debug, Default)]
+pub struct Timeline {
+    /// Tree or commit the workspace last held: the newest checkpoint or restore target.
+    current: Option<String>,
+    /// Every checkpoint tree with its turn, oldest first.
+    trees: Vec<(u64, String)>,
+    starts: BTreeMap<u64, TurnStart>,
+    /// Turns whose start and end trees differ, oldest first.
+    changed: Vec<u64>,
+    undone: BTreeSet<u64>,
+    /// Turn and saved commit of each undo not yet redone, oldest first.
+    redo: Vec<(u64, String)>,
+}
+
+impl Timeline {
+    /// Rebuilds the timeline from a session's events.
+    pub fn from_events(events: &[SessionEvent]) -> Self {
+        let mut timeline = Self::default();
+        for event in events {
+            timeline.apply(event);
+        }
+        timeline
+    }
+
+    /// Takes one event into account; events of other kinds are ignored.
+    pub fn apply(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::WorkspaceCheckpoint {
+                turn,
+                boundary,
+                tree,
+                complete,
+                ..
+            } => {
+                match boundary {
+                    Boundary::Start => {
+                        self.starts.insert(
+                            *turn,
+                            TurnStart {
+                                tree: tree.clone(),
+                                complete: *complete,
+                            },
+                        );
+                    }
+                    Boundary::End => {
+                        // A start identical to the previous checkpoint was not
+                        // recorded, so the turn started from the current tree.
+                        if !self.starts.contains_key(turn)
+                            && let Some(current) = &self.current
+                        {
+                            self.starts.insert(
+                                *turn,
+                                TurnStart {
+                                    tree: current.clone(),
+                                    complete: true,
+                                },
+                            );
+                        }
+                        let changed = self
+                            .starts
+                            .get(turn)
+                            .is_some_and(|start| start.tree != *tree);
+                        if changed {
+                            if !self.changed.contains(turn) {
+                                self.changed.push(*turn);
+                            }
+                            self.undone.remove(turn);
+                            self.redo.clear();
+                        }
+                    }
+                }
+                self.trees.push((*turn, tree.clone()));
+                self.current = Some(tree.clone());
+            }
+            SessionEvent::Restored {
+                turn,
+                direction,
+                target,
+                ..
+            } => {
+                match direction {
+                    RestoreDirection::Undo => {
+                        self.undone.insert(*turn);
+                        if let SessionEvent::Restored { saved, .. } = event {
+                            self.redo.push((*turn, saved.clone()));
+                        }
+                    }
+                    RestoreDirection::Redo => {
+                        self.redo.pop();
+                        self.undone.remove(turn);
+                    }
+                    RestoreDirection::Turn => {}
+                }
+                self.current = Some(target.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// Turn and start tree of the newest turn that changed files and is not undone.
+    pub fn undo_target(&self) -> Option<(u64, String)> {
+        self.changed
+            .iter()
+            .rev()
+            .find(|turn| !self.undone.contains(turn))
+            .and_then(|turn| {
+                self.starts
+                    .get(turn)
+                    .map(|start| (*turn, start.tree.clone()))
+            })
+    }
+
+    /// Turn and saved commit of the newest undo not yet redone.
+    pub fn redo_target(&self) -> Option<(u64, String)> {
+        self.redo.last().cloned()
+    }
+
+    /// The start checkpoint recorded for a turn.
+    pub fn turn_start(&self, turn: u64) -> Option<&TurnStart> {
+        self.starts.get(&turn)
+    }
+
+    /// The tree the workspace held before `turn`: its start checkpoint, or the
+    /// newest checkpoint of an earlier turn when the turn recorded none.
+    pub fn before_turn(&self, turn: u64) -> Option<TurnStart> {
+        if let Some(start) = self.starts.get(&turn) {
+            return Some(start.clone());
+        }
+        self.trees
+            .iter()
+            .rev()
+            .find(|(recorded, _)| *recorded < turn)
+            .map(|(_, tree)| TurnStart {
+                tree: tree.clone(),
+                complete: true,
+            })
+    }
+
+    /// The tree or commit the workspace was last known to hold.
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+}
+
+/// A restore asked for: the turn it refers to, what to restore to, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreRequest {
+    pub turn: u64,
+    pub target: String,
+    pub direction: RestoreDirection,
+}
+
+/// What a restore did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreReport {
+    /// The files restored, listed as the turn changed them: an undo of a turn
+    /// that created a file lists it as added. A redo lists what it puts back.
+    Done(Vec<FileChange>),
+    /// Files changed since the session's last checkpoint; nothing was written.
+    OutsideChanges(Vec<FileChange>),
+}
+
+/// The refusal for a turn whose start snapshot was not ready in time.
+pub fn incomplete(turn: u64) -> RuneError {
+    RuneError::new(
+        ErrorCode::InvalidState,
+        format!(
+            "the checkpoint for turn {turn} is incomplete (it was not ready before the turn changed files); restore refused"
+        ),
+    )
+}
+
+/// Restores the workspace for one request, the procedure every entry point shares.
+///
+/// Takes a snapshot first, so the state being replaced can be brought back, and
+/// refuses without `force` when files changed since the session's last
+/// checkpoint. A dry run returns the changes and writes nothing.
+pub fn restore_to(
+    shadow: &Shadow,
+    session: &str,
+    timeline: &mut Timeline,
+    request: &RestoreRequest,
+    force: bool,
+    dry_run: bool,
+    record: &Record,
+) -> Result<RestoreReport> {
+    if request.direction != RestoreDirection::Redo
+        && timeline
+            .before_turn(request.turn)
+            .is_some_and(|start| !start.complete)
+    {
+        return Err(incomplete(request.turn));
+    }
+    let (before, skipped) = shadow.stage()?;
+    if !force && let Some(current) = timeline.current() {
+        let known = shadow.tree_of(current)?;
+        if known != before {
+            let outside = shadow.diff(&known, &before)?;
+            if !outside.is_empty() {
+                return Ok(RestoreReport::OutsideChanges(outside));
+            }
+        }
+    }
+    // Going back lists the turn's own changes; going forward lists what returns.
+    let as_turn = |changes: Vec<FileChange>| -> Vec<FileChange> {
+        if request.direction == RestoreDirection::Redo {
+            changes
+        } else {
+            changes.iter().map(FileChange::reversed).collect()
+        }
+    };
+    if dry_run {
+        return Ok(RestoreReport::Done(as_turn(
+            shadow.diff(&before, &request.target)?,
+        )));
+    }
+    let saved = shadow.commit(session, "before restore", before.clone(), skipped)?;
+    let changes = as_turn(shadow.restore(&before, &request.target)?);
+    let event = SessionEvent::Restored {
+        turn: request.turn,
+        direction: request.direction,
+        target: request.target.clone(),
+        saved: saved.commit,
+    };
+    record(event.clone())?;
+    timeline.apply(&event);
+    Ok(RestoreReport::Done(changes))
+}
+
 /// One snapshot the worker is asked to take.
 struct Job {
     turn: u64,
@@ -364,6 +834,10 @@ struct State {
     /// Turns whose start snapshot was not ready when a change began.
     late: BTreeSet<u64>,
     latest: Option<CheckpointRecord>,
+    /// Jobs sent and jobs finished, so a restore can wait for the queue to drain.
+    sent: u64,
+    done: u64,
+    timeline: Timeline,
 }
 
 struct Shared {
@@ -382,6 +856,9 @@ pub struct Checkpoints {
     sender: Option<Sender<Job>>,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
+    shadow: Arc<Mutex<Shadow>>,
+    session: String,
+    record: Record,
 }
 
 impl Checkpoints {
@@ -414,6 +891,10 @@ impl Checkpoints {
         });
         let (sender, receiver) = mpsc::channel::<Job>();
         let worker_shared = Arc::clone(&shared);
+        let shadow = Arc::new(Mutex::new(shadow));
+        let worker_shadow = Arc::clone(&shadow);
+        let worker_session = session.clone();
+        let worker_record = Arc::clone(&record);
         let worker = std::thread::Builder::new()
             .name("rune-checkpoints".to_owned())
             .spawn(move || {
@@ -423,11 +904,24 @@ impl Checkpoints {
                     if !delay.is_zero() {
                         std::thread::sleep(delay);
                     }
-                    let mut outcome = take(&shadow, &session, &record, &worker_shared, &job);
+                    let shadow = worker_shadow.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut outcome = take(
+                        &shadow,
+                        &worker_session,
+                        &worker_record,
+                        &worker_shared,
+                        &job,
+                    );
                     if outcome.is_ok() && job.boundary == Boundary::End && !capped {
                         capped = true;
-                        outcome = shadow.enforce_cap(&session, STORE_CAP);
+                        outcome = shadow.enforce_cap(&worker_session, STORE_CAP);
                     }
+                    drop(shadow);
+                    {
+                        let mut state = worker_shared.lock();
+                        state.done = state.done.saturating_add(1);
+                    }
+                    worker_shared.ready.notify_all();
                     if let Err(error) = outcome
                         && !reported
                     {
@@ -445,7 +939,65 @@ impl Checkpoints {
             sender: worker.as_ref().map(|_| sender),
             shared,
             worker,
+            shadow,
+            session,
+            record,
         }
+    }
+
+    /// Starts from the checkpoints and restores a resumed session already recorded.
+    pub fn seed(&self, timeline: Timeline) {
+        self.shared.lock().timeline = timeline;
+    }
+
+    /// The session's checkpoints and restores so far.
+    pub fn timeline(&self) -> Timeline {
+        self.shared.lock().timeline.clone()
+    }
+
+    /// Blocks until every queued snapshot is written, at most `wait`.
+    /// Returns false on timeout.
+    pub fn wait_idle(&self, wait: Duration) -> bool {
+        let state = self.shared.lock();
+        let (state, _) = self
+            .shared
+            .ready
+            .wait_timeout_while(state, wait, |state| state.done < state.sent)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.done >= state.sent
+    }
+
+    /// Waits for queued snapshots, then restores for the request `choose` picks.
+    ///
+    /// `choose` sees the timeline and returns None when there is nothing to do.
+    pub fn restore(
+        &self,
+        choose: impl FnOnce(&Timeline) -> Result<Option<RestoreRequest>>,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<Option<(RestoreRequest, RestoreReport)>> {
+        if !self.wait_idle(RESTORE_WAIT) {
+            return Err(RuneError::new(
+                ErrorCode::LimitExceeded,
+                "a checkpoint is still being written; try again in a moment",
+            ));
+        }
+        let shadow = self.shadow.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut timeline = self.timeline();
+        let Some(request) = choose(&timeline)? else {
+            return Ok(None);
+        };
+        let report = restore_to(
+            &shadow,
+            &self.session,
+            &mut timeline,
+            &request,
+            force,
+            dry_run,
+            &self.record,
+        )?;
+        self.shared.lock().timeline = timeline;
+        Ok(Some((request, report)))
     }
 
     /// Queues the start snapshot of `turn`.
@@ -489,7 +1041,10 @@ impl Checkpoints {
 
     fn send(&self, turn: u64, boundary: Boundary) {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Job { turn, boundary });
+            let mut state = self.shared.lock();
+            if sender.send(Job { turn, boundary }).is_ok() {
+                state.sent = state.sent.saturating_add(1);
+            }
         }
     }
 }
@@ -542,8 +1097,11 @@ fn take(shadow: &Shadow, session: &str, record: &Record, shared: &Shared, job: &
         snapshot,
         complete,
     };
-    record(checkpoint.event())?;
-    shared.lock().latest = Some(checkpoint);
+    let event = checkpoint.event();
+    record(event.clone())?;
+    let mut state = shared.lock();
+    state.timeline.apply(&event);
+    state.latest = Some(checkpoint);
     Ok(())
 }
 
@@ -1081,6 +1639,207 @@ mod tests {
         );
         remove_session(&fixture.paths, &fixture.workspace, "kept").expect("remove");
         assert_eq!(references(&shadow), vec!["refs/rune/current".to_owned()]);
+    }
+
+    fn checkpoint(turn: u64, boundary: Boundary, tree: &str) -> SessionEvent {
+        SessionEvent::WorkspaceCheckpoint {
+            turn,
+            boundary,
+            tree: tree.to_owned(),
+            commit: format!("commit-{tree}"),
+            parent: None,
+            skipped: Vec::new(),
+            complete: true,
+        }
+    }
+
+    fn restored(turn: u64, direction: RestoreDirection, target: &str, saved: &str) -> SessionEvent {
+        SessionEvent::Restored {
+            turn,
+            direction,
+            target: target.to_owned(),
+            saved: saved.to_owned(),
+        }
+    }
+
+    #[test]
+    fn restore_writes_only_changed_paths() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        let kept = fixture.workspace.join("kept.txt");
+        std::fs::write(&kept, "kept\n").expect("file");
+        let before = shadow.snapshot("s", "turn 1 start").expect("snapshot");
+        std::fs::write(fixture.workspace.join("a.txt"), "changed\n").expect("edit");
+        let after = shadow.snapshot("s", "turn 1 end").expect("snapshot");
+        let stamp = std::fs::metadata(&kept)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let changes = shadow.restore(&after.tree, &before.tree).expect("restore");
+        assert_eq!(
+            changes.iter().map(FileChange::line).collect::<Vec<_>>(),
+            vec!["M a.txt +1 -1".to_owned()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("a.txt")).expect("read"),
+            "a\n"
+        );
+        let unchanged = std::fs::metadata(&kept)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_eq!(unchanged, stamp);
+    }
+
+    #[test]
+    fn restore_removes_files_the_target_lacks() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        let before = shadow.snapshot("s", "turn 1 start").expect("snapshot");
+        std::fs::create_dir_all(fixture.workspace.join("made/by")).expect("dir");
+        std::fs::write(fixture.workspace.join("made/by/command"), "x\n").expect("file");
+        let after = shadow.snapshot("s", "turn 1 end").expect("snapshot");
+
+        let changes = shadow.restore(&after.tree, &before.tree).expect("restore");
+        assert_eq!(
+            changes.iter().map(FileChange::line).collect::<Vec<_>>(),
+            vec!["D made/by/command".to_owned()]
+        );
+        assert!(
+            !fixture.workspace.join("made").exists(),
+            "empty directories are removed"
+        );
+        assert!(fixture.workspace.join("a.txt").exists());
+    }
+
+    #[test]
+    fn restore_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        let script = fixture.workspace.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho one\n").expect("file");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let first = shadow.snapshot("s", "turn 1 start").expect("snapshot");
+        std::fs::write(&script, "#!/bin/sh\necho two\n").expect("edit");
+        let second = shadow.snapshot("s", "turn 1 end").expect("snapshot");
+
+        shadow.restore(&second.tree, &first.tree).expect("undo");
+        let mode = std::fs::metadata(&script)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "undo keeps the mode");
+        shadow.restore(&first.tree, &second.tree).expect("redo");
+        let mode = std::fs::metadata(&script)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "redo keeps the mode");
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("read"),
+            "#!/bin/sh\necho two\n"
+        );
+    }
+
+    #[test]
+    fn unsafe_paths_are_refused_before_writing() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        for path in [
+            "../escape",
+            ".git/config",
+            "a/../../b",
+            "/etc/passwd",
+            "sub/.GIT/x",
+        ] {
+            let error = shadow.check_safe(path).expect_err(path);
+            assert_eq!(
+                error.message(),
+                format!("checkpoint path {path} is not safe to restore")
+            );
+        }
+        // A directory that is now a link out of the workspace is not written through.
+        std::fs::create_dir(fixture.workspace.join("link")).expect("dir");
+        std::fs::write(fixture.workspace.join("link/file.txt"), "inside\n").expect("file");
+        std::fs::write(fixture.workspace.join("a.txt"), "edited\n").expect("edit");
+        let target = shadow.snapshot("s", "turn 1 start").expect("snapshot");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::remove_dir_all(fixture.workspace.join("link")).expect("remove");
+        std::os::unix::fs::symlink(outside.path(), fixture.workspace.join("link")).expect("link");
+        std::fs::write(fixture.workspace.join("a.txt"), "later\n").expect("edit");
+        let current = shadow.snapshot("s", "turn 1 end").expect("snapshot");
+
+        let error = shadow
+            .restore(&current.tree, &target.tree)
+            .expect_err("refused");
+        assert_eq!(
+            error.message(),
+            "checkpoint path link/file.txt is not safe to restore"
+        );
+        assert!(!outside.path().join("file.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("a.txt")).expect("read"),
+            "later\n",
+            "nothing is written when one path is refused"
+        );
+    }
+
+    #[test]
+    fn timeline_steps_back_over_turns_without_changes() {
+        // Turns 1 and 3 changed files; turn 2 recorded nothing because its
+        // trees repeated the previous checkpoint.
+        let events = vec![
+            checkpoint(1, Boundary::Start, "t0"),
+            checkpoint(1, Boundary::End, "t1"),
+            checkpoint(3, Boundary::End, "t3"),
+        ];
+        let mut timeline = Timeline::from_events(&events);
+        assert_eq!(timeline.undo_target(), Some((3, "t1".to_owned())));
+        assert_eq!(
+            timeline.before_turn(2).map(|start| start.tree),
+            Some("t1".to_owned())
+        );
+        timeline.apply(&restored(3, RestoreDirection::Undo, "t1", "saved-3"));
+        assert_eq!(timeline.undo_target(), Some((1, "t0".to_owned())));
+        assert_eq!(timeline.redo_target(), Some((3, "saved-3".to_owned())));
+        timeline.apply(&restored(1, RestoreDirection::Undo, "t0", "saved-1"));
+        assert_eq!(timeline.undo_target(), None);
+        assert_eq!(timeline.redo_target(), Some((1, "saved-1".to_owned())));
+        timeline.apply(&restored(1, RestoreDirection::Redo, "saved-1", "saved-r"));
+        assert_eq!(timeline.redo_target(), Some((3, "saved-3".to_owned())));
+        assert_eq!(timeline.undo_target(), Some((1, "t0".to_owned())));
+        assert_eq!(timeline.current(), Some("saved-1"));
+    }
+
+    #[test]
+    fn a_new_change_clears_redo() {
+        let mut timeline = Timeline::from_events(&[
+            checkpoint(1, Boundary::Start, "t0"),
+            checkpoint(1, Boundary::End, "t1"),
+            restored(1, RestoreDirection::Undo, "t0", "saved-1"),
+        ]);
+        assert!(timeline.redo_target().is_some());
+        // A turn that changes nothing keeps the redo target.
+        timeline.apply(&checkpoint(2, Boundary::Start, "t0"));
+        assert!(timeline.redo_target().is_some());
+        timeline.apply(&checkpoint(3, Boundary::End, "t4"));
+        assert_eq!(timeline.redo_target(), None);
+        assert_eq!(timeline.undo_target(), Some((3, "t0".to_owned())));
     }
 
     /// The workspace checkpoints a session log holds, in order.

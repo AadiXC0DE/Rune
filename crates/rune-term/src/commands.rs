@@ -99,8 +99,13 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "undo",
-        arguments: "[preview]",
-        summary: "restore files changed in this session, or preview per-file diffs",
+        arguments: "[preview|confirm]",
+        summary: "restore the files of the last turn that changed them, or preview it",
+    },
+    Builtin {
+        name: "redo",
+        arguments: "",
+        summary: "put back what the last /undo restored",
     },
     Builtin {
         name: "tree",
