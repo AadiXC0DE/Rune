@@ -30,6 +30,7 @@ mod hooks;
 mod install;
 mod keys_file;
 mod mcp;
+mod mcp_oauth;
 mod model_limits;
 mod path_completion;
 mod permissions;
@@ -252,6 +253,20 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Mcp => {
             if launch.args.first().is_some_and(|action| action == "import") {
                 println!("{}", mcp::import(&settings, launch)?);
+                return Ok(ExitCode::from(EXIT_OK));
+            }
+            if launch
+                .args
+                .first()
+                .is_some_and(|action| action == "login" || action == "logout")
+            {
+                mcp::login_command(
+                    &settings,
+                    &paths,
+                    launch,
+                    &workspace,
+                    &mut std::io::stdout(),
+                )?;
                 return Ok(ExitCode::from(EXIT_OK));
             }
             let report = mcp::run(&settings, &paths, launch, &workspace)?;

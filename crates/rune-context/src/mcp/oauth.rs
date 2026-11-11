@@ -8,7 +8,7 @@
 
 use std::net::IpAddr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ureq::http::Uri;
 
@@ -17,7 +17,151 @@ use rune_core::error::{Result, RuneError};
 use super::config::{ServerConfig, Transport};
 
 mod loopback;
-pub use loopback::{LoopbackAuthorization, OAuthTokenStore, OAuthTokens};
+pub use loopback::{LoopbackAuthorization, OAuthTokenStore, OAuthTokens, register_client};
+
+/// Longest wait for one discovery request.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest metadata document read during discovery.
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
+
+/// The metadata documents an HTTP server's login was discovered from, kept so
+/// a later run can validate them again without contacting the server.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Discovery {
+    pub resource_metadata: Value,
+    pub authorization_metadata: Value,
+    pub issuer: String,
+}
+
+impl Discovery {
+    /// Validates both documents again against the configured server.
+    pub fn metadata(&self, config: &ServerConfig) -> Result<AuthorizationMetadata> {
+        ProtectedResourceMetadata::validate(config, &self.resource_metadata)?
+            .validate_authorization_server(&self.issuer, &self.authorization_metadata)
+    }
+}
+
+/// Finds and validates an HTTP server's authorization metadata.
+///
+/// The initialize request is posted without a token; a 401 naming
+/// `resource_metadata` in `WWW-Authenticate` points at the resource metadata,
+/// otherwise the well-known address under the endpoint's origin is used.
+pub fn discover(config: &ServerConfig) -> Result<Discovery> {
+    let Transport::Http { url, .. } = &config.transport else {
+        return Err(RuneError::invalid_field(
+            "oauth",
+            "OAuth login requires an HTTP server",
+        ));
+    };
+    check_endpoint("resource", url)?;
+    let agent = super::client::http_agent();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": super::protocol::SUPPORTED_VERSIONS.first().copied().unwrap_or_default(),
+            "capabilities": {},
+            "clientInfo": {"name": "rune", "version": env!("CARGO_PKG_VERSION")},
+        },
+    });
+    let response = agent
+        .post(url)
+        .config()
+        .timeout_global(Some(DISCOVERY_TIMEOUT))
+        .max_redirects(0)
+        .build()
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .send(initialize.to_string())
+        .map_err(|_| discovery_error("the server could not be reached"))?;
+    let named = (response.status().as_u16() == 401)
+        .then(|| {
+            response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find_map(resource_metadata_parameter)
+        })
+        .flatten();
+    let resource_url = match named {
+        Some(named) => named,
+        None => well_known_resource(url)?,
+    };
+    let resource_metadata = get_json(&agent, &resource_url)?;
+    let resource = ProtectedResourceMetadata::validate(config, &resource_metadata)?;
+    let issuer = resource
+        .authorization_servers()
+        .first()
+        .cloned()
+        .ok_or_else(|| discovery_error("no authorization server is advertised"))?;
+    let authorization_metadata = get_json(
+        &agent,
+        &format!(
+            "{}/.well-known/oauth-authorization-server",
+            issuer.trim_end_matches('/')
+        ),
+    )?;
+    resource.validate_authorization_server(&issuer, &authorization_metadata)?;
+    Ok(Discovery {
+        resource_metadata,
+        authorization_metadata,
+        issuer,
+    })
+}
+
+fn discovery_error(message: &str) -> RuneError {
+    RuneError::invalid_field("oauth_discovery", message)
+}
+
+/// The `resource_metadata` parameter of one `WWW-Authenticate` value.
+fn resource_metadata_parameter(header: &str) -> Option<String> {
+    let start = header.find("resource_metadata=")?;
+    let rest = header.get(start.saturating_add("resource_metadata=".len())..)?;
+    let value = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split([',', ' ']).next()?,
+    };
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// `{origin}/.well-known/oauth-protected-resource{path}` for an endpoint.
+fn well_known_resource(url: &str) -> Result<String> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|_| discovery_error("the server URL is not valid"))?;
+    let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
+        return Err(discovery_error("the server URL is not absolute"));
+    };
+    let path = uri.path().trim_end_matches('/');
+    Ok(format!(
+        "{scheme}://{authority}/.well-known/oauth-protected-resource{path}"
+    ))
+}
+
+fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value> {
+    check_endpoint("metadata", url)?;
+    let mut response = agent
+        .get(url)
+        .config()
+        .timeout_global(Some(DISCOVERY_TIMEOUT))
+        .max_redirects(0)
+        .build()
+        .header("accept", "application/json")
+        .call()
+        .map_err(|_| discovery_error("an OAuth metadata request failed"))?;
+    if response.status().as_u16() != 200 {
+        return Err(discovery_error("an OAuth metadata request failed"));
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_METADATA_BYTES)
+        .read_to_vec()
+        .map_err(|_| discovery_error("an OAuth metadata document is too large"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| discovery_error("an OAuth metadata document is not JSON"))
+}
 
 /// Protected resource metadata bound to a configured MCP endpoint.
 #[derive(Clone, Debug)]

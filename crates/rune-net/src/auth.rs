@@ -413,6 +413,12 @@ pub fn store_in_system_store(_provider: &str, _value: &str) -> bool {
     false
 }
 
+/// Reads a value from the platform secret store, where one is available.
+#[must_use]
+pub fn lookup_in_system_store(account: &str) -> Option<String> {
+    keychain_lookup(account)
+}
+
 /// Removes a credential from the platform secret store.
 #[cfg(target_os = "macos")]
 pub fn remove_from_system_store(provider: &str) -> bool {

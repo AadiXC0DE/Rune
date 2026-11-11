@@ -1071,6 +1071,59 @@ fn oversized_tool_results_have_a_bounded_preview_and_a_readable_full_body() {
 }
 
 #[test]
+fn large_mcp_results_obey_the_result_budget() {
+    // Advertised MCP tools and the deferred dispatcher both answer with a
+    // plain tool output, which the loop holds to the same caps.
+    let content = format!(
+        "MCP-HEAD {} MCP-MIDDLE {} MCP-TAIL",
+        "m".repeat(100 * 1024),
+        "m".repeat(100 * 1024)
+    );
+    for (name, arguments) in [
+        ("mcp_docs_dump", "{}"),
+        (
+            "mcp_call",
+            "{\"server\":\"docs\",\"tool\":\"dump\",\"arguments\":{}}",
+        ),
+    ] {
+        let endpoint = MockEndpoint::start(vec![
+            Script::tool_call("large", name, arguments),
+            Script::text("read"),
+        ]);
+        let host = TestHost::new(endpoint)
+            .with_tools(vec![ToolSpec {
+                name: name.to_owned(),
+                description: "MCP tool".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }])
+            .with_tool_response(ToolOutput::success(content.clone()));
+        let cap = host
+            .limits
+            .get_usize(rune_core::LimitName::MaxToolResultBytes);
+        let mut history = rune_agent::History::new();
+        history.push_user("dump");
+        let outcome = run_turn(&mut history, &host).expect("turn");
+        let shown = &outcome.calls[0].output;
+        assert!(
+            shown.text.len() <= cap,
+            "{name}: {} > {cap}",
+            shown.text.len()
+        );
+        assert!(shown.text.starts_with("MCP-HEAD "), "{name}");
+        assert!(!shown.text.contains("MCP-MIDDLE"), "{name}");
+        assert!(
+            shown.text.contains("omitted; read_tool_result reads them"),
+            "{name}"
+        );
+        let handle = retained_handle(&shown.text);
+        assert_eq!(
+            history.result_store().describe(&handle),
+            Some((name, content.len() as u64, false))
+        );
+    }
+}
+
+#[test]
 fn a_small_context_window_lowers_the_result_cap() {
     let content = format!("START {} END", "x".repeat(20 * 1024));
     for (window, configured) in [

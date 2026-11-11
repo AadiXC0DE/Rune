@@ -786,7 +786,7 @@ struct AskHost<'a> {
     compat: crate::provider_setup::CompatSource,
     registry: Registry,
     /// The connected MCP servers whose tools are advertised one by one.
-    mcp: Option<rune_context::mcp::Client>,
+    mcp: Option<std::sync::Arc<rune_context::mcp::Client>>,
     /// Runs `subagent` calls; none for a review or a run without tools.
     subagent: Option<std::sync::Arc<crate::subagent::Bridge>>,
     read_only: bool,

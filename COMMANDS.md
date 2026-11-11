@@ -184,9 +184,9 @@ List the models of the connected provider
 | `--refresh` | Download the published model catalog now. |
 | `--explain` | Show how requests to this model are shaped, and why. |
 | `--json` | Emit JSON. |
-### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
+### `rune mcp list | check [server] | login <server> | logout <server> | import claude-desktop <file>`
 
-Manage MCP servers: mcp list, mcp check, mcp import
+Manage MCP servers: mcp list, mcp check, mcp login, mcp logout, mcp import
 
 | Flag | Description |
 |---|---|

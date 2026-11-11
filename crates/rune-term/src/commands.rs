@@ -43,6 +43,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show or set network access for shell commands",
     },
     Builtin {
+        name: "mcp",
+        arguments: "[reconnect|login|disable <server>]",
+        summary: "show MCP servers, or reconnect, log in to, or disable one",
+    },
+    Builtin {
         name: "plan",
         arguments: "[task|off]",
         summary: "plan read-only before acting, or leave plan mode",

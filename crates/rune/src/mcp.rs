@@ -1,4 +1,4 @@
-//! Inspect and connect project MCP declarations without granting project trust.
+//! Inspect and connect user and project MCP declarations without granting project trust.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -68,54 +68,165 @@ pub fn import(settings: &Settings, launch: &Launch) -> Result<String> {
     Ok(output)
 }
 
-/// Owned by the interactive host. Dropping the client stops its stdio children.
+/// Owned by the interactive host. Dropping the last client handle stops its
+/// stdio children.
 pub struct Connection {
-    pub client: Client,
+    pub client: Arc<Client>,
     pub warnings: Vec<String>,
+    /// Every server considered, for the `/mcp` panel.
+    pub servers: Vec<Configured>,
 }
 
-/// Connects approved, enabled stdio and HTTP servers for the interactive host.
-/// Offline mode excludes HTTP before resolving configuration or credentials.
+/// One server the host considered, with the state it was left in when it was
+/// never handed to the client.
+#[derive(Clone, Debug)]
+pub struct Configured {
+    pub name: String,
+    /// `user` or `project`.
+    pub source: &'static str,
+    /// `disabled`, `needs login` or `failed: {error}`; `None` while the client
+    /// holds the server.
+    pub state: Option<String>,
+}
+
+/// The user servers of the settings as entries in the project file shape.
+#[must_use]
+pub fn user_entries(settings: &Settings) -> BTreeMap<String, Value> {
+    settings
+        .mcp_servers
+        .iter()
+        .map(|(name, server)| {
+            let mut entry = serde_json::Map::new();
+            if let Some(command) = &server.command {
+                entry.insert("command".to_owned(), json!(command));
+                entry.insert("args".to_owned(), json!(server.args));
+                entry.insert("env".to_owned(), json!(server.env));
+                entry.insert("type".to_owned(), json!("stdio"));
+            }
+            if let Some(url) = &server.url {
+                entry.insert("url".to_owned(), json!(url));
+                entry.insert("headers".to_owned(), json!(server.headers));
+                entry.insert("type".to_owned(), json!("http"));
+            }
+            entry.insert("enabled".to_owned(), json!(server.enabled));
+            entry.insert("required".to_owned(), json!(server.required));
+            if let Some(tools) = &server.tools {
+                entry.insert("tools".to_owned(), json!(tools));
+            }
+            (name.clone(), Value::Object(entry))
+        })
+        .collect()
+}
+
+/// The tool allow list of an entry, when it has one.
+fn entry_tools(entry: &Value) -> Option<Vec<String>> {
+    entry.get("tools").and_then(Value::as_array).map(|names| {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+fn clash_warning(name: &str) -> String {
+    format!("MCP server {name} in .mcp.json has the same name as a user server and was skipped")
+}
+
+/// User servers first, then the project servers that do not share a user
+/// server's name, each with its source.
+fn all_entries(
+    workspace: &Utf8Path,
+    settings: &Settings,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(String, Value, &'static str)>> {
+    let user = user_entries(settings);
+    let project = project_entries(workspace, settings)?;
+    let mut entries: Vec<_> = user
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.clone(), "user"))
+        .collect();
+    for (name, entry) in project {
+        if user.contains_key(&name) {
+            warnings.push(clash_warning(&name));
+            continue;
+        }
+        entries.push((name, entry, "project"));
+    }
+    Ok(entries)
+}
+
+/// Connects user servers, then approved project servers, for the interactive
+/// host. User servers need no project trust. Offline mode excludes HTTP before
+/// resolving configuration or credentials.
 pub fn connect_interactive(
     settings: &Settings,
     paths: &Paths,
     workspace: &Utf8Path,
 ) -> Result<Option<Connection>> {
     let workspace = trust::canonical_workspace(workspace);
-    let entries = project_entries(&workspace, settings)?;
+    let mut warnings = Vec::new();
+    let entries = all_entries(&workspace, settings, &mut warnings)?;
     if entries.is_empty() {
         return Ok(None);
     }
-    let trust = TrustStore::load(&paths.trust_file())?;
+    let trust = if entries.iter().any(|(_, _, source)| *source == "project") {
+        Some(TrustStore::load(&paths.trust_file())?)
+    } else {
+        None
+    };
     let secrets = RefCell::new(Vec::new());
     let mut configs = Vec::new();
-    let mut warnings = Vec::new();
-    for (name, entry) in entries {
+    let mut servers = Vec::new();
+    let client = Client::new(&settings.limits);
+    for (name, entry, source) in entries {
         let transport = transport_kind(&entry);
         // Filter before expansion or environment reads. Neither full-access
         // tool policy nor offline mode grants project startup trust.
-        if decision(&trust, &workspace, &name) != Decision::Approved
-            || !matches!(transport, "stdio" | "http")
-            || (settings.offline && transport != "stdio")
-            || entry.get("enabled").and_then(Value::as_bool) == Some(false)
+        if source == "project"
+            && trust
+                .as_ref()
+                .is_none_or(|trust| decision(trust, &workspace, &name) != Decision::Approved)
         {
             continue;
         }
+        if !matches!(transport, "stdio" | "http" | "sse")
+            || (settings.offline && transport != "stdio")
+        {
+            continue;
+        }
+        let mut configured = Configured {
+            name: name.clone(),
+            source,
+            state: None,
+        };
+        if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
+            configured.state = Some("disabled".to_owned());
+            servers.push(configured);
+            continue;
+        }
         match resolve(&name, &entry, &workspace, settings, &secrets) {
-            Ok(config) => configs.push(config),
+            Ok(config) => {
+                if let Some(tools) = entry_tools(&entry) {
+                    client.restrict_tools(&name, tools);
+                }
+                attach_login(&client, &name, &config, paths);
+                configs.push(config);
+            }
             Err(error) => {
                 let message = redact(error.message(), &mut secrets.borrow_mut());
                 if entry.get("required").and_then(Value::as_bool) == Some(true) {
                     return Err(RuneError::new(error.code(), message));
                 }
                 warnings.push(format!("MCP server `{name}`: {}: {message}", error.code()));
+                configured.state = Some(format!("failed: {message}"));
             }
         }
+        servers.push(configured);
     }
-    if configs.is_empty() && warnings.is_empty() {
+    if configs.is_empty() && warnings.is_empty() && servers.is_empty() {
         return Ok(None);
     }
-    let client = Client::new(&settings.limits);
     let report = client.connect_all(&configs).map_err(|error| {
         RuneError::new(
             error.code(),
@@ -123,14 +234,266 @@ pub fn connect_interactive(
         )
     })?;
     for failure in report.failed {
+        let message = redact(failure.error.message(), &mut secrets.borrow_mut());
+        if failure.error.code() == ErrorCode::AuthenticationRequired
+            && let Some(server) = servers
+                .iter_mut()
+                .find(|server| server.name == failure.server)
+        {
+            server.state = Some("needs login".to_owned());
+        }
+        let hint = if failure.error.code() == ErrorCode::AuthenticationRequired {
+            format!("; run rune mcp login {}", failure.server)
+        } else {
+            String::new()
+        };
         warnings.push(format!(
-            "MCP server `{}`: {}: {}",
+            "MCP server `{}`: {}: {message}{hint}",
             failure.server,
             failure.error.code(),
-            redact(failure.error.message(), &mut secrets.borrow_mut())
         ));
     }
-    Ok(Some(Connection { client, warnings }))
+    for status in client.status() {
+        warnings.extend(status.warnings.into_iter().filter(|warning| {
+            warning.starts_with("MCP server ") && warning.contains(" has no tool ")
+        }));
+    }
+    Ok(Some(Connection {
+        client: Arc::new(client),
+        warnings,
+        servers,
+    }))
+}
+
+/// Sends a stored login's token to an HTTP server.
+fn attach_login(client: &Client, name: &str, config: &ServerConfig, paths: &Paths) {
+    if config.transport.kind() != "http" {
+        return;
+    }
+    let directory = crate::mcp_oauth::directory(paths);
+    if let Some(login) = crate::mcp_oauth::StoredLogin::load(
+        name,
+        config,
+        &directory,
+        crate::mcp_oauth::token_store(paths),
+    ) {
+        client.authorize_with(name, Arc::new(login));
+    }
+}
+
+/// Runs `rune mcp login <server>` or `rune mcp logout <server>` for an HTTP
+/// server declared in the user file or approved in the project file.
+pub fn login_command(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let [action, name] = launch.args.as_slice() else {
+        return Err(RuneError::invalid_field(
+            "action",
+            "expected `rune mcp login <server>` or `rune mcp logout <server>`",
+        ));
+    };
+    let open_browser = std::env::var("RUNE_MCP_LOGIN_NO_BROWSER").as_deref() != Ok("1");
+    login_server(
+        settings,
+        paths,
+        workspace,
+        name,
+        action == "logout",
+        open_browser,
+        out,
+    )
+    .map(|_| ())
+}
+
+/// Logs in to, or out of, one HTTP server, returning its resolved configuration.
+pub fn login_server(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    name: &str,
+    logout: bool,
+    open_browser: bool,
+    out: &mut dyn std::io::Write,
+) -> Result<ServerConfig> {
+    let workspace = trust::canonical_workspace(workspace);
+    let mut warnings = Vec::new();
+    let (_, entry, source) = all_entries(&workspace, settings, &mut warnings)?
+        .into_iter()
+        .find(|(declared, _, _)| declared == name)
+        .ok_or_else(|| unknown_server(name))?;
+    if source == "project" {
+        let trust = TrustStore::load(&paths.trust_file())?;
+        if decision(&trust, &workspace, name) != Decision::Approved {
+            return Err(RuneError::new(
+                ErrorCode::PermissionDenied,
+                format!("MCP server {name} in .mcp.json is not approved"),
+            )
+            .with_hint("review it with rune projects status"));
+        }
+    }
+    if transport_kind(&entry) != "http" {
+        return Err(RuneError::invalid_field(
+            "server",
+            format!("MCP server {name} is not an HTTP server; only HTTP servers log in"),
+        ));
+    }
+    let secrets = RefCell::new(Vec::new());
+    let config = resolve(name, &entry, &workspace, settings, &secrets).map_err(|error| {
+        RuneError::new(
+            error.code(),
+            redact(error.message(), &mut secrets.borrow_mut()),
+        )
+    })?;
+    let directory = crate::mcp_oauth::directory(paths);
+    let store = crate::mcp_oauth::token_store(paths);
+    if logout {
+        let removed = crate::mcp_oauth::logout(name, &config, &directory, &store)?;
+        writeln!(
+            out,
+            "{}",
+            if removed {
+                format!("logged out of {name}")
+            } else {
+                format!("not logged in to {name}")
+            }
+        )?;
+        return Ok(config);
+    }
+    let user = settings.mcp_servers.get(name).filter(|_| source == "user");
+    let target = crate::mcp_oauth::Target {
+        name,
+        config: &config,
+        client_id: user.and_then(|server| server.oauth_client_id.as_deref()),
+        scope: user.and_then(|server| server.oauth_scope.as_deref()),
+    };
+    crate::mcp_oauth::login(&target, &directory, &store, out, open_browser).map_err(|error| {
+        RuneError::new(
+            error.code(),
+            redact(error.message(), &mut secrets.borrow_mut()),
+        )
+    })?;
+    Ok(config)
+}
+
+/// What `/mcp` shows and controls: every server the session considered.
+pub struct Panel {
+    client: Option<Arc<Client>>,
+    servers: Vec<Configured>,
+}
+
+impl Panel {
+    #[must_use]
+    pub fn new(client: Option<Arc<Client>>, servers: Vec<Configured>) -> Self {
+        Self { client, servers }
+    }
+
+    /// One line per server: name, state, tool count and source.
+    #[must_use]
+    pub fn render(&self) -> String {
+        if self.servers.is_empty() {
+            return "no MCP servers are configured".to_owned();
+        }
+        let mut out = String::new();
+        for server in &self.servers {
+            let status = self
+                .client
+                .as_ref()
+                .and_then(|client| client.server(&server.name));
+            let disabled = self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_disabled(&server.name));
+            let state = if disabled {
+                "disabled".to_owned()
+            } else if let Some(state) = &server.state {
+                state.clone()
+            } else {
+                match &status {
+                    Some(status) if status.connected => "connected".to_owned(),
+                    Some(status) => format!(
+                        "failed: {}",
+                        status.last_error.as_deref().unwrap_or("not connected")
+                    ),
+                    None => "failed: not connected".to_owned(),
+                }
+            };
+            let tools = status.map_or(0, |status| status.tools);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let _ = write!(
+                out,
+                "{}  {state}  {tools} tools  ({})",
+                server.name, server.source
+            );
+        }
+        out
+    }
+
+    fn find(&self, name: &str) -> Result<&Configured> {
+        self.servers
+            .iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| unknown_server(name))
+    }
+
+    /// Stops and restarts one server's connection.
+    pub fn reconnect(&mut self, name: &str) -> Result<String> {
+        let configured = self.find(name)?;
+        let client = self
+            .client
+            .as_ref()
+            .filter(|client| client.server(name).is_some())
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::InvalidState,
+                    format!(
+                        "MCP server {name} cannot be reconnected: it is {}",
+                        configured.state.as_deref().unwrap_or("not started")
+                    ),
+                )
+            })?;
+        let result = client.reconnect(name);
+        let state = match &result {
+            Err(error) if error.code() == ErrorCode::AuthenticationRequired => {
+                Some("needs login".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(server) = self.servers.iter_mut().find(|server| server.name == name) {
+            server.state = state;
+        }
+        result.map(|()| format!("reconnected MCP server {name}"))
+    }
+
+    /// After a login, sends the stored token to the server and reconnects it.
+    pub fn logged_in(
+        &mut self,
+        name: &str,
+        config: &ServerConfig,
+        paths: &Paths,
+    ) -> Result<String> {
+        if let Some(client) = &self.client {
+            attach_login(client, name, config, paths);
+        }
+        self.reconnect(name)
+    }
+
+    /// Refuses every later call to one server's tools for this session.
+    pub fn disable(&mut self, name: &str) -> Result<String> {
+        self.find(name)?;
+        if let Some(client) = &self.client {
+            client.disable(name);
+        }
+        if let Some(server) = self.servers.iter_mut().find(|server| server.name == name) {
+            server.state = Some("disabled".to_owned());
+        }
+        Ok(format!("MCP server {name} is disabled for this session"))
+    }
 }
 
 /// Combined schema bytes up to which `auto` advertises every MCP tool.
@@ -172,12 +535,12 @@ pub fn is_eager(setting: McpTools, tools: &[ProjectedTool]) -> bool {
 /// `capability_search` over it and returns `None`; the registry then owns the
 /// client.
 pub fn attach(
-    client: Client,
+    client: Arc<Client>,
     settings: &Settings,
     registry: &mut Registry,
     catalog: Arc<dyn Catalog>,
     cancellation: Cancellation,
-) -> Result<Option<Client>> {
+) -> Result<Option<Arc<Client>>> {
     if is_eager(settings.mcp_tools, &client.tools()) {
         return Ok(Some(client));
     }
@@ -244,7 +607,7 @@ pub fn call_tool(
 
 /// The tools of a live client, for `mcp_call` and the search, with the run's
 /// cancellation flag.
-pub struct ClientDirectory(pub Client, pub Cancellation);
+pub struct ClientDirectory(pub Arc<Client>, pub Cancellation);
 
 impl McpDirectory for ClientDirectory {
     fn entries(&self) -> Vec<McpEntry> {
@@ -338,6 +701,8 @@ fn project_entries(workspace: &Utf8Path, settings: &Settings) -> Result<BTreeMap
 pub struct Report {
     workspace: String,
     servers: Vec<Server>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -396,8 +761,8 @@ impl Report {
             };
             let _ = writeln!(
                 out,
-                "{}  {}  {}  {}",
-                server.name, server.transport, trust, server.status
+                "{}  {}  {}  {}  {}",
+                server.name, server.source, server.transport, trust, server.status
             );
             if let Some(error) = &server.startup_error {
                 let _ = writeln!(out, "  {}: {}", error.code, error.message);
@@ -422,6 +787,9 @@ impl Report {
                 );
             }
         }
+        for warning in &self.warnings {
+            let _ = writeln!(out, "warning: {warning}");
+        }
         out
     }
 }
@@ -441,32 +809,38 @@ pub fn run(
         _ => {
             return Err(RuneError::invalid_field(
                 "action",
-                "expected `rune mcp list`, `rune mcp check [server]`, or `rune mcp import claude-desktop <file>`",
+                "expected `rune mcp list`, `rune mcp check [server]`, `rune mcp login <server>`, `rune mcp logout <server>`, or `rune mcp import claude-desktop <file>`",
             ));
         }
     };
     let workspace = trust::canonical_workspace(workspace);
-    let trust = TrustStore::load(&paths.trust_file())?;
     let mut report = Report {
         workspace: workspace.to_string(),
         servers: Vec::new(),
+        warnings: Vec::new(),
     };
-    let entries = project_entries(&workspace, settings)?;
+    let entries = all_entries(&workspace, settings, &mut report.warnings)?;
     if entries.is_empty() {
         return empty_report(report, selected);
     }
+    let trust = TrustStore::load(&paths.trust_file())?;
     if let Some(name) = selected
-        && !entries.contains_key(name)
+        && !entries.iter().any(|(declared, _, _)| declared == name)
     {
         return Err(unknown_server(name));
     }
-    for (name, entry) in entries {
+    for (name, entry, source) in entries {
         if selected.is_some_and(|selected| selected != name) {
             continue;
         }
-        report.servers.push(inspect(
-            &name, &entry, &workspace, &trust, settings, checking,
-        ));
+        let scope = Scope {
+            workspace: &workspace,
+            trust: &trust,
+            settings,
+            paths,
+            checking,
+        };
+        report.servers.push(inspect(&name, &entry, source, scope));
     }
     Ok(report)
 }
@@ -482,15 +856,30 @@ fn empty_report(report: Report, selected: Option<&str>) -> Result<Report> {
     }
 }
 
-fn inspect(
-    name: &str,
-    entry: &Value,
-    workspace: &Utf8Path,
-    trust: &TrustStore,
-    settings: &Settings,
+/// What every inspected server is checked against.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    workspace: &'a Utf8Path,
+    trust: &'a TrustStore,
+    settings: &'a Settings,
+    paths: &'a Paths,
     checking: bool,
-) -> Server {
-    let decision = decision(trust, workspace, name);
+}
+
+fn inspect(name: &str, entry: &Value, source: &'static str, scope: Scope<'_>) -> Server {
+    let Scope {
+        workspace,
+        trust,
+        settings,
+        paths,
+        checking,
+    } = scope;
+    // User servers need no project trust.
+    let decision = if source == "user" {
+        Decision::Approved
+    } else {
+        decision(trust, workspace, name)
+    };
     let kind = transport_kind(entry);
     let transport = match kind {
         "stdio" => "stdio",
@@ -500,7 +889,7 @@ fn inspect(
     };
     let mut server = Server {
         name: name.to_owned(),
-        source: mcp_trust::PROJECT_FILE,
+        source,
         transport,
         trust: decision,
         enabled: entry
@@ -537,6 +926,10 @@ fn inspect(
     let secrets = RefCell::new(Vec::new());
     let result = resolve(name, entry, workspace, settings, &secrets).and_then(|config| {
         let client = Client::new(&settings.limits);
+        if let Some(tools) = entry_tools(entry) {
+            client.restrict_tools(name, tools);
+        }
+        attach_login(&client, name, &config, paths);
         // A separate client preserves required semantics while observing every
         // server, including those after a required server that fails.
         let result = client.connect_all(&[config]);
@@ -633,29 +1026,21 @@ fn resolve(
         .borrow_mut()
         .extend(expanded.environment.values().cloned());
     let kind = transport_kind(entry);
+    if kind == "sse" {
+        return Err(rune_context::mcp::client::legacy_sse(name));
+    }
     let transport = match kind {
         "stdio" if entry.get("url").is_none() => json!({
             "transport": "stdio", "command": expanded.command, "environment": expanded.environment
         }),
-        "http" | "sse" if entry.get("command").is_none() => {
+        "http" if entry.get("command").is_none() => {
             let url = entry
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(invalid)?;
             let url = mcp_trust::expand_template(url, workspace, &env)?;
             secrets.borrow_mut().push(url.clone());
-            if kind == "sse" {
-                // The legacy transport cannot carry configured headers.
-                if !expanded.headers.is_empty() {
-                    return Err(RuneError::new(
-                        ErrorCode::Unsupported,
-                        "SSE headers are not supported",
-                    ));
-                }
-                json!({"transport": "sse", "url": url})
-            } else {
-                json!({"transport": "http", "url": url, "headers": expanded.headers})
-            }
+            json!({"transport": "http", "url": url, "headers": expanded.headers})
         }
         _ => return Err(invalid()),
     };

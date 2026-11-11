@@ -434,7 +434,9 @@ struct SessionHost {
     turn_context: Mutex<ExecutionContext>,
     registry: Registry,
     /// MCP connections live until the session host is dropped.
-    mcp: Option<McpClient>,
+    mcp: Option<Arc<McpClient>>,
+    /// Every MCP server of the session, for `/mcp`.
+    mcp_panel: Mutex<crate::mcp::Panel>,
     subagent: Option<Arc<crate::subagent::Bridge>>,
     cancellation: Cancellation,
     steering: SteeringQueue,
@@ -2757,7 +2759,7 @@ impl SessionHost {
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
             queued: lock_value(&self.queued).len(),
             net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !self.endpoint.offline,
-            mcp: self.mcp.as_ref().map(McpClient::server_count),
+            mcp: self.mcp.as_ref().map(|client| client.server_count()),
         };
         let layout = footer::solve(
             (
@@ -4129,18 +4131,19 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .collect();
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
-    let (mcp, mcp_warnings) = match connection {
+    let (mcp, mcp_warnings, mcp_panel) = match connection {
         Some(connection) => (
             crate::mcp::attach(
-                connection.client,
+                Arc::clone(&connection.client),
                 &config.settings,
                 &mut config.registry,
                 Arc::clone(&config.catalog),
                 config.questions.cancellation.clone(),
             )?,
             connection.warnings,
+            crate::mcp::Panel::new(Some(connection.client), connection.servers),
         ),
-        None => (None, Vec::new()),
+        None => (None, Vec::new(), crate::mcp::Panel::new(None, Vec::new())),
     };
     let mut tools = inventory::advertisement(&config.registry);
     if let Some(client) = &mcp {
@@ -4379,6 +4382,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         context,
         registry: config.registry,
         mcp,
+        mcp_panel: Mutex::new(mcp_panel),
         subagent: config.subagent,
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
@@ -5047,6 +5051,19 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     }
                     Handled::Budget(requested) => note(set_budget(&host, requested.as_deref())),
                     Handled::Network(requested) => note(set_network(&host, requested.as_deref())),
+                    Handled::Mcp(Some(requested)) if requested.starts_with("login ") => {
+                        let name = requested.trim_start_matches("login ").trim();
+                        note(mcp_login(
+                            &host,
+                            &settings,
+                            &config.paths,
+                            &config.workspace,
+                            name,
+                        ));
+                    }
+                    Handled::Mcp(requested) => {
+                        note(mcp_command(&host.mcp_panel, requested.as_deref()));
+                    }
                     Handled::StatusLine(requested) => {
                         note(set_statusline(&host, requested.as_deref()));
                     }
@@ -8665,6 +8682,81 @@ fn git_branch(workspace: &Utf8Path) -> Option<String> {
 
 /// Shows the spend limit, or sets it from an amount in dollars, or turns it off.
 /// Shows or sets whether sandboxed shell commands may use the network.
+/// Runs `/mcp login <server>` with the terminal handed over the way the
+/// external editor gets it, then reconnects the server with its new token.
+fn mcp_login(
+    host: &SessionHost,
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    name: &str,
+) -> String {
+    /// Writes straight to the terminal, ending lines for raw mode.
+    struct Terminal<'a>(&'a SessionHost);
+    impl std::io::Write for Terminal<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let text = String::from_utf8_lossy(bytes).replace('\n', "\r\n");
+            self.0.show(text.as_bytes());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let result = {
+        let _screen = {
+            let _frame = host
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            host.transcript_open
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let screen = TranscriptScreen(host);
+            host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H");
+            rune_term::modes::mark(|modes| modes.alternate_screen = true);
+            screen
+        };
+        crate::mcp::login_server(
+            settings,
+            paths,
+            workspace,
+            name,
+            false,
+            true,
+            &mut Terminal(host),
+        )
+    };
+    match result {
+        Ok(config) => {
+            let reconnected = lock_value(&host.mcp_panel).logged_in(name, &config, paths);
+            match reconnected {
+                Ok(message) => format!("logged in to {name}; {message}"),
+                Err(error) => format!("logged in to {name}; {}", error.message()),
+            }
+        }
+        Err(error) => error.message().to_owned(),
+    }
+}
+
+/// Runs `/mcp`: the server list, or one action on a named server.
+fn mcp_command(panel: &Mutex<crate::mcp::Panel>, requested: Option<&str>) -> String {
+    let mut panel = lock_value(panel);
+    let Some(requested) = requested else {
+        return panel.render();
+    };
+    let usage = "usage: /mcp [reconnect|login|disable <server>]".to_owned();
+    let mut words = requested.split_whitespace();
+    let (Some(action), Some(name), None) = (words.next(), words.next(), words.next()) else {
+        return usage;
+    };
+    let result = match action {
+        "reconnect" => panel.reconnect(name),
+        "disable" => panel.disable(name),
+        _ => return usage,
+    };
+    result.unwrap_or_else(|error| error.message().to_owned())
+}
+
 fn set_network(host: &SessionHost, requested: Option<&str>) -> String {
     use std::sync::atomic::Ordering;
     let state = |on: bool| if on { "on" } else { "off" };
@@ -9629,6 +9721,8 @@ enum Handled {
     Budget(Option<String>),
     /// Show whether shell commands may use the network, or switch it.
     Network(Option<String>),
+    /// List the MCP servers, or reconnect, log in to or disable one.
+    Mcp(Option<String>),
     /// List the status row fields, or turn one on or off.
     StatusLine(Option<String>),
     /// Ask the user to choose a model from a list.
@@ -10131,6 +10225,9 @@ fn handle_command<W: std::io::Write>(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "network" => Ok(Handled::Network(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
+        "mcp" => Ok(Handled::Mcp(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "statusline" => Ok(Handled::StatusLine(
@@ -20846,6 +20943,7 @@ mod tests {
             turn_context: Mutex::new(ExecutionContext::new(Utf8PathBuf::from("/tmp"))),
             registry,
             mcp: None,
+            mcp_panel: Mutex::new(crate::mcp::Panel::new(None, Vec::new())),
             subagent: None,
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
@@ -21006,6 +21104,106 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
             assert_eq!(std::fs::read_to_string(&target).expect("read"), "outside\n");
         }
+    }
+
+    #[test]
+    fn mcp_panel_lists_state_and_disable_refuses_calls() {
+        const SERVER: &str = r#"
+import json, os, sys
+log = open(os.environ["MCP_PANEL_LOG"], "a", buffering=1)
+for line in sys.stdin:
+    request = json.loads(line)
+    log.write(request["method"] + "\n")
+    if "id" not in request:
+        continue
+    if request["method"] == "initialize":
+        result = {"protocolVersion": request["params"]["protocolVersion"], "capabilities": {"tools": {}}}
+    elif request["method"] == "tools/list":
+        schema = {"type": "object", "properties": {}}
+        result = {"tools": [{"name": "search", "description": "Find", "inputSchema": schema},
+                            {"name": "delete", "description": "Remove", "inputSchema": schema}]}
+    else:
+        result = {"content": [{"type": "text", "text": "done"}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let config = rune_context::mcp::ServerConfig::parse(&serde_json::json!({
+            "name": "local",
+            "transport": {
+                "transport": "stdio",
+                "command": ["python3", "-c", SERVER],
+                "environment": {"MCP_PANEL_LOG": log.to_string_lossy()},
+            },
+        }))
+        .expect("config");
+        let client = Arc::new(McpClient::new(&BudgetSet::new()));
+        client.connect_all(&[config]).expect("connect");
+        let configured = |name: &str, source, state: Option<&str>| crate::mcp::Configured {
+            name: name.to_owned(),
+            source,
+            state: state.map(str::to_owned),
+        };
+        let panel = Mutex::new(crate::mcp::Panel::new(
+            Some(Arc::clone(&client)),
+            vec![
+                configured("local", "user", None),
+                configured("off", "user", Some("disabled")),
+                configured("remote", "project", Some("needs login")),
+            ],
+        ));
+        assert_eq!(
+            mcp_command(&panel, None),
+            "local  connected  2 tools  (user)\n\
+             off  disabled  0 tools  (user)\n\
+             remote  needs login  0 tools  (project)"
+        );
+        let empty = Mutex::new(crate::mcp::Panel::new(None, Vec::new()));
+        assert_eq!(mcp_command(&empty, None), "no MCP servers are configured");
+        assert_eq!(
+            mcp_command(&panel, Some("reconnect local")),
+            "reconnected MCP server local"
+        );
+        assert!(mcp_command(&panel, Some("reconnect nothing")).contains("nothing"));
+        assert_eq!(
+            mcp_command(&panel, Some("disable local")),
+            "MCP server local is disabled for this session"
+        );
+        assert!(mcp_command(&panel, None).starts_with("local  disabled  2 tools  (user)"));
+        let before = std::fs::read_to_string(&log).expect("log");
+        let context = ExecutionContext::new(Utf8PathBuf::from("/tmp"));
+        let cancellation = Cancellation::new();
+        let direct = crate::mcp::call_tool(
+            &client,
+            "mcp_local_search",
+            &serde_json::json!({}),
+            &cancellation,
+            &context,
+        )
+        .expect("output");
+        let directory = crate::mcp::ClientDirectory(Arc::clone(&client), cancellation);
+        let deferred = rune_tools::mcp_tools::McpDirectory::call(
+            &directory,
+            "local",
+            "search",
+            &serde_json::json!({}),
+            &context,
+        )
+        .expect("output");
+        for output in [direct, deferred] {
+            assert!(output.is_error);
+            assert!(
+                output
+                    .text
+                    .contains("MCP server local is disabled for this session"),
+                "{}",
+                output.text
+            );
+        }
+        // Neither call reached the server.
+        assert_eq!(std::fs::read_to_string(&log).expect("log"), before);
+        assert!(!before.contains("tools/call"));
+        client.shutdown();
     }
 }
 

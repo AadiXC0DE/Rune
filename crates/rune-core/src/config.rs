@@ -699,6 +699,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_tools: Option<McpTools>,
 
+    /// MCP servers connected in every workspace, keyed by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<BTreeMap<String, UserMcpServer>>,
+
     /// Whether sandboxed shell commands may use the network. Off by default; offline mode overrules it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_network: Option<bool>,
@@ -847,6 +851,65 @@ pub struct UserConfig {
     pub shell_env: Option<Vec<String>>,
 }
 
+/// Longest MCP server name, in bytes.
+pub const MAX_MCP_SERVER_NAME_BYTES: usize = 32;
+
+/// One MCP server declared in the user configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserMcpServer {
+    /// Program and arguments of a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Endpoint of a Streamable HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Variables for a stdio server; values may use `${VAR}` and `${VAR:-default}`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Headers for an HTTP server; values may use `${VAR}` and `${VAR:-default}`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    /// Tool names to expose; absent exposes every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scope: Option<String>,
+}
+
+const fn yes() -> bool {
+    true
+}
+
+impl UserMcpServer {
+    /// Why the declaration named `name` cannot be used, if it cannot.
+    #[must_use]
+    pub fn validation_error(&self, name: &str) -> Option<String> {
+        if self.command.is_some() == self.url.is_some() {
+            return Some(format!("mcp server {name}: set command or url, not both"));
+        }
+        if name.is_empty()
+            || name.len() > MAX_MCP_SERVER_NAME_BYTES
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Some(format!(
+                "mcp server {name}: a name has 1 to {MAX_MCP_SERVER_NAME_BYTES} letters, digits, `_` or `-`"
+            ));
+        }
+        None
+    }
+}
+
 /// One `[providers.<name>]` table as written.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -965,6 +1028,8 @@ pub struct Settings {
     pub edit_tool: EditToolSetting,
     /// How MCP tools are offered.
     pub mcp_tools: McpTools,
+    /// Valid MCP servers from the user configuration.
+    pub mcp_servers: BTreeMap<String, UserMcpServer>,
     /// Switches for behaviour under measurement, from `RUNE_EXPERIMENT`.
     pub experiments: crate::experiment::Experiments,
     /// Whether sandboxed shell commands may use the network.
@@ -1086,6 +1151,7 @@ impl Default for Settings {
             web_tools: false,
             edit_tool: EditToolSetting::Auto,
             mcp_tools: McpTools::Auto,
+            mcp_servers: BTreeMap::new(),
             experiments: crate::experiment::Experiments::default(),
             shell_network: false,
             sandbox_cache_roots: None,
@@ -1323,6 +1389,10 @@ impl Settings {
                 } else {
                     format!("{} configured", self.hooks.len())
                 },
+            ),
+            (
+                "mcp_servers",
+                listed(&self.mcp_servers.keys().cloned().collect::<Vec<_>>()),
             ),
             (
                 "vision_model",
@@ -1628,6 +1698,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "temperature",
     "edit_tool",
     "mcp_tools",
+    "mcp_servers",
     "fast_mode",
     "theme",
     "color",
@@ -1661,6 +1732,7 @@ pub const USER_KEYS: &[&str] = &[
     "web_tools",
     "edit_tool",
     "mcp_tools",
+    "mcp_servers",
     "shell_network",
     "sandbox_cache_roots",
     "allow_unsandboxed",
@@ -1954,6 +2026,7 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
         "Command that may veto a tool call before it runs.",
     ),
     ("hooks", "Programs run at points of a session."),
+    ("mcp_servers", "MCP servers connected in every workspace."),
     (
         "vision_model",
         "Model that describes images on the active provider.",
@@ -2508,6 +2581,21 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(mcp_tools) = user.mcp_tools {
         settings.mcp_tools = mcp_tools;
         settings.sources.record("mcp_tools", layer);
+    }
+    if let Some(servers) = &user.mcp_servers {
+        settings.sources.record("mcp_servers", layer);
+        settings.mcp_servers.clear();
+        for (name, server) in servers {
+            if let Some(problem) = server.validation_error(name) {
+                settings.diagnostics.push(
+                    Diagnostic::new(layer, ErrorCode::InvalidField, problem)
+                        .with_key(format!("mcp_servers.{name}"))
+                        .with_hint("fix the `[mcp_servers]` entry or remove it"),
+                );
+            } else {
+                settings.mcp_servers.insert(name.clone(), server.clone());
+            }
+        }
     }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
@@ -3916,6 +4004,96 @@ mod tests {
     }
 
     #[test]
+    fn user_mcp_servers_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[mcp_servers.github]\nurl = \"https://example.test/mcp\"\n\
+             headers = { authorization = \"Bearer ${GITHUB_TOKEN}\" }\n\
+             tools = [\"search\"]\noauth_client_id = \"abc\"\noauth_scope = \"repo\"\n\
+             [mcp_servers.local]\ncommand = \"fixture\"\nargs = [\"--quiet\"]\n\
+             env = { LEVEL = \"${LEVEL:-info}\" }\nenabled = false\nrequired = true\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        let github = &settings.mcp_servers["github"];
+        assert_eq!(github.url.as_deref(), Some("https://example.test/mcp"));
+        assert_eq!(github.headers["authorization"], "Bearer ${GITHUB_TOKEN}");
+        assert_eq!(github.tools.as_deref(), Some(&["search".to_owned()][..]));
+        assert!(github.enabled && !github.required);
+        assert_eq!(github.oauth_client_id.as_deref(), Some("abc"));
+        assert_eq!(github.oauth_scope.as_deref(), Some("repo"));
+        let local = &settings.mcp_servers["local"];
+        assert_eq!(local.command.as_deref(), Some("fixture"));
+        assert_eq!(local.args, ["--quiet"]);
+        assert_eq!(local.env["LEVEL"], "${LEVEL:-info}");
+        assert!(!local.enabled && local.required && local.tools.is_none());
+        assert_eq!(settings.source_of("mcp_servers"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "mcp_servers" && row.value == "github,local")
+        );
+    }
+
+    #[test]
+    fn mcp_server_needs_command_or_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[mcp_servers.both]\ncommand = \"x\"\nurl = \"https://example.test\"\n\
+             [mcp_servers.neither]\nargs = [\"x\"]\n\
+             [mcp_servers.good]\ncommand = \"x\"\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(
+            settings.mcp_servers.keys().collect::<Vec<_>>(),
+            ["good"],
+            "invalid servers are dropped"
+        );
+        let messages: Vec<&str> = settings
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(messages.contains(&"mcp server both: set command or url, not both"));
+        assert!(messages.contains(&"mcp server neither: set command or url, not both"));
+        let long = "a".repeat(MAX_MCP_SERVER_NAME_BYTES + 1);
+        let user = write(
+            &dir,
+            "long.toml",
+            &format!("[mcp_servers.{long}]\ncommand = \"x\"\n"),
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.mcp_servers.is_empty());
+        assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+    }
+
+    #[test]
+    fn a_project_file_cannot_declare_user_mcp_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[mcp_servers.evil]\ncommand = \"/bin/sh\"\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.mcp_servers.is_empty());
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("mcp_servers")
+        }));
+        assert_eq!(settings.source_of("mcp_servers"), Layer::Default);
+    }
+
+    #[test]
     fn mcp_tools_defaults_to_auto() {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(load(None, None, &empty_env()).mcp_tools, McpTools::Auto);
@@ -4515,7 +4693,7 @@ max_agent_steps = 50
                     "pre_tool_hook" | "post_tool_hook" => toml::Value::Table(
                         toml::from_str("name = \"h\"\nargv = [\"true\"]\n").expect("hook"),
                     ),
-                    "models" | "providers" | "limits" | "permission" => {
+                    "models" | "providers" | "limits" | "permission" | "mcp_servers" => {
                         toml::Value::Table(toml::Table::new())
                     }
                     _ => toml::Value::Array(Vec::new()),

@@ -497,8 +497,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "Manage MCP servers: mcp list, mcp check, mcp import",
-        usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
+        summary: "Manage MCP servers: mcp list, mcp check, mcp login, mcp logout, mcp import",
+        usage: "rune mcp list | check [server] | login <server> | logout <server> | import claude-desktop <file>",
         flags: &[flag(
             "--json",
             "Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root.",
