@@ -292,7 +292,8 @@ pub fn pick_styled(
             | KeyAction::HistorySearch
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
-            | KeyAction::PullQueued => {}
+            | KeyAction::PullQueued
+            | KeyAction::Queue => {}
             KeyAction::Ignored => picker.set_query(reader.line()),
         }
     };

@@ -15,6 +15,7 @@ pub mod frame;
 pub mod highlight;
 pub mod inline;
 pub mod input;
+pub mod keys;
 pub mod markdown;
 pub mod modes;
 pub mod notify;

@@ -4125,6 +4125,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         rune_context::commands::discover(&config.workspace, &Paths::from_process().config_root)
             .unwrap_or_default();
 
+    // Read before raw mode, so a bad file stops the start on a plain terminal.
+    let keymap = crate::keys_file::load(&config.paths.keys_file())?;
+
     // Enable raw input before announcing the session. Otherwise input sent in
     // response to the banner can have its Enter translated by canonical mode
     // before the key reader starts, leaving a complete prompt unsubmitted.
@@ -4133,6 +4136,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     } else {
         rune_term::input::KeyReader::new()
     };
+    if let Some(keymap) = keymap {
+        reader.set_keymap(keymap);
+    }
     let keyed = reader.is_active();
 
     let probe = rune_term::probe::run(
@@ -4628,7 +4634,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     let _ = writeln!(
                         captured,
                         "\n{}",
-                        rune_term::input::render_bindings_help(reader.is_active())
+                        rune_term::input::render_bindings_help(reader.is_active(), reader.keymap())
                     );
                 }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
@@ -5791,7 +5797,10 @@ fn run_steerable<T: Send>(
             return;
         }
         sync_layout(reader, host, &prompt_marker(host));
-        let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
+        reader.set_context(rune_term::keys::Context::Turn);
+        let polled = reader.poll_key(rune_term::shell::POLL_INTERVAL);
+        reader.set_context(rune_term::keys::Context::Menu);
+        let Some(key) = polled else {
             host.flush_frame();
             host.tick();
             return;
@@ -5868,7 +5877,7 @@ fn run_steerable<T: Send>(
             }
             // Tab holds the draft as a new turn that starts once this one
             // ends.
-            KeyAction::Complete => {
+            KeyAction::Queue => {
                 gesture.disarm();
                 let text = lane_text(reader);
                 if text.is_empty() {
@@ -6161,6 +6170,7 @@ fn question_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::PullQueued
+        | KeyAction::Queue
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -6236,6 +6246,7 @@ fn approval_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::PullQueued
+        | KeyAction::Queue
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -6775,6 +6786,7 @@ fn await_submission(
         // A size that has not settled yet is drawn once it has, so the wait
         // for a key ends then.
         let resize = host.resize_wait();
+        reader.set_context(rune_term::keys::Context::Editor);
         let key = match (&flash, resize) {
             (Some((_, until)), _) => {
                 let left = until.saturating_duration_since(std::time::Instant::now());
@@ -6783,6 +6795,7 @@ fn await_submission(
             (None, Some(wait)) => reader.poll_key(wait),
             (None, None) => Some(reader.read_key()),
         };
+        reader.set_context(rune_term::keys::Context::Menu);
         reader.set_menu_open(false);
         let Some(key) = key else {
             if flash
@@ -6981,7 +6994,8 @@ fn idle_key(
         KeyAction::Suspend
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
-        | KeyAction::PullQueued => Idle::Stay,
+        | KeyAction::PullQueued
+        | KeyAction::Queue => Idle::Stay,
         KeyAction::Submit => {
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
@@ -7181,7 +7195,8 @@ fn confirm_choice(
                 KeyAction::Ignored
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
-                | KeyAction::PullQueued => {
+                | KeyAction::PullQueued
+                | KeyAction::Queue => {
                     let typed = answer.line().to_owned();
                     answer.clear();
                     match typed.as_str() {
@@ -7271,7 +7286,8 @@ fn run_picker(
             KeyAction::Ignored
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
-            | KeyAction::PullQueued => {
+            | KeyAction::PullQueued
+            | KeyAction::Queue => {
                 picker.set_query(reader.line());
             }
         }
@@ -7337,7 +7353,8 @@ fn search_prompt_history(
                 KeyAction::Ignored
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
-                | KeyAction::PullQueued => {
+                | KeyAction::PullQueued
+                | KeyAction::Queue => {
                     picker.set_query(query.line());
                 }
                 KeyAction::HistorySearch => {
@@ -9163,7 +9180,8 @@ fn choose_theme(
             KeyAction::Ignored
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
-            | KeyAction::PullQueued => {
+            | KeyAction::PullQueued
+            | KeyAction::Queue => {
                 picker.set_query(reader.line());
                 preview(&picker);
             }

@@ -80,3 +80,12 @@ fn an_interrupt_returns_the_queue_to_the_draft() {
     assert!(!screen.contains("queued 1:"), "{screen}");
     assert_eq!(row_over_caret(interrupted, 0), "> x");
 }
+
+#[test]
+fn a_rebound_queue_key_queues_and_tab_does_not() {
+    let stages = scenario("rebound");
+    assert_eq!(stages.len(), 1);
+    let (_, queued) = &stages[0];
+    assert_eq!(row_over_caret(queued, 0), ">");
+    assert_eq!(row_over_caret(queued, 1), "queued 1: second");
+}

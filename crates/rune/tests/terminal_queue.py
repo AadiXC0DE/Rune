@@ -20,7 +20,7 @@ requests = []
 errors = []
 release = threading.Event()
 scenario = sys.argv[2]
-assert scenario in {"order", "pull", "interrupt"}, scenario
+assert scenario in {"order", "pull", "interrupt", "rebound"}, scenario
 
 
 def event(text=None, finish=None):
@@ -79,6 +79,8 @@ with tempfile.TemporaryDirectory(prefix="rune-queue-") as directory:
     config_file = config / "config.toml"
     config_file.write_text("auto_upgrade = false\n")
     config_file.chmod(0o600)
+    if scenario == "rebound":
+        (config_file.parent / "keys.toml").write_text('queue = "ctrl+q"\n')
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -178,6 +180,20 @@ with tempfile.TemporaryDirectory(prefix="rune-queue-") as directory:
             release.set()
             wait_for("ANSWERED-first")
             assert requests == ["first"], requests
+        elif scenario == "rebound":
+            hold_first()
+            start = len(transcript)
+            os.write(master, b"second\t")
+            wait_for("second", start)
+            # Tab only completes now, which does nothing while a turn runs.
+            read_some(0.5)
+            assert b"queued 1:" not in transcript[start:], transcript.decode(errors="replace")
+            os.write(master, b"\x11")
+            wait_for("queued 1: second", start)
+            capture("queued")
+            release.set()
+            wait_for("ANSWERED-second", start)
+            assert requests == ["first", "second"], requests
         else:
             hold_first()
             start = len(transcript)

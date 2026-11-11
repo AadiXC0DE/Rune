@@ -570,6 +570,15 @@ pub const ACCOUNT: &[CommandSpec] = &[
         supports_json: true,
     },
     CommandSpec {
+        name: "keys",
+        aliases: &[],
+        summary: "List the key actions, their keys, and the file that rebinds them",
+        usage: "rune keys [--json]",
+        flags: &[flag("--json", "Emit JSON.")],
+        requirements: Requirements::NONE,
+        supports_json: true,
+    },
+    CommandSpec {
         name: "limits",
         aliases: &[],
         summary: "List every limit with its effective value and source",

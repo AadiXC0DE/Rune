@@ -15,6 +15,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
+use crate::keys::{ACTIONS, Context, Keymap};
 use crate::probe::Tri;
 
 /// Columns of the prompt marker until the session reports its layout.
@@ -28,48 +29,55 @@ const REDRAW_POLL: Duration = Duration::from_millis(100);
 
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
+/// The rebindable keys come from the action table and the keymap in use.
 #[must_use]
-pub fn render_bindings_help(active: bool) -> String {
+pub fn render_bindings_help(active: bool, keymap: &Keymap) -> String {
     if !active {
         return "Input: terminal line mode\nEnter submits one line; end of input leaves the session.\nComposer shortcuts, menus, and live steering require interactive key input."
             .to_owned();
     }
+    let rows = |contexts: &[Context]| {
+        ACTIONS
+            .iter()
+            .filter(|info| contexts.contains(&info.context))
+            .map(|info| {
+                let keys: Vec<String> = keymap
+                    .keys(info.id)
+                    .iter()
+                    .map(|name| key_label(name))
+                    .collect();
+                let keys = if keys.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    keys.join(" / ")
+                };
+                format!("  {keys:<32} {}  ({})", info.summary, info.id)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
         "Keyboard bindings (interactive key input)
+Actions are rebound by id in keys.toml; `rune keys` lists them.
 
 Composer:
-  Enter         submit the draft; while a turn runs, queue steering
-  Shift-Enter / Ctrl-J / Alt-Enter  insert a newline (also \\ then Enter)
+{}
   Left / Right  move by one grapheme, including across newlines
   Up / Down     move between rows of a long or multiline draft
-  Home / Ctrl-A start of the line; again for the draft
-  End / Ctrl-E  end of the line; again for the draft
-  Ctrl-B / Alt-Left   move one word left
-  Ctrl-F / Alt-Right  move one word right
-  Alt-B / Alt-F move one word left / right
   Backspace     delete the grapheme before the caret
   Delete        delete the grapheme at the caret
   Ctrl-D        delete at the caret; empty idle draft leaves the session
-  Ctrl-W        cut the word before the caret
-  Alt-Backspace cut the word before the caret
-  Alt-D         cut the word after the caret
-  Ctrl-U        cut to the start of the line
-  Ctrl-K        cut to the end of the line
-  Ctrl-Y        yank the last cut text at the caret
-  Alt-Y         cycle earlier cuts after Ctrl-Y
-  Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
-  Alt-R         redo a draft edit (Alt with lowercase r)
-  Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
   Alt-T         cycle how reasoning is shown
+
+While a turn runs (composer keys also apply):
+{}
 
 Idle prompt and menus:
   Up / Down     recall prompts from the first / last draft row;
                 select a menu row when a menu is open
-  Tab           complete a slash command or workspace path
   Enter         accept an incomplete command; run a complete command
   Tab / Enter   accept a path, model, or history selection
-  Ctrl-R        search workspace history by substring; type to filter;
-                Ctrl-R again switches to all workspaces and back
+                Ctrl-R again in history search switches to all workspaces
   Esc / Ctrl-C / Ctrl-D  cancel model/history menus (Ctrl-D: empty query)
                 cancelling preserves the draft and caret
   Esc           close a path menu first; otherwise clear the idle draft
@@ -87,20 +95,50 @@ Cancellation (outside menus and the transcript):
   Ctrl-D        with an empty draft during a turn, keep the turn running
 
 Transcript:
-  Ctrl-O        open a snapshot while idle or during a turn
+{}
   Up / Down     scroll one row
   PageUp / PageDown  scroll one page
   Home / End    jump to the beginning / end
   Tab / Shift-Tab  select the next / previous tool
   Space         collapse or expand the selected tool (16 KiB / 200 rows)
-  Esc / Ctrl-O / Ctrl-C / Ctrl-D  close and restore the draft and caret
+  Ctrl-C        close and restore the draft and caret
 
 Paste:
   Bracketed paste inserts at the caret without submitting or completing.
   Newlines and tabs stay in the draft; CR/CRLF become LF; other controls
   are removed. Terminals without bracketed paste send ordinary keys.",
-        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis()
+        rows(&[Context::Editor]),
+        rows(&[Context::Turn]),
+        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis(),
+        rows(&[Context::Viewer]),
     )
+}
+
+/// Spells a key file name the way help writes keys: `ctrl+r` is `Ctrl-R`.
+fn key_label(name: &str) -> String {
+    let parts: Vec<&str> = name.split('+').collect();
+    let parts = if name.ends_with("++") || name == "+" {
+        let mut parts: Vec<&str> = name.trim_end_matches('+').split('+').collect();
+        parts.retain(|part| !part.is_empty());
+        parts.push("+");
+        parts
+    } else {
+        parts
+    };
+    parts
+        .iter()
+        .map(|part| match *part {
+            "pageup" => "PageUp".to_owned(),
+            "pagedown" => "PageDown".to_owned(),
+            part => {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// What a key asks the session to do.
@@ -144,6 +182,8 @@ pub enum KeyAction {
     ModeCycle,
     /// Take the newest message waiting for a turn back into the draft.
     PullQueued,
+    /// Hold the draft as a new turn that starts once the running one ends.
+    Queue,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -175,16 +215,19 @@ pub enum TranscriptAction {
 
 /// Maps viewer input without touching a composer or its editing history.
 #[must_use]
-pub fn transcript_event(event: &Event) -> TranscriptAction {
+pub fn transcript_event(keymap: &Keymap, event: &Event) -> TranscriptAction {
     let Event::Key(key) = event else {
         return TranscriptAction::Ignored;
     };
     if key.kind == KeyEventKind::Release {
         return TranscriptAction::Ignored;
     }
+    if keymap.action(Context::Viewer, key) == Some("viewer_close") {
+        return TranscriptAction::Close;
+    }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match (key.code, control) {
-        (KeyCode::Esc, _) | (KeyCode::Char('o' | 'c' | 'd'), true) => TranscriptAction::Close,
+        (KeyCode::Char('c'), true) => TranscriptAction::Close,
         (KeyCode::Up, _) => TranscriptAction::Up,
         (KeyCode::Down, _) => TranscriptAction::Down,
         (KeyCode::PageUp, _) => TranscriptAction::PageUp,
@@ -210,6 +253,8 @@ pub struct KeyReader {
     width: usize,
     menu_open: bool,
     focus: Tri,
+    keymap: Keymap,
+    context: Context,
 }
 
 impl KeyReader {
@@ -246,6 +291,8 @@ impl KeyReader {
             width: DEFAULT_WIDTH,
             menu_open: false,
             focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
         }
     }
 
@@ -259,6 +306,8 @@ impl KeyReader {
             width: DEFAULT_WIDTH,
             menu_open: false,
             focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
         }
     }
 
@@ -271,6 +320,25 @@ impl KeyReader {
     /// Records whether a menu under the draft takes the vertical arrows.
     pub const fn set_menu_open(&mut self, open: bool) {
         self.menu_open = open;
+    }
+
+    /// Replaces the keys every action answers to.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+    }
+
+    /// Returns the keys every action answers to.
+    #[must_use]
+    pub const fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Records where keys are being read, which decides what a key means.
+    ///
+    /// A reader starts in [`Context::Menu`]; the session names the idle
+    /// prompt and the running turn around the reads it makes there.
+    pub const fn set_context(&mut self, context: Context) {
+        self.context = context;
     }
 
     /// Returns whether the terminal window has focus, as its last focus report
@@ -437,7 +505,7 @@ impl KeyReader {
         }
         let event = crossterm::event::read().ok()?;
         self.note_focus(&event);
-        Some(transcript_event(&event))
+        Some(transcript_event(&self.keymap, &event))
     }
 
     /// Records a focus report.
@@ -489,14 +557,113 @@ impl KeyReader {
     /// Applies one key to the line.
     ///
     /// Split from reading so a test drives the same mapping a terminal does.
+    /// The keymap decides first; a key no action holds keeps its fixed
+    /// meaning or is typed.
     pub fn apply(&mut self, key: KeyEvent) -> KeyAction {
+        match self.keymap.action(self.context, &key) {
+            Some(id) => self.run_action(id),
+            None => self.apply_unbound(key),
+        }
+    }
+
+    /// Runs one action of the keymap.
+    fn run_action(&mut self, id: &str) -> KeyAction {
+        match id {
+            "submit" => {
+                if self.composer.newline_after_backslash() {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Submit
+                }
+            }
+            "newline" => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
+            // Tab completes rather than inserting a tab. Pasted tabs stay in
+            // the draft and are displayed as spaces.
+            "complete" => KeyAction::Complete,
+            "queue" => KeyAction::Queue,
+            "pull_queued" => KeyAction::PullQueued,
+            "interrupt" => KeyAction::Escape,
+            // While a turn runs, Escape is the interrupt gesture, so clearing
+            // on another key only empties the draft.
+            "clear" if self.context == Context::Turn => {
+                self.composer.clear();
+                KeyAction::Ignored
+            }
+            "clear" => KeyAction::Escape,
+            "history_search" => KeyAction::HistorySearch,
+            "transcript" => KeyAction::Transcript,
+            "external_editor" => KeyAction::ExternalEditor,
+            // An open menu keeps the key, so it never changes the mode behind it.
+            "mode_cycle" if self.menu_open => KeyAction::Ignored,
+            "mode_cycle" => KeyAction::ModeCycle,
+            "line_start" => {
+                if !self.composer.move_line_start() {
+                    self.composer.move_home();
+                }
+                KeyAction::Ignored
+            }
+            "line_end" => {
+                if !self.composer.move_line_end() {
+                    self.composer.move_end();
+                }
+                KeyAction::Ignored
+            }
+            "kill_to_line_start" => {
+                self.composer.kill_to_start();
+                KeyAction::Ignored
+            }
+            "kill_to_line_end" => {
+                self.composer.kill_to_end();
+                KeyAction::Ignored
+            }
+            "yank" => {
+                self.composer.yank();
+                KeyAction::Ignored
+            }
+            "yank_pop" => {
+                self.composer.yank_pop();
+                KeyAction::Ignored
+            }
+            "undo" => {
+                self.composer.undo();
+                KeyAction::Ignored
+            }
+            "redo" => {
+                self.composer.redo();
+                KeyAction::Ignored
+            }
+            "kill_word_back" => {
+                self.composer.kill_word_back();
+                KeyAction::Ignored
+            }
+            "kill_word_forward" => {
+                self.composer.kill_word_forward();
+                KeyAction::Ignored
+            }
+            "word_left" => {
+                self.composer.move_word_left();
+                KeyAction::Ignored
+            }
+            "word_right" => {
+                self.composer.move_word_right();
+                KeyAction::Ignored
+            }
+            _ => KeyAction::Ignored,
+        }
+    }
+
+    /// Applies a key that no action holds.
+    fn apply_unbound(&mut self, key: KeyEvent) -> KeyAction {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Menus keep Tab and Escape even when their actions moved elsewhere,
+        // so a picker can always be accepted and left.
+        let menu = matches!(self.context, Context::Menu | Context::Approval);
 
         match (key.code, control, alt) {
-            (KeyCode::Char('r'), true, _) => KeyAction::HistorySearch,
-            (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
-            (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
             #[cfg(unix)]
             (KeyCode::Char('z'), true, _) => KeyAction::Suspend,
@@ -508,92 +675,9 @@ impl KeyReader {
                     KeyAction::Ignored
                 }
             }
-            (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => {
-                if !self.composer.move_line_start() {
-                    self.composer.move_home();
-                }
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => {
-                if !self.composer.move_line_end() {
-                    self.composer.move_end();
-                }
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('u'), true, _) => {
-                self.composer.kill_to_start();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('k'), true, _) => {
-                self.composer.kill_to_end();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('y'), true, _) => {
-                self.composer.yank();
-                KeyAction::Ignored
-            }
-            // Legacy terminals send Ctrl-_ as 0x1f, which Crossterm decodes
-            // as Ctrl-7. Enhanced keyboard events can report '_' directly.
-            (KeyCode::Char('_' | '7'), true, _) => {
-                self.composer.undo();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('r'), false, true) => {
-                self.composer.redo();
-                KeyAction::Ignored
-            }
             (KeyCode::Char('t'), false, true) => KeyAction::CycleReasoning,
-            (KeyCode::Char('w'), true, _) | (KeyCode::Backspace, _, true) => {
-                self.composer.kill_word_back();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('b'), true, _)
-            | (KeyCode::Char('b'), false, true)
-            | (KeyCode::Left, _, true) => {
-                self.composer.move_word_left();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('f'), true, _)
-            | (KeyCode::Char('f'), false, true)
-            | (KeyCode::Right, _, true) => {
-                self.composer.move_word_right();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('d'), false, true) => {
-                self.composer.kill_word_forward();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('y'), false, true) => {
-                self.composer.yank_pop();
-                KeyAction::Ignored
-            }
-            (KeyCode::Enter, _, _) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.composer.insert("\n");
-                KeyAction::Ignored
-            }
-            // Ctrl+J is the line feed byte, which every terminal can send.
-            (KeyCode::Char('j'), true, _) => {
-                self.composer.insert("\n");
-                KeyAction::Ignored
-            }
-            (KeyCode::Enter, _, true) => {
-                self.composer.insert("\n");
-                KeyAction::Ignored
-            }
-            (KeyCode::Enter, _, _) => {
-                if self.composer.newline_after_backslash() {
-                    KeyAction::Ignored
-                } else {
-                    KeyAction::Submit
-                }
-            }
-            // Tab completes rather than inserting a tab. Pasted tabs stay in
-            // the draft and are displayed as spaces.
-            (KeyCode::Tab, _, _) => KeyAction::Complete,
-            // An open menu keeps the key, so it never changes the mode behind it.
-            (KeyCode::BackTab, _, _) if self.menu_open => KeyAction::Ignored,
-            (KeyCode::BackTab, _, _) => KeyAction::ModeCycle,
-            (KeyCode::Esc, _, _) => KeyAction::Escape,
+            (KeyCode::Tab, _, _) if menu => KeyAction::Complete,
+            (KeyCode::Esc, _, _) if menu => KeyAction::Escape,
             (KeyCode::Backspace, _, _) => {
                 self.composer.delete_back();
                 KeyAction::Ignored
@@ -610,7 +694,7 @@ impl KeyReader {
                 self.composer.move_right();
                 KeyAction::Ignored
             }
-            (KeyCode::Up, _, true) => KeyAction::PullQueued,
+            (KeyCode::Up, _, true) => KeyAction::Ignored,
             // An open menu takes the vertical arrows. Otherwise they move
             // between drawn rows and are reported only from the first or last
             // row, where the session recalls an earlier prompt.
@@ -1006,7 +1090,7 @@ mod tests {
             (Event::Key(control('o')), TranscriptAction::Close),
             (Event::Key(control('c')), TranscriptAction::Close),
         ] {
-            assert_eq!(transcript_event(&event), expected);
+            assert_eq!(transcript_event(&Keymap::defaults(), &event), expected);
             assert_eq!((reader.line().to_owned(), reader.column()), before);
         }
         reader.recall_previous(&history);
@@ -1023,6 +1107,8 @@ mod tests {
             width: DEFAULT_WIDTH,
             menu_open: false,
             focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
         }
     }
 
@@ -1119,6 +1205,7 @@ mod tests {
     #[test]
     fn alt_up_pulls_a_queued_message_without_moving_the_caret() {
         let mut reader = reader();
+        reader.set_context(Context::Turn);
         typed(&mut reader, "one");
         reader.apply(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         typed(&mut reader, "two");
@@ -1710,7 +1797,68 @@ mod tests {
         let action = reader.apply(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
         assert_eq!(action, KeyAction::CycleReasoning);
         assert_eq!(reader.line(), "draft");
-        assert!(render_bindings_help(true).contains("Alt-T         cycle how reasoning is shown"));
+        assert!(
+            render_bindings_help(true, &Keymap::defaults())
+                .contains("Alt-T         cycle how reasoning is shown")
+        );
+    }
+
+    #[test]
+    fn a_rebound_queue_key_returns_the_queue_action() {
+        let mut reader = reader();
+        reader.set_context(Context::Turn);
+        let tab = key(KeyCode::Tab);
+        let control_q = control('q');
+        assert_eq!(reader.apply(tab), KeyAction::Queue);
+        assert_eq!(reader.apply(control_q), KeyAction::Ignored);
+
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("queue".to_owned(), vec!["ctrl+q".to_owned()]);
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        assert_eq!(reader.apply(control_q), KeyAction::Queue);
+        assert_eq!(reader.apply(tab), KeyAction::Complete);
+        reader.set_context(Context::Editor);
+        assert_eq!(reader.apply(control_q), KeyAction::Ignored);
+        assert_eq!(reader.apply(tab), KeyAction::Complete);
+        assert_eq!(reader.line(), "");
+    }
+
+    #[test]
+    fn a_rebound_clear_key_leaves_escape_to_menus_only() {
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("clear".to_owned(), vec!["ctrl+x".to_owned()]);
+        file.insert("interrupt".to_owned(), vec!["ctrl+t".to_owned()]);
+        let mut reader = reader();
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        let escape = key(KeyCode::Esc);
+        reader.set_context(Context::Editor);
+        assert_eq!(reader.apply(escape), KeyAction::Ignored);
+        assert_eq!(reader.apply(control('x')), KeyAction::Escape);
+        reader.set_context(Context::Menu);
+        assert_eq!(reader.apply(escape), KeyAction::Escape);
+        reader.set_context(Context::Turn);
+        typed(&mut reader, "draft");
+        assert_eq!(reader.apply(escape), KeyAction::Ignored);
+        assert_eq!(reader.line(), "draft");
+        assert_eq!(reader.apply(control('t')), KeyAction::Escape);
+        assert_eq!(reader.apply(control('x')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "");
+    }
+
+    #[test]
+    fn the_bindings_help_shows_the_keys_in_use() {
+        let help = render_bindings_help(true, &Keymap::defaults());
+        assert!(help.contains("Shift-Tab"), "{help}");
+        assert!(help.contains("Home / Ctrl-A"), "{help}");
+        assert!(help.contains("(mode_cycle)"), "{help}");
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("transcript".to_owned(), vec!["ctrl+s".to_owned()]);
+        let help = render_bindings_help(true, &Keymap::with_overrides(&file).expect("valid"));
+        let row = help
+            .lines()
+            .find(|line| line.ends_with("(transcript)"))
+            .expect("a transcript row");
+        assert!(row.contains("Ctrl-S") && !row.contains("Ctrl-O"), "{row}");
     }
 
     #[test]

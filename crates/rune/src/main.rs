@@ -28,6 +28,7 @@ mod help;
 mod helper_usage;
 mod hooks;
 mod install;
+mod keys_file;
 mod mcp;
 mod model_limits;
 mod path_completion;
@@ -226,6 +227,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Doctor => run_doctor(&settings, &paths, &workspace, &output_flags),
         Command::Status => run_status(&settings, &paths, &workspace, &output_flags),
         Command::Limits => run_limits(&settings, &output_flags),
+        Command::Keys => run_keys(&paths, &output_flags),
         Command::Config => run_config(&settings, &paths, &workspace, launch, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
@@ -1876,6 +1878,23 @@ fn run_uninstall(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result
                 paths.state_root
             );
         }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Lists the key actions with the keys they answer to.
+fn run_keys(paths: &Paths, output_flags: &OutputFlags) -> Result<ExitCode> {
+    let path = paths.keys_file();
+    let loaded = keys_file::load(&path)?;
+    let present = loaded.is_some();
+    let keymap = loaded.unwrap_or_default();
+    if output_flags.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&keys_file::json(&keymap))?
+        );
+    } else {
+        print!("{}", keys_file::render(&path, present, &keymap));
     }
     Ok(ExitCode::from(EXIT_OK))
 }

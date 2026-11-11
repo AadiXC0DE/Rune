@@ -228,6 +228,13 @@ Aliases:
 |---|---|
 | `--explain` | Show the source layer of every key. |
 | `--json` | Emit JSON. |
+### `rune keys [--json]`
+
+List the key actions, their keys, and the file that rebinds them
+
+| Flag | Description |
+|---|---|
+| `--json` | Emit JSON. |
 ### `rune limits [--json]`
 
 List every limit with its effective value and source

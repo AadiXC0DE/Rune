@@ -2942,3 +2942,96 @@ fn projects_approve_without_a_terminal_needs_yes() {
         status.stdout
     );
 }
+
+/// Runs `rune keys` with a config root that holds `keys` as `keys.toml`.
+fn keys(file: Option<&str>, args: &[&str]) -> (Output, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config = dir.path().join("config").join("rune");
+    std::fs::create_dir_all(&config).expect("config root");
+    let path = config.join("keys.toml");
+    if let Some(text) = file {
+        std::fs::write(&path, text).expect("keys file");
+    }
+    let output = Command::new(binary())
+        .arg("keys")
+        .args(args)
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .output()
+        .expect("run binary");
+    let output = Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    (output, path)
+}
+
+#[test]
+fn keys_lists_every_action() {
+    let (output, _) = keys(None, &["--json"]);
+    assert_eq!(output.status, Some(0), "{}", output.stderr);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&output.stdout).expect("json");
+    assert_eq!(rows.len(), rune_term::keys::ACTIONS.len());
+    let queue = rows
+        .iter()
+        .find(|row| row["id"] == "queue")
+        .expect("queue row");
+    assert_eq!(queue["context"], "turn");
+    assert_eq!(queue["keys"], serde_json::json!(["tab"]));
+    assert!(queue["summary"].is_string());
+
+    let (output, path) = keys(Some("queue = \"ctrl+q\"\n"), &[]);
+    assert_eq!(output.status, Some(0), "{}", output.stderr);
+    let mut lines = output.stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("keys file: {} (present)", path.display()).as_str())
+    );
+    let row = lines
+        .find(|line| line.starts_with("queue "))
+        .expect("queue row");
+    assert_eq!(
+        row,
+        format!(
+            "{:<20} {:<9} ctrl+q  queue the draft for after this turn",
+            "queue", "turn"
+        )
+    );
+
+    let (output, _) = keys(None, &[]);
+    assert!(
+        output.stdout.starts_with("keys file: "),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .ends_with(" (absent)")
+    );
+}
+
+#[test]
+fn an_invalid_keys_file_fails_with_the_path() {
+    let (output, path) = keys(Some("transcript = \"ctrl+r\"\n"), &[]);
+    assert_eq!(output.status, Some(1), "{}", output.stdout);
+    assert!(
+        output.stderr.contains(
+            "`ctrl+r` is bound to both `history_search` and `transcript` in the editor keys"
+        ),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains(&format!("fix {} or remove it", path.display())),
+        "{}",
+        output.stderr
+    );
+}
