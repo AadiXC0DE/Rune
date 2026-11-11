@@ -14,7 +14,13 @@
   ],
   "expect": {
     "exit_code": 0,
-    "final_output": "Done.",
-    "requests": 2
+    "final_output": "This answer is cut off before it ends.Done.",
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "The previous response was interrupted"
+      }
+    ]
   }
 }

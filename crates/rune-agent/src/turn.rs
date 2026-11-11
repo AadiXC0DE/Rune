@@ -782,6 +782,16 @@ const OUTPUT_LIMIT_RETRY: &str = "<harness_check>Your last reply reached the out
 token limit before giving any answer. Answer again more briefly: think less, and split \
 large writes into smaller steps.</harness_check>";
 
+/// Asks for the rest of a reply whose stream was cut before it ended.
+const INTERRUPTED_CONTINUE: &str = "<harness_check>The previous response was interrupted. \
+Continue from where it stopped without repeating what is already there.</harness_check>";
+
+/// Cut streams continued in a row before the next cut is retried in full.
+const MAX_CUT_CONTINUATIONS: u8 = 2;
+
+/// Shown when a cut stream is kept and continued rather than sent again.
+const CUT_NOTICE: &str = "the response was cut off; continuing from where it stopped";
+
 /// Asks for the rest of a reply the output limit cut off.
 const CONTINUE_NOTE: &str = "<harness_check>Your reply was cut at the output limit. Continue \
 exactly where it stopped. Do not repeat or apologise. Write large files in smaller pieces.</harness_check>";
@@ -807,6 +817,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
     // Cut replies continued in a row, and the cut text the next step continues.
     let mut continuations: u32 = 0;
     let mut carried = String::new();
+    // Cut streams kept and continued in a row.
+    let mut cut_continuations: u8 = 0;
     let mut reminders = limits
         .get(LimitName::VerificationReminders)
         .value()
@@ -953,6 +965,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             timeouts,
             max_attempts,
             &cancellation,
+            &mut cut_continuations,
         ) {
             Ok(streamed) => {
                 completed = completed.saturating_add(1);
@@ -1003,6 +1016,9 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         let finish = outcome.finish.unwrap_or(FinishReason::Stop);
         if finish != FinishReason::MaxTokens {
             continuations = 0;
+        }
+        if !outcome.interrupted {
+            cut_continuations = 0;
         }
 
         // Record the assistant turn, including any replay state the provider
@@ -1066,6 +1082,13 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         }
 
         if pending_calls.is_empty() {
+            // A reply whose stream was cut is kept and continued, and the next
+            // step's text is joined to it.
+            if outcome.interrupted && !last_step && host.objective_tokens_remaining() != Some(0) {
+                carried = text.clone();
+                history.push_user(INTERRUPTED_CONTINUE);
+                continue;
+            }
             // Steering that arrived while the last request was streaming gets a
             // response in this turn rather than the next one. Ending here would
             // drop it: the loop returns without reaching another drain, and a
@@ -1456,6 +1479,60 @@ impl ObjectiveAccounting {
     }
 }
 
+/// Returns what can be kept from a stream cut before it ended.
+///
+/// Complete calls are kept and the calls that never ended are dropped. A cut
+/// with neither a complete call nor any text keeps nothing, so the request is
+/// retried.
+fn kept_from_cut(err: &rune_net::error::NetError) -> Option<StreamOutcome> {
+    use rune_net::error::FailureKind;
+    use rune_net::stream::ProviderEvent;
+
+    if !matches!(
+        err.kind(),
+        FailureKind::IncompleteStream
+            | FailureKind::Network
+            | FailureKind::Timeout
+            | FailureKind::Unreachable
+    ) {
+        return None;
+    }
+    let partial = err.partial()?;
+    let ended: Vec<&rune_core::id::ToolCallId> = partial
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ToolCallEnd { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    let events: Vec<ProviderEvent> = partial
+        .events
+        .iter()
+        .filter(|event| match event {
+            ProviderEvent::ToolCallStart { id, .. } | ProviderEvent::ToolCallDelta { id, .. } => {
+                ended.contains(&id)
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    let finish = if !ended.is_empty() {
+        FinishReason::ToolCalls
+    } else if !partial.text().trim().is_empty() {
+        FinishReason::Stop
+    } else {
+        return None;
+    };
+    Some(StreamOutcome {
+        events,
+        usage: partial.usage,
+        replay: partial.replay.clone(),
+        finish: Some(finish),
+        interrupted: true,
+    })
+}
+
 /// Streams a request, retrying a transient failure within a bounded budget.
 ///
 /// Applies queued steering before rebuilding a retry request. Returns the
@@ -1472,6 +1549,7 @@ fn stream_with_retry(
     timeouts: transport::RequestTimeouts,
     max_attempts: usize,
     cancellation: &Cancellation,
+    cut_continuations: &mut u8,
 ) -> Result<(StreamOutcome, bool, crate::tokens::Measure)> {
     let steering = host.steering();
     let mut attempt = 0_usize;
@@ -1577,6 +1655,25 @@ fn stream_with_retry(
             &mut observe,
         );
         host.attempt_finished();
+        // What a cut stream produced is kept rather than produced again, a
+        // limited number of times in a row.
+        let response = match response {
+            Err(err)
+                if *cut_continuations < MAX_CUT_CONTINUATIONS && !cancellation.is_cancelled() =>
+            {
+                match kept_from_cut(&err) {
+                    Some(kept) => {
+                        *cut_continuations = cut_continuations.saturating_add(1);
+                        host.emit(Event::Notice {
+                            text: CUT_NOTICE.to_owned(),
+                        });
+                        Ok(kept)
+                    }
+                    None => Err(err),
+                }
+            }
+            other => other,
+        };
         accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
         match response {
             Ok(outcome) => {

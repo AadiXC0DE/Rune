@@ -1516,9 +1516,12 @@ fn ask_jsonl_validation_failures_emit_start_and_final_only() {
 
 #[test]
 fn ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result() {
+    // Text followed by a transient failure is sent again in full; a stream
+    // that is only cut keeps its text instead.
     let partial = format!(
-        "data: {}\n\n",
-        json!({"choices": [{"delta": {"content": "Discard this attempt."}, "finish_reason": null}]})
+        "data: {}\n\ndata: {}\n\n",
+        json!({"choices": [{"delta": {"content": "Discard this attempt."}, "finish_reason": null}]}),
+        json!({"error": {"message": "the model is overloaded", "type": "overloaded_error"}})
     );
     let incomplete = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",

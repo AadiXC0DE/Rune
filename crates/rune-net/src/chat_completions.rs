@@ -1091,6 +1091,27 @@ impl StreamReducer for Reducer {
         serde_json::to_string(&replay).ok()
     }
 
+    fn salvage(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) {
+        for slot in &mut self.calls {
+            if !slot.started || slot.ended {
+                continue;
+            }
+            let Some(id) = slot.id.clone() else {
+                continue;
+            };
+            let whole = serde_json::from_str::<serde_json::Value>(&slot.arguments)
+                .is_ok_and(|value| value.is_object());
+            if !whole {
+                continue;
+            }
+            out.push(crate::stream::ProviderEvent::ToolCallEnd {
+                id,
+                arguments: slot.arguments.clone(),
+            });
+            slot.ended = true;
+        }
+    }
+
     fn finish(&self) -> Result<FinishReason> {
         if !self.saw_done && !self.ended_without_marker {
             return Err(incomplete_stream());
@@ -1632,6 +1653,31 @@ mod tests {
             reducer.apply(Some(frame), &mut events).expect("apply");
         }
         (events, reducer)
+    }
+
+    #[test]
+    fn salvage_closes_only_calls_with_complete_arguments() {
+        let (mut events, mut reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"read_file","arguments":"[1]"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"c3","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+        ]);
+        reducer.salvage(&mut events);
+        let ended: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallEnd { id, arguments } => {
+                    Some((id.to_string(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [("c1".to_owned(), r#"{"path":"a"}"#.to_owned())]);
+
+        // A closed call is not closed twice.
+        let mut again = Vec::new();
+        reducer.salvage(&mut again);
+        assert!(again.is_empty(), "{again:?}");
     }
 
     #[test]

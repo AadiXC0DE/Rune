@@ -297,6 +297,12 @@ pub trait StreamReducer {
     /// saw a terminal event must fail here, because a truncated stream must
     /// never yield a success with partial arguments.
     fn finish(&self) -> Result<FinishReason>;
+
+    /// Closes what can be kept from a stream that was cut.
+    ///
+    /// Called with the events so far when the transport fails mid-stream, so
+    /// a call whose arguments are already whole can still run.
+    fn salvage(&mut self, _out: &mut Vec<ProviderEvent>) {}
 }
 
 /// Builds the error used when a stream ends without a terminal event.

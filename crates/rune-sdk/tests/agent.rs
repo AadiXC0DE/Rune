@@ -1139,7 +1139,13 @@ fn permanent_provider_failures_are_never_retried() {
 
 #[test]
 fn retrying_a_failed_stream_discards_its_partial_text_and_usage() {
-    let endpoint = MockEndpoint::start(vec![Script::truncated("discard me"), Script::text("kept")]);
+    // Text then a transient failure is sent again in full; a stream that is
+    // only cut keeps its text instead.
+    let failed = Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{"content":"discard me"}}]}"#.to_owned(),
+        r#"{"error":{"message":"the model is overloaded","type":"overloaded_error"}}"#.to_owned(),
+    ]);
+    let endpoint = MockEndpoint::start(vec![failed, Script::text("kept")]);
     let fetch = Arc::new(CountingFetch::new());
     let mut agent = Agent::new(options(&endpoint.base_url(), fetch.clone())).expect("agent");
     let mut turn = agent

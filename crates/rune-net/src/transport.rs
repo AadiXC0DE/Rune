@@ -387,6 +387,8 @@ pub struct StreamOutcome {
     pub replay: Option<String>,
     /// Normalized stop reason.
     pub finish: Option<crate::stream::FinishReason>,
+    /// Whether this is what arrived before the stream was cut.
+    pub interrupted: bool,
 }
 
 impl StreamOutcome {
@@ -1240,8 +1242,8 @@ fn read_stream_started(
     trace: Option<TraceEntry>,
 ) -> NetResult<StreamOutcome> {
     let mut state = StreamState::new(provider, plan, observe, timeouts, started, trace);
-    feed(body, &mut state, cancel)?;
-    state.finish()
+    let result = feed(body, &mut state, cancel).and_then(|()| state.finish());
+    result.map_err(|err| state.attach_partial(err))
 }
 
 /// Feeds a body to the decoder on a thread of its own.
@@ -1444,8 +1446,39 @@ impl<'a> StreamState<'a> {
         Ok(())
     }
 
+    /// Attaches what arrived so far to a failure that cut the stream.
+    ///
+    /// Calls whose arguments are already whole are closed first. A cancelled
+    /// or refused stream keeps nothing.
+    fn attach_partial(&mut self, err: NetError) -> NetError {
+        if !matches!(
+            err.kind(),
+            FailureKind::IncompleteStream
+                | FailureKind::Network
+                | FailureKind::Timeout
+                | FailureKind::Unreachable
+        ) {
+            return err;
+        }
+        // The user's total deadline is final: what arrived before it is not
+        // continued in another request.
+        if self.check_request_timeout().is_err() {
+            return err;
+        }
+        let mut events = std::mem::take(&mut self.outcome.events);
+        self.reducer.salvage(&mut events);
+        let partial = StreamOutcome {
+            events,
+            usage: self.reducer.usage(),
+            replay: self.reducer.replay(),
+            finish: None,
+            interrupted: false,
+        };
+        err.with_partial(partial)
+    }
+
     /// Ends the stream and returns what it produced.
-    fn finish(mut self) -> NetResult<StreamOutcome> {
+    fn finish(&mut self) -> NetResult<StreamOutcome> {
         if let Some(entry) = self.trace.take() {
             entry.finish();
         }
@@ -1476,7 +1509,7 @@ impl<'a> StreamState<'a> {
         self.outcome.finish = Some(self.reducer.finish().map_err(NetError::from)?);
         self.outcome.usage = self.reducer.usage();
         self.outcome.replay = self.reducer.replay();
-        Ok(self.outcome)
+        Ok(std::mem::take(&mut self.outcome))
     }
 }
 

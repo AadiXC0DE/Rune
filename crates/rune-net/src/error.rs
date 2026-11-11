@@ -156,6 +156,8 @@ pub struct NetError {
     /// The error a caller-supplied client reported, returned unchanged by
     /// [`NetError::to_rune_error`] so its code and detail survive the trip.
     source: Option<Box<RuneError>>,
+    /// What a stream produced before it was cut, so the caller can keep it.
+    partial: Option<Box<crate::transport::StreamOutcome>>,
 }
 
 impl NetError {
@@ -198,6 +200,7 @@ impl NetError {
             provider_code: None,
             hint: None,
             source: None,
+            partial: None,
         }
     }
 
@@ -234,6 +237,19 @@ impl NetError {
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+
+    /// Attaches what a cut stream produced before it stopped.
+    #[must_use]
+    pub fn with_partial(mut self, partial: crate::transport::StreamOutcome) -> Self {
+        self.partial = Some(Box::new(partial));
+        self
+    }
+
+    /// Returns what a cut stream produced before it stopped, when kept.
+    #[must_use]
+    pub fn partial(&self) -> Option<&crate::transport::StreamOutcome> {
+        self.partial.as_deref()
     }
 
     /// Returns what went wrong.

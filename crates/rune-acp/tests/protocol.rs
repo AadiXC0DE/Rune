@@ -1357,12 +1357,16 @@ fn a_streamed_answer_reaches_the_client_once_and_whole() {
 
 #[test]
 fn a_retried_answer_is_not_sent_to_the_client_twice() {
-    // The first attempt is cut off after its opening words, which the client
-    // has already been sent. The retry streams the answer from the start, and
+    // The first attempt fails after its opening words, which the client has
+    // already been sent. The retry streams the answer from the start, and
     // resending that opening would show it twice.
     let mut harness = Harness::start(
         vec![
-            Script::truncated("alpha "),
+            Script::Frames(vec![
+                r#"{"choices":[{"index":0,"delta":{"content":"alpha "}}]}"#.to_owned(),
+                r#"{"error":{"message":"the model is overloaded","type":"overloaded_error"}}"#
+                    .to_owned(),
+            ]),
             Script::Frames(vec![
                 r#"{"choices":[{"index":0,"delta":{"content":"alpha "}}]}"#.to_owned(),
                 r#"{"choices":[{"index":0,"delta":{"content":"beta"}}]}"#.to_owned(),

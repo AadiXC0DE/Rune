@@ -2700,13 +2700,53 @@ fn an_exhausted_budget_never_announces_a_pending_retry() {
     assert_eq!(host.server.as_ref().expect("server").request_count(), 1);
 }
 
+/// A frame that adds a tool call, or extends one, with these arguments.
+fn call_frame(index: usize, id: &str, arguments: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "function": { "name": "read_file", "arguments": arguments },
+                }],
+            },
+        }],
+    })
+    .to_string()
+}
+
+/// A frame that adds text to the answer.
+fn text_frame(text: &str) -> String {
+    serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": text } }] }).to_string()
+}
+
+/// A stream that sends some text and then reports a transient failure.
+fn failed_mid_stream(text: &str) -> Script {
+    Script::Frames(vec![
+        text_frame(text),
+        r#"{"error":{"message":"the model is overloaded","type":"overloaded_error"}}"#.to_owned(),
+    ])
+}
+
+/// The text of every turn in the history, with its role.
+fn transcript(history: &rune_agent::History) -> Vec<(rune_net::message::Role, String)> {
+    history
+        .turns()
+        .iter()
+        .map(|turn| (turn.role, turn.text()))
+        .collect()
+}
+
 #[test]
 fn a_truncated_stream_is_retried_rather_than_accepted() {
+    // Nothing in the cut attempt can be kept: its only call never finished.
     let endpoint = MockEndpoint::start(vec![
-        Script::truncated("partial answer"),
+        Script::Frames(vec![call_frame(0, "c1", r#"{"path":"#)]),
         Script::text("complete answer"),
     ]);
-    let host = TestHost::new(endpoint);
+    let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
     let mut history = rune_agent::History::new();
     history.push_user("hello");
 
@@ -2714,12 +2754,209 @@ fn a_truncated_stream_is_retried_rather_than_accepted() {
     // The truncated attempt must not be accepted as a success, so the final
     // text comes from the recovered attempt.
     assert_eq!(outcome.text, "complete answer");
+    assert!(host.executed_calls().is_empty());
+}
+
+#[test]
+fn a_cut_answer_is_kept_and_continued() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::truncated("Part one"),
+        Script::text("Part two"),
+    ]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(outcome.text, "Part onePart two");
+    let note = "<harness_check>The previous response was interrupted. Continue from where it \
+                stopped without repeating what is already there.</harness_check>";
+    assert_eq!(
+        transcript(&history),
+        [
+            (rune_net::message::Role::User, "hello".to_owned()),
+            (rune_net::message::Role::Assistant, "Part one".to_owned()),
+            (rune_net::message::Role::User, note.to_owned()),
+            (rune_net::message::Role::Assistant, "Part two".to_owned()),
+        ]
+    );
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    let body = server.last_body().expect("continuation request");
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages[2]["content"], "Part one");
+    assert_eq!(messages[3]["content"], note);
+    let events = host.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { .. })),
+        "the text already shown is kept, so the step is not restarted"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Notice { text } if text == "the response was cut off; continuing from where it stopped"
+    )));
+    history
+        .validate()
+        .expect("valid history after a continuation");
+}
+
+#[test]
+fn a_complete_call_before_the_cut_runs() {
+    // The second call has a name and no arguments when the stream stops.
+    let endpoint = MockEndpoint::start(vec![
+        Script::Frames(vec![
+            text_frame("Reading."),
+            call_frame(0, "c1", r#"{"path":"a.rs"}"#),
+            call_frame(1, "c2", ""),
+        ]),
+        Script::text("read it"),
+    ]);
+    let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+    let mut history = rune_agent::History::new();
+    history.push_user("read a.rs");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.text, "read it");
+    assert_eq!(
+        host.executed_calls(),
+        [(
+            "read_file".to_owned(),
+            serde_json::json!({ "path": "a.rs" })
+        )]
+    );
+    let server = host.server.as_ref().expect("server");
+    assert_eq!(server.request_count(), 2);
+    let body = server.last_body().expect("second request").to_string();
+    assert!(
+        !body.contains("The previous response was interrupted"),
+        "a step with calls to run needs no note: {body}"
+    );
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::StepRestarted { .. }))
+    );
+    history
+        .validate()
+        .expect("valid history after the kept call");
+}
+
+#[test]
+fn a_call_cut_mid_arguments_is_dropped() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::Frames(vec![
+            text_frame("Reading both."),
+            call_frame(0, "c1", r#"{"path":"a.rs"}"#),
+            call_frame(1, "c2", r#"{"path":"b"#),
+        ]),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint).with_tools(vec![read_tool()]);
+    let mut history = rune_agent::History::new();
+    history.push_user("read both");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(outcome.text, "done");
+    assert_eq!(
+        host.executed_calls(),
+        [(
+            "read_file".to_owned(),
+            serde_json::json!({ "path": "a.rs" })
+        )]
+    );
+    let assistant = &history.turns()[1];
+    assert_eq!(assistant.text(), "Reading both.");
+    let ids: Vec<String> = assistant
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            rune_net::message::ContentPart::ToolCall { id, .. } => Some(id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["c1"]);
+    let body = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("second request")
+        .to_string();
+    assert!(!body.contains("\"c2\""), "{body}");
+    history
+        .validate()
+        .expect("no call is left without a result");
+}
+
+#[test]
+fn continuations_stop_after_two() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::truncated("one "),
+        Script::truncated("two "),
+        Script::truncated("three "),
+        Script::text("done"),
+    ]);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 4);
+    // The third cut is sent again in full, so its text is not kept.
+    assert_eq!(outcome.text, "one two done");
+    let events = host.events();
+    let notices = events
+        .iter()
+        .filter(|event| matches!(event, Event::Notice { .. }))
+        .count();
+    let restarts = events
+        .iter()
+        .filter(|event| matches!(event, Event::StepRestarted { step: 3 }))
+        .count();
+    assert_eq!((notices, restarts), (2, 1));
+    let rendered = transcript(&history)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(!rendered.contains("three"), "{rendered}");
+    history
+        .validate()
+        .expect("valid history after a full retry");
+}
+
+#[test]
+fn a_third_cut_with_no_retries_left_fails_the_step() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::truncated("one "),
+        Script::truncated("two "),
+        Script::truncated("three "),
+    ]);
+    let mut host = TestHost::new(endpoint);
+    host.limits
+        .set(
+            rune_core::LimitName::ProviderMaxAttempts,
+            rune_core::budget::Budget::Bounded(1),
+            rune_core::config::Layer::User,
+        )
+        .expect("limit");
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+
+    let outcome = run_turn(&mut history, &host).expect("turn keeps what it has");
+    let error = outcome.error.expect("the cut stands");
+    assert_eq!(error.code(), rune_core::ErrorCode::IncompleteStream);
+    assert_eq!(host.server.as_ref().expect("server").request_count(), 3);
 }
 
 #[test]
 fn steering_during_a_failed_stream_reaches_the_retry_request() {
     let endpoint = MockEndpoint::start(vec![
-        Script::truncated("partial answer"),
+        failed_mid_stream("partial answer"),
         Script::text("corrected answer"),
     ]);
     let host = TestHost::new(endpoint)
@@ -2766,7 +3003,7 @@ fn a_retried_step_tells_the_host_to_drop_what_it_streamed() {
     // streams the answer again from the start. Without a restart between them
     // a host shows the partial answer followed by the whole one.
     let endpoint = MockEndpoint::start(vec![
-        Script::truncated("partial answer"),
+        failed_mid_stream("partial answer"),
         Script::text("complete answer"),
     ]);
     let host = TestHost::new(endpoint);
