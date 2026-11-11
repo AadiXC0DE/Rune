@@ -32,6 +32,11 @@ pub const HIDE_CURSOR: &str = "\u{1b}[?25l";
 /// Shows the cursor once the region is consistent.
 pub const SHOW_CURSOR: &str = "\u{1b}[?25h";
 
+/// Starts a synchronized update: the terminal shows the last frame until the end mark.
+pub const BEGIN_SYNC: &str = "\u{1b}[?2026h";
+/// Ends a synchronized update.
+pub const END_SYNC: &str = "\u{1b}[?2026l";
+
 /// Erases from the cursor to the end of the screen.
 const ERASE_BELOW: &str = "\u{1b}[J";
 
@@ -79,6 +84,10 @@ pub struct Inline {
     max_rows: u16,
     /// Where the cursor was left inside the region, counted from its top.
     cursor_row: u16,
+    /// The column the cursor was left at.
+    cursor_col: u16,
+    /// Whether each frame is wrapped in a synchronized update.
+    synchronized: bool,
     /// Whether the region has been drawn at least once.
     drawn: bool,
     /// Rows of the region as the terminal last received them.
@@ -100,10 +109,17 @@ impl Inline {
             cols,
             max_rows: u16::MAX,
             cursor_row: 0,
+            cursor_col: 0,
+            synchronized: true,
             drawn: false,
             shown: Vec::new(),
             shown_settled: 0,
         }
+    }
+
+    /// Turns the synchronized-update marks around each frame on or off.
+    pub const fn set_synchronized(&mut self, on: bool) {
+        self.synchronized = on;
     }
 
     /// Changes the width, which invalidates nothing because every row is redrawn.
@@ -176,6 +192,38 @@ impl Inline {
     /// Returns the bytes to write. Nothing here reads the terminal, so the same
     /// inputs always produce the same bytes.
     pub fn frame(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        let body = self.render(frame, false);
+        self.wrap(body)
+    }
+
+    /// Renders one frame, or nothing when it would change nothing on screen.
+    ///
+    /// Like [`Inline::frame`], except that an unchanged frame whose caret is
+    /// already where the last frame left it returns no bytes at all.
+    pub fn frame_if_changed(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        let body = self.render(frame, true);
+        self.wrap(body)
+    }
+
+    /// Puts a frame's bytes inside one synchronized update, when enabled.
+    fn wrap(&self, body: String) -> Vec<u8> {
+        if body.is_empty() || !self.synchronized {
+            return body.into_bytes();
+        }
+        let mut out = String::with_capacity(
+            body.len()
+                .saturating_add(BEGIN_SYNC.len())
+                .saturating_add(END_SYNC.len()),
+        );
+        out.push_str(BEGIN_SYNC);
+        out.push_str(&body);
+        out.push_str(END_SYNC);
+        out.into_bytes()
+    }
+
+    /// Builds the bytes of one frame; `skip_unchanged` drops a caret move that
+    /// would leave the caret where it already is.
+    fn render(&mut self, frame: &Frame<'_>, skip_unchanged: bool) -> String {
         let Frame {
             settled,
             arriving,
@@ -285,6 +333,9 @@ impl Inline {
             && self.shown_settled == settled.len()
             && settled.is_empty();
         if unchanged {
+            if skip_unchanged && caret_row == self.cursor_row && caret.1 == self.cursor_col {
+                return String::new();
+            }
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
             // Move directly between input rows. Walking past the region and
@@ -298,7 +349,8 @@ impl Inline {
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
             self.cursor_row = caret_row;
-            return out.into_bytes();
+            self.cursor_col = caret.1;
+            return out;
         }
 
         // The region only grows at the bottom while text streams in and the
@@ -387,8 +439,9 @@ impl Inline {
         self.shown = rows;
         self.shown_settled = settled.len();
         self.cursor_row = caret_row;
+        self.cursor_col = caret.1;
         self.drawn = true;
-        out.into_bytes()
+        out
     }
 
     /// Clears the region, for a clean exit.
@@ -408,9 +461,10 @@ impl Inline {
         out.push_str(SHOW_CURSOR);
         self.drawn = false;
         self.cursor_row = 0;
+        self.cursor_col = 0;
         self.shown.clear();
         self.shown_settled = 0;
-        out.into_bytes()
+        self.wrap(out)
     }
 
     /// Cuts a row to the terminal width.
@@ -440,6 +494,33 @@ fn down(out: &mut String, rows: u16) {
 /// Appends a move to a zero-based column of the current row.
 fn column(out: &mut String, col: u16) {
     let _ = write!(out, "\u{1b}[{}G", col.saturating_add(1));
+}
+
+/// Writes frames to standard output, one system call per write on Unix.
+///
+/// The standard library's handle is line buffered and would split a frame at
+/// every line break, so a frame passed to `write_all` would reach the terminal
+/// in pieces.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalOutput;
+
+impl std::io::Write for TerminalOutput {
+    #[cfg(unix)]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        rustix::io::write(rustix::stdio::stdout(), buf).map_err(std::io::Error::from)
+    }
+
+    #[cfg(not(unix))]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut out = std::io::stdout().lock();
+        out.write_all(buf)?;
+        out.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1620,5 +1701,128 @@ mod tests {
             "erasing the region's tail scrolled the prompt off:\nbefore:\n{before}\nafter:\n{}",
             grid.text()
         );
+    }
+
+    /// Asserts a frame is one synchronized update: one begin mark first and
+    /// one end mark last.
+    fn assert_wrapped(bytes: &[u8], what: &str) {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(text.starts_with(BEGIN_SYNC), "{what}: {text:?}");
+        assert!(text.ends_with(END_SYNC), "{what}: {text:?}");
+        assert_eq!(text.matches(BEGIN_SYNC).count(), 1, "{what}: {text:?}");
+        assert_eq!(text.matches(END_SYNC).count(), 1, "{what}: {text:?}");
+    }
+
+    #[test]
+    fn every_frame_and_clear_are_wrapped_in_synchronized_output() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let first = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a"]),
+            (0, 2),
+        );
+        assert_wrapped(&first, "first frame");
+        let partial = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(!String::from_utf8_lossy(&partial).contains(ERASE_BELOW));
+        assert_wrapped(&partial, "partial repaint");
+        let caret = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(!String::from_utf8_lossy(&caret).contains("status"));
+        assert_wrapped(&caret, "caret-only frame");
+        let full = frame(
+            &mut inline,
+            &rows(&["settled"]),
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(String::from_utf8_lossy(&full).contains(ERASE_BELOW));
+        assert_wrapped(&full, "full repaint");
+        let cleared = inline.clear();
+        assert_wrapped(&cleared, "clear");
+        assert!(inline.clear().is_empty());
+    }
+
+    #[test]
+    fn synchronized_output_can_be_turned_off() {
+        let mut inline = Inline::new(40);
+        inline.set_synchronized(false);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let mut written = frame(
+            &mut inline,
+            &rows(&["settled"]),
+            None,
+            &footer,
+            &prompt,
+            &[],
+            (0, 2),
+        );
+        written.extend(frame(&mut inline, &[], None, &footer, &prompt, &[], (0, 2)));
+        written.extend(inline.clear());
+        let text = String::from_utf8_lossy(&written);
+        assert!(text.contains("status"), "{text:?}");
+        assert!(!text.contains("?2026"), "{text:?}");
+    }
+
+    #[test]
+    fn a_paced_frame_that_changes_nothing_writes_nothing() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let draw = |inline: &mut Inline, caret: (u16, u16)| {
+            inline.frame_if_changed(&Frame {
+                settled: &[],
+                arriving: &[],
+                activity: None,
+                footer: &footer,
+                prompt: &rows(&["> abc"]),
+                menu: &[],
+                caret,
+            })
+        };
+        let first = draw(&mut inline, (0, 2));
+        assert!(String::from_utf8_lossy(&first).contains("status"));
+        assert_wrapped(&first, "first paced frame");
+        assert!(draw(&mut inline, (0, 2)).is_empty());
+        let moved = draw(&mut inline, (0, 4));
+        let text = String::from_utf8_lossy(&moved).into_owned();
+        assert!(!text.contains("status"), "{text:?}");
+        assert!(escapes(&moved).iter().any(|s| s == "\u{1b}[5G"), "{text:?}");
+        assert_wrapped(&moved, "caret move");
+        assert!(draw(&mut inline, (0, 4)).is_empty());
+        // The immediate path still places the caret for an unchanged frame.
+        let immediate = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> abc"]),
+            &[],
+            (0, 4),
+        );
+        assert!(String::from_utf8_lossy(&immediate).contains(SHOW_CURSOR));
     }
 }
