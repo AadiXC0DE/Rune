@@ -16,6 +16,7 @@ mod auto_review;
 mod bench;
 mod cache_warming;
 mod capabilities;
+mod checkpoint;
 mod cli;
 mod compaction_archive;
 mod completion;
