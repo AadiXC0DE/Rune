@@ -321,6 +321,61 @@ pub struct ProjectConfig {
     /// Limit overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, Budget>>,
+    /// Permission rules; `allow` rules apply only after the user approves them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<PermissionTable>,
+}
+
+/// The permission table of a configuration file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionTable {
+    /// Rules in file order.
+    #[serde(default)]
+    pub rules: Vec<ConfiguredRule>,
+}
+
+/// One rule as written in a file.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredRule {
+    /// Tool name, `shell` for commands, or `*`.
+    pub tool: String,
+    /// Command pattern for `shell`, path glob for file tools, `*` for any.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// What the rule decides.
+    pub decision: RuleDecision,
+    /// Only in this workspace, when set (canonical path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Utf8PathBuf>,
+    /// Date the rule was saved from an approval prompt, `YYYY-MM-DD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<String>,
+}
+
+/// What a configured rule decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDecision {
+    /// Run without asking.
+    Allow,
+    /// Ask first.
+    Ask,
+    /// Refuse.
+    Deny,
+}
+
+impl RuleDecision {
+    /// Returns the name used in files.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// Input capacity assumed when a model does not declare one.
@@ -762,7 +817,7 @@ pub struct UserConfig {
 
     /// Permission rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission: Option<toml::Value>,
+    pub permission: Option<PermissionTable>,
 
     /// Image analysis model on the active provider and endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1000,6 +1055,16 @@ pub struct Settings {
     pub cache_warming: bool,
     /// Directory provider requests and responses are traced to, when set.
     pub trace_dir: Option<Utf8PathBuf>,
+    /// Permission rules from the user file, in file order.
+    pub user_rules: Vec<ConfiguredRule>,
+    /// Permission rules from the project file, in file order.
+    pub project_rules: Vec<ConfiguredRule>,
+    /// The file the user layer was read from.
+    pub user_config_path: Option<Utf8PathBuf>,
+    /// The canonical workspace the project file belongs to.
+    pub workspace: Option<Utf8PathBuf>,
+    /// Whether the user approved the project file's `allow` rules.
+    pub project_allow_approved: bool,
     /// Where each value came from.
     pub sources: MergeReport,
     /// Diagnostics produced while loading.
@@ -1059,6 +1124,11 @@ impl Default for Settings {
             compaction_model: None,
             cache_warming: false,
             trace_dir: None,
+            user_rules: Vec::new(),
+            project_rules: Vec::new(),
+            user_config_path: None,
+            workspace: None,
+            project_allow_approved: false,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
         }
@@ -1508,6 +1578,7 @@ pub const PROJECT_KEYS: &[&str] = &[
     "provider_order",
     "provider_strict",
     "limits",
+    "permission",
 ];
 
 /// Values the `color` setting accepts, the default first.
@@ -1551,7 +1622,6 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "api_key_env",
     "anonymous",
     "permission_mode",
-    "permission",
     "effort",
     "temperature",
     "edit_tool",
@@ -1952,7 +2022,16 @@ pub fn load(
     user_path: Option<&Utf8Path>,
     env: &EnvironmentOverrides,
 ) -> Settings {
-    let mut settings = Settings::default();
+    let mut settings = Settings {
+        user_config_path: user_path.map(Utf8Path::to_path_buf),
+        workspace: project_path.and_then(Utf8Path::parent).map(|parent| {
+            std::fs::canonicalize(parent)
+                .ok()
+                .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+                .unwrap_or_else(|| parent.to_path_buf())
+        }),
+        ..Settings::default()
+    };
 
     if let Some(path) = user_path {
         match read_user(path) {
@@ -2334,6 +2413,45 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
     Ok(Some(text))
 }
 
+/// Returns the rules that can be applied, with a diagnostic for each one dropped.
+/// A project rule may not carry `workspace` or `saved`.
+fn usable_rules(
+    settings: &mut Settings,
+    rules: &[ConfiguredRule],
+    layer: Layer,
+    project: bool,
+) -> Vec<ConfiguredRule> {
+    let mut usable = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        let problem = if rule.tool.trim().is_empty() {
+            Some("`tool` is empty")
+        } else if rule.pattern.trim().is_empty() {
+            Some("`match` is empty")
+        } else if project && (rule.workspace.is_some() || rule.saved.is_some()) {
+            Some("a project file may not set `workspace` or `saved`")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!(
+                        "permission rule {} was ignored: {problem}",
+                        index.saturating_add(1)
+                    ),
+                )
+                .with_key("permission.rules")
+                .with_hint("fix the `[[permission.rules]]` entry or remove it"),
+            );
+        } else {
+            usable.push(rule.clone());
+        }
+    }
+    usable
+}
+
 /// Rebuilds `Settings::hooks` from the legacy tables and `[[hooks]]`, dropping invalid hooks.
 fn apply_hooks(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     let mut hooks: Vec<Hook> = settings
@@ -2374,6 +2492,9 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.sources.record("pre_tool_hook", layer);
     }
     apply_hooks(settings, user, layer);
+    if let Some(table) = &user.permission {
+        settings.user_rules = usable_rules(settings, &table.rules, layer, false);
+    }
     if let Some(offline) = user.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
@@ -2757,6 +2878,9 @@ fn apply_provider_headers(
 
 /// Applies a project configuration, ignoring anything not repository safe.
 fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer) {
+    if let Some(table) = &project.permission {
+        settings.project_rules = usable_rules(settings, &table.rules, layer, true);
+    }
     // A repository may state the sandbox posture, and the only value it may
     // state is the restrictive one: a repository cannot grant itself the right
     // to run commands unrestricted on someone else's machine.
@@ -3614,6 +3738,89 @@ mod tests {
                 && diagnostic.key.as_deref() == Some("hooks")
         }));
         assert_eq!(settings.source_of("hooks"), Layer::Default);
+    }
+
+    #[test]
+    fn permission_rules_parse_in_both_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'git status*'\ndecision = 'allow'\n\
+             workspace = '/elsewhere'\nsaved = '2026-11-10'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = ''\ndecision = 'allow'\n",
+        );
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[permission.rules]]\ntool = 'write_file'\nmatch = 'migrations/*'\ndecision = 'ask'\n",
+        );
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        assert_eq!(settings.user_rules.len(), 2);
+        assert_eq!(settings.user_rules[0].pattern, "rm *");
+        assert_eq!(settings.user_rules[0].decision, RuleDecision::Deny);
+        assert_eq!(
+            settings.user_rules[1].workspace.as_deref(),
+            Some(Utf8Path::new("/elsewhere"))
+        );
+        assert_eq!(settings.user_rules[1].saved.as_deref(), Some("2026-11-10"));
+        assert_eq!(settings.project_rules.len(), 1);
+        assert_eq!(settings.project_rules[0].tool, "write_file");
+        assert_eq!(settings.project_rules[0].decision, RuleDecision::Ask);
+        assert_eq!(settings.user_config_path.as_ref(), Some(&user));
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonical");
+        assert_eq!(
+            settings.workspace.as_deref().map(Utf8Path::as_std_path),
+            Some(canonical.as_path())
+        );
+        // The empty `match` is reported and dropped, and nothing else is.
+        let dropped: Vec<&Diagnostic> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.key.as_deref() == Some("permission.rules"))
+            .collect();
+        assert_eq!(dropped.len(), 1, "{:?}", settings.diagnostics);
+        assert!(dropped[0].message.contains("`match` is empty"));
+        assert_eq!(dropped[0].layer, Layer::User);
+        // A project file may set the table now; it is not a user-only key.
+        assert!(
+            !settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == ErrorCode::KeyNotAllowedInScope)
+        );
+    }
+
+    #[test]
+    fn project_rules_cannot_carry_workspace_or_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[permission.rules]]\ntool = 'shell'\nmatch = 'curl*'\ndecision = 'allow'\n\
+             workspace = '/w'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'ls*'\ndecision = 'allow'\n\
+             saved = '2026-11-10'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.project_rules.len(), 1);
+        assert_eq!(settings.project_rules[0].pattern, "rm *");
+        let dropped: Vec<&Diagnostic> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.key.as_deref() == Some("permission.rules"))
+            .collect();
+        assert_eq!(dropped.len(), 2, "{:?}", settings.diagnostics);
+        for diagnostic in dropped {
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert!(
+                diagnostic
+                    .message
+                    .contains("a project file may not set `workspace` or `saved`")
+            );
+        }
     }
 
     #[test]

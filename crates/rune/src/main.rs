@@ -146,6 +146,19 @@ fn handle_runtime_free(launch: &Launch) -> Option<ExitCode> {
     }
 }
 
+/// Records whether the user approved the project file's `allow` rules.
+fn apply_project_rule_approval(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    settings: &mut Settings,
+) -> Result<()> {
+    if let Some(digest) = permissions::project_allow_digest(settings) {
+        settings.project_allow_approved =
+            project_trust::load(paths)?.rules_approved(workspace, &digest);
+    }
+    Ok(())
+}
+
 /// Runs a command that needs the resolved environment.
 fn run(launch: &Launch) -> Result<ExitCode> {
     let paths = Paths::from_process().require_absolute()?;
@@ -169,6 +182,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         // A typo in a switch ends the run before any request.
         settings.experiments =
             rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
+        apply_project_rule_approval(&paths, &workspace, &mut settings)?;
         settings
     } else {
         Settings::default()
@@ -678,6 +692,7 @@ fn run_interactive(
         );
         settings.experiments =
             rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
+        apply_project_rule_approval(paths, workspace, &mut settings)?;
         cli::apply_to_settings(launch, &mut settings);
         // The connection flow has already named what it connected, so the
         // session says only what it is doing next.
@@ -1542,6 +1557,11 @@ fn run_projects(
     let mut store = trust::TrustStore::load(&paths.trust_file())?;
     let action = launch.args.first().map_or("status", String::as_str);
     let project_hooks = project_trust::ProjectHooks::read(workspace);
+    let project = config::load(
+        Some(&workspace.join(".rune.toml")),
+        None,
+        &EnvironmentOverrides::default(),
+    );
     if !matches!(action, "status" | "list") {
         // Created private before any record is written, or a first write
         // would leave a state root that every later run refuses.
@@ -1557,6 +1577,7 @@ fn run_projects(
                 println!("approved {canonical}");
             }
             approve_project_hooks(paths, &canonical, &project_hooks, launch, output)?;
+            approve_project_rules(paths, &canonical, &project, launch, output)?;
         }
         "reject" => {
             store.reject(&canonical);
@@ -1599,6 +1620,7 @@ fn run_projects(
             None => println!("{canonical}: no decision recorded"),
         }
         print_project_hooks(paths, &canonical, &project_hooks)?;
+        print_project_rules(paths, &canonical, &project)?;
         let known = store.entries();
         if known.is_empty() {
             println!("no workspaces have a recorded decision");
@@ -1634,6 +1656,80 @@ fn print_project_hooks(
                     println!("{}", project_trust::hook_line(hook));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// One project `allow` rule as the user reviews it: `  allow {tool} "{match}"`.
+fn project_rule_line(rule: &config::ConfiguredRule) -> String {
+    format!("  allow {} {:?}", rule.tool.escape_debug(), rule.pattern)
+}
+
+/// Prints whether the project `allow` rules are approved, listing them when
+/// not. Prints nothing when the project file has none.
+fn print_project_rules(paths: &Paths, workspace: &Utf8Path, project: &Settings) -> Result<()> {
+    let Some(digest) = permissions::project_allow_digest(project) else {
+        return Ok(());
+    };
+    if project_trust::load(paths)?.rules_approved(workspace, &digest) {
+        println!("project allow rules: approved");
+    } else {
+        println!("project allow rules: not approved");
+        for rule in permissions::project_allow_rules(project) {
+            println!("{}", project_rule_line(rule));
+        }
+    }
+    Ok(())
+}
+
+/// Approves the project `allow` rules after the user saw them, as the hooks
+/// are approved.
+fn approve_project_rules(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    project: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    let Some(digest) = permissions::project_allow_digest(project) else {
+        return Ok(());
+    };
+    let mut approvals = project_trust::load(paths)?;
+    if approvals.rules_approved(workspace, &digest) {
+        return Ok(());
+    }
+    let yes = launch.has_flag("--yes");
+    let ask = !yes && !output.json && std::io::stdin().is_terminal();
+    if !output.json {
+        for rule in permissions::project_allow_rules(project) {
+            println!("{}", project_rule_line(rule));
+        }
+    }
+    let approved = if yes {
+        true
+    } else if ask {
+        print!("allow these actions without asking? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        let line = "project allow rules not approved: pass --yes to approve them without a prompt";
+        if output.json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        false
+    };
+    if approved {
+        approvals.approve_rules(workspace, &digest);
+        approvals.save(paths)?;
+        if !output.json {
+            println!("approved the allow rules in .rune.toml");
         }
     }
     Ok(())
@@ -1846,12 +1942,13 @@ fn run_permissions(
     };
     if let Some((tool, target)) = action {
         if output.json {
-            let value = permissions::explain_json(&rules, settings.permission_mode, tool, target);
+            let value =
+                permissions::explain_json(&rules, settings, settings.permission_mode, tool, target);
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!(
                 "{}",
-                permissions::explain(&rules, settings.permission_mode, tool, target)
+                permissions::explain(&rules, settings, settings.permission_mode, tool, target)
             );
         }
         return Ok(ExitCode::from(EXIT_OK));

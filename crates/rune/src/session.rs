@@ -3779,6 +3779,16 @@ impl SessionHost {
     }
 }
 
+/// The notice for project `allow` rules that do not apply until approved.
+fn unapproved_project_rules(settings: &Settings) -> Option<String> {
+    let count = crate::permissions::project_allow_rules(settings).len();
+    (count > 0 && !settings.project_allow_approved).then(|| {
+        format!(
+            "{count} allow rule(s) in .rune.toml are not approved and do not apply; review them with rune projects status"
+        )
+    })
+}
+
 /// Runs an interactive session.
 ///
 /// Returns the exit code the process should use.
@@ -3809,6 +3819,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         .chain(project_hooks.unapproved.then(|| {
             "project hooks in .rune/hooks.toml are not approved and will not run; review them with rune projects status".to_owned()
         }))
+        .chain(unapproved_project_rules(&config.settings))
         .collect();
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
@@ -10951,6 +10962,33 @@ fn session_registry(
 mod tests {
     use super::*;
     use rune_term::shell::{ScriptedSource, Shell};
+
+    #[test]
+    fn unapproved_project_allow_rules_are_noticed() {
+        let rule = |decision| rune_core::config::ConfiguredRule {
+            tool: "shell".to_owned(),
+            pattern: "curl*".to_owned(),
+            decision,
+            workspace: None,
+            saved: None,
+        };
+        let mut settings = Settings::default();
+        assert_eq!(unapproved_project_rules(&settings), None);
+        settings.project_rules = vec![rule(rune_core::config::RuleDecision::Deny)];
+        assert_eq!(unapproved_project_rules(&settings), None);
+        settings.project_rules = vec![
+            rule(rune_core::config::RuleDecision::Allow),
+            rule(rune_core::config::RuleDecision::Allow),
+        ];
+        assert_eq!(
+            unapproved_project_rules(&settings).as_deref(),
+            Some(
+                "2 allow rule(s) in .rune.toml are not approved and do not apply; review them with rune projects status"
+            )
+        );
+        settings.project_allow_approved = true;
+        assert_eq!(unapproved_project_rules(&settings), None);
+    }
 
     #[test]
     fn a_rebuilt_prefix_keeps_the_tool_guidance_of_the_variant() {
