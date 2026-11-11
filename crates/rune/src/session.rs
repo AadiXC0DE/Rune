@@ -769,6 +769,7 @@ impl Host for SessionHost {
 
     fn record_child_usage(&self, model: &str, usage: &rune_net::stream::Usage) {
         self.record_usage(usage);
+        lock_value(&self.totals).record_model(model, usage, None);
         if let Some(paths) = &self.usage_paths {
             let mut record = UsageRecord::new(now_ms(), model, HelperKind::Main);
             record.input_tokens = usage.input_tokens;
@@ -1528,6 +1529,7 @@ impl SessionHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            spend_limit: self.spend_limit.lock().ok().and_then(|limit| *limit),
         }
     }
 
@@ -1553,7 +1555,7 @@ impl SessionHost {
             self.totals
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record_helper(label, &usage, cost);
+                .record_helper(label, &model, &usage, cost);
             if let Some(paths) = &self.usage_paths
                 && let Err(error) =
                     crate::helper_usage::append_to_ledger(paths, kind, &model, &usage, cost)
@@ -2973,6 +2975,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 .to_owned(),
                         );
                     }
+                    Handled::Context => {
+                        for row in context_view(&host, &history)? {
+                            note(row);
+                            note("\n".to_owned());
+                        }
+                    }
                     Handled::Compact => {
                         // Handled here because this closure already mutably
                         // borrows the conversation, and a second borrower would
@@ -3268,10 +3276,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         prices.cost_at(&outcome.usage, rune_net::transport::now_timestamp())
                     });
                 record_usage(&config.paths, &host.model(), &outcome, cost);
-                if let Some(cost) = cost
-                    && let Ok(mut totals) = host.totals.lock()
-                {
-                    totals.cost = Some(totals.cost.unwrap_or_default().saturating_add(cost));
+                if let Ok(mut totals) = host.totals.lock() {
+                    if let Some(cost) = cost {
+                        totals.cost = Some(totals.cost.unwrap_or_default().saturating_add(cost));
+                    }
+                    totals.record_model(&host.model(), &outcome.usage, cost);
                 }
                 host.record_usage(&outcome.usage);
                 host.record_context_usage(&history, &outcome.last_request)?;
@@ -5607,50 +5616,269 @@ fn render_cost(info: &SessionInfo<'_>) -> String {
     if totals.requests == 0 {
         return "no requests have been made in this session yet".to_owned();
     }
+    let dollars = |cost: Option<u64>| {
+        cost.map_or_else(
+            || "-".to_owned(),
+            |cost| format!("${}", rune_net::models_dev::dollars(cost)),
+        )
+    };
     let mut out = String::new();
-    let _ = writeln!(out, "Requests: {}", totals.requests);
     let _ = writeln!(
         out,
-        "Tokens:   {} in, {} out",
+        "spent {} this session ({} requests, {} in, {} out)",
+        dollars(totals.cost),
+        totals.requests,
         footer::format_tokens(totals.input_tokens),
         footer::format_tokens(totals.output_tokens)
     );
-    if totals.cache_read_tokens > 0 || totals.cache_write_tokens > 0 {
+    let row = |out: &mut String, model: &str, used: &ModelTotals| {
+        let percent = (used.cached.saturating_mul(100))
+            .checked_div(used.input)
+            .unwrap_or(0);
         let _ = writeln!(
             out,
-            "Cache:    {} read, {} written",
-            footer::format_tokens(totals.cache_read_tokens),
-            footer::format_tokens(totals.cache_write_tokens)
+            "  {model}   {} req   in {}  cached {} ({percent}%)  out {}  reasoning {}   {}",
+            used.requests,
+            footer::format_tokens(used.input),
+            footer::format_tokens(used.cached),
+            footer::format_tokens(used.output),
+            footer::format_tokens(used.reasoning),
+            dollars(used.cost)
         );
+    };
+    for (model, used) in &totals.by_model {
+        row(&mut out, model, used);
     }
-    if totals.reasoning_tokens > 0 {
-        let _ = writeln!(
-            out,
-            "Reasoning: {}",
-            footer::format_tokens(totals.reasoning_tokens)
-        );
-    }
-    if let Some(cost) = totals.cost {
-        let _ = writeln!(
-            out,
-            "Cost:     ${} estimated from published prices",
-            rune_net::models_dev::dollars(cost)
-        );
-    }
-    for (label, helper) in &totals.helpers {
-        let _ = write!(
-            out,
-            "  of which {label}: {} requests, {} in, {} out",
-            helper.requests,
-            footer::format_tokens(helper.input_tokens),
-            footer::format_tokens(helper.output_tokens)
-        );
-        if let Some(cost) = helper.cost {
-            let _ = write!(out, ", ${}", rune_net::models_dev::dollars(cost));
+    if !totals.helper_models.is_empty() {
+        out.push_str("helpers\n");
+        for (model, used) in &totals.helper_models {
+            row(&mut out, model, used);
         }
-        out.push('\n');
+    }
+    if let Some(limit) = info.spend_limit {
+        let left = limit.saturating_sub(totals.cost.unwrap_or(0));
+        let _ = writeln!(
+            out,
+            "budget ${}: ${} left",
+            rune_net::models_dev::dollars(limit),
+            rune_net::models_dev::dollars(left)
+        );
     }
     out.trim_end().to_owned()
+}
+
+/// Builds the `/context` rows for the request the next turn would send.
+fn context_view(host: &SessionHost, history: &History) -> Result<Vec<String>> {
+    if history.is_empty() {
+        return Ok(vec!["no request has been sent yet".to_owned()]);
+    }
+    let mut copy = history.clone();
+    let plan = turn::request_plan(host, &mut copy);
+    let window = host.context_window().unwrap_or(0);
+    let breakdown = rune_agent::tokens::context_breakdown(
+        host.dialect(),
+        &plan,
+        Host::instruction_sizes(host),
+        history.anchor(),
+        rune_agent::tokens::ceiling(window, &host.limits),
+    )?;
+    Ok(render_context(
+        &breakdown,
+        host.width(),
+        &host.theme(),
+        host.depth,
+        host.ascii,
+    ))
+}
+
+/// Letter that marks each context part where colour is not available.
+fn context_letter(part: &str) -> char {
+    match part {
+        "base_prompt" => 'b',
+        "tool_schemas" => 's',
+        "skill_catalog" => 'k',
+        "project_instructions" => 'p',
+        "repository_map" => 'm',
+        "user_messages" => 'u',
+        "assistant_text" => 'a',
+        "reasoning" => 'r',
+        "tool_results" => 't',
+        "checkpoint" => 'c',
+        _ => 'o',
+    }
+}
+
+/// Colour slot of each context part in the bar.
+const fn context_slot(letter: char) -> Slot {
+    match letter {
+        'b' => Slot::Accent,
+        's' => Slot::Function,
+        'k' => Slot::Keyword,
+        'p' => Slot::Heading,
+        'm' => Slot::Number,
+        'u' => Slot::UserRail,
+        'a' => Slot::Fg,
+        'r' => Slot::Comment,
+        't' => Slot::String,
+        'c' => Slot::Warning,
+        _ => Slot::Dim,
+    }
+}
+
+/// Label of a context part in the listing.
+fn context_label(part: &str) -> String {
+    part.replace('_', " ")
+}
+
+/// Splits `cells` bar cells between the parts by their share of `ceiling`.
+///
+/// A part too small for one cell goes to `other`. The parts' cells and the
+/// free cells always add up to `cells`.
+fn context_cells(
+    parts: &BTreeMap<&'static str, u64>,
+    ceiling: u64,
+    cells: usize,
+) -> (Vec<(char, usize)>, usize) {
+    let share = |tokens: u64| -> usize {
+        let scaled = u128::from(tokens)
+            .saturating_mul(cells as u128)
+            .saturating_add(u128::from(ceiling / 2))
+            .checked_div(u128::from(ceiling.max(1)))
+            .unwrap_or(0);
+        usize::try_from(scaled).unwrap_or(usize::MAX)
+    };
+    let mut other = parts.get("other").copied().unwrap_or(0);
+    let mut drawn = Vec::new();
+    for (part, tokens) in parts {
+        if *part == "other" || *tokens == 0 {
+            continue;
+        }
+        let count = share(*tokens);
+        if count == 0 {
+            other = other.saturating_add(*tokens);
+        } else {
+            drawn.push((context_letter(part), count));
+        }
+    }
+    let other_cells = share(other);
+    if other_cells > 0 {
+        drawn.push(('o', other_cells));
+    }
+    // Rounding may overshoot a full window: trim the largest parts first.
+    let mut used: usize = drawn.iter().map(|(_, count)| *count).sum();
+    while used > cells {
+        let Some(largest) = drawn.iter_mut().max_by_key(|(_, count)| *count) else {
+            break;
+        };
+        largest.1 = largest.1.saturating_sub(1);
+        used = used.saturating_sub(1);
+    }
+    drawn.retain(|(_, count)| *count > 0);
+    (drawn, cells.saturating_sub(used))
+}
+
+/// Renders the `/context` view: a bar, the totals, and one row per part.
+fn render_context(
+    breakdown: &rune_agent::tokens::ContextBreakdown,
+    width: u16,
+    theme: &Theme,
+    depth: ColorDepth,
+    ascii: bool,
+) -> Vec<String> {
+    let reset = rune_term::engine::Style::RESET;
+    let letters = depth == ColorDepth::Ansi16 || depth == ColorDepth::None;
+    let total = breakdown.total_tokens;
+    let estimated = if breakdown.anchored {
+        ""
+    } else {
+        " (estimated)"
+    };
+    let mut rows = Vec::new();
+    match breakdown.ceiling_tokens {
+        Some(ceiling) => {
+            let cells = usize::from(width.saturating_sub(2)).min(60);
+            let (drawn, free) = context_cells(&breakdown.parts, ceiling, cells);
+            let mut bar = String::new();
+            for (letter, count) in drawn {
+                let mark = if letters {
+                    letter.to_string()
+                } else if ascii {
+                    "#".to_owned()
+                } else {
+                    "\u{2588}".to_owned()
+                };
+                let _ = write!(
+                    bar,
+                    "{}{}{reset}",
+                    theme.sgr(context_slot(letter), depth),
+                    mark.repeat(count)
+                );
+            }
+            let gap = if ascii || letters { "." } else { "\u{2591}" };
+            let _ = write!(
+                bar,
+                "{}{}{reset}",
+                theme.sgr(Slot::Dim, depth),
+                gap.repeat(free)
+            );
+            rows.push(bar);
+            let percent = total.saturating_mul(100).checked_div(ceiling).unwrap_or(0);
+            rows.push(format!(
+                "{} of {} tokens ({percent}%){estimated} \u{b7} compaction at {} \u{b7} {} free",
+                footer::format_tokens(total),
+                footer::format_tokens(ceiling),
+                footer::format_tokens(ceiling),
+                footer::format_tokens(breakdown.free_tokens.unwrap_or(0))
+            ));
+        }
+        None => rows.push(format!(
+            "{} tokens{estimated}, window size unknown",
+            footer::format_tokens(total)
+        )),
+    }
+    let mut parts: Vec<(&&str, &u64)> = breakdown
+        .parts
+        .iter()
+        .filter(|(_, tokens)| **tokens > 0)
+        .collect();
+    parts.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+    let percent_of = |tokens: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let share = tokens as f64 * 100.0 / total as f64;
+            share
+        }
+    };
+    for (part, tokens) in parts {
+        let letter = context_letter(part);
+        let mark = if letters {
+            letter.to_string()
+        } else if ascii {
+            "#".to_owned()
+        } else {
+            "\u{2588}".to_owned()
+        };
+        rows.push(format!(
+            "{}{mark}{reset} {:<20} {:>8} {:>5.1}%",
+            theme.sgr(context_slot(letter), depth),
+            context_label(part),
+            tokens,
+            percent_of(*tokens)
+        ));
+        if **part == *"tool_results" {
+            let mut tools: Vec<(&String, &u64)> = breakdown.tool_results.iter().collect();
+            tools.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+            for (tool, tokens) in tools.into_iter().take(5) {
+                rows.push(format!(
+                    "    {tool:<20} {tokens:>8} {:>5.1}%",
+                    percent_of(*tokens)
+                ));
+            }
+        }
+    }
+    rows
 }
 
 /// Shows the spend limit, or sets it from an amount in dollars, or turns it off.
@@ -6285,6 +6513,8 @@ enum Handled {
     Reload,
     /// Switch to the named theme, or choose one.
     Theme(Option<String>),
+    /// Show what fills the context window.
+    Context,
     /// Put the last reply on the terminal's clipboard.
     Copy,
     /// Start a fresh conversation in this terminal.
@@ -6332,6 +6562,45 @@ struct Totals {
     cost: Option<u64>,
     /// The share of these totals each helper accounts for, by its label.
     helpers: BTreeMap<&'static str, HelperTotals>,
+    /// The main requests of this session, by the model that served them.
+    by_model: BTreeMap<String, ModelTotals>,
+    /// The helper requests of this session, by model and helper label.
+    helper_models: BTreeMap<String, ModelTotals>,
+}
+
+/// What one model has used in a session.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct ModelTotals {
+    /// Requests made.
+    requests: u64,
+    /// Input tokens reported.
+    input: u64,
+    /// Input tokens read from the prompt cache.
+    cached: u64,
+    /// Output tokens reported.
+    output: u64,
+    /// Reasoning tokens reported.
+    reasoning: u64,
+    /// Estimated cost in millionths of a dollar. Absent until a request is priced.
+    cost: Option<u64>,
+}
+
+impl ModelTotals {
+    /// Adds one request.
+    fn add(&mut self, usage: &rune_net::stream::Usage, cost: Option<u64>) {
+        self.requests = self.requests.saturating_add(1);
+        self.input = self.input.saturating_add(usage.input_tokens.unwrap_or(0));
+        self.cached = self
+            .cached
+            .saturating_add(usage.cache_read_tokens.unwrap_or(0));
+        self.output = self.output.saturating_add(usage.output_tokens.unwrap_or(0));
+        self.reasoning = self
+            .reasoning
+            .saturating_add(usage.reasoning_tokens.unwrap_or(0));
+        if let Some(cost) = cost {
+            self.cost = Some(self.cost.unwrap_or(0).saturating_add(cost));
+        }
+    }
 }
 
 /// What one kind of helper request has used in a session.
@@ -6400,10 +6669,19 @@ impl Totals {
         }
     }
 
+    /// Adds one main request to the row of the model that served it.
+    fn record_model(&mut self, model: &str, usage: &rune_net::stream::Usage, cost: Option<u64>) {
+        self.by_model
+            .entry(model.to_owned())
+            .or_default()
+            .add(usage, cost);
+    }
+
     /// Adds one helper request to the session's totals and to its own label.
     fn record_helper(
         &mut self,
         label: &'static str,
+        model: &str,
         usage: &rune_net::stream::Usage,
         cost: Option<u64>,
     ) {
@@ -6413,6 +6691,10 @@ impl Totals {
         fn add_cost(total: &mut Option<u64>, cost: u64) {
             *total = Some(total.unwrap_or(0).saturating_add(cost));
         }
+        self.helper_models
+            .entry(format!("{model} ({label})"))
+            .or_default()
+            .add(usage, cost);
         self.record(usage);
         let helper = self.helpers.entry(label).or_default();
         helper.requests = helper.requests.saturating_add(1);
@@ -6575,6 +6857,8 @@ struct SessionInfo<'a> {
     context_limit: u64,
     /// What this session has spent so far.
     totals: Totals,
+    /// The spend at which requests stop, in millionths of a dollar, when set.
+    spend_limit: Option<u64>,
 }
 
 /// What the input loop does after handling one line.
@@ -6638,6 +6922,7 @@ fn handle_command<W: std::io::Write>(
         "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
         "reload" => Ok(Handled::Reload),
+        "context" => Ok(Handled::Context),
         "theme" => Ok(Handled::Theme(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -10221,9 +10506,10 @@ mod tests {
             ..rune_net::stream::Usage::default()
         });
         let rendered = render_cost(&test_info_with(totals));
-        assert!(rendered.contains("Requests: 2"), "{rendered}");
-        assert!(rendered.contains("1.2k in"), "{rendered}");
-        assert!(rendered.contains("500 out"), "{rendered}");
+        assert!(
+            rendered.starts_with("spent - this session (2 requests, 1.2k in, 500 out)"),
+            "{rendered}"
+        );
     }
 
     /// Answers every POST with a short Anthropic stream and keeps each body.
@@ -10398,11 +10684,14 @@ mod tests {
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(sent.expect("thread"), 6);
         host.absorb_helper_usage();
-        assert_eq!(
-            render_cost(&host.info("p", "e")),
-            "Requests: 6\n\
-             Tokens:   66 in, 42 out\n  \
-             of which cache warming: 6 requests, 66 in, 42 out"
+        let rendered = render_cost(&host.info("p", "e"));
+        assert!(
+            rendered.starts_with("spent - this session (6 requests, 66 in, 42 out)\nhelpers\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(cache warming)   6 req   in 66  cached 0 (0%)  out 42"),
+            "{rendered}"
         );
     }
 
@@ -10435,11 +10724,11 @@ mod tests {
         });
         assert_eq!(
             render_cost(&host.info("p", "e")),
-            "Requests: 5\n\
-             Tokens:   5.0k in, 620 out\n  \
-             of which compaction: 1 requests, 2.0k in, 400 out\n  \
-             of which image analysis: 1 requests, 1.5k in, 90 out\n  \
-             of which permission review: 2 requests, 500 in, 30 out"
+            "spent - this session (5 requests, 5.0k in, 620 out)\n\
+             helpers\n  \
+             eyes (image analysis)   1 req   in 1.5k  cached 0 (0%)  out 90  reasoning 0   -\n  \
+             small (permission review)   2 req   in 500  cached 0 (0%)  out 30  reasoning 0   -\n  \
+             test (compaction)   1 req   in 2.0k  cached 0 (0%)  out 400  reasoning 0   -"
         );
         assert!(host.helper_usage.drain().is_empty());
     }
@@ -10452,21 +10741,172 @@ mod tests {
             output_tokens: Some(10),
             ..rune_net::stream::Usage::default()
         };
-        totals.record_helper("image analysis", &usage, Some(1_500_000));
-        totals.record_helper("image analysis", &usage, Some(500_000));
-        totals.record_helper("permission review", &usage, None);
+        totals.record_helper("image analysis", "m", &usage, Some(1_500_000));
+        totals.record_helper("image analysis", "m", &usage, Some(500_000));
+        totals.record_helper("permission review", "m", &usage, None);
         assert_eq!(totals.cost, Some(2_000_000));
         assert_eq!(totals.requests, 3);
         let rendered = render_cost(&test_info_with(totals));
         let dollars = rune_net::models_dev::dollars(2_000_000);
         assert!(
-            rendered.contains(&format!(
-                "  of which image analysis: 2 requests, 200 in, 20 out, ${dollars}\n"
+            rendered.starts_with(&format!(
+                "spent ${dollars} this session (3 requests, 300 in, 30 out)\n"
             )),
             "{rendered}"
         );
         assert!(
-            rendered.ends_with("  of which permission review: 1 requests, 100 in, 10 out"),
+            rendered.contains(&format!(
+                "  m (image analysis)   2 req   in 200  cached 0 (0%)  out 20  reasoning 0   ${dollars}\n"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with(
+                "  m (permission review)   1 req   in 100  cached 0 (0%)  out 10  reasoning 0   -"
+            ),
+            "{rendered}"
+        );
+    }
+
+    fn parts(entries: &[(&'static str, u64)]) -> BTreeMap<&'static str, u64> {
+        rune_agent::tokens::CONTEXT_PARTS
+            .iter()
+            .map(|key| (*key, 0))
+            .chain(entries.iter().copied())
+            .collect()
+    }
+
+    fn breakdown(
+        entries: &[(&'static str, u64)],
+        ceiling: Option<u64>,
+    ) -> rune_agent::tokens::ContextBreakdown {
+        let parts = parts(entries);
+        let total = parts.values().sum();
+        rune_agent::tokens::ContextBreakdown {
+            total_tokens: total,
+            anchored: true,
+            ceiling_tokens: ceiling,
+            free_tokens: ceiling.map(|ceiling: u64| ceiling.saturating_sub(total)),
+            parts,
+            tool_results: std::iter::once(("read_file".to_owned(), 300)).collect(),
+        }
+    }
+
+    #[test]
+    fn context_bar_cells_sum_to_the_width() {
+        for width in [12_u16, 40, 80, 200] {
+            let cells = usize::from(width.saturating_sub(2)).min(60);
+            let shares = parts(&[
+                ("base_prompt", 333),
+                ("tool_schemas", 2_000),
+                ("tool_results", 4_100),
+            ]);
+            let (drawn, free) = context_cells(&shares, 10_000, cells);
+            let used: usize = drawn.iter().map(|(_, count)| *count).sum();
+            assert_eq!(used + free, cells, "{width}");
+        }
+        // A request over the ceiling still fills the bar exactly.
+        let (drawn, free) = context_cells(&parts(&[("tool_results", 30_000)]), 10_000, 40);
+        assert_eq!(
+            drawn.iter().map(|(_, count)| *count).sum::<usize>() + free,
+            40
+        );
+    }
+
+    #[test]
+    fn small_parts_merge_into_other() {
+        let shares = parts(&[("tool_results", 9_000), ("reasoning", 40)]);
+        let (drawn, _) = context_cells(&shares, 10_000, 38);
+        assert!(drawn.iter().all(|(letter, _)| *letter != 'r'), "{drawn:?}");
+        assert!(drawn.iter().any(|(letter, _)| *letter == 't'), "{drawn:?}");
+    }
+
+    #[test]
+    fn ansi16_bar_uses_letters() {
+        let view = render_context(
+            &breakdown(
+                &[("tool_schemas", 2_000), ("tool_results", 4_000)],
+                Some(10_000),
+            ),
+            40,
+            &Theme::dark(),
+            ColorDepth::Ansi16,
+            false,
+        );
+        let mut grid = rune_term::Grid::new(80, 2).expect("grid");
+        grid.feed(view[0].as_bytes()).expect("bar");
+        let plain = grid.row_text(0);
+        assert!(plain.contains("sss") && plain.contains("ttt"), "{plain}");
+        assert!(!plain.contains('\u{2588}'), "{plain}");
+        assert_eq!(plain.chars().count(), 38, "{plain}");
+        assert!(
+            view[1].starts_with("6.0k of 10.0k tokens (60%)"),
+            "{}",
+            view[1]
+        );
+        let tools = view
+            .iter()
+            .position(|row| row.contains("tool results"))
+            .expect("row");
+        assert!(
+            view[tools + 1].trim_start().starts_with("read_file"),
+            "{view:?}"
+        );
+        let unknown = render_context(
+            &breakdown(&[("tool_results", 10)], None),
+            40,
+            &Theme::dark(),
+            ColorDepth::Ansi16,
+            false,
+        );
+        assert_eq!(unknown[0], "10 tokens, window size unknown");
+    }
+
+    #[test]
+    fn cost_lists_each_model_and_helpers() {
+        let mut totals = Totals::default();
+        let usage = rune_net::stream::Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(100),
+            cache_read_tokens: Some(500),
+            reasoning_tokens: Some(20),
+            ..rune_net::stream::Usage::default()
+        };
+        for model in ["alpha", "beta"] {
+            totals.record(&usage);
+            totals.record_model(model, &usage, None);
+        }
+        totals.record_helper("permission review", "small", &usage, None);
+        let rendered = render_cost(&test_info_with(totals));
+        assert_eq!(
+            rendered,
+            "spent - this session (3 requests, 3.0k in, 300 out)\n  \
+             alpha   1 req   in 1.0k  cached 500 (50%)  out 100  reasoning 20   -\n  \
+             beta   1 req   in 1.0k  cached 500 (50%)  out 100  reasoning 20   -\n\
+             helpers\n  \
+             small (permission review)   1 req   in 1.0k  cached 500 (50%)  out 100  reasoning 20   -"
+        );
+    }
+
+    #[test]
+    fn budget_line_shows_what_is_left() {
+        let mut totals = Totals::default();
+        let usage = rune_net::stream::Usage {
+            input_tokens: Some(10),
+            ..rune_net::stream::Usage::default()
+        };
+        totals.record(&usage);
+        totals.record_model("alpha", &usage, Some(250_000));
+        totals.cost = Some(250_000);
+        let mut info = test_info_with(totals);
+        info.spend_limit = Some(1_000_000);
+        let rendered = render_cost(&info);
+        let (limit, left) = (
+            rune_net::models_dev::dollars(1_000_000),
+            rune_net::models_dev::dollars(750_000),
+        );
+        assert!(
+            rendered.ends_with(&format!("budget ${limit}: ${left} left")),
             "{rendered}"
         );
     }
@@ -10509,7 +10949,7 @@ mod tests {
         });
         assert_eq!(
             render_cost(&host.info("p", "e")),
-            "Requests: 4\nTokens:   700 in, 70 out"
+            "spent - this session (4 requests, 700 in, 70 out)"
         );
     }
 
@@ -13251,6 +13691,7 @@ mod tests {
             context_source: None,
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
             totals,
+            spend_limit: None,
         }
     }
 

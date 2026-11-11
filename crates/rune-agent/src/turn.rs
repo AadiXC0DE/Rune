@@ -1790,7 +1790,7 @@ fn request_origin(host: &dyn Host) -> String {
 
 /// Builds the next request from `history` as the loop sends it, before the
 /// host prepares it.
-pub(crate) fn request_plan(host: &dyn Host, history: &mut History) -> RequestPlan {
+pub fn request_plan(host: &dyn Host, history: &mut History) -> RequestPlan {
     let mut plan = RequestPlan::new(host.model());
     plan.instructions = host.instructions();
     plan.stable_instructions_len = host.stable_instructions_len();
