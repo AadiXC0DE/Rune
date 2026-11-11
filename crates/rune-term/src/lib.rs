@@ -17,6 +17,7 @@ pub mod inline;
 pub mod input;
 pub mod markdown;
 pub mod picker;
+pub mod probe;
 pub mod screen;
 pub mod shell;
 pub mod theme;
