@@ -152,9 +152,13 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
             } else {
                 let request: Value = serde_json::from_slice(&bytes).expect("JSON");
                 assert!(
-                    request["messages"][0]["content"].as_str().is_some_and(
-                        |text| text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
-                    )
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .is_some_and(|text| {
+                            text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
+                                || text
+                                    .starts_with(rune_agent::compaction::CHECKPOINT_UPDATE_OPENING)
+                        })
                 );
                 summaries.push(request);
                 (

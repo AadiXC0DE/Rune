@@ -77,7 +77,7 @@
       "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
     },
     {
-      "match": "Write a checkpoint of the conversation above",
+      "match": "Write one updated checkpoint that replaces it",
       "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
     },
     {

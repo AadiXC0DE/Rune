@@ -73,7 +73,10 @@ fn fixture_turns_compact_before_the_next_cli_model_request() {
             let request: Value = serde_json::from_slice(&bytes).expect("request JSON");
             let summary = request["messages"][0]["content"]
                 .as_str()
-                .is_some_and(|text| text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING));
+                .is_some_and(|text| {
+                    text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
+                        || text.starts_with(rune_agent::compaction::CHECKPOINT_UPDATE_OPENING)
+                });
             requests.push((summary, request));
             let (delta, finish) = if summary {
                 (

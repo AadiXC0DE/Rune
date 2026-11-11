@@ -157,7 +157,7 @@ pub fn compact(
     let limits = host.limits();
     let request = render_summary_request(history, plan);
     let mut request_plan = RequestPlan::new(host.model());
-    request_plan.instructions = checkpoint_instruction(false);
+    request_plan.instructions = checkpoint_instruction(starts_with_checkpoint(history));
     request_plan.messages = transport::one_shot_messages(&request);
     request_plan.cache_key = host.cache_key();
     let first = summarize(host, client, &limits, &mut request_plan, cancelled)?;
@@ -710,7 +710,7 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
         out.push('\n');
     }
     out.push_str("</conversation>\n\n");
-    out.push_str(&checkpoint_instruction(false));
+    out.push_str(&checkpoint_instruction(starts_with_checkpoint(history)));
     out
 }
 
@@ -770,6 +770,18 @@ const RECENT_ARGUMENT_CHARS: usize = 300;
 /// Returns true for text that opens a summary installed by compaction.
 fn is_checkpoint(text: &str) -> bool {
     text.starts_with("<conversation-checkpoint>")
+}
+
+/// Returns true when the first turn is a user turn holding a checkpoint from
+/// an earlier compaction.
+///
+/// Only a leading tag counts; text that quotes the tag later does not.
+#[must_use]
+pub fn starts_with_checkpoint(history: &History) -> bool {
+    history
+        .turns()
+        .first()
+        .is_some_and(|turn| turn.role == Role::User && is_checkpoint(&turn.text()))
 }
 
 /// Returns the user messages a summary at the front of the history carries.
@@ -1556,6 +1568,96 @@ mod tests {
         assert!(err.message().contains("token limit"), "{}", err.message());
         assert_eq!(fetch.bodies().len(), 2);
         assert_eq!(history.turns(), before.turns());
+    }
+
+    /// Returns the text of the last user message of a summarizer request body.
+    fn last_user_text(body: &serde_json::Value) -> String {
+        body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("a user message")
+            .to_owned()
+    }
+
+    #[test]
+    fn a_second_compaction_asks_for_an_update() {
+        let host = SummaryHost::new();
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop"), (CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        assert!(!starts_with_checkpoint(&history));
+        let first = plan(&history, &host.limits()).expect("a plan");
+        compact(&mut history, &first, &host, &fetch, None, &|| false).expect("first compaction");
+        assert!(starts_with_checkpoint(&history));
+
+        history.push_user("question 3");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "answer 3".to_owned(),
+        }]);
+        let second = plan(&history, &host.limits()).expect("a second plan");
+        compact(&mut history, &second, &host, &fetch, None, &|| false).expect("second compaction");
+
+        let bodies = fetch.bodies();
+        assert_eq!(bodies.len(), 2);
+        let opening = |body: &serde_json::Value| {
+            let request = last_user_text(body);
+            let (_, instruction) = request
+                .split_once("</conversation>\n\n")
+                .expect("an instruction after the conversation");
+            instruction.to_owned()
+        };
+        assert!(opening(&bodies[0]).starts_with(CHECKPOINT_OPENING));
+        assert!(opening(&bodies[1]).starts_with(CHECKPOINT_UPDATE_OPENING));
+        assert_eq!(bodies[1]["messages"][0]["role"], "system");
+        assert!(
+            bodies[1]["messages"][0]["content"]
+                .as_str()
+                .expect("system text")
+                .starts_with(CHECKPOINT_UPDATE_OPENING)
+        );
+
+        let mut quoted = History::new();
+        quoted.push_user("what does <conversation-checkpoint> mean");
+        assert!(!starts_with_checkpoint(&quoted));
+        let mut assistant_first = History::new();
+        assistant_first.push_assistant(vec![ContentPart::Text {
+            text: "<conversation-checkpoint>".to_owned(),
+        }]);
+        assert!(!starts_with_checkpoint(&assistant_first));
+    }
+
+    #[test]
+    fn user_messages_survive_two_compactions() {
+        let host = SummaryHost::new();
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop"), (CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        let first = plan(&history, &host.limits()).expect("a plan");
+        compact(&mut history, &first, &host, &fetch, None, &|| false).expect("first compaction");
+
+        history.push_user("question 3");
+        history.push_assistant(vec![ContentPart::Text {
+            text: "answer 3".to_owned(),
+        }]);
+        let second = plan(&history, &host.limits()).expect("a second plan");
+        compact(&mut history, &second, &host, &fetch, None, &|| false).expect("second compaction");
+
+        let text = user_text(&history);
+        assert_eq!(
+            text.matches("<conversation-checkpoint>").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "<user-messages>\n<message>\nquestion 0\n</message>\n<message>\nquestion 1\n</message>\n<message>\nquestion 2\n</message>\n</user-messages>\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(history.turns()[1].text(), "question 3");
+        history.validate().expect("valid after two compactions");
     }
 
     #[test]
