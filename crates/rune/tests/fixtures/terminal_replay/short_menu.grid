@@ -6,7 +6,7 @@ completion-last: 32x8, caret 3,3
 04|  /help|
 05|  /terminal-setup|
 06|> /quit|
-07|  24-26 of 26|
+07|  25-27 of 27|
 completion-closed: 32x8, caret 2,3
 00|session ************|
 01|ctrl-c cancel  /help commands  e|
