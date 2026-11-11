@@ -73,11 +73,11 @@ with tempfile.TemporaryDirectory(prefix="rune-cache-resume-") as directory:
                     transcript.extend(os.read(master, 65536))
 
         try:
-            wait_for("ctrl-c cancel")
+            wait_for("/ commands")
             os.write(master, prompt.encode() + b"\r")
             wait_for(reply)
-            mark = len(transcript)
-            wait_for("ctrl-c cancel", mark)
+            mark = transcript.find(reply.encode())
+            wait_for("/ commands", mark)
             os.write(master, b"/quit\r")
             assert drain_wait(child, master, 15, transcript) == 0
         finally:

@@ -178,7 +178,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"die\r")
         wait_for("STREAM-03", start)
@@ -208,7 +208,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         stop()
 
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[failed: incomplete_stream]", start)

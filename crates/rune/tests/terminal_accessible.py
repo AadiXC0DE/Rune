@@ -159,7 +159,7 @@ class Terminal:
         # CRLF is terminal newline translation, not an application cursor move.
         output = bytes(self.output).replace(b"\r\n", b"\n")
         assert not any(byte < 32 and byte not in (9, 10) for byte in output), repr(output)
-        assert b"ctrl-c cancel" not in output, "interactive footer leaked"
+        assert b"/ commands" not in output, "interactive footer leaked"
         assert b"ctx " not in output, "context status row leaked"
         return output
 

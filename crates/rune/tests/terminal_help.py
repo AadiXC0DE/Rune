@@ -177,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             print(json.dumps(captures))
             sys.exit(0)
 
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         keys(b"/help\r")
         wait_for("Terminals without bracketed paste send ordinary keys.")
         # Verify the complete help through the output emitted by /help itself.
@@ -324,7 +324,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         )
         os.close(slave)
         transcript = bytearray()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"\x03")
         assert drain_wait(child, master, 10, transcript) == 0
         assert not errors, errors

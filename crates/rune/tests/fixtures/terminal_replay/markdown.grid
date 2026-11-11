@@ -14,7 +14,7 @@ markdown-streaming: 80x24, caret 2,17
 12|```|
 13||
 14||
-15|ctrl-c cancel  /help commands  esc clear|
+15|ctrl-c interrupt   enter steer|
 16|replay-fixture | full access | ctx ~###k (request bytes)|
 17|>|
 18||
@@ -45,6 +45,6 @@ markdown-finished: 80x24, caret 2,23
 18|bb   │ 22|
 19||
 20|MARKDOWN-END|
-21|ctrl-c cancel  /help commands  esc clear|
+21|/ commands|
 22|replay-fixture | full access | ctx ~###k (request bytes)|
 23|>|

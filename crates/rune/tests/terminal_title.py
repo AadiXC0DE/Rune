@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="rune-title-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         first = bytes(transcript)
         on = sys.argv[3] == "on"
         if on:
@@ -85,8 +85,8 @@ with tempfile.TemporaryDirectory(prefix="rune-title-") as directory:
         assert b"\x1b]9;4;3;0\x07" in turn, turn
         if on:
             assert "\u00b7 working".encode() in turn, turn
-        mark = len(transcript)
-        wait_for("ctrl-c cancel", mark)
+        mark = transcript.find(b"First.", mark)
+        wait_for("/ commands", mark)
         wait_for("\x1b]9;4;0;0\x07", 0)
         mark = len(transcript)
         os.write(master, b"/quit\r")

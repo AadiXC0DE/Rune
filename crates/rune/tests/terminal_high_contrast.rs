@@ -27,7 +27,11 @@ fn high_contrast_draws_explicit_pairs_and_no_color_suppresses_them() {
     for (stage, bytes) in captures {
         let mut grid = rune_term::Grid::new(100, 24).expect("grid");
         grid.feed(&bytes).expect("terminal output");
-        assert!(grid.text().contains("ctrl-c cancel"), "{stage}");
+        assert!(
+            grid.text()
+                .contains("up/down select   tab complete   esc close"),
+            "{stage}"
+        );
         assert!(grid.text().contains("/model"), "{stage}");
         let colorless = stage.starts_with("no-color");
         let depth = if stage == "truecolor" {

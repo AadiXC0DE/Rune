@@ -210,7 +210,7 @@ sys.exit(9 if mode == "editor-failed" else 0)
 
     earlier = []
     try:
-        wait_for("ctrl-c cance")
+        wait_for("/ commands")
         if editor_mode:
             if editor_mode == "editor-steering":
                 os.write(master, b"start\r")

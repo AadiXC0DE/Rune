@@ -42,7 +42,7 @@ def capture(binary, root, environment):
                 transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for(b"ctrl-c cancel")
+        wait_for(b"/ commands")
         start = len(transcript)
         os.write(master, b"/")
         wait_for(b"/model", start)

@@ -30,7 +30,7 @@ use rune_policy::decision::Outcome;
 use rune_policy::review::{ReviewOutcome, ReviewRequest, ReviewSession, Reviewer};
 use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
-use rune_term::footer::{self, FooterState, ProviderRetry};
+use rune_term::footer::{self, FooterState, ProviderRetry, StatusField, UiState};
 use rune_term::input::KeyAction;
 use rune_term::probe::TerminalEnv;
 use rune_term::shell::ExitReason;
@@ -514,6 +514,11 @@ struct SessionHost {
     /// Whether commands run without a sandbox: none works here and the user
     /// allowed that. Decided once, at the start.
     unsandboxed: bool,
+    /// Branch of the workspace's repository, read at the start and after
+    /// each turn.
+    branch: Mutex<Option<String>>,
+    /// Status row fields shown, highest priority first; `/statusline` changes it.
+    statusline: Mutex<Vec<StatusField>>,
     questions: Arc<TerminalQuestions>,
     /// The last request as it was sent, which a cache warming ping repeats.
     last_plan: Mutex<Option<rune_net::provider::RequestPlan>>,
@@ -2325,7 +2330,19 @@ impl SessionHost {
     }
 
     /// Returns the status line for the current state.
+    #[cfg(test)]
     fn status_line(&self, width: usize) -> String {
+        self.status_line_in(width, None)
+    }
+
+    /// Returns the footer rows, with `ui` naming an open menu or picker; absent,
+    /// the hints follow whether a turn is running.
+    fn status_line_in(&self, width: usize, ui: Option<UiState>) -> String {
+        let running = self
+            .turn_started
+            .lock()
+            .is_ok_and(|started| started.is_some());
+        let (_, effort) = self.effective_effort();
         let state = FooterState {
             provider_retry: *self
                 .provider_retry
@@ -2355,6 +2372,18 @@ impl SessionHost {
                 .ok()
                 .and_then(|totals| totals.cost)
                 .map(|micro| format!("${}.{:04}", micro / 1_000_000, (micro % 1_000_000) / 100)),
+            ui: ui.unwrap_or(if running {
+                UiState::Running
+            } else {
+                UiState::Idle
+            }),
+            idle_hints: Vec::new(),
+            fields: Some(lock_value(&self.statusline).clone()),
+            branch: lock_value(&self.branch).clone(),
+            effort: (effort != Effort::Auto).then(|| effort.to_string()),
+            queued: self.steering.len(),
+            net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !self.endpoint.offline,
+            mcp: self.mcp.as_ref().map(McpClient::server_count),
         };
         let layout = footer::solve(
             (
@@ -2424,7 +2453,7 @@ impl SessionHost {
         arriving: &[String],
         caret: (u16, u16),
     ) -> Result<Vec<u8>> {
-        self.paint_with_menu(settled, activity, prompt, arriving, &[], caret, false)
+        self.paint_in(None, settled, activity, prompt, arriving, &[], caret, false)
     }
 
     /// Draws the live region with a list opened under the input.
@@ -2435,6 +2464,25 @@ impl SessionHost {
     #[allow(clippy::too_many_arguments)]
     fn paint_with_menu(
         &self,
+        settled: &[String],
+        activity: Option<&str>,
+        prompt: &[String],
+        arriving: &[String],
+        menu: &[String],
+        caret: (u16, u16),
+        paced: bool,
+    ) -> Result<Vec<u8>> {
+        self.paint_in(
+            None, settled, activity, prompt, arriving, menu, caret, paced,
+        )
+    }
+
+    /// Draws the live region with the footer hints of `ui`, when a menu, picker
+    /// or approval decides them.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_in(
+        &self,
+        ui: Option<UiState>,
         settled: &[String],
         activity: Option<&str>,
         prompt: &[String],
@@ -2454,7 +2502,7 @@ impl SessionHost {
             return Ok(transcript::append_lines(&lines));
         }
         self.refresh_size();
-        let footer_rows = self.status_rows();
+        let footer_rows = self.status_rows(ui);
         let mut inline = self
             .inline
             .lock()
@@ -2544,11 +2592,16 @@ impl SessionHost {
     }
 
     /// Returns the footer rows for the current state.
-    fn status_rows(&self) -> Vec<String> {
-        self.status_line(usize::from(self.width()))
+    fn status_rows(&self, ui: Option<UiState>) -> Vec<String> {
+        self.status_line_in(usize::from(self.width()), ui)
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Reads the workspace's branch again, since a turn may have switched it.
+    fn refresh_branch(&self) {
+        *lock_value(&self.branch) = git_branch(Utf8Path::new(&self.workspace));
     }
 
     /// Rows left below the one-line prompt, including menu headings and hints.
@@ -2556,7 +2609,7 @@ impl SessionHost {
         self.refresh_size();
         usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
             .saturating_sub(1)
-            .saturating_sub(self.status_rows().len())
+            .saturating_sub(self.status_rows(None).len())
             .saturating_sub(1)
     }
 
@@ -3747,6 +3800,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         ignored_reported: Mutex::new(std::collections::BTreeSet::new()),
         planning: std::sync::atomic::AtomicBool::new(false),
         unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
+        branch: Mutex::new(git_branch(&config.workspace)),
+        statusline: Mutex::new(
+            config
+                .settings
+                .statusline
+                .iter()
+                .filter_map(|name| StatusField::from_name(name))
+                .collect(),
+        ),
         questions: config.questions,
     };
     if !reuse_prefix {
@@ -4125,7 +4187,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             None => {
                                 let stream = Arc::clone(&sink.stream);
                                 let mut draw = |rows: &[String], caret: (u16, u16)| -> Result<()> {
-                                    let painted = host.paint_with_menu(
+                                    let painted = host.paint_in(
+                                        Some(UiState::Menu),
                                         &[],
                                         None,
                                         rows,
@@ -4291,6 +4354,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     }
                     Handled::Budget(requested) => note(set_budget(&host, requested.as_deref())),
                     Handled::Network(requested) => note(set_network(&host, requested.as_deref())),
+                    Handled::StatusLine(requested) => {
+                        note(set_statusline(&host, requested.as_deref()));
+                    }
                     Handled::Plan(argument) => {
                         let leave = argument.as_deref() == Some("off");
                         host.planning
@@ -5417,14 +5483,12 @@ fn draw_choice(
         .ok()
         .and_then(|slot| slot.clone())
         .ok_or_else(|| RuneError::new(ErrorCode::InputRequired, "choice output is unavailable"))?;
-    let hint = vec![String::from(
-        "Up/Down choose, Enter confirm, Esc/Ctrl-C cancel",
-    )];
     let menu = picker.rows(&host.theme(), host.depth);
-    let painted = host.paint_with_menu(
+    let painted = host.paint_in(
+        Some(UiState::Approval),
         settled,
         Some(picker.title()),
-        &hint,
+        &[],
         &[],
         &menu,
         (0, 0),
@@ -5523,6 +5587,7 @@ fn close_turn(
     activity: Option<&str>,
     unsent: &[String],
 ) -> Result<()> {
+    host.refresh_branch();
     let mut notice = activity.map(str::to_owned);
     if !unsent.is_empty() {
         let mut restored = unsent.join(" ");
@@ -6183,7 +6248,8 @@ fn draw_prompt(
         reader.column(),
         usize::from(host.width()),
     );
-    let painted = host.paint_with_menu(&[], None, &rows, &[], menu, caret, false)?;
+    let ui = (!menu.is_empty()).then_some(UiState::Menu);
+    let painted = host.paint_in(ui, &[], None, &rows, &[], menu, caret, false)?;
     if !painted.is_empty() {
         sink.write_all(&painted)?;
         sink.flush()?;
@@ -7548,6 +7614,95 @@ fn render_context(
     rows
 }
 
+/// Lists the status row fields, or turns one on or off for this session.
+///
+/// A field turned back on returns to its place in the default order.
+fn set_statusline(host: &SessionHost, requested: Option<&str>) -> String {
+    let mut shown = lock_value(&host.statusline);
+    let Some(name) = requested else {
+        return StatusField::ALL
+            .into_iter()
+            .chain(shown.iter().copied())
+            .fold(Vec::new(), |mut order: Vec<StatusField>, field| {
+                if !order.contains(&field) {
+                    order.push(field);
+                }
+                order
+            })
+            .into_iter()
+            .map(|field| {
+                let state = if shown.contains(&field) { "on" } else { "off" };
+                format!("{} {state}", field.name())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    };
+    let Some(field) = StatusField::from_name(name) else {
+        let names: Vec<&str> = StatusField::ALL.iter().map(|field| field.name()).collect();
+        return format!(
+            "unknown status field `{name}`; fields: {}",
+            names.join(", ")
+        );
+    };
+    if let Some(at) = shown.iter().position(|&shown| shown == field) {
+        shown.remove(at);
+        return format!("{} off", field.name());
+    }
+    let rank = |field: StatusField| StatusField::ALL.iter().position(|&known| known == field);
+    let at = shown
+        .iter()
+        .position(|&other| rank(other) > rank(field))
+        .unwrap_or(shown.len());
+    shown.insert(at, field);
+    format!("{} on", field.name())
+}
+
+/// Returns the branch checked out in the repository that holds `workspace`,
+/// or the first seven characters of a detached commit.
+///
+/// Reads `HEAD` directly, a few KiB at most, without starting a process.
+fn git_branch(workspace: &Utf8Path) -> Option<String> {
+    use std::io::Read as _;
+    const LIMIT: u64 = 4096;
+    let read = |path: &Utf8Path| -> Option<String> {
+        let mut text = String::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(LIMIT)
+            .read_to_string(&mut text)
+            .ok()?;
+        Some(text)
+    };
+    let dot_git = workspace
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|path| path.exists())?;
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let link = read(&dot_git)?;
+        let target = Utf8Path::new(
+            link.lines()
+                .find_map(|line| line.strip_prefix("gitdir: "))?
+                .trim(),
+        );
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            dot_git.parent()?.join(target)
+        }
+    };
+    let head = read(&git_dir.join("HEAD"))?;
+    let head = head.trim();
+    if let Some(name) = head.strip_prefix("ref: refs/heads/") {
+        return (!name.is_empty()).then(|| name.to_owned());
+    }
+    if head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return head.get(..7).map(str::to_owned);
+    }
+    None
+}
+
 /// Shows the spend limit, or sets it from an amount in dollars, or turns it off.
 /// Shows or sets whether sandboxed shell commands may use the network.
 fn set_network(host: &SessionHost, requested: Option<&str>) -> String {
@@ -8301,6 +8456,8 @@ enum Handled {
     Budget(Option<String>),
     /// Show whether shell commands may use the network, or switch it.
     Network(Option<String>),
+    /// List the status row fields, or turn one on or off.
+    StatusLine(Option<String>),
     /// Ask the user to choose a model from a list.
     PickModel,
     /// Put back the files the session changed.
@@ -8801,6 +8958,9 @@ fn handle_command<W: std::io::Write>(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "network" => Ok(Handled::Network(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
+        "statusline" => Ok(Handled::StatusLine(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "plan" => Ok(Handled::Plan(
@@ -11116,7 +11276,15 @@ mod tests {
             grid.feed(&std::mem::take(&mut *bytes.lock().expect("bytes")))
                 .expect("feed");
             let screen = grid.text();
-            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            let hint_rows = screen
+                .lines()
+                .filter(|row| {
+                    [UiState::Idle, UiState::Running]
+                        .iter()
+                        .any(|&ui| row.trim_end() == footer::hints(ui))
+                })
+                .count();
+            assert_eq!(hint_rows, 1, "{screen}");
             assert!(screen.contains("> saved draft"), "{screen}");
             assert_eq!(grid.cursor().col, 7);
             screen
@@ -11426,7 +11594,7 @@ mod tests {
             1,
             "the report was not kept on screen:\n{screen}"
         );
-        for row in ["ctrl-c cancel", "| auto |"] {
+        for row in ["/ commands", "| auto |"] {
             assert_eq!(
                 screen.matches(row).count(),
                 1,
@@ -11601,7 +11769,7 @@ mod tests {
                 1,
                 "{screen}"
             );
-            assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+            assert_eq!(screen.matches("/ commands").count(), 1, "{screen}");
             assert_eq!(screen.matches("test | ").count(), 1, "{screen}");
             assert_eq!(screen.matches("draft after panic").count(), 1, "{screen}");
             assert!(screen.contains("partial before panic"), "{screen}");
@@ -16581,6 +16749,69 @@ mod tests {
     }
 
     #[test]
+    fn git_branch_reads_head_without_a_subprocess() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf-8");
+        let repo = root.join("repo");
+        let nested = repo.join("src/deep");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/footer\n").expect("head");
+        assert_eq!(git_branch(&nested).as_deref(), Some("feat/footer"));
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .expect("detached");
+        assert_eq!(git_branch(&repo).as_deref(), Some("0123456"));
+
+        let worktree = root.join("worktree");
+        let admin = root.join("admin/worktrees/one");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&admin).expect("admin");
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/side\n").expect("head");
+        std::fs::write(worktree.join(".git"), format!("gitdir: {admin}\n")).expect("link");
+        assert_eq!(git_branch(&worktree).as_deref(), Some("side"));
+        std::fs::write(worktree.join(".git"), "gitdir: ../admin/worktrees/one\n")
+            .expect("relative link");
+        assert_eq!(git_branch(&worktree).as_deref(), Some("side"));
+
+        let broken = root.join("broken");
+        std::fs::create_dir_all(broken.join(".git")).expect("empty git dir");
+        assert_eq!(git_branch(&broken), None, "no HEAD");
+        std::fs::write(broken.join(".git/HEAD"), "garbage\n").expect("head");
+        assert_eq!(git_branch(&broken), None, "unrecognised HEAD");
+        let stray = root.join("stray");
+        std::fs::create_dir_all(&stray).expect("stray");
+        std::fs::write(stray.join(".git"), "not a link\n").expect("file");
+        assert_eq!(git_branch(&stray), None, "a .git file without gitdir");
+    }
+
+    #[test]
+    fn statusline_command_toggles_a_field() {
+        let host = test_host();
+        let listed = set_statusline(&host, None);
+        assert_eq!(listed.lines().count(), StatusField::ALL.len(), "{listed}");
+        assert!(listed.starts_with("model on\nmode on\n"), "{listed}");
+        assert!(host.status_line(200).contains("auto"));
+        assert_eq!(set_statusline(&host, Some("mode")), "mode off");
+        assert!(set_statusline(&host, None).contains("mode off"));
+        assert!(!host.status_line(200).contains("auto"), "mode hidden");
+        assert_eq!(set_statusline(&host, Some("Mode")), "mode on");
+        assert_eq!(
+            lock_value(&host.statusline).as_slice(),
+            StatusField::ALL.as_slice(),
+            "back in its place"
+        );
+        assert!(host.status_line(200).contains("auto"));
+        assert_eq!(
+            set_statusline(&host, Some("retry")),
+            "unknown status field `retry`; fields: model, mode, unsandboxed, context, queued, \
+             effort, net, branch, mcp, cost, workspace, session"
+        );
+    }
+
+    #[test]
     fn network_command_shows_and_switches_shell_network() {
         let host = test_host();
         assert_eq!(set_network(&host, None), "shell network: off");
@@ -17902,6 +18133,8 @@ mod tests {
             grants: Mutex::new(Grants::new()),
             planning: std::sync::atomic::AtomicBool::new(false),
             unsandboxed: false,
+            branch: Mutex::new(None),
+            statusline: Mutex::new(StatusField::ALL.to_vec()),
             questions,
             last_plan: Mutex::new(None),
             warming: Arc::default(),

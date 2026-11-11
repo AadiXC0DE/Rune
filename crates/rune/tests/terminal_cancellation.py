@@ -158,12 +158,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"slow\r")
         wait_for("STREAM-03", start)
+        # While the turn runs, the hint row names the keys that act on it.
+        wait_for("ctrl-c interrupt   enter steer", start)
         os.write(master, b"\x03")
         wait_for("[cancelled]", start)
+        wait_for("/ commands", start)
         release_stream.set()
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
@@ -182,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         stop()
 
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[cancelled]", start)

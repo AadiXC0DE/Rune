@@ -70,7 +70,7 @@ class Session:
         finally:
             os.close(slave)
         self.transcript = bytearray()
-        self.wait_for("ctrl-c cancel")
+        self.wait_for("/ commands")
 
     def wait_for(self, text, start=0):
         deadline = time.monotonic() + 30
@@ -90,7 +90,7 @@ class Session:
         os.write(self.master, line.encode() + b"\r")
         self.wait_for(expect, mark)
         # The idle footer is drawn again once the turn is over.
-        self.wait_for("ctrl-c cancel", self.transcript.index(expect.encode(), mark))
+        self.wait_for("/ commands", self.transcript.index(expect.encode(), mark))
 
     def quit(self):
         os.write(self.master, b"/quit\r")

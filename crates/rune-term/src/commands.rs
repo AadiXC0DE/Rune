@@ -68,6 +68,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show the model, provider, context, and session",
     },
     Builtin {
+        name: "statusline",
+        arguments: "[field]",
+        summary: "show the status fields, or turn one on or off for this session",
+    },
+    Builtin {
         name: "cost",
         arguments: "",
         summary: "show what this session has spent",

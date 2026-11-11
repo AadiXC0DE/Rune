@@ -134,7 +134,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         offset = len(transcript)
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"retry please\r")
         capture("provider retry 2/3 in 1000ms")
         assert len(requests) == 1, requests

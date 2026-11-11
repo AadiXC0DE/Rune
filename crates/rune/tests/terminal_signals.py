@@ -114,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix="rune-signals-") as directory:
             assert all(part in text[:at] for part in RESTORED), text.decode(errors="replace")
             result["status"] = status
         else:
-            wait_for(b"ctrl-c cance")
+            wait_for(b"/ commands")
             time.sleep(0.2)
             mark = len(transcript)
             if scenario == "suspend":
@@ -134,7 +134,7 @@ with tempfile.TemporaryDirectory(prefix="rune-signals-") as directory:
                 mark = len(transcript)
                 os.kill(child.pid, signal.SIGCONT)
                 wait_for(b"\x1b[?2004h", mark)
-                wait_for(b"ctrl-c cance", mark)
+                wait_for(b"/ commands", mark)
                 os.write(master, b"\x04")
                 result["status"] = until_exit()
             else:

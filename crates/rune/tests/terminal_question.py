@@ -183,7 +183,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         return start
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = question()
         assert not results, "question answered before confirmation"
         send(b"\x1b[B\r")

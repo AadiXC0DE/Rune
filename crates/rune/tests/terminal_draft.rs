@@ -179,8 +179,10 @@ fn external_editor_reloads_the_draft_and_restores_the_terminal_on_success_and_fa
                 "{scenario}/{stage}"
             );
             assert_eq!(grid.cursor().col, column, "{scenario}/{stage}");
+            // The steering scenario edits while a turn runs, whose hints differ.
+            let screen = grid.text();
             assert_eq!(
-                grid.text().matches("ctrl-c cancel").count(),
+                screen.matches("/ commands").count() + screen.matches("enter steer").count(),
                 1,
                 "{scenario}/{stage}"
             );
@@ -303,11 +305,7 @@ fn pasted_multiline_drafts_show_each_edited_line_and_its_terminal_caret() {
             "{stage}: {screen}"
         );
         assert_eq!(grid.cursor().col, column, "{stage}: {screen}");
-        assert_eq!(
-            screen.matches("ctrl-c cancel").count(),
-            1,
-            "{stage}: {screen}"
-        );
+        assert_eq!(screen.matches("/ commands").count(), 1, "{stage}: {screen}");
     }
 }
 

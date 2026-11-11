@@ -67,18 +67,18 @@ with tempfile.TemporaryDirectory(prefix="rune-context-update-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"hello\r")
         wait_for("First.")
-        mark = len(transcript)
-        wait_for("ctrl-c cancel", mark)
+        mark = transcript.find(b"First.")
+        wait_for("/ commands", mark)
         os.write(master, b"/permissions auto\r")
         wait_for("permissions set to", mark)
         mark = len(transcript)
         os.write(master, b"again\r")
         wait_for("Second.", mark)
-        mark = len(transcript)
-        wait_for("ctrl-c cancel", mark)
+        mark = transcript.find(b"Second.", mark)
+        wait_for("/ commands", mark)
         os.write(master, b"/quit\r")
         assert drain_wait(child, master, 15, transcript) == 0
     finally:

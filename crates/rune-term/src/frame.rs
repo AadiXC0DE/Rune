@@ -891,6 +891,7 @@ mod tests {
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
             cost: None,
+            ..crate::footer::FooterState::default()
         };
         let layout = crate::footer::solve((80, 24), 1, false, crate::footer::DEFAULT_MINIMUM_ROWS);
         assert!(!layout.too_small);
@@ -907,9 +908,12 @@ mod tests {
         let composed = compose(&regions, 80, 24).expect("compose");
         assert_eq!(
             composed.row_text(23),
-            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left) | /Users/dev/"
+            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left)"
         );
-        assert_eq!(composed.row_text(22), crate::footer::HINTS);
+        assert_eq!(
+            composed.row_text(22),
+            crate::footer::hints(crate::footer::UiState::Idle)
+        );
         assert_eq!(composed.row_text(21), ">");
         assert_eq!(composed.row_text(20), "line 39");
         assert_eq!(composed.row_text(0), "line 19");

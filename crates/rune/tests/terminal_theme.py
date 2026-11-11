@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="rune-theme-") as directory:
     try:
         wait_for(QUERY)
         os.write(master, REPLIES)
-        wait_for(b"ctrl-c cance")
+        wait_for(b"/ commands")
         drain()
         marks = {"first": len(transcript)}
         os.write(master, b"/theme\r")

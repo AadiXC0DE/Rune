@@ -354,7 +354,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("compact-idle", expected="compact mode (4 rows): prompts work")
         else:
             # At 12 columns the hint is deliberately clipped to this prefix.
-            wait_for("ctrl-c cance")
+            wait_for("/ commands")
         if scenario.startswith("help-"):
             capture("help-settled", b"/help\r")
             assert not prompts, prompts

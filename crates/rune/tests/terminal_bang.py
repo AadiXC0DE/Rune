@@ -71,29 +71,29 @@ with tempfile.TemporaryDirectory(prefix="rune-bang-") as directory:
         return transcript.index(text.encode(), start) + len(text.encode())
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"!echo BANG-OUT\r")
         seen = wait_for("shell echo BANG-OUT")
         seen = wait_for("exit 0", seen)
-        wait_for("ctrl-c cancel", seen)
+        wait_for("/ commands", seen)
         print("ROW", flush=True)
         assert sys.stdin.readline().strip() == "go"
         mark = len(transcript)
         os.write(master, b"what did it print\r")
         seen = wait_for("First.", mark)
-        wait_for("ctrl-c cancel", seen)
+        wait_for("/ commands", seen)
         mark = len(transcript)
         os.write(master, b"# always use tabs\r")
         wait_for("add to AGENTS.md? y/n", mark)
         os.write(master, b"y")
         seen = wait_for("added to AGENTS.md", mark)
-        wait_for("ctrl-c cancel", seen)
+        wait_for("/ commands", seen)
         notes = (workspace / "AGENTS.md").read_text()
         assert notes.endswith("- always use tabs\n"), notes
         mark = len(transcript)
         os.write(master, b"again\r")
         seen = wait_for("Second.", mark)
-        wait_for("ctrl-c cancel", seen)
+        wait_for("/ commands", seen)
         os.write(master, b"/quit\r")
         assert drain_wait(child, master, 15, transcript) == 0
     finally:

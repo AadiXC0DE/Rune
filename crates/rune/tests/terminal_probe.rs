@@ -56,7 +56,7 @@ fn a_silent_terminal_delays_the_first_frame_only_briefly() {
         "{status}"
     );
     let frame = String::from_utf8_lossy(&first_frame(&result)).into_owned();
-    assert!(frame.contains("ctrl-c cance"), "{frame}");
+    assert!(frame.contains("/ commands"), "{frame}");
 }
 
 #[test]

@@ -75,12 +75,22 @@ fn completion_and_model_menus_fit_a_short_terminal_and_close_cleanly() {
             .nth(usize::from(grid.cursor().row))
             .expect("input row");
         assert!(matches!(input, ">" | "> /"), "{stage}: {screen}");
+        let hints = screen
+            .lines()
+            .filter(|row| row.starts_with("/ commands") || row.starts_with("up/down select"))
+            .count();
+        assert_eq!(hints, 1, "{stage}: {screen}");
+        let open = matches!(stage.as_str(), "completion-last" | "model-last");
         assert_eq!(
-            screen.matches("ctrl-c cancel").count(),
-            1,
+            screen.contains("up/down select   tab complete"),
+            open,
             "{stage}: {screen}"
         );
-        assert_eq!(screen.matches("| auto |").count(), 1, "{stage}: {screen}");
+        let status = screen
+            .lines()
+            .filter(|row| row.starts_with("menu-model-01 | auto"))
+            .count();
+        assert_eq!(status, 1, "{stage}: {screen}");
         match stage.as_str() {
             "completion-last" => assert!(screen.contains("> /quit"), "{screen}"),
             "model-last" => assert!(screen.contains("> menu-model-15"), "{screen}"),
@@ -124,6 +134,13 @@ fn discovered_custom_slash_command_can_be_completed_and_expanded_in_a_terminal()
                 assert!(
                     grid.text()
                         .contains("> /audit-command  Describe audit command files."),
+                    "{stage}: {}",
+                    grid.text()
+                );
+                assert!(
+                    grid.text()
+                        .lines()
+                        .any(|row| row == "up/down select   tab complete   esc close"),
                     "{stage}: {}",
                     grid.text()
                 );

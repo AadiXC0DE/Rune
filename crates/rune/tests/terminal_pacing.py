@@ -124,7 +124,7 @@ with tempfile.TemporaryDirectory(prefix="rune-pacing-") as directory:
         return transcript.index(text, start)
 
     try:
-        wait_for(b"ctrl-c cance")
+        wait_for(b"/ commands")
         os.write(master, b"pace")
         wait_for(b"> pace")
         start = len(transcript)
@@ -148,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix="rune-pacing-") as directory:
         end = wait_for(b"PACING-END\r\n", start, timeout=150)
         result["elapsed_ms"] = (time.monotonic() - written) * 1000
         if scenario == "dumb":
-            wait_for(b"ctrl-c cance", end)
+            wait_for(b"/ commands", end)
             time.sleep(0.2)
             pump(0.05)
             result["bytes"] = list(transcript)

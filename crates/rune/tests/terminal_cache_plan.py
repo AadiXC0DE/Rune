@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix="rune-cache-plan-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"hello\r")
         wait_for("First.")
         mark = len(transcript)

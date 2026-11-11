@@ -20,7 +20,7 @@ finished-answer: 12x24, caret 2,23
 18|WWWWWWWWWW|
 19|END-LONG-W|
 20|ORD|
-21|ctrl-c cance|
+21|/ commands|
 22|replay-fixtu|
 23|>|
 answer rows in scrollback and screen:
