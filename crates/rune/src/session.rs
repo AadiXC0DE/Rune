@@ -32,6 +32,7 @@ use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::footer::{self, FooterState, ProviderRetry};
 use rune_term::input::KeyAction;
+use rune_term::probe::TerminalEnv;
 use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, InputSource, Shell};
 use rune_term::theme::{Slot, Theme};
@@ -328,6 +329,8 @@ struct SessionHost {
     workspace: String,
     /// Whether the terminal can render direct color.
     truecolor: bool,
+    /// What the terminal reported at startup.
+    caps: rune_term::probe::TerminalCaps,
     /// Terminal width the live region is drawn for.
     ///
     /// Held behind an atomic because a resize is noticed while the region is
@@ -1403,6 +1406,7 @@ impl SessionHost {
             effort: self.effective_effort().1,
             session_id: self.session_id_name(),
             workspace: &self.workspace,
+            terminal: self.caps.summary(),
             context_used: self.context_used.load(std::sync::atomic::Ordering::Relaxed),
             context_source: *self
                 .context_source
@@ -2421,6 +2425,22 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         rune_context::commands::discover(&config.workspace, &Paths::from_process().config_root)
             .unwrap_or_default();
 
+    // Enable raw input before announcing the session. Otherwise input sent in
+    // response to the banner can have its Enter translated by canonical mode
+    // before the key reader starts, leaving a complete prompt unsubmitted.
+    let mut reader = if config.accessible {
+        rune_term::input::KeyReader::line_mode()
+    } else {
+        rune_term::input::KeyReader::new()
+    };
+    let keyed = reader.is_active();
+
+    let probe = rune_term::probe::run(
+        TerminalEnv::from_lookup(|k| std::env::var(k).ok()),
+        keyed && !config.accessible && std::env::var("RUNE_NO_PROBE").as_deref() != Ok("1"),
+    );
+    reader.type_ahead(&probe.typed);
+
     // Resolved before the host literal because the registry is moved into it,
     // and because the reasoning lane's colour has to be read off the theme
     // before the theme itself moves into the host.
@@ -2523,6 +2543,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         ),
         workspace: config.workspace.to_string(),
         truecolor: truecolor_supported(),
+        caps: probe.caps,
         // Seeded from the terminal and refreshed on every frame, so a window
         // resized while the session runs is picked up.
         width: std::sync::atomic::AtomicU16::new(terminal_width()),
@@ -2581,16 +2602,6 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
     crate::provider_setup::refresh_catalog_in_background(&config.settings, &config.paths);
 
-    // Enable raw input before announcing the session. Otherwise input sent in
-    // response to the banner can have its Enter translated by canonical mode
-    // before the key reader starts, leaving a complete prompt unsubmitted.
-    let mut reader = if config.accessible {
-        rune_term::input::KeyReader::line_mode()
-    } else {
-        rune_term::input::KeyReader::new()
-    };
-    let keyed = reader.is_active();
-
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
@@ -2626,7 +2637,17 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             opening.extend(render_entries(&entries, &host));
         }
-        let (prompt_row, caret) = host.idle_prompt();
+        // Text typed while the terminal was queried is the first draft.
+        let (prompt_row, caret) = if reader.line().is_empty() {
+            host.idle_prompt()
+        } else {
+            transcript::render_draft_at(
+                rune_term::shell::prompt(),
+                reader.line(),
+                reader.column(),
+                usize::from(host.width()),
+            )
+        };
         let painted = host.paint(&opening, None, &prompt_row, &[], caret)?;
         if let Ok(mut sink) = out.lock() {
             sink.write_all(&painted)?;
@@ -5365,6 +5386,7 @@ fn render_status(info: &SessionInfo<'_>) -> String {
     let _ = writeln!(out, "effort         {}", info.effort);
     let _ = writeln!(out, "session        {}", info.session_id);
     let _ = writeln!(out, "workspace      {}", info.workspace);
+    let _ = writeln!(out, "terminal       {}", info.terminal);
     let _ = write!(
         out,
         "context        {}",
@@ -6227,6 +6249,8 @@ struct SessionInfo<'a> {
     session_id: String,
     /// Workspace the session runs in.
     workspace: &'a str,
+    /// What the terminal reported at startup, as one line.
+    terminal: String,
     /// Tokens spent from the context window.
     context_used: u64,
     /// Source of an estimate, absent for live provider-reported readings.
@@ -9587,6 +9611,24 @@ mod tests {
     }
 
     #[test]
+    fn the_status_command_names_the_terminal_after_the_workspace() {
+        let mut host = test_host();
+        host.caps.name = Some("FakeTerm(1.0)".to_owned());
+        host.caps.background = Some((0x1e, 0x1e, 0x1e));
+        let rendered = render_status(&host.info("p", "e"));
+        let rows: Vec<&str> = rendered.lines().collect();
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("workspace "))
+            .expect("workspace row");
+        assert_eq!(
+            rows[at + 1],
+            "terminal       FakeTerm(1.0); background #1e1e1e (dark); synchronized output \
+             unknown; kitty keyboard no; tmux no; ssh no"
+        );
+    }
+
+    #[test]
     fn a_status_line_never_prints_the_credential() {
         // The endpoint carries the credential beside its address, so a status
         // row built from the wrong field would leak the key to the screen.
@@ -12339,6 +12381,7 @@ mod tests {
             effort: Effort::Auto,
             session_id: "sessiontest1".to_owned(),
             workspace: "/w",
+            terminal: rune_term::probe::TerminalCaps::default().summary(),
             context_used: 0,
             context_source: None,
             context_limit: rune_net::catalog::DEFAULT_CONTEXT_WINDOW,
@@ -12527,6 +12570,7 @@ mod tests {
             session_id: Mutex::new("sessiontest1".to_owned()),
             workspace: "/tmp".to_owned(),
             truecolor: false,
+            caps: rune_term::probe::TerminalCaps::default(),
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),
             pinned_size: Some((80, 24)),

@@ -253,6 +253,12 @@ impl KeyReader {
         self.composer.replace_range(range, replacement);
     }
 
+    /// Inserts text typed before the reader started at the caret, as one
+    /// undoable edit.
+    pub fn type_ahead(&mut self, text: &str) {
+        self.composer.insert(text);
+    }
+
     /// Empties the line.
     pub fn clear(&mut self) {
         self.composer.clear();
@@ -734,6 +740,20 @@ mod tests {
         reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
         assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
         assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+    }
+
+    #[test]
+    fn type_ahead_is_one_undoable_edit_at_the_caret() {
+        let mut reader = reader();
+        reader.type_ahead("");
+        assert_eq!(reader.line(), "");
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        reader.type_ahead("hello ");
+        assert_eq!(reader.line(), "ahello b");
+        assert_eq!(reader.cursor_byte(), "ahello ".len());
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "ab");
     }
 
     #[test]

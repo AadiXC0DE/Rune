@@ -20,6 +20,9 @@ crossterm = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["stdio", "event"] }
+
 [dev-dependencies]
 insta = { workspace = true }
 tempfile.workspace = true

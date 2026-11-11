@@ -1148,6 +1148,7 @@ dependencies = [
  "crossterm",
  "insta",
  "rune-core",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
