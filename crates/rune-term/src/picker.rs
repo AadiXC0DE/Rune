@@ -27,7 +27,8 @@ pub struct Picker {
     title: String,
     items: Vec<String>,
     /// Each item lowercased once, so narrowing a long catalog does not
-    /// re-case every entry on every keystroke.
+    /// re-case every entry on every keystroke. Replaced by the lowercased
+    /// haystack when one is set.
     folded: Vec<String>,
     /// What the user has typed. Empty means everything matches.
     query: String,
@@ -70,6 +71,22 @@ impl Picker {
         self.current =
             current.and_then(|current| self.items.iter().position(|item| item == current));
         self
+    }
+
+    /// Matches the query against `haystack` instead of the drawn items.
+    ///
+    /// Each entry stands for the item at the same position, so an item can be
+    /// found by text it does not show. A list of another length is ignored.
+    pub fn set_haystack(&mut self, haystack: Vec<String>) {
+        if haystack.len() != self.items.len() {
+            return;
+        }
+        self.folded = haystack
+            .into_iter()
+            .map(|entry| entry.to_lowercase())
+            .collect();
+        self.cursor = 0;
+        self.offset = 0;
     }
 
     /// Returns the heading shown above the items.
@@ -307,6 +324,23 @@ mod tests {
             "claude-opus-4".to_owned(),
             "gpt-5".to_owned(),
         ]
+    }
+
+    #[test]
+    fn a_haystack_filters_without_being_drawn() {
+        let mut picker = Picker::new("sessions", items(3), DEFAULT_WINDOW);
+        picker.set_haystack(vec![
+            "item-0\u{0}alpha prompt".to_owned(),
+            "item-1\u{0}beta prompt".to_owned(),
+            "item-2\u{0}gamma prompt".to_owned(),
+        ]);
+        picker.set_query("BETA");
+        assert_eq!(picker.matches(), [1]);
+        assert_eq!(picker.selected(), Some("item-1"));
+        let rows = picker.rows(&Theme::no_color(), ColorDepth::None);
+        assert_eq!(rows, ["> item-1"]);
+        picker.set_query("item-2");
+        assert_eq!(picker.selected(), Some("item-2"));
     }
 
     #[test]
