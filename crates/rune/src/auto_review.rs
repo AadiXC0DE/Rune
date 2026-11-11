@@ -11,12 +11,19 @@ use std::time::Duration;
 use rune_core::config::{Effort, Settings};
 use rune_core::error::Result;
 use rune_core::paths::Paths;
+use rune_net::compat::ModelTraits;
 use rune_net::error::FailureKind;
 use rune_net::error::NetError;
 use rune_net::message::Message;
-use rune_net::provider::{Provider, RequestPlan};
-use rune_net::transport::{Endpoint, RequestTimeouts, agent, is_loopback_url, stream_completion};
-use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer, ReviewerKind, reviewer_for};
+use rune_net::provider::{MarkerPolicy, Provider, RequestPlan};
+use rune_net::stream::Usage;
+use rune_net::transport::{
+    Endpoint, RequestTimeouts, agent, is_loopback_url, stream_completion_observed,
+};
+use rune_policy::review::{ReviewOutcome, ReviewRequest, Reviewer, reviewer_for};
+use rune_session::usage::HelperKind;
+
+use crate::helper_usage::{HelperUsage, note_usage};
 
 /// Most characters of one evidence excerpt kept in the prompt.
 ///
@@ -39,15 +46,23 @@ const RETRIES: u64 = 1;
 /// session model. Returns `None` only when no endpoint or credential is
 /// configured, or no model is selected yet, so an unresolved action asks the
 /// user instead.
-pub fn build(settings: &Settings, paths: &Paths) -> Result<Option<Box<dyn Reviewer>>> {
-    let Some(reviewer) = configure(settings, paths)? else {
+pub fn build(
+    settings: &Settings,
+    paths: &Paths,
+    usage: HelperUsage,
+) -> Result<Option<Box<dyn Reviewer>>> {
+    let Some(reviewer) = configure(settings, paths, usage)? else {
         return Ok(None);
     };
     Ok(Some(Box::new(reviewer)))
 }
 
 /// Chooses the reviewer's model, effort and endpoint for [`build`].
-fn configure(settings: &Settings, paths: &Paths) -> Result<Option<ModelReviewer>> {
+fn configure(
+    settings: &Settings,
+    paths: &Paths,
+    usage: HelperUsage,
+) -> Result<Option<ModelReviewer>> {
     let Some(base_url) = crate::provider_setup::configured_base_url(settings) else {
         return Ok(None);
     };
@@ -68,28 +83,16 @@ fn configure(settings: &Settings, paths: &Paths) -> Result<Option<ModelReviewer>
     };
 
     let dialect = crate::provider_setup::dialect_for(&settings.provider);
-    let effort = match kind {
-        ReviewerKind::SessionModel { .. } => {
-            let (_, traits) = rune_net::compat::resolve(
-                settings.provider.as_str(),
-                Some(&base_url),
-                kind.model(),
-            );
-            let accepted: Vec<Effort> = dialect
-                .capabilities()
-                .efforts
-                .iter()
-                .copied()
-                .filter(|effort| traits.efforts.contains(effort))
-                .collect();
-            review_effort(&accepted)
-        }
-        ReviewerKind::Fixed { .. } | ReviewerKind::Custom { .. } => Effort::Auto,
-    };
+    // The reviewer's own model decides, which may not be the session's.
+    let (_, traits) =
+        rune_net::compat::resolve(settings.provider.as_str(), Some(&base_url), kind.model());
+    let effort = rune_agent::compaction::lowest_effort(traits.efforts, dialect.as_ref());
 
     Ok(Some(ModelReviewer {
         model: kind.model().to_owned(),
         effort,
+        traits,
+        usage,
         dialect,
         endpoint,
         timeout: Duration::from_millis(
@@ -119,21 +122,14 @@ fn vendor_review_model(provider: &str, base_url: &str) -> Option<&'static str> {
         .flatten()
 }
 
-/// Returns the least reasoning a session model can be asked for.
-///
-/// A review is one short answer, so the lowest of `minimal` and `low` the
-/// model accepts is used, and the provider's default when it takes neither.
-fn review_effort(accepted: &[Effort]) -> Effort {
-    [Effort::Minimal, Effort::Low]
-        .into_iter()
-        .find(|effort| accepted.contains(effort))
-        .unwrap_or(Effort::Auto)
-}
-
 /// A reviewer that asks a model.
 struct ModelReviewer {
     model: String,
     effort: Effort,
+    /// How the reviewing model takes its effort setting.
+    traits: ModelTraits,
+    /// Where each request's usage is left for the session to count.
+    usage: HelperUsage,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     timeout: Duration,
@@ -214,8 +210,11 @@ impl ModelReviewer {
         plan.messages = vec![Message::user(render_request(request))];
         plan.max_output_tokens = Some(200);
         plan.effort = self.effort;
+        plan.traits = self.traits;
+        plan.cache_markers = MarkerPolicy::None;
 
-        let outcome = stream_completion(
+        let mut reported = Usage::default();
+        let outcome = stream_completion_observed(
             &agent(),
             &self.endpoint,
             self.dialect.as_ref(),
@@ -225,8 +224,15 @@ impl ModelReviewer {
                 total: self.request_timeout,
             },
             &|| false,
-        )?;
-        Ok(outcome.text())
+            &mut |event| note_usage(&mut reported, event),
+        );
+        self.usage.record_ended(
+            HelperKind::PermissionReview,
+            &self.model,
+            outcome.as_ref().ok().map(|done| done.usage),
+            reported,
+        );
+        Ok(outcome?.text())
     }
 }
 
@@ -404,7 +410,7 @@ mod tests {
     fn no_selected_model_means_no_reviewer() {
         let dir = tempfile::tempdir().expect("temp");
         assert!(
-            build(&Settings::default(), &paths(&dir))
+            build(&Settings::default(), &paths(&dir), HelperUsage::default())
                 .expect("built")
                 .is_none()
         );
@@ -420,19 +426,107 @@ mod tests {
             ..Settings::default()
         };
         let dir = tempfile::tempdir().expect("temp");
-        let reviewer = configure(&settings, &paths(&dir))
+        let reviewer = configure(&settings, &paths(&dir), HelperUsage::default())
             .expect("built")
             .expect("a reviewer without a configured review model");
         assert_eq!(reviewer.model, "qwen3-coder");
-        assert_eq!(reviewer.effort, Effort::Minimal);
+        assert_eq!(reviewer.effort, Effort::None);
         assert_eq!(reviewer.endpoint.base_url, "http://127.0.0.1:8080/v1");
 
         settings.review_model = Some("gpt-5-mini".to_owned());
-        let reviewer = configure(&settings, &paths(&dir))
+        let reviewer = configure(&settings, &paths(&dir), HelperUsage::default())
             .expect("built")
             .expect("the configured reviewer");
         assert_eq!(reviewer.model, "gpt-5-mini");
-        assert_eq!(reviewer.effort, Effort::Auto);
+        let (_, traits) = rune_net::compat::resolve(
+            "chat_completions",
+            Some("http://127.0.0.1:8080/v1"),
+            "gpt-5-mini",
+        );
+        assert_eq!(
+            reviewer.effort,
+            rune_agent::compaction::lowest_effort(traits.efforts, reviewer.dialect.as_ref())
+        );
+        assert_ne!(reviewer.effort, Effort::Auto);
+    }
+
+    #[test]
+    fn the_reviewer_sends_no_cache_markers_and_its_lowest_effort() {
+        let reply = crate::helper_usage::fixture::anthropic_reply("clear", "end_turn");
+        let (port, body) = crate::helper_usage::fixture::answer_one(reply);
+        let settings = Settings {
+            provider: rune_core::config::Provider::Anthropic,
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            anonymous: true,
+            model: "claude-haiku-5-5".to_owned(),
+            ..Settings::default()
+        };
+        let dir = tempfile::tempdir().expect("temp");
+        let usage = HelperUsage::default();
+        let reviewer = configure(&settings, &paths(&dir), usage.clone())
+            .expect("built")
+            .expect("reviewer");
+        let (_, traits) = rune_net::compat::resolve(
+            "anthropic",
+            Some(&format!("http://127.0.0.1:{port}")),
+            "claude-haiku-5-5",
+        );
+        let lowest =
+            rune_agent::compaction::lowest_effort(traits.efforts, reviewer.dialect.as_ref());
+        assert_eq!(reviewer.effort, lowest);
+
+        let outcome = reviewer.review(&request());
+        assert!(outcome.authorizes("rm -rf build"), "{outcome:?}");
+
+        let sent = body.join().expect("captured");
+        let request: serde_json::Value = serde_json::from_str(&sent).expect("json");
+        assert!(!sent.contains("cache_control"), "{sent}");
+        assert_eq!(request["max_tokens"], 200);
+        let mut expected = RequestPlan::new("claude-haiku-5-5");
+        expected.effort = lowest;
+        expected.traits = traits;
+        expected.max_output_tokens = Some(200);
+        expected.messages = vec![Message::user("x")];
+        let shape = rune_net::anthropic::Anthropic
+            .build_request(&expected)
+            .expect("expected body");
+        assert_eq!(request.get("thinking"), shape.get("thinking"), "{sent}");
+        assert_eq!(
+            request.get("output_config"),
+            shape.get("output_config"),
+            "{sent}"
+        );
+
+        let recorded = usage.drain();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, HelperKind::PermissionReview);
+        assert_eq!(recorded[0].1, "claude-haiku-5-5");
+        assert_eq!(recorded[0].2.input_tokens, Some(11));
+        assert_eq!(recorded[0].2.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn an_unusable_answer_still_counts_what_it_used() {
+        let reply = crate::helper_usage::fixture::anthropic_reply("not a decision", "end_turn");
+        let (port, body) = crate::helper_usage::fixture::answer_one(reply);
+        let usage = HelperUsage::default();
+        let reviewer = ModelReviewer {
+            model: "review/test".to_owned(),
+            effort: Effort::Auto,
+            traits: ModelTraits::default(),
+            usage: usage.clone(),
+            dialect: Box::new(rune_net::anthropic::Anthropic),
+            endpoint: Endpoint::new(format!("http://127.0.0.1:{port}"), "k"),
+            timeout: Duration::from_secs(5),
+            request_timeout: None,
+            attempts: 0,
+        };
+        assert!(matches!(
+            reviewer.review(&request()),
+            ReviewOutcome::Invalid
+        ));
+        body.join().expect("captured");
+        assert_eq!(usage.drain().len(), 1);
     }
 
     #[test]
@@ -469,25 +563,14 @@ mod tests {
     }
 
     #[test]
-    fn the_review_effort_is_the_least_the_model_accepts() {
-        assert_eq!(
-            review_effort(rune_net::provider::ALL_EFFORTS),
-            Effort::Minimal
-        );
-        assert_eq!(
-            review_effort(&[Effort::Auto, Effort::Low, Effort::High]),
-            Effort::Low
-        );
-        assert_eq!(review_effort(&[Effort::Auto]), Effort::Auto);
-    }
-
-    #[test]
     fn an_offline_reviewer_reports_that_it_is_unavailable() {
         // Offline is not a judgment about the action, so it must never be
         // remembered as one.
         let reviewer = |base: &str| ModelReviewer {
             model: "review/test".to_owned(),
             effort: Effort::Auto,
+            traits: ModelTraits::default(),
+            usage: HelperUsage::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new(base, "k").offline(true),
             timeout: Duration::from_millis(10),
@@ -520,6 +603,8 @@ mod tests {
         let reviewer = ModelReviewer {
             model: "review/test".to_owned(),
             effort: Effort::Auto,
+            traits: ModelTraits::default(),
+            usage: HelperUsage::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(30),
@@ -543,6 +628,8 @@ mod tests {
         let reviewer = ModelReviewer {
             model: "review/test".to_owned(),
             effort: Effort::Auto,
+            traits: ModelTraits::default(),
+            usage: HelperUsage::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             endpoint: Endpoint::new("http://127.0.0.1:1/v1", "k"),
             timeout: Duration::from_millis(20),
