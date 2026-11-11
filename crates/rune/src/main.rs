@@ -19,6 +19,7 @@ mod capabilities;
 mod cli;
 mod compaction_archive;
 mod completion;
+mod config_edit;
 mod connect_flow;
 mod context_watch;
 mod diagnostics;
@@ -208,7 +209,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Doctor => run_doctor(&settings, &paths, &workspace, &output_flags),
         Command::Status => run_status(&settings, &paths, &workspace, &output_flags),
         Command::Limits => run_limits(&settings, &output_flags),
-        Command::Config => run_config(&settings, &output_flags),
+        Command::Config => run_config(&settings, &paths, &workspace, launch, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
@@ -1748,7 +1749,16 @@ fn run_limits(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
 }
 
 /// Runs `config`.
-fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
+fn run_config(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if let Some(action) = launch.args.first() {
+        return run_config_action(action, settings, paths, workspace, launch, output);
+    }
     if output.json {
         let value = diagnostics::config_json(settings);
         println!(
@@ -1759,6 +1769,61 @@ fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
         print!("{}", diagnostics::config_text(settings));
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Runs `config get`, `set`, `unset`, `path` or `edit`.
+fn run_config_action(
+    action: &str,
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let argument = |index: usize, name: &str| {
+        launch
+            .args
+            .get(index)
+            .map(String::as_str)
+            .ok_or_else(|| RuneError::missing_field(name))
+    };
+    let user = config_edit::user_file(paths);
+    let unknown = |err: &RuneError| {
+        report_error(err);
+        Ok(ExitCode::from(config_edit::EXIT_UNKNOWN_KEY))
+    };
+    match action {
+        "get" => match config_edit::get(settings, argument(1, "key")?, output.json) {
+            Ok(()) => Ok(ExitCode::from(EXIT_OK)),
+            Err(err) => unknown(&err),
+        },
+        "set" | "unset" => {
+            let key = argument(1, "key")?;
+            if !config::USER_KEYS.contains(&key) {
+                return unknown(&config_edit::unknown_setting(
+                    key,
+                    config::USER_KEYS.iter().copied(),
+                ));
+            }
+            if action == "set" {
+                let line = config_edit::set(&user, key, argument(2, "value")?)?;
+                println!("set {line} in {user}");
+            } else {
+                config_edit::unset(&user, key)?;
+                println!("unset {key} in {user}");
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
+        "path" => {
+            config_edit::print_path(&user, workspace, output.json);
+            Ok(ExitCode::from(EXIT_OK))
+        }
+        "edit" => config_edit::edit(&user),
+        other => Err(
+            RuneError::invalid_field("config", format!("`{other}` is not a subcommand"))
+                .with_hint("use get, set, unset, path, or edit"),
+        ),
+    }
 }
 
 /// Runs `bench`: every task under the given directory, each in a fresh copy.

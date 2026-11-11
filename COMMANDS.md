@@ -211,9 +211,9 @@ Inspect or change workspace trust
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune config [--explain] [--json]`
+### `rune config [--explain] [--json] | rune config get <key> [--json] | rune config set <key> <value> | rune config unset <key> | rune config path [--json] | rune config edit`
 
-Show the resolved configuration and where each value came from
+Show, read or change the configuration and where each value came from
 
 Aliases:
 
@@ -338,12 +338,12 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `command_output_bytes` | 32768 | bytes | 0 to unbounded | Bytes retained from one command's output. |
 | `read_file_lines` | 2000 | items | 0 to unbounded | Lines returned by one file read. |
 | `read_file_line_bytes` | 2000 | bytes | 0 to unbounded | Bytes per line before truncation in a file read. |
-| `list_entries` | 1000 | bytes | 0 to unbounded | Entries returned by one listing or glob. |
+| `list_entries` | 1000 | items | 0 to unbounded | Entries returned by one listing or glob. |
 | `parallel_tool_calls` | 8 | items | 1 to 64 | Tool calls executed concurrently within one step. |
 | `subagent_children` | 256 | items | 0 to 4096 | Subagent children one parent session may register. |
 | `provider_head_timeout_ms` | 120000 | ms | 1000 to 3600000 | Time to wait for a model response head. |
 | `provider_request_timeout_ms` | 600000 | ms | 1000 to 7200000 | Total time allowed for one model request attempt. |
-| `provider_max_attempts` | 10 | bytes | 1 to 20 | Provider attempts before the turn fails. |
+| `provider_max_attempts` | 10 | items | 1 to 20 | Provider attempts before the turn fails. |
 | `acp_permission_timeout_ms` | 120000 | ms | 0 to unbounded | Time allowed for a client to answer an ACP permission request. |
 | `mcp_operation_timeout_ms` | 60000 | ms | 0 to unbounded | Time allowed for one MCP operation. |
 | `mcp_startup_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for an MCP server to start and be discovered. |
@@ -351,7 +351,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `review_context_bytes` | 8192 | bytes | 0 to unbounded | Current-turn tool output shown to the safety reviewer. |
 | `review_holds_per_turn` | 64 | items | 0 to unbounded | Safety review holds permitted in one turn. |
 | `review_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for one safety review request. |
-| `compaction_trigger_percent` | 80 | items | 10 to 99 | Compaction trigger as a percentage of usable input. |
+| `compaction_trigger_percent` | 80 | percent | 10 to 99 | Compaction trigger as a percentage of usable input. |
 | `context_cap_tokens` | 256000 | items | 0 to 100000000 | Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off. |
 | `compaction_keep_tokens` | 20000 | items | 0 to 1000000 | Newest conversation kept verbatim by compaction, in estimated tokens. |
 | `web_fetch_redirects` | 5 | items | 0 to 20 | Redirects followed by one web fetch. |

@@ -116,8 +116,8 @@ impl Report {
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!(
-            "rune {} ({})\nworkspace {}\nconfig {}\nstate  {}\n\n",
-            self.version, self.workspace, self.workspace, self.config_root, self.state_root
+            "{}\nworkspace {}\nconfig    {}\nstate     {}\n\n",
+            self.version, self.workspace, self.config_root, self.state_root
         );
         for check in &self.checks {
             let marker = match check.outcome {
@@ -404,9 +404,14 @@ pub fn limits_text(settings: &Settings) -> String {
 /// Renders the resolved configuration as text.
 #[must_use]
 pub fn config_text(settings: &Settings) -> String {
-    let mut out = String::from("key                               value                source\n");
+    let mut out =
+        String::from("key                               value                source       help\n");
     for row in settings.explain() {
-        let _ = writeln!(out, "{:<33} {:<20} {}", row.key, row.value, row.source);
+        let _ = writeln!(
+            out,
+            "{:<33} {:<20} {:<12} {}",
+            row.key, row.value, row.source, row.help
+        );
     }
     out
 }
@@ -451,6 +456,23 @@ mod tests {
         let settings = config::load(None, None, &EnvironmentOverrides::default());
         let report = run(&settings, &paths, workspace);
         assert_eq!(report.exit_code(), 0, "{}", report.render());
+    }
+
+    #[test]
+    fn the_header_names_the_program_once() {
+        let report = Report {
+            version: crate::version::version_line(),
+            workspace: "/work".to_owned(),
+            config_root: "/config".to_owned(),
+            state_root: "/state".to_owned(),
+            checks: Vec::new(),
+        };
+        let expected = format!(
+            "{}\nworkspace /work\nconfig    /config\nstate     /state\n\n",
+            crate::version::version_line()
+        );
+        assert_eq!(report.render(), expected);
+        assert!(!report.render().starts_with("rune rune"));
     }
 
     #[test]

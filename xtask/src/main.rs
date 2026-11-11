@@ -217,6 +217,20 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     run("cargo", args)
 }
 
+/// Runs cargo with extra environment variables, inheriting stdio.
+fn cargo_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(args)
+        .envs(env.iter().copied())
+        .status()
+        .map_err(|err| format!("could not run `cargo`: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`cargo {}` failed", args.join(" ")))
+    }
+}
+
 /// The target the landing page's harness is built for.
 const WEB_TARGET: &str = "wasm32-wasip1";
 
@@ -1070,18 +1084,26 @@ fn release(extra: &[String]) -> Result<(), String> {
         return Err("--sign-identity requires a macOS release target".to_owned());
     }
 
+    // The binary reports the channel the archive manifest records.
+    let channel_env = [("RUNE_CHANNEL", channel)];
     if target == env!("TARGET") {
-        cargo(&["build", "--release", "--locked", "-p", "rune"])?;
+        cargo_with_env(
+            &["build", "--release", "--locked", "-p", "rune"],
+            &channel_env,
+        )?;
     } else {
-        cargo(&[
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "rune",
-            "--target",
-            &target,
-        ])?;
+        cargo_with_env(
+            &[
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "rune",
+                "--target",
+                &target,
+            ],
+            &channel_env,
+        )?;
     }
 
     let binary = binary_path(&target);

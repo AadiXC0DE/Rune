@@ -940,8 +940,11 @@ impl Settings {
 
     /// Surfaces a rejected user layer before a command relies on its provider.
     pub fn require_valid_user_config(&self) -> Result<()> {
+        // A diagnostic naming a key cost only that key; the rest of the file loaded.
         if let Some(diagnostic) = self.diagnostics.iter().find(|diagnostic| {
-            diagnostic.layer == Layer::User && diagnostic.code == ErrorCode::InvalidConfiguration
+            diagnostic.layer == Layer::User
+                && diagnostic.code == ErrorCode::InvalidConfiguration
+                && diagnostic.key.is_none()
         }) {
             let location = diagnostic.path.as_ref().map_or_else(
                 || "user configuration".to_owned(),
@@ -990,7 +993,13 @@ impl Settings {
             ),
             ("permission_mode", self.permission_mode.to_string()),
             ("anonymous", self.anonymous.to_string()),
+            ("offline", self.offline.to_string()),
             ("effort", self.effort.to_string()),
+            (
+                "temperature",
+                self.temperature
+                    .map_or_else(|| "model default".to_owned(), |value| value.to_string()),
+            ),
             ("fast_mode", self.fast_mode.to_string()),
             (
                 "theme",
@@ -1000,7 +1009,23 @@ impl Settings {
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("edit_tool", self.edit_tool.to_string()),
+            (
+                "mcp_tools",
+                match self.mcp_tools {
+                    McpTools::Auto => "auto",
+                    McpTools::Eager => "eager",
+                    McpTools::Deferred => "deferred",
+                }
+                .to_owned(),
+            ),
             ("shell_network", self.shell_network.to_string()),
+            ("allow_unsandboxed", self.allow_unsandboxed.to_string()),
+            (
+                "sandbox_cache_roots",
+                self.sandbox_cache_roots
+                    .as_ref()
+                    .map_or_else(|| "default".to_owned(), |roots| listed(roots)),
+            ),
             (
                 "post_tool_hook",
                 self.post_tool_hook
@@ -1019,21 +1044,37 @@ impl Settings {
                     .clone()
                     .unwrap_or_else(|| "unavailable".to_owned()),
             ),
+            (
+                "review_model",
+                self.review_model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+            ),
+            (
+                "compaction_model",
+                self.compaction_model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+            ),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
             ("cache_warming", self.cache_warming.to_string()),
             ("context", self.context.to_string()),
-            ("provider_strict", self.provider_strict.to_string()),
             (
-                "shell_env",
-                if self.shell_env.is_empty() {
-                    "none".to_owned()
-                } else {
-                    self.shell_env.join(",")
-                },
+                "additional_directories",
+                listed(
+                    &self
+                        .additional_directories
+                        .iter()
+                        .map(|path| path.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                ),
             ),
+            ("provider_order", listed(&self.provider_order)),
+            ("provider_strict", self.provider_strict.to_string()),
+            ("shell_env", listed(&self.shell_env)),
         ];
 
         let mut out: Vec<Explained> = rows
@@ -1042,6 +1083,7 @@ impl Settings {
                 key: key.to_owned(),
                 value,
                 source: self.sources.source(key),
+                help: setting_help(key),
             })
             .collect();
 
@@ -1050,6 +1092,7 @@ impl Settings {
                 key: name.as_str().to_owned(),
                 value: self.limits.get(*name).to_string(),
                 source: self.limits.source(*name).unwrap_or(Layer::Default),
+                help: name.description(),
             });
         }
 
@@ -1066,6 +1109,18 @@ pub struct Explained {
     pub value: String,
     /// Layer that supplied it.
     pub source: Layer,
+    /// One line describing the setting.
+    #[serde(skip_deserializing)]
+    pub help: &'static str,
+}
+
+/// Renders a list for `--explain`: `none` when empty, else comma separated.
+fn listed(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(",")
+    }
 }
 
 /// Environment overrides read for this process.
@@ -1225,11 +1280,12 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// Keys accepted in a project configuration file.
+/// Keys accepted in a project configuration file, every `ProjectConfig` field
+/// in declaration order.
 ///
 /// Any other known key found in a project file is ignored with a diagnostic,
 /// because a repository can be changed by anyone who can open a pull request.
-const PROJECT_SAFE_KEYS: &[&str] = &[
+pub const PROJECT_KEYS: &[&str] = &[
     "sandbox",
     "max_agent_steps",
     "max_tool_result_bytes",
@@ -1274,6 +1330,320 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "vision_model",
 ];
 
+/// Every `UserConfig` field name, in declaration order.
+pub const USER_KEYS: &[&str] = &[
+    "pre_tool_hook",
+    "post_tool_hook",
+    "provider",
+    "offline",
+    "web_tools",
+    "edit_tool",
+    "mcp_tools",
+    "shell_network",
+    "sandbox_cache_roots",
+    "allow_unsandboxed",
+    "models",
+    "providers",
+    "base_url",
+    "api_key_env",
+    "anonymous",
+    "permission_mode",
+    "effort",
+    "temperature",
+    "fast_mode",
+    "theme",
+    "color",
+    "ascii",
+    "auto_upgrade",
+    "collapse_tool_calls",
+    "ambiguous_width",
+    "session_titles",
+    "context",
+    "additional_directories",
+    "limits",
+    "permission",
+    "vision_model",
+    "review_model",
+    "compaction_model",
+    "cache_warming",
+    "provider_order",
+    "provider_strict",
+    "shell_env",
+];
+
+/// Top-level `UserConfig` keys that hold one value, which `rune config set` can write.
+pub const SCALAR_KEYS: &[&str] = &[
+    "provider",
+    "offline",
+    "web_tools",
+    "edit_tool",
+    "mcp_tools",
+    "shell_network",
+    "allow_unsandboxed",
+    "base_url",
+    "api_key_env",
+    "anonymous",
+    "permission_mode",
+    "effort",
+    "temperature",
+    "fast_mode",
+    "theme",
+    "color",
+    "ascii",
+    "auto_upgrade",
+    "collapse_tool_calls",
+    "ambiguous_width",
+    "session_titles",
+    "context",
+    "vision_model",
+    "review_model",
+    "compaction_model",
+    "cache_warming",
+    "provider_strict",
+];
+
+/// The type of a value `rune config set` writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarKind {
+    /// Written `true` or `false`.
+    Boolean,
+    /// Written as a TOML number.
+    Number,
+    /// Written TOML-quoted.
+    Text,
+    /// One of the listed names, written TOML-quoted.
+    Choice(&'static [&'static str]),
+}
+
+/// Returns how a scalar key's value is typed, or `None` for any other key.
+#[must_use]
+pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
+    if !SCALAR_KEYS.contains(&key) {
+        return None;
+    }
+    Some(match key {
+        "offline"
+        | "web_tools"
+        | "shell_network"
+        | "allow_unsandboxed"
+        | "anonymous"
+        | "fast_mode"
+        | "ascii"
+        | "auto_upgrade"
+        | "collapse_tool_calls"
+        | "session_titles"
+        | "context"
+        | "cache_warming"
+        | "provider_strict" => ScalarKind::Boolean,
+        "temperature" | "ambiguous_width" => ScalarKind::Number,
+        "edit_tool" => ScalarKind::Choice(&["auto", "replace", "patch"]),
+        "mcp_tools" => ScalarKind::Choice(&["auto", "eager", "deferred"]),
+        "permission_mode" => ScalarKind::Choice(&["ask", "auto", "full_access"]),
+        "effort" => ScalarKind::Choice(&[
+            "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ]),
+        "color" => ScalarKind::Choice(&COLOR_VALUES),
+        _ => ScalarKind::Text,
+    })
+}
+
+/// Renders a value written on the command line as the TOML a scalar key takes.
+pub fn scalar_literal(key: &str, raw: &str) -> Result<String> {
+    let Some(kind) = scalar_kind(key) else {
+        return Err(RuneError::new(
+            ErrorCode::InvalidField,
+            format!("{key} is not a single value; use rune config edit"),
+        ));
+    };
+    match kind {
+        ScalarKind::Boolean => parse_bool(raw)
+            .map(|value| value.to_string())
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::InvalidField,
+                    format!("{key} takes a boolean, not `{raw}`"),
+                )
+                .with_hint(format!("use one of {BOOLEAN_SPELLINGS}"))
+            }),
+        ScalarKind::Number => {
+            let value: toml::Value = toml::from_str(&format!("value = {}", raw.trim()))
+                .ok()
+                .and_then(|table: toml::Table| table.get("value").cloned())
+                .filter(|value| value.is_integer() || value.is_float())
+                .ok_or_else(|| {
+                    RuneError::new(
+                        ErrorCode::InvalidField,
+                        format!("{key} takes a number, not `{raw}`"),
+                    )
+                })?;
+            Ok(value.to_string())
+        }
+        ScalarKind::Text => Ok(toml::Value::String(raw.to_owned()).to_string()),
+        ScalarKind::Choice(names) => {
+            if names.contains(&raw) {
+                Ok(toml::Value::String(raw.to_owned()).to_string())
+            } else {
+                Err(RuneError::new(
+                    ErrorCode::InvalidField,
+                    format!("{key} takes one of {}, not `{raw}`", names.join(", ")),
+                ))
+            }
+        }
+    }
+}
+
+/// Reads user configuration text the way a load does and returns its diagnostics.
+///
+/// The error is a diagnostic that would make a load skip the whole file.
+pub fn check_user_text(
+    path: &Utf8Path,
+    text: &str,
+) -> std::result::Result<Vec<Diagnostic>, Diagnostic> {
+    let parse_error = |err: toml::de::Error| {
+        Diagnostic::new(
+            Layer::User,
+            ErrorCode::InvalidConfiguration,
+            format!("could not parse: {err}"),
+        )
+        .with_path(path)
+    };
+    let value: toml::Value = toml::from_str(text).map_err(parse_error)?;
+    let (user, mut diagnostics) =
+        deserialize_lenient::<UserConfig>(text, value, Layer::User, path, USER_KEYS)
+            .map_err(parse_error)?;
+    let mut settings = Settings::default();
+    apply_user(&mut settings, &user, Layer::User);
+    diagnostics.append(&mut settings.diagnostics);
+    Ok(diagnostics)
+}
+
+/// One line describing each `rune config --explain` key that is not a limit.
+///
+/// Limits are described by [`LimitName::description`].
+pub const SETTING_HELP: &[(&str, &str)] = &[
+    (
+        "provider",
+        "Provider requests are sent to; set with rune connect.",
+    ),
+    ("model", "Model used for the active provider."),
+    ("context_window", "Input tokens the selected model accepts."),
+    ("base_url", "Endpoint for the active provider."),
+    (
+        "api_key_env",
+        "Environment variable that holds the credential.",
+    ),
+    (
+        "permission_mode",
+        "How tool calls are approved: ask, auto or full_access.",
+    ),
+    (
+        "anonymous",
+        "Connect to a loopback endpoint without a credential.",
+    ),
+    (
+        "offline",
+        "Refuse provider requests and keep tools off the network.",
+    ),
+    ("effort", "Reasoning effort requested from the model."),
+    (
+        "temperature",
+        "Sampling temperature, 0 to 2, for models that accept one.",
+    ),
+    (
+        "fast_mode",
+        "Request fast mode where the provider offers it.",
+    ),
+    ("theme", "Terminal theme name, or a light or dark pin."),
+    ("color", "Color depth: auto, truecolor, 256, 16 or none."),
+    ("ascii", "Draw terminal decorations with ASCII only."),
+    (
+        "web_tools",
+        "Let the web fetch and search tools reach the network.",
+    ),
+    (
+        "edit_tool",
+        "File-edit tool offered to the model: auto, replace or patch.",
+    ),
+    (
+        "mcp_tools",
+        "How MCP tools are offered: auto, eager or deferred.",
+    ),
+    (
+        "shell_network",
+        "Let sandboxed shell commands use the network.",
+    ),
+    (
+        "allow_unsandboxed",
+        "Run commands unsandboxed when no sandbox works on this machine.",
+    ),
+    (
+        "sandbox_cache_roots",
+        "Directories commands may write besides the workspace.",
+    ),
+    (
+        "post_tool_hook",
+        "Command that observes each completed tool result.",
+    ),
+    (
+        "pre_tool_hook",
+        "Command that may veto a tool call before it runs.",
+    ),
+    (
+        "vision_model",
+        "Model that describes images on the active provider.",
+    ),
+    (
+        "review_model",
+        "Model that reviews tool calls in auto permission mode.",
+    ),
+    (
+        "compaction_model",
+        "Model that summarizes a conversation too large for its own.",
+    ),
+    ("auto_upgrade", "Check for a newer release automatically."),
+    (
+        "collapse_tool_calls",
+        "Collapse groups of tool calls in the transcript.",
+    ),
+    (
+        "ambiguous_width",
+        "Columns an East Asian ambiguous character takes, 1 or 2.",
+    ),
+    ("session_titles", "Name sessions from their first prompt."),
+    (
+        "cache_warming",
+        "Keep the prompt cache warm while a session is idle.",
+    ),
+    (
+        "context",
+        "Load project instructions and workspace context.",
+    ),
+    (
+        "additional_directories",
+        "Workspace roots besides the current directory.",
+    ),
+    ("provider_order", "Upstream providers to prefer, in order."),
+    (
+        "provider_strict",
+        "Send requests only to the listed upstream providers.",
+    ),
+    (
+        "shell_env",
+        "Extra environment variables passed to shell commands.",
+    ),
+];
+
+/// Returns the help line of an explain key.
+#[must_use]
+pub fn setting_help(key: &str) -> &'static str {
+    SETTING_HELP
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, help)| *help)
+        .or_else(|| key.parse::<LimitName>().ok().map(LimitName::description))
+        .unwrap_or("")
+}
+
 /// Loads and merges every configuration layer.
 ///
 /// Missing files are not an error. A malformed file produces a diagnostic and
@@ -1288,7 +1658,10 @@ pub fn load(
 
     if let Some(path) = user_path {
         match read_user(path) {
-            Ok(Some(user)) => apply_user(&mut settings, &user, Layer::User),
+            Ok(Some((user, diagnostics))) => {
+                settings.diagnostics.extend(diagnostics);
+                apply_user(&mut settings, &user, Layer::User);
+            }
             Ok(None) => {}
             Err(diagnostic) => settings.diagnostics.push(diagnostic),
         }
@@ -1311,11 +1684,14 @@ pub fn load(
 }
 
 /// Reads the user configuration file.
-fn read_user(path: &Utf8Path) -> std::result::Result<Option<UserConfig>, Diagnostic> {
+#[allow(clippy::type_complexity)]
+fn read_user(
+    path: &Utf8Path,
+) -> std::result::Result<Option<(UserConfig, Vec<Diagnostic>)>, Diagnostic> {
     let Some(text) = read_bounded(path, Layer::User)? else {
         return Ok(None);
     };
-    let config: UserConfig = toml::from_str(&text).map_err(|err| {
+    let parse_error = |err: toml::de::Error| {
         Diagnostic::new(
             Layer::User,
             ErrorCode::InvalidConfiguration,
@@ -1323,8 +1699,187 @@ fn read_user(path: &Utf8Path) -> std::result::Result<Option<UserConfig>, Diagnos
         )
         .with_path(path)
         .with_hint("run `rune doctor` for the resolved configuration")
-    })?;
-    Ok(Some(config))
+    };
+    let value: toml::Value = toml::from_str(&text).map_err(parse_error)?;
+    let (config, diagnostics) =
+        deserialize_lenient::<UserConfig>(&text, value, Layer::User, path, USER_KEYS)
+            .map_err(parse_error)?;
+    Ok(Some((config, diagnostics)))
+}
+
+/// Deserializes a configuration value, dropping each unknown key in turn.
+///
+/// One misspelled key costs only itself: it is removed, reported with its
+/// path and the nearest known name, and the rest is read again. Any other
+/// error is returned, and the caller skips the layer.
+fn deserialize_lenient<T: serde::de::DeserializeOwned>(
+    text: &str,
+    mut value: toml::Value,
+    layer: Layer,
+    path: &Utf8Path,
+    known: &[&str],
+) -> std::result::Result<(T, Vec<Diagnostic>), toml::de::Error> {
+    const MAX_REMOVALS: usize = 64;
+    let mut diagnostics = Vec::new();
+    let mut removals = 0;
+    loop {
+        let err = match value.clone().try_into::<T>() {
+            Ok(config) => return Ok((config, diagnostics)),
+            Err(err) => err,
+        };
+        if removals == MAX_REMOVALS {
+            return Err(err);
+        }
+        let message = err.message().to_owned();
+        let Some(name) = unknown_field(&message) else {
+            // Parsed from the text unchanged, the error names its line.
+            if removals == 0 {
+                toml::from_str::<T>(text)?;
+            }
+            return Err(err);
+        };
+        let Some(key_path) = remove_first_key(&mut value, name) else {
+            return Err(err);
+        };
+        removals = removals.saturating_add(1);
+        let expected = expected_fields(&message);
+        let candidates: Vec<&str> = if expected.is_empty() {
+            known.to_vec()
+        } else {
+            expected
+        };
+        let hint = suggest(name, candidates.iter().copied()).map_or_else(
+            || "remove it".to_owned(),
+            |key| format!("did you mean {key}?"),
+        );
+        diagnostics.push(
+            Diagnostic::new(
+                layer,
+                ErrorCode::InvalidConfiguration,
+                format!("unknown key {key_path}"),
+            )
+            .with_key(key_path)
+            .with_path(path)
+            .with_hint(hint),
+        );
+    }
+}
+
+/// Returns the field named by a serde ``unknown field `name` `` message.
+fn unknown_field(message: &str) -> Option<&str> {
+    let rest = message.split_once("unknown field `")?.1;
+    Some(rest.split_once('`')?.0)
+}
+
+/// Returns the names a serde unknown-field message says were expected.
+fn expected_fields(message: &str) -> Vec<&str> {
+    let Some((_, rest)) = message.split_once("expected ") else {
+        return Vec::new();
+    };
+    rest.split('`').skip(1).step_by(2).collect()
+}
+
+/// Removes the first key called `name`, breadth first, and returns its dotted path.
+fn remove_first_key(value: &mut toml::Value, name: &str) -> Option<String> {
+    use std::collections::VecDeque;
+
+    // Each entry is the route to a table: keys and array positions.
+    let mut queue: VecDeque<Vec<Step>> = VecDeque::from([Vec::new()]);
+    let mut found = None;
+    while let Some(route) = queue.pop_front() {
+        let node = walk(value, &route)?;
+        if let Some(table) = node.as_table() {
+            if table.contains_key(name) {
+                found = Some(route);
+                break;
+            }
+            for (key, child) in table {
+                let mut next = route.clone();
+                next.push(Step::Key(key.clone()));
+                match child {
+                    toml::Value::Table(_) => queue.push_back(next),
+                    toml::Value::Array(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if item.is_table() {
+                                let mut item_route = next.clone();
+                                item_route.push(Step::Index(index));
+                                queue.push_back(item_route);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let route = found?;
+    let mut node = &mut *value;
+    for step in &route {
+        node = match step {
+            Step::Key(key) => node.as_table_mut()?.get_mut(key)?,
+            Step::Index(index) => node.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    node.as_table_mut()?.remove(name)?;
+    let mut parts: Vec<&str> = route
+        .iter()
+        .filter_map(|step| match step {
+            Step::Key(key) => Some(key.as_str()),
+            Step::Index(_) => None,
+        })
+        .collect();
+    parts.push(name);
+    Some(parts.join("."))
+}
+
+/// One step on the way to a nested table.
+#[derive(Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn walk<'a>(value: &'a toml::Value, route: &[Step]) -> Option<&'a toml::Value> {
+    route.iter().try_fold(value, |node, step| match step {
+        Step::Key(key) => node.get(key.as_str()),
+        Step::Index(index) => node.get(*index),
+    })
+}
+
+/// Returns the known name nearest to `name`, when one is close enough to be a typo.
+///
+/// Close enough is an edit distance of at most 2, or a third of the known
+/// name's length when that is larger.
+pub fn suggest<'a>(name: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    known
+        .into_iter()
+        .filter(|candidate| *candidate != name)
+        .map(|candidate| (edit_distance(name, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= (candidate.chars().count() / 3).max(2))
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut current = vec![i.saturating_add(1)];
+        for (j, b) in right.iter().enumerate() {
+            let above = previous.get(j).copied().unwrap_or(usize::MAX);
+            let left_cell = current.get(j).copied().unwrap_or(usize::MAX);
+            let diagonal = previous
+                .get(j.saturating_add(1))
+                .copied()
+                .unwrap_or(usize::MAX);
+            let substitution = above.saturating_add(usize::from(a != *b));
+            let insertion = left_cell.saturating_add(1);
+            let deletion = diagonal.saturating_add(1);
+            current.push(substitution.min(insertion).min(deletion));
+        }
+        previous = current;
+    }
+    previous.last().copied().unwrap_or(0)
 }
 
 /// Reads the project configuration file.
@@ -1362,30 +1917,21 @@ fn read_project(
                     .with_path(path)
                     .with_hint("set this in the user config instead"),
                 );
-            } else if !PROJECT_SAFE_KEYS.contains(&key.as_str()) {
-                return Err(Diagnostic::new(
-                    Layer::Project,
-                    ErrorCode::InvalidConfiguration,
-                    format!("unknown key `{key}`"),
-                )
-                .with_key(key)
-                .with_path(path)
-                .with_hint(format!(
-                    "accepted keys are {}",
-                    PROJECT_SAFE_KEYS.join(", ")
-                )));
             }
         }
     }
 
-    let config: ProjectConfig = value.try_into().map_err(|err: toml::de::Error| {
-        Diagnostic::new(
-            Layer::Project,
-            ErrorCode::InvalidConfiguration,
-            format!("could not parse: {err}"),
-        )
-        .with_path(path)
-    })?;
+    let (config, unknown) =
+        deserialize_lenient::<ProjectConfig>(&text, value, Layer::Project, path, PROJECT_KEYS)
+            .map_err(|err| {
+                Diagnostic::new(
+                    Layer::Project,
+                    ErrorCode::InvalidConfiguration,
+                    format!("could not parse: {err}"),
+                )
+                .with_path(path)
+            })?;
+    diagnostics.extend(unknown);
     Ok(Some((config, diagnostics)))
 }
 
@@ -2228,7 +2774,7 @@ pub fn unconfigured_model_error() -> RuneError {
 /// Renders the project configuration keys, for documentation consistency tests.
 #[must_use]
 pub const fn project_safe_keys() -> &'static [&'static str] {
-    PROJECT_SAFE_KEYS
+    PROJECT_KEYS
 }
 
 /// Renders the profile-owned keys, for documentation consistency tests.
@@ -2469,8 +3015,8 @@ mod tests {
                     && row.value == "fixture guard"
                     && row.source == Layer::User)
         );
-        let encoded =
-            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        let encoded = toml::to_string(&read_user(&user).expect("read").expect("config").0)
+            .expect("serialize");
         assert!(encoded.contains("pre_tool_hook"));
     }
 
@@ -2502,8 +3048,8 @@ mod tests {
                     && row.value == "fixture guard"
                     && row.source == Layer::User)
         );
-        let encoded =
-            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        let encoded = toml::to_string(&read_user(&user).expect("read").expect("config").0)
+            .expect("serialize");
         assert!(encoded.contains("post_tool_hook"));
         assert_eq!(
             to_status_json(&settings, Utf8Path::new("/fixture"))["post_tool_hook"]["name"],
@@ -3014,13 +3560,151 @@ max_agent_steps = 50
     }
 
     #[test]
-    fn unknown_project_key_is_rejected_with_the_accepted_set() {
+    fn unknown_project_key_drops_only_itself() {
         let dir = TempDir::new().expect("tempdir");
-        let project = write(&dir, ".rune.toml", "nonsense = true\n");
-        let diagnostic = read_project(&project).expect_err("rejected");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "nonsense = true\nmax_agent_step = 4\nmax_agent_steps = 5\n",
+        );
+        let (config, diagnostics) = read_project(&project).expect("read").expect("present");
+        assert_eq!(config.max_agent_steps, Some(5));
+        let keys: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.key.as_deref()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (ErrorCode::InvalidConfiguration, Some("max_agent_step")),
+                (ErrorCode::InvalidConfiguration, Some("nonsense")),
+            ]
+        );
+        assert_eq!(
+            diagnostics[0].hint.as_deref(),
+            Some("did you mean max_agent_steps?")
+        );
+        assert_eq!(diagnostics[1].hint.as_deref(), Some("remove it"));
+    }
+
+    #[test]
+    fn an_unknown_key_drops_only_itself() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "theme = \"dark\"\nbogus_key = 1\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+        assert_eq!(settings.diagnostics.len(), 1);
+        let diagnostic = &settings.diagnostics[0];
+        assert_eq!(diagnostic.layer, Layer::User);
         assert_eq!(diagnostic.code, ErrorCode::InvalidConfiguration);
-        assert_eq!(diagnostic.key.as_deref(), Some("nonsense"));
-        assert!(diagnostic.hint.is_some());
+        assert_eq!(diagnostic.message, "unknown key bogus_key");
+        assert_eq!(diagnostic.hint.as_deref(), Some("remove it"));
+        assert!(settings.require_valid_user_config().is_ok());
+
+        let misspelled = write(&dir, "typo.toml", "permision_mode = \"ask\"\n");
+        let settings = load(None, Some(&misspelled), &empty_env());
+        assert_eq!(
+            settings.diagnostics[0].hint.as_deref(),
+            Some("did you mean permission_mode?")
+        );
+    }
+
+    #[test]
+    fn nested_unknown_keys_are_reported_with_their_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "theme = \"dark\"\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\ntimout_ms = 9\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+        let hook = settings.pre_tool_hook.as_ref().expect("hook kept");
+        assert_eq!(hook.name, "guard");
+        assert_eq!(hook.timeout_ms, 5_000);
+        assert_eq!(settings.diagnostics.len(), 1);
+        assert_eq!(
+            settings.diagnostics[0].message,
+            "unknown key pre_tool_hook.timout_ms"
+        );
+        assert_eq!(
+            settings.diagnostics[0].hint.as_deref(),
+            Some("did you mean timeout_ms?")
+        );
+    }
+
+    #[test]
+    fn user_keys_list_every_field() {
+        fn expected_by_serde<T: serde::de::DeserializeOwned + fmt::Debug>() -> Vec<String> {
+            let err = toml::from_str::<T>("not_a_field_of_anything = 1\n").expect_err("unknown");
+            expected_fields(err.message())
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        assert_eq!(expected_by_serde::<UserConfig>(), USER_KEYS);
+        assert_eq!(expected_by_serde::<ProjectConfig>(), PROJECT_KEYS);
+        // A TOML that sets every listed key to a value of its type parses.
+        let mut table = toml::Table::new();
+        for key in USER_KEYS {
+            let value = match scalar_kind(key) {
+                Some(ScalarKind::Boolean) => toml::Value::Boolean(true),
+                Some(ScalarKind::Number) => toml::Value::Integer(1),
+                Some(ScalarKind::Choice(names)) => toml::Value::String(names[0].to_owned()),
+                Some(ScalarKind::Text) => toml::Value::String("x".to_owned()),
+                None => match *key {
+                    "pre_tool_hook" | "post_tool_hook" => toml::Value::Table(
+                        toml::from_str("name = \"h\"\nargv = [\"true\"]\n").expect("hook"),
+                    ),
+                    "models" | "providers" | "limits" | "permission" => {
+                        toml::Value::Table(toml::Table::new())
+                    }
+                    _ => toml::Value::Array(Vec::new()),
+                },
+            };
+            table.insert((*key).to_owned(), value);
+        }
+        let parsed: std::result::Result<UserConfig, _> = toml::Value::Table(table).try_into();
+        assert!(parsed.is_ok(), "{parsed:?}");
+        for key in SCALAR_KEYS {
+            assert!(USER_KEYS.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn every_explain_row_has_help() {
+        for row in Settings::default().explain() {
+            assert!(!row.help.is_empty(), "{} has no help line", row.key);
+        }
+        for (key, help) in SETTING_HELP {
+            assert!(
+                Settings::default()
+                    .explain()
+                    .iter()
+                    .any(|row| row.key == *key),
+                "{key} is not explained"
+            );
+            assert!(help.ends_with('.'), "{key}");
+        }
+    }
+
+    #[test]
+    fn scalar_values_are_typed_by_their_key() {
+        assert_eq!(scalar_literal("offline", "yes").expect("bool"), "true");
+        assert!(scalar_literal("offline", "maybe").is_err());
+        assert_eq!(scalar_literal("theme", "dark").expect("text"), "\"dark\"");
+        assert_eq!(
+            scalar_literal("effort", "high").expect("choice"),
+            "\"high\""
+        );
+        assert!(scalar_literal("effort", "huge").is_err());
+        assert_eq!(scalar_literal("temperature", "0.5").expect("number"), "0.5");
+        assert!(scalar_literal("temperature", "warm").is_err());
+        let err = scalar_literal("models", "x").expect_err("table");
+        assert_eq!(
+            err.message(),
+            "models is not a single value; use rune config edit"
+        );
     }
 
     #[test]
@@ -3472,7 +4156,7 @@ max_agent_steps = 50
         };
         apply_user(
             &mut settings,
-            &read_user(&user).expect("read").expect("present"),
+            &read_user(&user).expect("read").expect("present").0,
             Layer::User,
         );
         assert_eq!(settings.model, "claude-x");
@@ -3519,7 +4203,7 @@ max_agent_steps = 50
         };
         apply_user(
             &mut settings,
-            &read_user(&user).expect("read").expect("present"),
+            &read_user(&user).expect("read").expect("present").0,
             Layer::User,
         );
         assert_eq!(

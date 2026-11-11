@@ -540,8 +540,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
             "settings",
             "Same as `rune config`; shows resolved configuration and value sources.",
         )],
-        summary: "Show the resolved configuration and where each value came from",
-        usage: "rune config [--explain] [--json]",
+        summary: "Show, read or change the configuration and where each value came from",
+        usage: "rune config [--explain] [--json] | rune config get <key> [--json] | rune config set <key> <value> | rune config unset <key> | rune config path [--json] | rune config edit",
         flags: &[
             flag("--explain", "Show the source layer of every key."),
             flag("--json", "Emit JSON."),
