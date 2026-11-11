@@ -1050,8 +1050,9 @@ shell, once per eligible call before tool execution, including concurrent reads.
 The command receives `RUNE_PRE_TOOL_CALL`, a JSON object with `event` set to
 `pre_tool`, the call `id`, tool `name`, and decoded `arguments`. Input is limited
 to 32 KiB. The command gets the normal minimal command environment, excluding
-provider credentials, and closed stdin. It runs with the user's authority;
-only configure commands you trust.
+provider credentials, and the same event as a JSON payload on standard input
+(see Hooks below). It runs with the user's authority; only configure commands
+you trust.
 
 Exit successfully and print exactly one JSON decision on stdout:
 `{"decision":"allow"}` or `{"decision":"veto","reason":"generated file"}`.
@@ -1081,7 +1082,7 @@ credential and credential-shaped content, and truncates the redacted output to
 Arguments are omitted. The complete event is limited to 32 KiB.
 
 Post-tool commands use the same workspace directory, explicit argv, minimal
-environment, closed stdin, and user authority as pre-tool commands. Their output
+environment, payload on standard input, and user authority as pre-tool commands. Their output
 is captured with a 4 KiB bound per pipe and ignored. Nonzero exits, invalid hook
 configuration, and timeouts report a named warning without changing the tool
 result or retrying the hook. The deadline defaults to 5 seconds and accepts
