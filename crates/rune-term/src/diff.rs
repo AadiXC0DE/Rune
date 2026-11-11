@@ -11,17 +11,37 @@ use std::ops::Range;
 use crate::transcript::sanitize;
 use crate::width::{expand_tabs, str_width, truncate_to_width};
 
-/// Escape sequences for each kind of line; empty strings draw no colour.
+/// Escape sequences for each part of a diff row; empty strings draw nothing.
 #[derive(Clone, Debug, Default)]
 pub struct DiffStyle {
-    /// Added lines.
-    pub added: String,
-    /// Removed lines.
-    pub removed: String,
-    /// The note that lines were left out.
+    /// The line numbers.
+    pub number: String,
+    /// The `+` of an added line.
+    pub added_sign: String,
+    /// The `-` of a removed line.
+    pub removed_sign: String,
+    /// The background of an added line, erased to the row's end.
+    pub added_bg: String,
+    /// The background of a removed line, erased to the row's end.
+    pub removed_bg: String,
+    /// The words an added line changed.
+    pub added_word: String,
+    /// The words a removed line changed.
+    pub removed_word: String,
+    /// Marks changed words where there is no word colour, such as bold.
+    pub emphasis: String,
+    /// The rows between hunks and the note that rows were left out.
     pub dim: String,
     /// Ends a styled span.
     pub reset: String,
+}
+
+impl DiffStyle {
+    /// No escapes at all, for text that is measured as it is.
+    #[must_use]
+    pub fn plain() -> Self {
+        Self::default()
+    }
 }
 
 /// How a line of a diff relates the two texts.
@@ -488,45 +508,160 @@ impl Search<'_, '_> {
     }
 }
 
-/// Draws marked lines indented under a tool row, at most `max_lines` of them,
-/// each cut to `width` columns.
+/// Draws hunks as numbered rows indented under a tool row.
+///
+/// Each row is `{old} {new} {sign} {text}`: the numbers right-aligned to the
+/// widest one shown, the sign `+`, `-` or a space, the text sanitized, with
+/// tabs expanded, cut to `width`, and its changed words marked. A row with a
+/// background is erased to its end rather than padded. Hunks are separated by
+/// a dim `...` row. With `max_rows`, rows past it are dropped and counted by
+/// the changed lines they held.
 #[must_use]
 pub fn render(
-    lines: &[(char, &str)],
+    hunks: &[Hunk<'_>],
     style: &DiffStyle,
-    max_lines: usize,
+    max_rows: Option<usize>,
     width: usize,
     ascii: bool,
 ) -> Vec<String> {
     let indent = "    ";
-    let room = width.saturating_sub(indent.len().saturating_add(2)).max(8);
     let ellipsis = if ascii { "..." } else { "\u{2026}" };
-    let mut out: Vec<String> = lines
+    let digits = hunks
         .iter()
-        .take(max_lines)
-        .map(|(mark, text)| {
-            let text = sanitize(&expand_tabs(text));
-            let shown = if str_width(&text) > room {
-                let (cut, _) = truncate_to_width(&text, room.saturating_sub(str_width(ellipsis)));
-                format!("{cut}{ellipsis}")
+        .flat_map(|hunk| &hunk.lines)
+        .flat_map(|line| [line.old, line.new])
+        .flatten()
+        .max()
+        .map_or(0, |widest| widest.to_string().len());
+    let gutter = if digits == 0 {
+        0
+    } else {
+        digits.saturating_mul(2).saturating_add(2)
+    };
+    let room = width
+        .saturating_sub(indent.len().saturating_add(gutter).saturating_add(2))
+        .max(8);
+    let mut rows: Vec<(String, bool)> = Vec::new();
+    for (index, hunk) in hunks.iter().enumerate() {
+        if index > 0 {
+            rows.push((format!("{}{indent}...{}", style.dim, style.reset), false));
+        }
+        let words = word_highlights(&hunk.lines);
+        for (line, ranges) in hunk.lines.iter().zip(&words) {
+            let numbers = if digits == 0 {
+                String::new()
             } else {
-                text
+                let cell = |number: Option<usize>| {
+                    number.map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"))
+                };
+                format!(
+                    "{}{} {}{} ",
+                    style.number,
+                    cell(line.old),
+                    cell(line.new),
+                    style.reset
+                )
             };
-            let colour = if *mark == '+' {
-                &style.added
+            let (sign, sign_style, bg, word) = match line.op {
+                Op::Context => (' ', "", "", ""),
+                Op::Added => (
+                    '+',
+                    style.added_sign.as_str(),
+                    style.added_bg.as_str(),
+                    style.added_word.as_str(),
+                ),
+                Op::Removed => (
+                    '-',
+                    style.removed_sign.as_str(),
+                    style.removed_bg.as_str(),
+                    style.removed_word.as_str(),
+                ),
+            };
+            let text = row_text(
+                line.text,
+                ranges,
+                room,
+                ellipsis,
+                word,
+                &style.emphasis,
+                bg,
+                &style.reset,
+            );
+            let end = if bg.is_empty() {
+                style.reset.clone()
             } else {
-                &style.removed
+                format!("\u{1b}[K{}", style.reset)
             };
-            format!("{indent}{colour}{mark} {shown}{}", style.reset)
-        })
-        .collect();
-    let more = lines.len().saturating_sub(max_lines);
-    if more > 0 {
-        let noun = if more == 1 { "line" } else { "lines" };
+            rows.push((
+                format!(
+                    "{indent}{numbers}{bg}{sign_style}{sign}{}{bg} {text}{end}",
+                    style.reset
+                ),
+                line.op != Op::Context,
+            ));
+        }
+    }
+    let Some(limit) = max_rows.filter(|limit| rows.len() > *limit) else {
+        return rows.into_iter().map(|(row, _)| row).collect();
+    };
+    let hidden = rows[limit..].iter().filter(|(_, changed)| *changed).count();
+    let mut out: Vec<String> = rows.into_iter().take(limit).map(|(row, _)| row).collect();
+    if hidden > 0 {
+        let noun = if hidden == 1 { "line" } else { "lines" };
         out.push(format!(
-            "{indent}{}{ellipsis} {more} more changed {noun}{}",
+            "{}{indent}... {hidden} more changed {noun} (ctrl-o shows the full diff){}",
             style.dim, style.reset
         ));
+    }
+    out
+}
+
+/// One row's text: sanitized, tabs expanded, cut to `room` columns, with the
+/// changed words wrapped in `word` and `emphasis` and the row's background
+/// restored after each.
+#[allow(clippy::too_many_arguments)]
+fn row_text(
+    text: &str,
+    ranges: &[Range<usize>],
+    room: usize,
+    ellipsis: &str,
+    word: &str,
+    emphasis: &str,
+    bg: &str,
+    reset: &str,
+) -> String {
+    let clean = sanitize(&expand_tabs(text));
+    let (shown, cut) = if str_width(&clean) > room {
+        let (prefix, _) = truncate_to_width(&clean, room.saturating_sub(str_width(ellipsis)));
+        (prefix.to_owned(), true)
+    } else {
+        (clean.clone(), false)
+    };
+    // Byte ranges point into the original line, so they are used only when
+    // cleaning left it as it was.
+    let mark = format!("{word}{emphasis}");
+    let mut out = String::with_capacity(shown.len());
+    if mark.is_empty() || clean != text {
+        out.push_str(&shown);
+    } else {
+        let mut at = 0;
+        for range in ranges {
+            let start = range.start.min(shown.len());
+            let end = range.end.min(shown.len());
+            if start >= end || !shown.is_char_boundary(start) || !shown.is_char_boundary(end) {
+                continue;
+            }
+            out.push_str(&shown[at..start]);
+            out.push_str(&mark);
+            out.push_str(&shown[start..end]);
+            out.push_str(reset);
+            out.push_str(bg);
+            at = end;
+        }
+        out.push_str(&shown[at.min(shown.len())..]);
+    }
+    if cut {
+        out.push_str(ellipsis);
     }
     out
 }
@@ -778,37 +913,130 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_view_is_cut_in_lines_and_columns_and_says_so() {
-        let lines = [
-            ('-', "one"),
-            ('+', "two two two two two two two"),
-            ('+', "three"),
-        ];
-        let style = DiffStyle {
-            added: "<g>".to_owned(),
-            removed: "<r>".to_owned(),
+    fn tagged() -> DiffStyle {
+        DiffStyle {
+            number: "<n>".to_owned(),
+            added_sign: "<g>".to_owned(),
+            removed_sign: "<r>".to_owned(),
+            added_bg: "<G>".to_owned(),
+            removed_bg: "<R>".to_owned(),
+            added_word: "<gw>".to_owned(),
+            removed_word: "<rw>".to_owned(),
+            emphasis: String::new(),
             dim: "<d>".to_owned(),
             reset: "</>".to_owned(),
-        };
-        let out = render(&lines, &style, 2, 20, true);
-        assert_eq!(out[0], "    <r>- one</>");
-        assert_eq!(out[1], "    <g>+ two two two...</>");
-        assert_eq!(out[2], "    <d>... 1 more changed line</>");
+        }
     }
 
     #[test]
-    fn a_tab_in_a_changed_line_expands_to_the_next_stop() {
-        let lines = [('+', "\tx"), ('-', "abc\ty")];
+    fn rows_carry_numbers_signs_and_erase_to_the_edge() {
+        let hunks = hunks("alpha\nbeta\ngamma\n", "alpha\nBETA\nbeta two\ngamma\n", 1);
+        let out = render(&hunks, &tagged(), None, 80, true);
+        assert_eq!(
+            out,
+            [
+                "    <n>1 1</>  </> alpha</>",
+                "    <n>2  </> <R><r>-</><R> beta\u{1b}[K</>",
+                "    <n>  2</> <G><g>+</><G> BETA\u{1b}[K</>",
+                "    <n>  3</> <G><g>+</><G> beta two\u{1b}[K</>",
+                "    <n>3 4</>  </> gamma</>",
+            ]
+        );
+        // A changed line paired with its old version marks the changed word.
+        let renamed = render(
+            &hunks_of("let a = 1;", "let b = 1;"),
+            &tagged(),
+            None,
+            80,
+            true,
+        );
+        assert_eq!(
+            renamed[1],
+            "    <n>  1</> <G><g>+</><G> let <gw>b</><G> = 1;\u{1b}[K</>"
+        );
+        // Text is cut to the width with the numbers kept.
+        let narrow = render(&hunks, &DiffStyle::plain(), None, 20, true);
+        assert_eq!(narrow[3], "      3 + beta two");
+        let wide = "y".repeat(60);
+        let long = hunks_of("x", &wide);
+        let cut = render(&long, &DiffStyle::plain(), None, 30, true);
+        assert!(cut[1].ends_with("..."), "{cut:?}");
+        assert!(cut[1].starts_with("      1 + yyy"), "{cut:?}");
+    }
+
+    fn hunks_of<'a>(old: &'a str, new: &'a str) -> Vec<Hunk<'a>> {
+        hunks(old, new, 1)
+    }
+
+    #[test]
+    fn sixteen_colours_have_no_background() {
+        // At 16 colours or none the sign alone carries the meaning, words are bold.
         let style = DiffStyle {
-            added: "<g>".to_owned(),
-            removed: "<r>".to_owned(),
-            dim: "<d>".to_owned(),
+            added_sign: "<g>".to_owned(),
+            removed_sign: "<r>".to_owned(),
+            emphasis: "\u{1b}[1m".to_owned(),
             reset: "</>".to_owned(),
+            ..DiffStyle::plain()
         };
-        let out = render(&lines, &style, 2, 40, true);
-        assert_eq!(out[0], "    <g>+         x</>");
-        assert_eq!(out[1], "    <r>- abc     y</>");
+        let out = render(
+            &hunks_of("let a = 1;", "let b = 1;"),
+            &style,
+            None,
+            80,
+            true,
+        );
+        assert_eq!(out[0], "    1  </> <r>-</> let \u{1b}[1ma</> = 1;</>");
+        assert_eq!(out[1], "      1</> <g>+</> let \u{1b}[1mb</> = 1;</>");
+        assert!(out.iter().all(|row| !row.contains("\u{1b}[K")));
+    }
+
+    #[test]
+    fn the_cap_counts_the_hidden_changed_lines() {
+        let new = numbered(200);
+        let out = render(&hunks_of("", &new), &DiffStyle::plain(), Some(12), 80, true);
+        assert_eq!(out.len(), 13);
+        assert_eq!(
+            out[12],
+            "    ... 188 more changed lines (ctrl-o shows the full diff)"
+        );
+        let two = render(
+            &hunks_of("", "a\nb\n"),
+            &DiffStyle::plain(),
+            Some(1),
+            80,
+            true,
+        );
+        assert_eq!(
+            two[1],
+            "    ... 1 more changed line (ctrl-o shows the full diff)"
+        );
+    }
+
+    #[test]
+    fn hunks_are_separated_by_a_dim_row() {
+        let old = numbered(20);
+        let new = changed(&old, &[2, 18]);
+        let hunks = hunks(&old, &new, 1);
+        assert_eq!(hunks.len(), 2);
+        let out = render(&hunks, &tagged(), None, 80, true);
+        assert_eq!(
+            out.iter().filter(|row| *row == "<d>    ...</>").count(),
+            1,
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn plain_style_writes_no_escape() {
+        let out = render(
+            &hunks_of("one\ttab\n\u{1b}[31mred\n", "one\ttab\nred\n"),
+            &DiffStyle::plain(),
+            None,
+            80,
+            false,
+        );
+        assert!(out.iter().all(|row| !row.contains('\u{1b}')), "{out:?}");
+        assert_eq!(out[0], "    1 1   one     tab");
     }
 
     #[test]

@@ -1322,12 +1322,12 @@ impl Host for SessionHost {
     ) -> (Outcome, String) {
         let preview = if name == "edit_file" {
             let pairs = edit_pairs(arguments);
-            let lines = edit_changes(&pairs);
+            let hunks = edit_hunks(&pairs, None);
             // Plain text: the prompt measures its lines without escapes.
             rune_term::diff::render(
-                &lines,
-                &rune_term::diff::DiffStyle::default(),
-                APPROVAL_PREVIEW_LINES,
+                &hunks,
+                &rune_term::diff::DiffStyle::plain(),
+                Some(APPROVAL_PREVIEW_LINES),
                 usize::from(self.width()),
                 self.ascii,
             )
@@ -3124,53 +3124,85 @@ impl SessionHost {
     }
 
     /// Draws the lines a write or an edit removed and added, cut to a few,
-    /// under its row. The tool's own preview of the applied change is used
-    /// when it sent one; otherwise an edit's arguments are.
+    /// under its row. An edit is drawn from its arguments, numbered from the
+    /// line its result names; another write from the tool's own preview.
     fn change_preview(&self, call: &turn::PreparedCall, output: &ToolOutput) -> Vec<String> {
+        use rune_term::diff::{DiffLine, Hunk, Op};
         let pairs;
         let mut cut = false;
-        let lines: Vec<(char, &str)> = if let Some(diff) = &output.diff {
-            diff.lines()
+        let hunks: Vec<Hunk<'_>> = if call.name == "edit_file" {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or_default();
+            pairs = edit_pairs(&arguments);
+            edit_hunks(&pairs, first_changed_line(&output.text))
+        } else if let Some(diff) = &output.diff {
+            let lines = diff
+                .lines()
                 .filter_map(|line| {
                     if line == "..." {
                         cut = true;
                     }
                     let (mark, text) = line.split_at_checked(2)?;
-                    match mark {
-                        "- " => Some(('-', text)),
-                        "+ " => Some(('+', text)),
-                        _ => None,
-                    }
+                    let op = match mark {
+                        "- " => Op::Removed,
+                        "+ " => Op::Added,
+                        _ => return None,
+                    };
+                    Some(DiffLine {
+                        op,
+                        old: None,
+                        new: None,
+                        text,
+                    })
                 })
-                .collect()
-        } else if call.name == "edit_file" {
-            let arguments: serde_json::Value =
-                serde_json::from_str(&call.arguments).unwrap_or_default();
-            pairs = edit_pairs(&arguments);
-            edit_changes(&pairs)
+                .collect::<Vec<_>>();
+            vec![Hunk { lines }]
         } else {
             return Vec::new();
         };
-        let sgr = |slot| self.theme().sgr(slot, self.depth);
-        let style = rune_term::diff::DiffStyle {
-            added: sgr(Slot::Success),
-            removed: sgr(Slot::Error),
-            dim: sgr(Slot::Dim),
-            reset: rune_term::engine::Style::RESET.to_owned(),
-        };
+        let style = self.diff_style();
+        let changed = hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.op != Op::Context)
+            .count();
         let mut shown = rune_term::diff::render(
-            &lines,
+            &hunks,
             &style,
-            EDIT_PREVIEW_LINES,
+            Some(EDIT_PREVIEW_LINES),
             usize::from(self.width()),
             self.ascii,
         );
         // The tool cut its preview; say so unless the view already does.
-        if cut && lines.len() <= EDIT_PREVIEW_LINES {
+        if cut && changed <= EDIT_PREVIEW_LINES {
             let ellipsis = if self.ascii { "..." } else { "\u{2026}" };
             shown.push(format!("    {}{ellipsis}{}", style.dim, style.reset));
         }
         shown
+    }
+
+    /// The diff colours of this session's theme: tinted rows where the terminal
+    /// has 256 colours or more, else coloured signs and bold changed words.
+    fn diff_style(&self) -> rune_term::diff::DiffStyle {
+        let sgr = |slot| self.theme().sgr(slot, self.depth);
+        let tinted = matches!(self.depth, ColorDepth::TrueColor | ColorDepth::Ansi256);
+        let tint = |slot| if tinted { sgr(slot) } else { String::new() };
+        rune_term::diff::DiffStyle {
+            number: sgr(Slot::Dim),
+            added_sign: sgr(Slot::Success),
+            removed_sign: sgr(Slot::Error),
+            added_bg: tint(Slot::DiffAddedBg),
+            removed_bg: tint(Slot::DiffRemovedBg),
+            added_word: tint(Slot::DiffAddedWord),
+            removed_word: tint(Slot::DiffRemovedWord),
+            emphasis: if tinted {
+                String::new()
+            } else {
+                "\u{1b}[1m".to_owned()
+            },
+            dim: sgr(Slot::Dim),
+            reset: rune_term::engine::Style::RESET.to_owned(),
+        }
     }
 
     /// Returns how Markdown in an answer is drawn with this session's theme.
@@ -9666,7 +9698,7 @@ fn window_title(session: &str, state: &str, ascii: bool) -> String {
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Changed lines drawn under an edit's tool row before the rest is counted.
-const EDIT_PREVIEW_LINES: usize = 8;
+const EDIT_PREVIEW_LINES: usize = 12;
 
 /// Changed lines an approval prompt shows for an edit.
 const APPROVAL_PREVIEW_LINES: usize = 12;
@@ -9689,19 +9721,37 @@ fn edit_pairs(arguments: &serde_json::Value) -> Vec<(String, String)> {
     }
 }
 
-/// The lines each replacement removes and adds, marked `-` and `+`, in the
-/// order of its hunks.
-fn edit_changes(pairs: &[(String, String)]) -> Vec<(char, &str)> {
+/// The hunks of each replacement an edit asks for, numbered from
+/// `first_line` when one replacement's place in the file is known; otherwise
+/// the numbers are left blank, since they would count from the snippet.
+fn edit_hunks(
+    pairs: &[(String, String)],
+    first_line: Option<usize>,
+) -> Vec<rune_term::diff::Hunk<'_>> {
+    let first_line = first_line.filter(|_| pairs.len() == 1);
     pairs
         .iter()
-        .flat_map(|(old, new)| rune_term::diff::hunks(old, new, 1))
-        .flat_map(|hunk| hunk.lines)
-        .filter_map(|line| match line.op {
-            rune_term::diff::Op::Removed => Some(('-', line.text)),
-            rune_term::diff::Op::Added => Some(('+', line.text)),
-            rune_term::diff::Op::Context => None,
+        .flat_map(|(old, new)| {
+            let mut hunks = rune_term::diff::hunks(old, new, first_line.unwrap_or(1));
+            if first_line.is_none() {
+                for line in hunks.iter_mut().flat_map(|hunk| hunk.lines.iter_mut()) {
+                    line.old = None;
+                    line.new = None;
+                }
+            }
+            hunks
         })
         .collect()
+}
+
+/// The first line of the `line N` or `lines A-B` detail of an edit's result.
+fn first_changed_line(text: &str) -> Option<usize> {
+    let rest = text
+        .split_once("lines ")
+        .or_else(|| text.split_once("line "))
+        .map(|(_, rest)| rest)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|line| *line > 0)
 }
 
 fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
@@ -16712,9 +16762,10 @@ mod tests {
             elapsed: std::time::Duration::from_millis(2),
         });
         let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
-        assert!(shown.contains("- before"), "{shown}");
-        assert!(shown.contains("+ more"), "{shown}");
-        assert!(shown.contains('\u{2026}'), "{shown}");
+        let plain = shown.replace("\u{1b}[0m", "");
+        assert!(plain.contains("    - before"), "{plain}");
+        assert!(plain.contains("    + more"), "{plain}");
+        assert!(plain.contains('\u{2026}'), "{plain}");
     }
 
     #[test]
@@ -16738,19 +16789,38 @@ mod tests {
             elapsed: std::time::Duration::from_millis(3),
         });
         let shown = String::from_utf8_lossy(&bytes.lock().expect("lock")).into_owned();
-        assert!(shown.contains("- old line"), "{shown}");
-        assert!(shown.contains("+ new line"), "{shown}");
-        assert!(!shown.contains("keep too"), "{shown}");
+        let plain = shown.replace("\u{1b}[0m", "");
+        // Numbered from the line the result names, shared lines as context.
+        for row in [
+            "    2 2   keep",
+            "    3   - old line",
+            "      3 + new line",
+            "    4 4   keep too",
+        ] {
+            assert!(plain.contains(row), "{row:?} in {plain}");
+        }
     }
 
     #[test]
     fn an_edit_preview_leaves_out_shared_lines_between_two_changes() {
+        use rune_term::diff::Op::{Added, Removed};
         let old = "first\nb\nc\nd\ne\nf\ng\nh\nlast";
         let new = "FIRST\nb\nc\nd\ne\nf\ng\nh\nLAST";
         let pairs = [(old.to_owned(), new.to_owned())];
+        let changed: Vec<(rune_term::diff::Op, &str)> = edit_hunks(&pairs, None)
+            .into_iter()
+            .flat_map(|hunk| hunk.lines)
+            .filter(|line| line.op != rune_term::diff::Op::Context)
+            .map(|line| (line.op, line.text))
+            .collect();
         assert_eq!(
-            edit_changes(&pairs),
-            [('-', "first"), ('+', "FIRST"), ('-', "last"), ('+', "LAST")]
+            changed,
+            [
+                (Removed, "first"),
+                (Added, "FIRST"),
+                (Removed, "last"),
+                (Added, "LAST")
+            ]
         );
     }
 
@@ -17070,6 +17140,9 @@ mod tests {
         let lines = answerer.join().expect("answered");
         assert!(lines.contains("    - old"), "{lines}");
         assert!(lines.contains("    + new"), "{lines}");
+        // Shared lines are context, and the snippet's own numbers are not shown.
+        assert!(lines.contains("\n      a\n"), "{lines}");
+        assert!(!lines.contains("1 1"), "{lines}");
         assert!(host.approval_preview.lock().expect("slot").is_empty());
     }
 
