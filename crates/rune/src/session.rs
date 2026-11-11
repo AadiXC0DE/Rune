@@ -3014,6 +3014,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // turn so a prompt typed now is recallable next, and read from the file
     // rather than kept beside it so there is one source of truth.
     let mut recall = recorded_prompts(history_file.as_ref(), &config.workspace);
+    // Every recorded prompt, for a history search across workspaces.
+    let mut everywhere = all_prompts(history_file.as_ref());
 
     let mut source = rune_term::shell::StdinSource::new(input);
 
@@ -3576,7 +3578,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             &mut reader,
             &host,
             &out,
-            &recall,
+            RecordedPrompts {
+                here: &recall,
+                all: &everywhere,
+            },
             &completion_context,
             &completion_limits,
         )? {
@@ -3613,6 +3618,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             // arrow. The file is the source of truth, so it is read rather than
             // appended to a copy that could drift from it.
             recall = recorded_prompts(history_file.as_ref(), &config.workspace);
+            everywhere = all_prompts(history_file.as_ref());
         }
         reason
     } else if config.accessible {
@@ -3890,6 +3896,7 @@ fn run_turn_steerable(
                 host.draw_stream_with(reader.line(), reader.column());
                 return;
             }
+            sync_layout(reader, host, rune_term::shell::prompt());
             let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
                 host.flush_frame();
                 host.tick();
@@ -4328,6 +4335,7 @@ fn close_turn(
         ));
     }
     let marker = rune_term::shell::prompt();
+    sync_layout(reader, host, marker);
     let (prompt_rows, caret) = transcript::render_draft_at(
         marker,
         reader.line(),
@@ -4635,10 +4643,11 @@ fn await_submission(
     reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
-    recall: &[String],
+    prompts: RecordedPrompts<'_>,
     context: &ExecutionContext,
     limits: &rune_tools::workspace::FileLimits,
 ) -> Result<Option<Input>> {
+    let recall = prompts.here;
     let marker = rune_term::shell::prompt();
     // Which completion row is highlighted. While the dropdown is open the
     // arrows move it rather than walking the prompt history, because the list is
@@ -4672,7 +4681,9 @@ fn await_submission(
 
         let draft = reader.line().to_owned();
         let caret = reader.cursor_byte();
+        reader.set_menu_open(!rows.is_empty());
         let key = reader.read_key();
+        reader.set_menu_open(false);
         // Resize and other non-edit events still redraw the prompt, but must
         // not reset its completion selection or dismiss an open path menu.
         if key == KeyAction::Ignored && reader.line() == draft && reader.cursor_byte() == caret {
@@ -4689,7 +4700,7 @@ fn await_submission(
             continue;
         }
         if key == KeyAction::HistorySearch {
-            search_prompt_history(reader, host, out, recall)?;
+            search_prompt_history(reader, host, out, recall, prompts.all)?;
             selected = 0;
             paths = None;
             continue;
@@ -4944,12 +4955,13 @@ fn open_completion<'a>(
 /// The visible draft scrolls with the caret so the terminal's cursor is where
 /// the next character will go.
 fn draw_prompt(
-    reader: &rune_term::input::KeyReader,
+    reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
     menu: &[String],
     marker: &str,
 ) -> Result<()> {
+    sync_layout(reader, host, marker);
     let mut sink = out
         .lock()
         .map_err(|_| RuneError::new(ErrorCode::Internal, "the output lock was poisoned"))?;
@@ -4965,6 +4977,13 @@ fn draw_prompt(
         sink.flush()?;
     }
     Ok(())
+}
+
+/// Tells the reader how the draft is drawn, so the arrows move by drawn rows.
+fn sync_layout(reader: &mut rune_term::input::KeyReader, host: &SessionHost, marker: &str) {
+    let width = usize::from(host.width());
+    let prompt_width = rune_term::width::str_width(marker).min(width.saturating_sub(1));
+    reader.set_layout(prompt_width, width);
 }
 
 /// Runs an inline picker and returns the chosen entry.
@@ -5045,15 +5064,19 @@ fn history_preview(row: &str, ascii: bool) -> String {
         .replace('\t', " ")
 }
 
-/// Searches workspace recall, restoring a choice without handing it to the session.
+/// Searches recorded prompts, restoring a choice without handing it to the
+/// session. It opens on this workspace; Ctrl-R switches to every workspace and
+/// back, keeping the query.
 fn search_prompt_history(
     reader: &mut rune_term::input::KeyReader,
     host: &SessionHost,
     out: &LiveSink,
     recall: &[String],
+    all: &[String],
 ) -> Result<()> {
     let chosen = reader.with_temporary_line(|query| -> Result<Option<String>> {
-        let mut picker = history_picker(recall);
+        let mut everywhere = false;
+        let mut picker = history_picker(recall, everywhere);
         loop {
             let rows = picker_menu(
                 &mut picker,
@@ -5087,7 +5110,11 @@ fn search_prompt_history(
                     picker.down();
                 }
                 KeyAction::Ignored => picker.set_query(query.line()),
-                KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+                KeyAction::HistorySearch => {
+                    everywhere = !everywhere;
+                    picker = switch_history_scope(&picker, everywhere, recall, all);
+                }
+                KeyAction::Transcript | KeyAction::ExternalEditor => {}
             }
         }
     })?;
@@ -5097,11 +5124,32 @@ fn search_prompt_history(
     Ok(())
 }
 
+/// Returns the history search title for this workspace or for every workspace.
+const fn history_scope(all: bool) -> &'static str {
+    if all {
+        "prompt history: all workspaces (ctrl-r for this workspace)"
+    } else {
+        "prompt history: this workspace (ctrl-r for all)"
+    }
+}
+
+/// Rebuilds a history search for the other scope, keeping its query.
+fn switch_history_scope(
+    picker: &rune_term::picker::Picker,
+    all: bool,
+    recall: &[String],
+    everywhere: &[String],
+) -> rune_term::picker::Picker {
+    let mut next = history_picker(if all { everywhere } else { recall }, all);
+    next.set_query(picker.query());
+    next
+}
+
 /// Newest first, with case-insensitive substring matching supplied by the picker.
-fn history_picker(recall: &[String]) -> rune_term::picker::Picker {
+fn history_picker(prompts: &[String], all: bool) -> rune_term::picker::Picker {
     rune_term::picker::Picker::new(
-        "prompt history (Enter restores without submitting)",
-        recall.iter().rev().cloned().collect(),
+        history_scope(all),
+        prompts.iter().rev().cloned().collect(),
         rune_term::picker::DEFAULT_WINDOW,
     )
 }
@@ -5808,6 +5856,28 @@ fn recorded_prompts(
         .map(|history| {
             history
                 .for_workspace(workspace)
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The recorded prompts the idle prompt recalls and searches, oldest first.
+#[derive(Clone, Copy)]
+struct RecordedPrompts<'a> {
+    /// Prompts recorded in this workspace.
+    here: &'a [String],
+    /// Prompts recorded in every workspace.
+    all: &'a [String],
+}
+
+/// Returns every recorded prompt, oldest first.
+fn all_prompts(history: Option<&crate::prompt_history::History>) -> Vec<String> {
+    history
+        .map(|history| {
+            history
+                .entries()
                 .iter()
                 .map(|entry| entry.text.clone())
                 .collect()
@@ -8731,8 +8801,9 @@ mod tests {
             let drawn = std::mem::take(&mut *bytes.lock().expect("lock"));
             assert!(last_caret_column(&drawn).expect("caret") <= 80);
             grid.feed(&drawn).expect("feed");
-            assert!(grid.text().contains("TAIL-END"), "{}", grid.text());
-            assert_eq!(grid.cursor().col, 79);
+            assert!(grid.text().contains("  aaaaTAIL-END"), "{}", grid.text());
+            // 168 characters wrap to 78 + 78 + 12 columns after the prompt.
+            assert_eq!(grid.cursor().col, 14);
         };
         host.draw_stream_with(reader.line(), reader.column());
         check(&mut grid);
@@ -8797,10 +8868,10 @@ mod tests {
         )
         .expect("closed");
         check(&mut grid, 2);
-        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("idle prompt");
+        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ").expect("idle prompt");
         check(&mut grid, 2);
         reader.clear();
-        draw_prompt(&reader, &host, &sink.stream, &[], "> ").expect("cleared");
+        draw_prompt(&mut reader, &host, &sink.stream, &[], "> ").expect("cleared");
         grid.feed(&std::mem::take(&mut *bytes.lock().expect("lock")))
             .expect("feed");
         assert!(!grid.text().contains("second"), "{}", grid.text());
@@ -9105,7 +9176,7 @@ mod tests {
                 .expect("record");
         }
         let reopened = crate::prompt_history::History::open(&paths).expect("reopen");
-        let mut picker = history_picker(&recorded_prompts(Some(&reopened), root));
+        let mut picker = history_picker(&recorded_prompts(Some(&reopened), root), false);
         assert_eq!(picker.len(), 3);
         assert_eq!(picker.selected(), Some("newer needle prompt"));
         picker.set_query("NEEDLE");
@@ -9114,7 +9185,40 @@ mod tests {
         assert_eq!(picker.selected(), Some("older needle prompt\n界"));
         picker.set_query("absent");
         assert_eq!(picker.selected(), None);
-        assert_eq!(history_picker(&[]).selected(), None);
+        assert_eq!(history_picker(&[], false).selected(), None);
+    }
+
+    #[test]
+    fn history_search_toggles_scope_with_ctrl_r() {
+        let recall: Vec<String> = ["here needle", "here other"].map(str::to_owned).to_vec();
+        let all: Vec<String> = ["there needle", "here needle", "here other"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut picker = history_picker(&recall, false);
+        assert_eq!(picker.title(), history_scope(false));
+        assert_eq!(
+            history_scope(false),
+            "prompt history: this workspace (ctrl-r for all)"
+        );
+        picker.set_query("needle");
+        assert_eq!(picker.matches().len(), 1);
+
+        let picker = switch_history_scope(&picker, true, &recall, &all);
+        assert_eq!(
+            picker.title(),
+            "prompt history: all workspaces (ctrl-r for this workspace)"
+        );
+        assert_eq!(picker.query(), "needle");
+        assert_eq!(picker.matches().len(), 2);
+
+        let picker = switch_history_scope(&picker, false, &recall, &all);
+        assert_eq!(picker.title(), history_scope(false));
+        assert_eq!(picker.query(), "needle");
+        assert_eq!(picker.selected(), Some("here needle"));
+
+        // With nothing recorded elsewhere both scopes list the same prompts.
+        let only = switch_history_scope(&history_picker(&recall, false), true, &recall, &recall);
+        assert_eq!(only.len(), history_picker(&recall, false).len());
     }
 
     #[test]

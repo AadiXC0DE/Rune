@@ -13,10 +13,169 @@
 
 use std::collections::VecDeque;
 
-use crate::width::{graphemes, str_width};
+use crate::width::{grapheme_width, graphemes, str_width};
 
 /// How many editing steps are kept for undo.
 pub const HISTORY_LIMIT: usize = 128;
+
+/// How many killed texts are kept for a yank.
+pub const KILL_RING_LIMIT: usize = 8;
+
+/// One row of a draft as it is drawn, in character indexes.
+///
+/// `end` is exclusive and never includes a line break. `line` is the logical
+/// line the row belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VisualRow {
+    /// First character of the row.
+    pub start: usize,
+    /// Character after the last one on the row.
+    pub end: usize,
+    /// Index of the logical line, counting line breaks.
+    pub line: usize,
+}
+
+/// Breaks a draft into the rows it is drawn on.
+///
+/// Row 0 has `width - first_indent` columns and every later row
+/// `width - indent`. A logical line breaks after the last space that fits,
+/// else before the cluster that does not fit, so a row never splits a
+/// grapheme cluster. A line that fills its last row exactly gets one more,
+/// empty row, so a caret at its end has a cell to stand on.
+#[must_use]
+pub fn layout(text: &str, first_indent: usize, indent: usize, width: usize) -> Vec<VisualRow> {
+    let room_for = |row: usize| {
+        width
+            .saturating_sub(if row == 0 { first_indent } else { indent })
+            .max(1)
+    };
+    let mut rows = Vec::new();
+    let mut at = 0usize;
+    for (line, part) in text.split('\n').enumerate() {
+        let mut start = at;
+        let mut pos = at;
+        let mut col = 0usize;
+        // The character after the last space on the row, and the columns after it.
+        let mut space: Option<usize> = None;
+        let mut after_space = 0usize;
+        for grapheme in graphemes(part) {
+            let cells = cell_width(grapheme);
+            while col.saturating_add(cells) > room_for(rows.len()) && pos > start {
+                if let Some(brk) = space.take().filter(|brk| *brk > start) {
+                    rows.push(VisualRow {
+                        start,
+                        end: brk,
+                        line,
+                    });
+                    start = brk;
+                    col = after_space;
+                } else {
+                    rows.push(VisualRow {
+                        start,
+                        end: pos,
+                        line,
+                    });
+                    start = pos;
+                    col = 0;
+                }
+                after_space = col;
+            }
+            col = col.saturating_add(cells);
+            pos = pos.saturating_add(grapheme.chars().count());
+            if grapheme.chars().all(char::is_whitespace) {
+                space = Some(pos);
+                after_space = 0;
+            } else {
+                after_space = after_space.saturating_add(cells);
+            }
+        }
+        let full = col > 0 && col >= room_for(rows.len());
+        rows.push(VisualRow {
+            start,
+            end: pos,
+            line,
+        });
+        if full {
+            rows.push(VisualRow {
+                start: pos,
+                end: pos,
+                line,
+            });
+        }
+        at = pos.saturating_add(1);
+    }
+    rows
+}
+
+/// Returns the row holding a caret and the columns before it on that row.
+///
+/// A caret at the end of a wrapped row stands at the start of the next one.
+#[must_use]
+pub fn caret_in(text: &str, rows: &[VisualRow], caret: usize) -> (usize, usize) {
+    let row = rows
+        .iter()
+        .rposition(|row| row.start <= caret && caret <= row.end)
+        .unwrap_or(0);
+    let start = rows.get(row).map_or(0, |row| row.start);
+    (row, span_width(text, start, caret))
+}
+
+/// Returns the columns a cluster takes in a draft row; a tab takes one.
+fn cell_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        1
+    } else {
+        grapheme_width(grapheme)
+    }
+}
+
+/// Returns the text between two character indexes.
+fn char_slice(text: &str, start: usize, end: usize) -> &str {
+    let byte = |chars: usize| {
+        text.char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(byte, _)| byte)
+    };
+    text.get(byte(start)..byte(end.max(start)))
+        .unwrap_or_default()
+}
+
+/// Returns the columns between two character indexes of a draft row.
+fn span_width(text: &str, start: usize, end: usize) -> usize {
+    graphemes(char_slice(text, start, end))
+        .map(cell_width)
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Returns the caret position on `row` at or before `column`.
+///
+/// The end of a wrapped row is the start of the next row, so a caret placed
+/// on a wrapped row stops before its last cluster.
+fn position_in(text: &str, rows: &[VisualRow], row: usize, column: usize) -> usize {
+    let Some(target) = rows.get(row) else {
+        return 0;
+    };
+    let wrapped = rows
+        .get(row.saturating_add(1))
+        .is_some_and(|next| next.line == target.line);
+    let clusters: Vec<&str> = graphemes(char_slice(text, target.start, target.end)).collect();
+    let usable = if wrapped {
+        clusters.len().saturating_sub(1)
+    } else {
+        clusters.len()
+    };
+    let mut at = target.start;
+    let mut used = 0usize;
+    for cluster in clusters.iter().take(usable) {
+        let next = used.saturating_add(cell_width(cluster));
+        if next > column {
+            break;
+        }
+        used = next;
+        at = at.saturating_add(cluster.chars().count());
+    }
+    at
+}
 
 /// One editor state.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -74,7 +233,8 @@ pub struct Composer {
     cursor: usize,
     undo: VecDeque<Snapshot>,
     redo: VecDeque<Snapshot>,
-    kill: String,
+    kill_ring: VecDeque<String>,
+    last_yank: Option<(usize, usize, usize)>,
     recall: Option<usize>,
     draft: String,
 }
@@ -120,8 +280,47 @@ impl Composer {
         str_width(&displayed(self.head()))
     }
 
+    /// Returns the visual row of the caret and its column inside that row.
+    #[must_use]
+    pub fn caret_row_col(
+        &self,
+        first_indent: usize,
+        indent: usize,
+        width: usize,
+    ) -> (usize, usize) {
+        let rows = layout(&self.text, first_indent, indent, width);
+        caret_in(&self.text, &rows, self.cursor)
+    }
+
+    /// Moves the caret to the previous visual row, keeping its column.
+    ///
+    /// Returns false, without moving, when the caret is on the first row.
+    pub fn move_up(&mut self, first_indent: usize, indent: usize, width: usize) -> bool {
+        self.move_vertically(first_indent, indent, width, false)
+    }
+
+    /// Moves the caret to the next visual row, keeping its column.
+    ///
+    /// Returns false, without moving, when the caret is on the last row.
+    pub fn move_down(&mut self, first_indent: usize, indent: usize, width: usize) -> bool {
+        self.move_vertically(first_indent, indent, width, true)
+    }
+
+    /// Moves the caret to the start of its logical line.
+    pub fn move_line_start(&mut self) -> bool {
+        self.last_yank = None;
+        self.jump(self.line_start())
+    }
+
+    /// Moves the caret to the end of its logical line.
+    pub fn move_line_end(&mut self) -> bool {
+        self.last_yank = None;
+        self.jump(self.line_end())
+    }
+
     /// Inserts text at the cursor.
     pub fn insert(&mut self, text: &str) {
+        self.last_yank = None;
         if text.is_empty() {
             return;
         }
@@ -159,6 +358,7 @@ impl Composer {
     /// abandoned, and a walk that carried on from the old position would skip
     /// the newest entry and bring back a draft that was already let go.
     pub fn clear(&mut self) {
+        self.last_yank = None;
         self.recall = None;
         self.draft.clear();
         if self.text.is_empty() {
@@ -171,6 +371,7 @@ impl Composer {
 
     /// Removes the cluster before the cursor.
     pub fn delete_back(&mut self) -> bool {
+        self.last_yank = None;
         let start = self.floor(self.cursor.saturating_sub(1));
         if start == self.cursor {
             return false;
@@ -185,6 +386,7 @@ impl Composer {
 
     /// Removes the cluster at the cursor.
     pub fn delete_forward(&mut self) -> bool {
+        self.last_yank = None;
         let end = self.ceil(self.cursor);
         if end == self.cursor {
             return false;
@@ -198,6 +400,7 @@ impl Composer {
 
     /// Moves the cursor one cluster left.
     pub fn move_left(&mut self) -> bool {
+        self.last_yank = None;
         let at = self.floor(self.cursor.saturating_sub(1));
         let moved = at != self.cursor;
         self.cursor = at;
@@ -206,27 +409,26 @@ impl Composer {
 
     /// Moves the cursor one cluster right.
     pub fn move_right(&mut self) -> bool {
+        self.last_yank = None;
         let at = self.ceil(self.cursor);
         let moved = at != self.cursor;
         self.cursor = at;
         moved
     }
 
-    /// Removes the word before the cursor, and the space before that.
+    /// Kills the word before the cursor, and the space before that.
     ///
     /// Trailing whitespace goes first, so the word being removed is the one the
     /// user is looking at rather than the gap after it.
-    pub fn delete_word(&mut self) -> bool {
+    pub fn kill_word_back(&mut self) -> bool {
         let start = self.word_start();
-        if start == self.cursor {
-            return false;
-        }
-        self.record();
-        let from = self.byte_of(start);
-        let to = self.byte_of(self.cursor);
-        self.text.replace_range(from..to, "");
-        self.cursor = start;
-        true
+        self.kill_range(start, self.cursor)
+    }
+
+    /// Kills the word after the cursor and the space before it.
+    pub fn kill_word_forward(&mut self) -> bool {
+        let end = self.floor(self.cursor.saturating_add(self.word_after()));
+        self.kill_range(self.cursor, end)
     }
 
     /// Moves the cursor to the start of the word before it.
@@ -248,19 +450,7 @@ impl Composer {
 
     /// Moves the cursor to the end of the word after it.
     pub fn move_word_right(&mut self) -> bool {
-        let mut count = 0usize;
-        let mut word = false;
-        for c in self.tail().chars() {
-            if c.is_whitespace() {
-                if word {
-                    break;
-                }
-            } else {
-                word = true;
-            }
-            count = count.saturating_add(1);
-        }
-        self.jump(self.cursor.saturating_add(count))
+        self.jump(self.cursor.saturating_add(self.word_after()))
     }
 
     /// Moves the cursor to the start of the line.
@@ -273,51 +463,73 @@ impl Composer {
         self.jump(self.text.chars().count())
     }
 
-    /// Removes everything from the cursor to the end of the line, keeping it
-    /// for a yank.
+    /// Kills from the cursor to the end of its logical line.
+    ///
+    /// At the end of a line the line break goes instead, joining the next
+    /// line to this one.
     pub fn kill_to_end(&mut self) -> bool {
-        let at = self.byte_of(self.cursor);
-        if at >= self.text.len() {
-            return false;
-        }
-        self.record();
-        self.text
-            .get(at..)
-            .unwrap_or_default()
-            .clone_into(&mut self.kill);
-        self.text.truncate(at);
-        true
+        let end = self.line_end();
+        let end = if end == self.cursor {
+            let total = self.text.chars().count();
+            end.saturating_add(1).min(total)
+        } else {
+            end
+        };
+        self.kill_range(self.cursor, end)
     }
 
-    /// Removes everything from the start of the line to the cursor, keeping it
-    /// for a yank.
+    /// Kills from the start of the cursor's logical line to the cursor.
+    ///
+    /// At the start of a line the line break before it goes instead.
     pub fn kill_to_start(&mut self) -> bool {
-        if self.cursor == 0 {
+        let start = self.line_start();
+        let start = if start == self.cursor {
+            start.saturating_sub(1)
+        } else {
+            start
+        };
+        self.kill_range(start, self.cursor)
+    }
+
+    /// Inserts the newest killed text at the cursor.
+    pub fn yank(&mut self) -> bool {
+        let Some(killed) = self.kill_ring.back().cloned() else {
             return false;
-        }
-        self.record();
-        let at = self.byte_of(self.cursor);
-        self.text
-            .get(..at)
-            .unwrap_or_default()
-            .clone_into(&mut self.kill);
-        self.text.replace_range(..at, "");
-        self.cursor = 0;
+        };
+        let start = self.cursor;
+        self.insert(&killed);
+        let index = self.kill_ring.len().saturating_sub(1);
+        self.last_yank = Some((start, self.cursor, index));
         true
     }
 
-    /// Inserts the last killed text at the cursor.
-    pub fn yank(&mut self) -> bool {
-        if self.kill.is_empty() {
+    /// Replaces the text just yanked with the next older kill, as one edit.
+    ///
+    /// Works only straight after a yank or another yank pop; past the oldest
+    /// kill it wraps to the newest.
+    pub fn yank_pop(&mut self) -> bool {
+        let Some((start, end, index)) = self.last_yank else {
             return false;
-        }
-        let killed = self.kill.clone();
-        self.insert(&killed);
+        };
+        let older = index
+            .checked_sub(1)
+            .unwrap_or_else(|| self.kill_ring.len().saturating_sub(1));
+        let Some(killed) = self.kill_ring.get(older).cloned() else {
+            self.last_yank = None;
+            return false;
+        };
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(end);
+        self.text.replace_range(from..to, &killed);
+        self.cursor = start.saturating_add(killed.chars().count());
+        self.last_yank = Some((start, self.cursor, older));
         true
     }
 
     /// Reverts the last edit.
     pub fn undo(&mut self) -> bool {
+        self.last_yank = None;
         let Some(previous) = self.undo.pop_back() else {
             return false;
         };
@@ -329,6 +541,7 @@ impl Composer {
 
     /// Reapplies the last reverted edit.
     pub fn redo(&mut self) -> bool {
+        self.last_yank = None;
         let Some(next) = self.redo.pop_back() else {
             return false;
         };
@@ -449,6 +662,7 @@ impl Composer {
 
     /// Replaces the line, parking the cursor at the end.
     fn show(&mut self, text: &str) {
+        self.last_yank = None;
         text.clone_into(&mut self.text);
         self.undo.clear();
         self.redo.clear();
@@ -457,6 +671,7 @@ impl Composer {
 
     /// Moves the cursor to `at`, keeping it on a cluster boundary.
     fn jump(&mut self, at: usize) -> bool {
+        self.last_yank = None;
         let at = self.floor(at);
         let moved = at != self.cursor;
         self.cursor = at;
@@ -477,6 +692,7 @@ impl Composer {
     /// reverted state, replaying that state is no longer what the user asked
     /// for.
     fn record(&mut self) {
+        self.last_yank = None;
         self.redo.clear();
         self.push_undo(self.snapshot());
     }
@@ -565,6 +781,90 @@ impl Composer {
             count = count.saturating_add(1);
         }
         self.floor(self.cursor.saturating_sub(count))
+    }
+
+    /// Removes a character range as one edit, keeping it in the kill ring.
+    fn kill_range(&mut self, start: usize, end: usize) -> bool {
+        if start >= end {
+            self.last_yank = None;
+            return false;
+        }
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(end);
+        let killed = self.text.get(from..to).unwrap_or_default().to_owned();
+        self.text.replace_range(from..to, "");
+        self.cursor = start;
+        self.kill_ring.push_back(killed);
+        while self.kill_ring.len() > KILL_RING_LIMIT {
+            self.kill_ring.pop_front();
+        }
+        true
+    }
+
+    /// Returns the characters from the cursor to the end of the next word.
+    fn word_after(&self) -> usize {
+        let mut count = 0usize;
+        let mut word = false;
+        for c in self.tail().chars() {
+            if c.is_whitespace() {
+                if word {
+                    break;
+                }
+            } else {
+                word = true;
+            }
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
+    /// Returns the character index where the cursor's logical line starts.
+    fn line_start(&self) -> usize {
+        self.head()
+            .chars()
+            .rev()
+            .position(|c| c == '\n')
+            .map_or(0, |back| self.cursor.saturating_sub(back))
+    }
+
+    /// Returns the character index where the cursor's logical line ends.
+    fn line_end(&self) -> usize {
+        let tail = self.tail();
+        let ahead = tail
+            .chars()
+            .position(|c| c == '\n')
+            .unwrap_or_else(|| tail.chars().count());
+        self.cursor.saturating_add(ahead)
+    }
+
+    /// Moves the caret one visual row, keeping its screen column.
+    fn move_vertically(
+        &mut self,
+        first_indent: usize,
+        indent: usize,
+        width: usize,
+        down: bool,
+    ) -> bool {
+        self.last_yank = None;
+        let rows = layout(&self.text, first_indent, indent, width);
+        let (row, column) = caret_in(&self.text, &rows, self.cursor);
+        let target = if down {
+            row.saturating_add(1)
+        } else {
+            let Some(above) = row.checked_sub(1) else {
+                return false;
+            };
+            above
+        };
+        if target >= rows.len() {
+            return false;
+        }
+        let indent_of = |row: usize| if row == 0 { first_indent } else { indent };
+        let screen = column.saturating_add(indent_of(row));
+        let column = screen.saturating_sub(indent_of(target));
+        self.cursor = position_in(&self.text, &rows, target, column);
+        true
     }
 
     /// Keeps the cursor inside the line and off the interior of a cluster.
@@ -658,6 +958,225 @@ mod tests {
             edges.push(at);
         }
         edges
+    }
+
+    /// Returns the rows of a layout as `(start, end)` pairs.
+    fn spans(text: &str, first_indent: usize, indent: usize, width: usize) -> Vec<(usize, usize)> {
+        layout(text, first_indent, indent, width)
+            .iter()
+            .map(|row| (row.start, row.end))
+            .collect()
+    }
+
+    /// Returns a composer holding `text` with the caret at character `at`.
+    fn at(text: &str, at: usize) -> Composer {
+        let mut composer = Composer::new();
+        composer.insert(text);
+        composer.move_home();
+        for _ in 0..at {
+            composer.move_right();
+        }
+        composer
+    }
+
+    #[test]
+    fn layout_wraps_at_spaces_and_never_splits_graphemes() {
+        assert_eq!(spans("hello world", 0, 0, 8), vec![(0, 6), (6, 11)]);
+        // A wide character moves whole to the next row, and a letter keeps
+        // its combining accent.
+        assert_eq!(
+            spans("ab\u{6f22}e\u{301}c", 0, 0, 3),
+            vec![(0, 2), (2, 5), (5, 6)]
+        );
+        // Row 0 leaves room for the first indent; a full last row gets an
+        // empty one for the caret.
+        assert_eq!(spans("abcdef", 2, 0, 4), vec![(0, 2), (2, 6), (6, 6)]);
+        let rows = layout("a\n\nb", 2, 2, 80);
+        assert_eq!(
+            rows,
+            vec![
+                VisualRow {
+                    start: 0,
+                    end: 1,
+                    line: 0
+                },
+                VisualRow {
+                    start: 2,
+                    end: 2,
+                    line: 1
+                },
+                VisualRow {
+                    start: 3,
+                    end: 4,
+                    line: 2
+                },
+            ]
+        );
+        assert_eq!(
+            spans(&"x".repeat(100), 2, 2, 40),
+            vec![(0, 38), (38, 76), (76, 100)]
+        );
+    }
+
+    #[test]
+    fn up_and_down_keep_the_display_column_across_wide_characters() {
+        let text = "ab\n\u{6f22}\u{5b57}x\nlonger line";
+        let mut composer = at(text, 1);
+        assert_eq!(composer.caret_row_col(2, 2, 80), (0, 1));
+        assert!(composer.move_down(2, 2, 80));
+        // Column 1 is inside the first wide character: the caret stays before it.
+        assert_eq!(composer.cursor(), 3);
+        assert_eq!(composer.caret_row_col(2, 2, 80), (1, 0));
+
+        let mut composer = at(text, 2);
+        assert!(composer.move_down(2, 2, 80));
+        assert_eq!(composer.cursor(), 4);
+        assert_eq!(composer.caret_row_col(2, 2, 80), (1, 2));
+        assert!(composer.move_down(2, 2, 80));
+        assert_eq!(composer.cursor(), 9);
+        assert_eq!(composer.caret_row_col(2, 2, 80), (2, 2));
+
+        let mut composer = at(text, 10);
+        assert!(composer.move_up(2, 2, 80));
+        assert_eq!(
+            composer.cursor(),
+            4,
+            "column 3 falls inside the second wide character"
+        );
+        assert!(composer.move_up(2, 2, 80));
+        assert_eq!(composer.cursor(), 2, "the short row clamps to its end");
+        assert_eq!(composer.text(), text);
+    }
+
+    #[test]
+    fn vertical_motion_reports_the_edges() {
+        let text = "x".repeat(100);
+        let mut composer = Composer::new();
+        composer.insert(&text);
+        assert_eq!(composer.caret_row_col(2, 2, 40), (2, 24));
+        assert!(!composer.move_down(2, 2, 40));
+        assert!(composer.move_up(2, 2, 40));
+        assert_eq!(composer.caret_row_col(2, 2, 40), (1, 24));
+        assert!(composer.move_up(2, 2, 40));
+        assert_eq!(composer.caret_row_col(2, 2, 40), (0, 24));
+        assert!(!composer.move_up(2, 2, 40));
+        assert_eq!(composer.cursor(), 24);
+        assert!(composer.move_down(2, 2, 40));
+        assert_eq!(composer.cursor(), 62);
+        assert_eq!(composer.text(), text);
+
+        let mut single = at("abc", 1);
+        assert!(!single.move_up(2, 2, 80));
+        assert!(!single.move_down(2, 2, 80));
+        assert_eq!(single.cursor(), 1);
+    }
+
+    #[test]
+    fn home_then_home_goes_to_the_draft_start() {
+        let mut composer = Composer::new();
+        composer.insert("one\ntwo");
+        assert!(composer.move_line_start());
+        assert_eq!(composer.cursor(), 4);
+        assert!(!composer.move_line_start());
+        assert!(composer.move_home());
+        assert_eq!(composer.cursor(), 0);
+
+        assert!(composer.move_line_end());
+        assert_eq!(composer.cursor(), 3);
+        assert!(!composer.move_line_end());
+        assert!(composer.move_end());
+        assert_eq!(composer.cursor(), 7);
+    }
+
+    #[test]
+    fn ctrl_k_at_a_line_end_joins_the_lines() {
+        let mut composer = at("one\ntwo", 3);
+        assert!(composer.kill_to_end());
+        assert_eq!(composer.text(), "onetwo");
+        assert!(composer.kill_to_end());
+        assert_eq!(composer.text(), "one");
+        assert!(
+            !composer.kill_to_end(),
+            "the end of the draft kills nothing"
+        );
+        assert!(composer.yank());
+        assert_eq!(composer.text(), "onetwo");
+
+        let mut composer = at("one\ntwo three", 8);
+        assert!(composer.kill_to_start());
+        assert_eq!(composer.text(), "one\nthree");
+        assert_eq!(composer.cursor(), 4);
+        assert!(composer.kill_to_start());
+        assert_eq!(composer.text(), "onethree");
+        assert_eq!(composer.cursor(), 3);
+    }
+
+    #[test]
+    fn kill_ring_keeps_eight_and_cycles() {
+        let mut composer = Composer::new();
+        for index in 0..9 {
+            composer.insert(&format!("k{index}"));
+            assert!(composer.kill_to_start());
+        }
+        assert!(composer.yank());
+        assert_eq!(composer.text(), "k8");
+        for index in (1..8).rev() {
+            assert!(composer.yank_pop());
+            assert_eq!(composer.text(), format!("k{index}"));
+        }
+        assert!(composer.yank_pop());
+        assert_eq!(
+            composer.text(),
+            "k8",
+            "the oldest kept entry wraps to the newest"
+        );
+        assert_eq!(composer.cursor(), 2);
+
+        // Undo walks back through the pops one at a time, then removes the yank.
+        let mut composer = Composer::new();
+        composer.insert("first");
+        composer.kill_to_start();
+        composer.insert("second");
+        composer.kill_to_start();
+        composer.insert("> ");
+        assert!(composer.yank());
+        assert!(composer.yank_pop());
+        assert_eq!(composer.text(), "> first");
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "> second");
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "> ");
+    }
+
+    #[test]
+    fn yank_pop_needs_a_preceding_yank() {
+        let mut composer = Composer::new();
+        assert!(!composer.yank_pop());
+        composer.insert("one two");
+        assert!(composer.kill_word_back());
+        assert!(composer.kill_word_back());
+        assert!(!composer.yank_pop());
+        assert!(composer.yank());
+        assert_eq!(composer.text(), "one ");
+        composer.move_left();
+        assert!(!composer.yank_pop(), "a motion ends the yank");
+        composer.move_right();
+        assert!(composer.yank());
+        composer.insert("z");
+        assert!(!composer.yank_pop(), "an edit ends the yank");
+        assert_eq!(composer.text(), "one one z");
+    }
+
+    #[test]
+    fn alt_d_kills_the_next_word() {
+        let mut composer = at("alpha beta gamma", 5);
+        assert!(composer.kill_word_forward());
+        assert_eq!(composer.text(), "alpha gamma");
+        assert_eq!(composer.cursor(), 5);
+        assert!(composer.yank());
+        assert_eq!(composer.text(), "alpha beta gamma");
+        composer.move_end();
+        assert!(!composer.kill_word_forward());
     }
 
     #[test]

@@ -334,10 +334,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert not prompts, prompts
         elif scenario == "resize":
             draft = "0123456789" * 5 + "VISIBLE-END"
-            capture("narrow-draft", draft.encode(), "VISIBLE-END")
+            # The draft wraps: at 32 columns its last row holds only the D, at
+            # 20 columns the tail after VISI.
+            capture("narrow-draft", draft.encode(), "  D")
             # No key is sent on either resize. A stale draft must fail here.
             capture("grown-draft", expected=draft, size=(80, 24))
-            capture("shrunk-draft", expected="VISIBLE-END", size=(20, 24))
+            capture("shrunk-draft", expected="BLE-END", size=(20, 24))
             capture("grown-again", expected=draft, size=(80, 24))
             os.write(master, b"\x03")
             wait_for("\x1b[?25h", offset)
