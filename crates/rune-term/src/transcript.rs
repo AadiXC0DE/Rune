@@ -849,6 +849,181 @@ fn assistant_line(
     )
 }
 
+/// The kind of Markdown block a streaming answer is in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Block {
+    /// Between blocks: everything before is sealed.
+    #[default]
+    None,
+    Paragraph,
+    List,
+    Quote,
+    Table,
+    /// Inside a fence.
+    Code,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LineKind {
+    #[default]
+    Other,
+    Blank,
+    Row,
+    Delimiter,
+}
+
+/// Finds where the finished blocks of a streaming answer end.
+///
+/// A block is finished once a later line shows it cannot change: its blank
+/// line, the next heading, a fence of its own, the end of a table. Only
+/// complete lines are examined, so text after the last newline is never
+/// sealed.
+#[derive(Clone, Debug, Default)]
+pub struct Sealer {
+    scanned: usize,
+    sealed: usize,
+    block: Block,
+    fence: Option<Fence>,
+    table_rows: usize,
+    previous: LineKind,
+}
+
+impl Sealer {
+    /// Examines the complete lines of `text` not seen yet and returns the
+    /// sealed byte offset: always a line start, never decreasing.
+    pub fn advance(&mut self, text: &str) -> usize {
+        if text.len() < self.scanned {
+            self.reset();
+        }
+        while let Some(at) = text[self.scanned..].find('\n') {
+            let start = self.scanned;
+            let end = start.saturating_add(at).saturating_add(1);
+            self.line(&text[start..end.saturating_sub(1)], start, end);
+            self.scanned = end;
+        }
+        self.sealed
+    }
+
+    /// The block the unsealed text is in.
+    #[must_use]
+    pub const fn block(&self) -> Block {
+        self.block
+    }
+
+    /// Rows of the table being written, counting its header and delimiter.
+    #[must_use]
+    pub const fn open_table_rows(&self) -> usize {
+        if matches!(self.block, Block::Table) {
+            self.table_rows
+        } else {
+            0
+        }
+    }
+
+    /// The start of the line not yet complete.
+    #[must_use]
+    pub const fn line_start(&self) -> usize {
+        self.scanned
+    }
+
+    /// Forgets everything, for an answer that was cleared.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn seal(&mut self, at: usize) {
+        self.sealed = self.sealed.max(at);
+    }
+
+    fn line(&mut self, line: &str, start: usize, end: usize) {
+        let candidate = fence_start(line);
+        if let Some(open) = self.fence {
+            if candidate.is_some_and(|(close, rest)| {
+                close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
+            }) {
+                self.fence = None;
+                self.block = Block::None;
+                self.seal(end);
+            }
+            self.previous = LineKind::Other;
+            return;
+        }
+        let row = crate::markdown::is_row(line);
+        let kind = if crate::markdown::is_delimiter(line) {
+            LineKind::Delimiter
+        } else if row {
+            LineKind::Row
+        } else if line.trim_matches(' ').is_empty() {
+            LineKind::Blank
+        } else {
+            LineKind::Other
+        };
+        let previous = std::mem::replace(&mut self.previous, kind);
+        if self.block == Block::Table {
+            if row {
+                self.table_rows = self.table_rows.saturating_add(1);
+                return;
+            }
+            self.seal(start);
+            self.block = Block::None;
+            self.table_rows = 0;
+        }
+        if let Some((open, rest)) = candidate
+            && (open.marker != b'`' || !rest.contains('`'))
+        {
+            self.seal(start);
+            self.fence = Some(open);
+            self.block = Block::Code;
+            return;
+        }
+        if kind == LineKind::Blank {
+            self.seal(end);
+            self.block = Block::None;
+            return;
+        }
+        let indent = line
+            .len()
+            .saturating_sub(line.trim_start_matches(' ').len());
+        let rest = &line[indent..];
+        if indent <= 3
+            && (crate::markdown::heading(rest).is_some() || crate::markdown::is_rule(rest))
+        {
+            self.seal(end);
+            self.block = Block::None;
+            return;
+        }
+        if row && matches!(previous, LineKind::Row | LineKind::Delimiter) {
+            self.block = Block::Table;
+            self.table_rows = 2;
+            return;
+        }
+        let item = crate::markdown::bullet(rest).is_some() || ordered_item(rest);
+        if self.block == Block::List && !item && indent >= 2 {
+            return;
+        }
+        let quote = indent <= 3 && rest.starts_with('>');
+        let next = if item {
+            Block::List
+        } else if quote {
+            Block::Quote
+        } else {
+            Block::Paragraph
+        };
+        if next != self.block {
+            self.seal(start);
+            self.block = next;
+        }
+    }
+}
+
+/// Returns true for an ordered list item: digits, `.` or `)`, then a space.
+fn ordered_item(text: &str) -> bool {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=9).contains(&digits)
+        && matches!(text.as_bytes().get(digits), Some(b'.' | b')'))
+        && text.as_bytes().get(digits.saturating_add(1)) == Some(&b' ')
+}
+
 /// Hard wraps code by grapheme, retaining every space instead of word breaks.
 fn wrap_code(source: &str, width: usize, ascii: bool) -> Vec<String> {
     let expanded = expand_tabs(source);
@@ -1071,6 +1246,82 @@ fn caret_index(input: &str, column: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed(text: &str) -> usize {
+        Sealer::default().advance(text)
+    }
+
+    #[test]
+    fn a_paragraph_seals_at_its_blank_line() {
+        assert_eq!(sealed("one\ntwo\n"), 0);
+        assert_eq!(sealed("one\ntwo\n\nthree\n"), "one\ntwo\n\n".len());
+    }
+
+    #[test]
+    fn a_fence_seals_at_its_closing_line_and_not_before() {
+        let open = "intro\n```rust\nfn main() {}\n\n";
+        let mut sealer = Sealer::default();
+        assert_eq!(sealer.advance(open), "intro\n".len());
+        assert_eq!(sealer.block(), Block::Code);
+        let closed = format!("{open}```\n");
+        assert_eq!(sealer.advance(&closed), closed.len());
+        assert_eq!(sealer.block(), Block::None);
+    }
+
+    #[test]
+    fn a_heading_seals_at_its_line_end() {
+        assert_eq!(sealed("# Title\nbody"), "# Title\n".len());
+        assert_eq!(sealed("text\n## Next\n"), "text\n## Next\n".len());
+    }
+
+    #[test]
+    fn a_table_seals_at_the_first_line_that_is_not_a_row() {
+        let table = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+        let mut sealer = Sealer::default();
+        assert_eq!(sealer.advance(table), 0);
+        assert_eq!(sealer.block(), Block::Table);
+        assert_eq!(sealer.open_table_rows(), 3);
+        let after = format!("{table}after\n");
+        assert_eq!(sealer.advance(&after), table.len());
+        assert_eq!(sealer.block(), Block::Paragraph);
+    }
+
+    #[test]
+    fn a_list_seals_at_a_blank_or_unindented_line() {
+        assert_eq!(sealed("- one\n  more\n- two\n"), 0);
+        assert_eq!(sealed("- one\n- two\n\n"), "- one\n- two\n\n".len());
+        assert_eq!(sealed("- one\n1. two\nafter\n"), "- one\n1. two\n".len());
+        assert_eq!(sealed("text\n- item\n"), "text\n".len());
+    }
+
+    #[test]
+    fn an_unfinished_line_is_never_sealed() {
+        assert_eq!(
+            sealed("one\n\n# heading without its newline"),
+            "one\n\n".len()
+        );
+        assert_eq!(sealed("unfinished"), 0);
+    }
+
+    #[test]
+    fn sealing_one_delta_at_a_time_matches_sealing_the_whole_text() {
+        let answer = "# Report\n\nIntro line\nsecond line\n\n- a\n  more\n- b\n> quoted\n\
+            plain\n| a | b |\n| - | - |\n| 1 | 2 |\ntail\n```\ncode\n\n```\n---\nend";
+        let mut whole = Sealer::default();
+        let expected = whole.advance(answer);
+        let mut stepped = Sealer::default();
+        let mut last = 0;
+        for end in 1..=answer.len() {
+            if answer.is_char_boundary(end) {
+                let offset = stepped.advance(&answer[..end]);
+                assert!(offset >= last, "the sealed offset went back at {end}");
+                assert!(answer[..offset].is_empty() || answer[..offset].ends_with('\n'));
+                last = offset;
+            }
+        }
+        assert_eq!(last, expected);
+        assert_eq!(expected, answer.len() - "end".len());
+    }
 
     #[test]
     fn a_long_draft_wraps_at_forty_columns_with_the_caret_on_the_right_row() {
