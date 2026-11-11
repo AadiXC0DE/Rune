@@ -345,6 +345,14 @@ fn run_ask(
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let jsonl = launch.has_flag("--jsonl");
+    let context_report = launch.has_flag("--context-report");
+    if context_report && !jsonl && !output.json {
+        return Err(RuneError::invalid_field(
+            "--context-report",
+            "--context-report needs --json or --jsonl",
+        )
+        .with_hint("add --json or --jsonl"));
+    }
     // Chosen now so the stream's first record can name the saved session.
     let session_id = (!launch.has_flag("--no-save")).then(rune_core::id::SessionId::generate);
     if jsonl {
@@ -441,6 +449,7 @@ fn run_ask(
         read_only: false,
         goal,
         judge,
+        context_report,
         images: launch
             .flags
             .iter()
@@ -527,6 +536,7 @@ fn run_review(
         read_only: true,
         goal: None,
         judge: false,
+        context_report: false,
         max_steps: None,
         timeout: None,
         max_cost_cents: None,

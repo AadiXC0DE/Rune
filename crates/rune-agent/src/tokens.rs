@@ -7,7 +7,9 @@
 
 use rune_core::budget::{Budget, BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
-use rune_net::message::ContentPart;
+use std::collections::BTreeMap;
+
+use rune_net::message::{ContentPart, Role};
 use rune_net::provider::{Provider, RequestPlan};
 use serde::{Deserialize, Serialize};
 
@@ -347,6 +349,211 @@ impl UsageTotals {
     }
 }
 
+/// Bytes of the instruction sections, recorded once when a host builds them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InstructionSizes {
+    /// The base system prompt and the tool guidance.
+    pub base: usize,
+    /// The skill catalog.
+    pub skill_catalog: usize,
+    /// Project instruction files.
+    pub project: usize,
+    /// The repository map.
+    pub map: usize,
+}
+
+/// The parts a [`ContextBreakdown`] reports.
+pub const CONTEXT_PARTS: [&str; 11] = [
+    "base_prompt",
+    "tool_schemas",
+    "skill_catalog",
+    "project_instructions",
+    "repository_map",
+    "user_messages",
+    "assistant_text",
+    "reasoning",
+    "tool_results",
+    "checkpoint",
+    "other",
+];
+
+/// Where the estimated tokens of one request go.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContextBreakdown {
+    /// The estimated input tokens of the request.
+    pub total_tokens: u64,
+    /// Whether the estimate was anchored on provider-reported usage.
+    pub anchored: bool,
+    /// The input-token level at which compaction is required, when the window is known.
+    pub ceiling_tokens: Option<u64>,
+    /// Tokens left under the ceiling, when the window is known.
+    pub free_tokens: Option<u64>,
+    /// Tokens by part; every key is present, zero when empty.
+    pub parts: BTreeMap<&'static str, u64>,
+    /// Tool result tokens by tool name.
+    pub tool_results: BTreeMap<String, u64>,
+}
+
+/// Bytes and images counted under one part.
+#[derive(Clone, Copy, Default)]
+struct Share {
+    bytes: u64,
+    images: u64,
+}
+
+/// Reports the estimated tokens of each part of a request.
+///
+/// Text tokens are shared out by bytes and each image costs [`IMAGE_TOKENS`]
+/// in the part that holds it, so the parts always sum to the estimate. Bytes
+/// nothing else claims, such as framing and the environment line, are `other`.
+pub fn context_breakdown(
+    dialect: &dyn Provider,
+    plan: &RequestPlan,
+    sizes: InstructionSizes,
+    anchor: Option<&Anchor>,
+    ceiling: Option<u64>,
+) -> Result<ContextBreakdown> {
+    let now = measure(dialect, plan)?;
+    let (total, anchored) = estimate_input(now, anchor, dialect.name(), &plan.model);
+
+    let mut parts: BTreeMap<&'static str, Share> = CONTEXT_PARTS
+        .iter()
+        .map(|key| (*key, Share::default()))
+        .collect();
+    let mut tools: BTreeMap<String, Share> = BTreeMap::new();
+    let mut add = |key: &'static str, bytes: u64, images: u64| {
+        let share = parts.entry(key).or_default();
+        share.bytes = share.bytes.saturating_add(bytes);
+        share.images = share.images.saturating_add(images);
+    };
+    add("base_prompt", sizes.base as u64, 0);
+    add("skill_catalog", sizes.skill_catalog as u64, 0);
+    add("project_instructions", sizes.project as u64, 0);
+    add("repository_map", sizes.map as u64, 0);
+    for spec in &plan.tools {
+        let bytes = serde_json::to_vec(spec)
+            .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+            .len() as u64;
+        add("tool_schemas", bytes, 0);
+    }
+    for message in &plan.messages {
+        let text_part = match message.role {
+            Role::System => "other",
+            Role::Assistant => "assistant_text",
+            Role::User
+                if message
+                    .parts
+                    .first()
+                    .and_then(ContentPart::as_text)
+                    .is_some_and(|text| text.starts_with(CHECKPOINT_TAG)) =>
+            {
+                "checkpoint"
+            }
+            Role::User | Role::Tool => "user_messages",
+        };
+        // A stored replay is what the dialect sends in place of the reasoning parts.
+        let replayed = message.role == Role::Assistant && message.replay.is_some();
+        if replayed {
+            add(
+                "reasoning",
+                message.replay.as_ref().map_or(0, String::len) as u64,
+                0,
+            );
+        }
+        let mut result_tool: Option<&str> = None;
+        for part in &message.parts {
+            match part {
+                // System messages are framing, counted in `other` by difference.
+                ContentPart::Text { .. } if message.role == Role::System => {}
+                ContentPart::Text { text } => add(text_part, text.len() as u64, 0),
+                ContentPart::Reasoning { text } if !replayed => {
+                    add("reasoning", text.len() as u64, 0);
+                }
+                ContentPart::Reasoning { .. } => {}
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => add(
+                    "assistant_text",
+                    name.len().saturating_add(arguments.len()) as u64,
+                    0,
+                ),
+                ContentPart::ToolResult { name, content, .. } => {
+                    let share = tools.entry(name.clone()).or_default();
+                    share.bytes = share.bytes.saturating_add(content.len() as u64);
+                    result_tool = Some(name);
+                }
+                ContentPart::Image { .. } => match result_tool {
+                    Some(name) => {
+                        let share = tools.entry(name.to_owned()).or_default();
+                        share.images = share.images.saturating_add(1);
+                    }
+                    None => add(text_part, 0, 1),
+                },
+            }
+        }
+    }
+    let counted = parts
+        .values()
+        .chain(tools.values())
+        .fold(0_u64, |sum, share| sum.saturating_add(share.bytes));
+    let other_bytes = now.text_bytes.saturating_sub(counted);
+    if let Some(share) = parts.get_mut("other") {
+        share.bytes = other_bytes;
+    }
+
+    let mut remaining = total;
+    let mut take = |tokens: u64| {
+        let tokens = tokens.min(remaining);
+        remaining = remaining.saturating_sub(tokens);
+        tokens
+    };
+    let image_tokens = |share: &Share| share.images.saturating_mul(IMAGE_TOKENS);
+    let images_total = parts
+        .values()
+        .chain(tools.values())
+        .fold(0_u64, |sum, share| sum.saturating_add(image_tokens(share)));
+    let text_tokens = total.saturating_sub(images_total);
+    let denominator = counted.saturating_add(other_bytes);
+    let text_share = |bytes: u64| -> u64 {
+        let share = u128::from(text_tokens)
+            .saturating_mul(u128::from(bytes))
+            .checked_div(u128::from(denominator))
+            .unwrap_or(0);
+        u64::try_from(share).unwrap_or(u64::MAX)
+    };
+
+    let mut tool_results = BTreeMap::new();
+    let mut results_sum = 0_u64;
+    for (name, share) in &tools {
+        let tokens = take(text_share(share.bytes).saturating_add(image_tokens(share)));
+        results_sum = results_sum.saturating_add(tokens);
+        tool_results.insert(name.clone(), tokens);
+    }
+    let mut report: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for (key, share) in &parts {
+        let tokens = match *key {
+            "tool_results" => results_sum,
+            "other" => 0,
+            _ => take(text_share(share.bytes).saturating_add(image_tokens(share))),
+        };
+        report.insert(*key, tokens);
+    }
+    // The other part takes its share and every rounding remainder.
+    report.insert("other", remaining);
+
+    Ok(ContextBreakdown {
+        total_tokens: total,
+        anchored,
+        ceiling_tokens: ceiling,
+        free_tokens: ceiling.map(|ceiling| ceiling.saturating_sub(total)),
+        parts: report,
+        tool_results,
+    })
+}
+
+/// The tag that opens a checkpoint message.
+const CHECKPOINT_TAG: &str = "<conversation-checkpoint>";
+
 /// Adds a reported count to a running total, preserving absence.
 fn add(total: Option<u64>, reported: Option<u64>) -> Option<u64> {
     match (total, reported) {
@@ -371,6 +578,185 @@ mod tests {
                 images: 0,
             },
         }
+    }
+
+    fn call_id(raw: &str) -> rune_core::id::ToolCallId {
+        rune_core::id::ToolCallId::new(raw).expect("id")
+    }
+
+    fn result(id: &str, name: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: call_id(id),
+            name: name.to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn tool_message(parts: Vec<ContentPart>) -> rune_net::message::Message {
+        rune_net::message::Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+            origin: None,
+        }
+    }
+
+    /// A plan with instructions, a tool, a user message, a call and its result.
+    fn sample_plan() -> RequestPlan {
+        let mut plan = RequestPlan::new("model-a");
+        plan.instructions = format!("{}\n\n{}", "b".repeat(400), "p".repeat(1_200));
+        plan.tools = vec![rune_core::tool::ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Reads a file.".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.messages = vec![
+            rune_net::message::Message::user("fix the failing test"),
+            rune_net::message::Message::assistant(vec![
+                ContentPart::Text {
+                    text: "Reading it.".to_owned(),
+                },
+                ContentPart::ToolCall {
+                    id: call_id("call-1"),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                },
+            ]),
+            tool_message(vec![result("call-1", "read_file", &"x".repeat(8_000))]),
+        ];
+        plan
+    }
+
+    fn sample_sizes() -> InstructionSizes {
+        InstructionSizes {
+            base: 400,
+            skill_catalog: 0,
+            project: 1_200,
+            map: 0,
+        }
+    }
+
+    fn sum(breakdown: &ContextBreakdown) -> u64 {
+        breakdown.parts.values().sum()
+    }
+
+    #[test]
+    fn the_parts_sum_to_the_total() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let plan = sample_plan();
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, Some(100_000)).expect("ok");
+        assert_eq!(breakdown.parts.len(), CONTEXT_PARTS.len());
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+        assert!(!breakdown.anchored);
+        assert!(breakdown.parts["base_prompt"] > 0, "{breakdown:?}");
+        assert!(breakdown.parts["project_instructions"] > breakdown.parts["base_prompt"]);
+        assert!(breakdown.parts["tool_schemas"] > 0);
+        assert!(breakdown.parts["user_messages"] > 0);
+        assert!(breakdown.parts["assistant_text"] > 0);
+        assert_eq!(breakdown.parts["checkpoint"], 0);
+        assert_eq!(
+            breakdown.free_tokens,
+            Some(100_000 - breakdown.total_tokens)
+        );
+
+        // An anchored total that no byte count explains still sums exactly.
+        let measured = measure(&provider, &plan).expect("measure");
+        let anchor = Anchor {
+            dialect: provider.name().to_owned(),
+            model: "model-a".to_owned(),
+            input_tokens: 4_321,
+            measure: measured,
+        };
+        let anchored =
+            context_breakdown(&provider, &plan, sample_sizes(), Some(&anchor), None).expect("ok");
+        assert!(anchored.anchored);
+        assert_eq!(anchored.total_tokens, 4_321);
+        assert_eq!(sum(&anchored), 4_321);
+    }
+
+    #[test]
+    fn a_checkpoint_is_counted_apart() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        plan.messages.insert(
+            0,
+            rune_net::message::Message::user(format!(
+                "<conversation-checkpoint>\n{}\n</conversation-checkpoint>",
+                "s".repeat(6_000)
+            )),
+        );
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        assert!(
+            breakdown.parts["checkpoint"] > breakdown.parts["user_messages"] * 10,
+            "{breakdown:?}"
+        );
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+    }
+
+    #[test]
+    fn tool_results_are_split_by_tool() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        plan.messages.push(tool_message(vec![result(
+            "call-2",
+            "bash",
+            &"y".repeat(2_000),
+        )]));
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        let read = breakdown.tool_results["read_file"];
+        let bash = breakdown.tool_results["bash"];
+        assert!(read > bash * 3, "{breakdown:?}");
+        assert!(bash > 0);
+        assert_eq!(breakdown.parts["tool_results"], read + bash);
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+    }
+
+    #[test]
+    fn an_unknown_window_has_no_free_space() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let breakdown =
+            context_breakdown(&provider, &sample_plan(), sample_sizes(), None, None).expect("ok");
+        assert_eq!(breakdown.ceiling_tokens, None);
+        assert_eq!(breakdown.free_tokens, None);
+        let json = serde_json::to_value(&breakdown).expect("json");
+        assert!(json["ceiling_tokens"].is_null());
+        assert!(json["free_tokens"].is_null());
+        let full = context_breakdown(&provider, &sample_plan(), sample_sizes(), None, Some(10))
+            .expect("ok");
+        assert_eq!(full.free_tokens, Some(0));
+    }
+
+    #[test]
+    fn an_image_counts_in_the_part_that_holds_it() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        let image = ContentPart::Image {
+            image: rune_net::message::ImageRef {
+                id: 7,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 300_000,
+            },
+        };
+        plan.messages.push(tool_message(vec![
+            result("call-2", "screenshot", "captured"),
+            image.clone(),
+        ]));
+        plan.messages
+            .push(rune_net::message::Message::user_parts(vec![image]));
+        plan.image_data.insert(7, "A".repeat(400_000).into());
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        assert!(
+            breakdown.tool_results["screenshot"] >= IMAGE_TOKENS,
+            "{breakdown:?}"
+        );
+        assert!(breakdown.parts["user_messages"] >= IMAGE_TOKENS);
+        assert!(breakdown.parts["other"] < IMAGE_TOKENS);
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
     }
 
     #[test]

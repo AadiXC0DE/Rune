@@ -238,6 +238,10 @@ pub const RUN: &[CommandSpec] = &[
                 "--judge",
                 "With --goal, check the result against the objective before finishing.",
             ),
+            flag(
+                "--context-report",
+                "Add a context object to the JSON result: the last request's estimated tokens by part.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,

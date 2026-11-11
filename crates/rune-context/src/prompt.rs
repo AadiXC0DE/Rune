@@ -324,6 +324,12 @@ pub fn base_instructions_split(
     config_root: &Utf8Path,
     limits: &BudgetSet,
 ) -> (String, usize) {
+    let prompt = base_prompt(workspace, config_root, limits);
+    (prompt.instructions, prompt.stable_len)
+}
+
+/// Builds the base instructions with the size of each section.
+pub fn base_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
     let home = rune_core::paths::home_directory();
     instructions_under(workspace, home.as_deref(), config_root, limits)
 }
@@ -390,7 +396,7 @@ fn instructions_under(
     home: Option<&Utf8Path>,
     config_root: &Utf8Path,
     limits: &BudgetSet,
-) -> (String, usize) {
+) -> Prompt {
     let skills = crate::skills::discover(workspace, home, config_root).unwrap_or_default();
     let project = crate::instructions::Options::new(workspace, home, config_root)
         .discover()
@@ -406,10 +412,15 @@ fn instructions_under(
         host_instructions: environment.as_deref(),
         project: &project,
     };
-    assemble(&inputs, limits).map_or_else(
-        |_| (system.to_owned(), 0),
-        |prompt| (prompt.instructions, prompt.stable_len),
-    )
+    assemble(&inputs, limits).unwrap_or_else(|_| Prompt {
+        instructions: system.to_owned(),
+        stable_len: 0,
+        included: vec![IncludedSection {
+            section: Section::System,
+            bytes: system.len(),
+        }],
+        omissions: Vec::new(),
+    })
 }
 
 /// Describes the machine a command will run on, in one line.
@@ -907,7 +918,7 @@ mod tests {
             &root.join("config"),
             &BudgetSet::new(),
         )
-        .0;
+        .instructions;
 
         assert!(text.contains("repository rules"), "{text}");
         assert!(text.contains("user-skill"), "{text}");
@@ -1114,11 +1125,25 @@ mod tests {
             std::fs::write(root.join("AGENTS.md"), file).expect("write");
             let config = root.join("config");
             std::fs::create_dir_all(&config).expect("config");
-            let (text, stable_len) = instructions_under(&root, None, &config, &BudgetSet::new());
-            assert!(stable_len < text.len());
-            text[..stable_len].to_owned()
+            let prompt = instructions_under(&root, None, &config, &BudgetSet::new());
+            assert!(prompt.stable_len < prompt.instructions.len());
+            prompt.instructions[..prompt.stable_len].to_owned()
         };
         assert_eq!(build("first rule"), build("a different rule"));
+    }
+
+    #[test]
+    fn the_base_prompt_reports_its_section_sizes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        std::fs::write(root.join("AGENTS.md"), "project rule").expect("write");
+        let config = root.join("config");
+        std::fs::create_dir_all(&config).expect("config");
+        let prompt = instructions_under(&root, None, &config, &BudgetSet::new());
+        assert_eq!(prompt.section_bytes(Section::System), SYSTEM_PROMPT.len());
+        let project = prompt.section_bytes(Section::ProjectContext);
+        assert!(project > "project rule".len(), "{prompt:?}");
+        assert!(prompt.instructions.len() > SYSTEM_PROMPT.len() + project);
     }
 
     #[test]

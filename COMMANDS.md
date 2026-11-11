@@ -51,6 +51,7 @@ Run one bounded turn without an interactive session
 | `--max-cost <usd>` | Stop the run once its estimated cost reaches this many dollars. |
 | `--goal <objective>` | Work toward this objective; it is added to the instructions. |
 | `--judge` | With --goal, check the result against the objective before finishing. |
+| `--context-report` | Add a context object to the JSON result: the last request's estimated tokens by part. |
 
 ```text
 Exit status:

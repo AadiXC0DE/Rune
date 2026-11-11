@@ -298,6 +298,12 @@ pub trait Host {
         0
     }
 
+    /// Returns the bytes of each instruction section, for a context breakdown;
+    /// all zero when the host does not record them.
+    fn instruction_sizes(&self) -> crate::tokens::InstructionSizes {
+        crate::tokens::InstructionSizes::default()
+    }
+
     /// Returns the registered tool's activity for event presentation.
     ///
     /// Hosts with a registry should return its declared activity. When none

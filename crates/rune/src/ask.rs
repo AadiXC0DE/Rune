@@ -108,6 +108,8 @@ pub struct Options {
     pub goal: Option<String>,
     /// Check the result against the objective before finishing.
     pub judge: bool,
+    /// Add the last request's estimated tokens by part to the JSON result.
+    pub context_report: bool,
 }
 
 /// Appended to the prompt of a run nobody can answer.
@@ -131,6 +133,21 @@ fn first_message(prompt: &str, tool_loop: bool, read_only: bool) -> String {
         RUN_CONTEXT
     };
     format!("{prompt}\n\n{note}")
+}
+
+/// The section sizes a context report needs, from the assembled base prompt.
+pub(crate) fn instruction_sizes(
+    prompt: &rune_context::prompt::Prompt,
+) -> rune_agent::tokens::InstructionSizes {
+    use rune_context::prompt::Section;
+    rune_agent::tokens::InstructionSizes {
+        base: prompt
+            .section_bytes(Section::System)
+            .saturating_add(prompt.section_bytes(Section::ToolGuidance)),
+        skill_catalog: prompt.section_bytes(Section::SkillCatalog),
+        project: prompt.section_bytes(Section::ProjectContext),
+        map: 0,
+    }
 }
 
 /// The limits instructions are built with, after the `map` experiment: `off`
@@ -567,6 +584,10 @@ pub struct JsonResult {
     /// prices of a cached model catalog. Absent when no price is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
+    /// The last request's estimated tokens by part, with `--context-report`.
+    /// Absent when no request was built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<rune_agent::tokens::ContextBreakdown>,
     /// Experiment keys that differ from the default, as `key=value` pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experiment: Option<String>,
@@ -663,6 +684,7 @@ impl JsonResult {
             repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
+            context: None,
             experiment: None,
             verification: None,
             tests_modified: None,
@@ -722,6 +744,12 @@ struct AskHost<'a> {
     tools: Vec<ToolSpec>,
     /// The instructions with the repository map, fixed for the run.
     mapped: rune_context::prompt::MappedInstructions,
+    /// Bytes of each section of `instructions`, without the map.
+    instruction_sizes: rune_agent::tokens::InstructionSizes,
+    /// The last request `prepare_request` finished, kept for `--context-report`.
+    last_plan: std::sync::Mutex<Option<rune_net::provider::RequestPlan>>,
+    /// Whether the run reports its context, so `last_plan` is kept.
+    context_report: bool,
     dialect: Box<dyn Provider>,
     endpoint: Endpoint,
     /// How requests to the endpoint are shaped, per model.
@@ -918,6 +946,21 @@ impl Host for AskHost<'_> {
         self.stable_instructions_len
     }
 
+    fn instruction_sizes(&self) -> rune_agent::tokens::InstructionSizes {
+        let base = &self.instructions;
+        let mapped = self.mapped.get(
+            base,
+            self.context.workspace(),
+            &map_limits(&self.limits, self.settings.experiments),
+        );
+        // The map follows the base after a blank line.
+        let map = mapped.len().saturating_sub(base.len().saturating_add(2));
+        rune_agent::tokens::InstructionSizes {
+            map,
+            ..self.instruction_sizes
+        }
+    }
+
     fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
         self.registry.activity(name)
     }
@@ -974,6 +1017,9 @@ impl Host for AskHost<'_> {
         let (_, encoded) =
             rune_agent::compaction::auto_compact_encoded(history, plan, self, client, self.window)?;
         *lock(&self.encoded_request) = Some(encoded);
+        if self.context_report {
+            *lock(&self.last_plan) = Some(plan.clone());
+        }
         Ok(())
     }
 
@@ -1493,11 +1539,14 @@ pub fn run(
     context
         .additional_roots
         .clone_from(&settings.additional_directories);
-    let (instructions, stable_instructions_len) = rune_context::prompt::base_instructions_split(
+    let base_prompt = rune_context::prompt::base_prompt(
         context.workspace(),
         &paths.config_root,
         &settings.limits,
     );
+    let instruction_sizes = instruction_sizes(&base_prompt);
+    let (instructions, stable_instructions_len) =
+        (base_prompt.instructions, base_prompt.stable_len);
     let mut tools = inventory::advertisement(&registry);
     if let Some(client) = &mcp {
         crate::mcp::append_tools(&mut tools, client)?;
@@ -1520,6 +1569,9 @@ pub fn run(
         stable_instructions_len,
         tools,
         mapped: rune_context::prompt::MappedInstructions::default(),
+        instruction_sizes,
+        last_plan: std::sync::Mutex::new(None),
+        context_report: options.context_report,
         dialect,
         endpoint,
         compat,
@@ -1767,6 +1819,16 @@ pub fn run(
             })
             .map(|cost| cost.saturating_add(helpers.other_models_cost))
             .map(rune_net::models_dev::dollars),
+        context: lock(&host.last_plan).take().and_then(|plan| {
+            rune_agent::tokens::context_breakdown(
+                host.dialect(),
+                &plan,
+                host.instruction_sizes(),
+                history.anchor(),
+                rune_agent::tokens::ceiling(host.window.0, &host.limits),
+            )
+            .ok()
+        }),
         experiment: Some(settings.experiments.render()).filter(|keys| !keys.is_empty()),
         verification: error.is_none().then(|| outcome.verification.as_str()),
         tests_modified: error.is_none().then(|| {
@@ -2460,6 +2522,7 @@ mod tests {
             repaired_calls: 0,
             narration: Vec::new(),
             cost_usd: None,
+            context: None,
             experiment: None,
             verification: Some("not_applicable"),
             tests_modified: Some(false),

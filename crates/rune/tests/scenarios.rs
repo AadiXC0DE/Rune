@@ -51,6 +51,7 @@ const SCENARIOS: &[&str] = &[
     "goal_without_judge",
     "goal_experiment_judge",
     "goal_judge_spend",
+    "context_report",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -79,6 +80,28 @@ fn run_scenario(name: &str) -> scenario::Report {
 #[test]
 fn fix_one_file() {
     run_scenario("fix_one_file");
+}
+
+#[test]
+fn context_report() {
+    let report = run_scenario("context_report");
+    let result = report.result.expect("a result");
+    let context = &result["context"];
+    assert!(
+        context["tool_results"]["read_file"].as_u64() > Some(0),
+        "{result}"
+    );
+    let parts = context["parts"].as_object().expect("parts");
+    assert_eq!(parts.len(), 11, "{context}");
+    let sum: u64 = parts.values().filter_map(serde_json::Value::as_u64).sum();
+    assert_eq!(Some(sum), context["total_tokens"].as_u64(), "{context}");
+    assert_eq!(context["anchored"], true, "{context}");
+    assert!(parts["base_prompt"].as_u64() > Some(0), "{context}");
+    assert!(parts["tool_schemas"].as_u64() > Some(0), "{context}");
+    // The key follows the cost on the wire.
+    let keys: Vec<&String> = result.as_object().expect("object").keys().collect();
+    let position = |key: &str| keys.iter().position(|name| *name == key);
+    assert!(position("context") > position("narration"), "{result}");
 }
 
 #[test]
