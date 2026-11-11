@@ -210,6 +210,107 @@ fn check_object_schema(schema: &Value) -> Result<()> {
     }
 }
 
+/// Checks call arguments against a tool's input schema, at the top level only.
+///
+/// Required properties must be present, a given property must have the
+/// top-level `type` its schema declares, and an unknown property is refused
+/// when `additionalProperties` is false. Anything deeper is the server's to
+/// judge. Every problem found is named in the returned reason.
+///
+/// # Errors
+///
+/// Returns the reason, as one line, when the arguments do not match.
+pub fn check_arguments(schema: &Value, arguments: &Value) -> std::result::Result<(), String> {
+    let Some(given) = arguments.as_object() else {
+        return Err("the arguments must be a JSON object".to_owned());
+    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let mut problems = Vec::new();
+    for name in schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !given.contains_key(name) {
+            problems.push(format!("missing required property `{name}`"));
+        }
+    }
+    let closed = schema.get("additionalProperties").and_then(Value::as_bool) == Some(false);
+    for (name, value) in given {
+        match properties.and_then(|known| known.get(name)) {
+            Some(property) => {
+                if let Some(expected) = property.get("type")
+                    && !type_matches(expected, value)
+                {
+                    problems.push(format!(
+                        "property `{name}` must be of type {}, not {}",
+                        compact_type(expected),
+                        json_type(value)
+                    ));
+                }
+            }
+            None if closed => problems.push(format!("unknown property `{name}`")),
+            None => {}
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Returns true when `value` has the type, or one of the types, declared.
+///
+/// An unrecognised type name matches anything, so a schema this check does not
+/// understand is left to the server.
+fn type_matches(expected: &Value, value: &Value) -> bool {
+    match expected {
+        Value::String(kind) => kind_matches(kind, value),
+        Value::Array(kinds) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kind| kind_matches(kind, value)),
+        _ => true,
+    }
+}
+
+fn kind_matches(kind: &str, value: &Value) -> bool {
+    match kind {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => {
+            value.is_i64()
+                || value.is_u64()
+                || value.as_f64().is_some_and(|number| number.fract() == 0.0)
+        }
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn compact_type(expected: &Value) -> String {
+    expected
+        .as_str()
+        .map_or_else(|| expected.to_string(), str::to_owned)
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +511,55 @@ mod tests {
             resolve_limit(LimitName::McpDescriptionBytes)
         );
         assert!(projected.description.ends_with(MARKER));
+    }
+
+    #[test]
+    fn check_arguments_reports_missing_and_mistyped_fields() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "count": { "type": "integer" },
+                "tags": { "type": ["array", "null"] },
+                "any": { "anyOf": [{ "type": "string" }, { "type": "number" }] }
+            },
+            "required": ["title", "count"],
+            "additionalProperties": false
+        });
+        assert_eq!(
+            check_arguments(&schema, &json!({ "title": "a", "count": 2 })),
+            Ok(())
+        );
+        assert_eq!(
+            check_arguments(
+                &schema,
+                &json!({ "title": "a", "count": 2.0, "tags": null, "any": true })
+            ),
+            Ok(()),
+            "an untyped property and a whole float are accepted"
+        );
+        let reason = check_arguments(&schema, &json!({ "count": "two" })).expect_err("refused");
+        assert!(
+            reason.contains("missing required property `title`"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("property `count` must be of type integer, not string"),
+            "{reason}"
+        );
+        let reason = check_arguments(&schema, &json!({ "title": "a", "count": 1, "tags": 3 }))
+            .expect_err("refused");
+        assert!(
+            reason.contains(r#"property `tags` must be of type ["array","null"], not number"#),
+            "{reason}"
+        );
+        let reason = check_arguments(&schema, &json!({ "title": "a", "count": 1, "extra": 1 }))
+            .expect_err("refused");
+        assert_eq!(reason, "unknown property `extra`");
+        assert!(check_arguments(&schema, &json!(["title"])).is_err());
+
+        let open = json!({ "type": "object", "properties": {} });
+        assert_eq!(check_arguments(&open, &json!({ "extra": 1 })), Ok(()));
     }
 
     #[test]

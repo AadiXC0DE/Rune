@@ -226,11 +226,19 @@ is blocked, disabled or skipped offline; an unknown name is an error. JSON adds
 a `check` object to each server entry. An empty workspace reports no servers
 and succeeds.
 
-Interactive sessions connect approved, enabled stdio and HTTP servers from `.mcp.json`
-once at startup. Their discovered schemas are advertised as
-`mcp_<server>_<tool>`, and each call still goes through tool permission checks.
+Interactive sessions and `rune ask` connect approved, enabled stdio and HTTP servers
+from `.mcp.json` once at startup (`rune review` connects none). When the combined
+schemas of the connected tools fit in 2,048 bytes they are advertised as
+`mcp_<server>_<tool>`. Larger catalogs are deferred: the model finds a tool with
+`capability_search`, which returns the schemas of the best matches, and calls it
+through `mcp_call`, so the tool list does not grow with the catalog. The
+`mcp_tools` setting (`auto`, `eager` or `deferred`) overrides that choice. Each
+call still goes through tool permission checks; a deferred call is checked as
+`mcp_call` with the target `mcp:<server>/<tool>`, and a rule written for the
+tool's own name still applies to it; the stricter answer wins.
 Full-access mode does not grant project startup trust. Optional startup failures
-appear as notices; a required server failure prevents the session from starting.
+appear as notices (warnings on standard error in `rune ask`); a required server
+failure prevents the session or run from starting.
 Startup and calls use the configured MCP timeouts. Ctrl-C cancels a pending
 stdio call, and exiting the session terminates its server process groups with a
 bounded termination grace. HTTP servers are skipped with `--offline`, including

@@ -200,6 +200,19 @@ impl EditToolSetting {
     }
 }
 
+/// How the tools of connected MCP servers reach the model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTools {
+    /// Eager while the combined schemas are small, deferred otherwise.
+    #[default]
+    Auto,
+    /// Every tool is advertised with its schema.
+    Eager,
+    /// Tools are found with `capability_search` and called through `mcp_call`.
+    Deferred,
+}
+
 impl fmt::Display for EditToolSetting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -477,6 +490,12 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_tool: Option<EditToolSetting>,
 
+    /// How MCP tools are offered: `auto` (advertised while their combined
+    /// schemas are small, otherwise found by search), `eager` or `deferred`.
+    /// Decided once when a session starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<McpTools>,
+
     /// Whether sandboxed shell commands may use the network. Off by default; offline mode overrules it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_network: Option<bool>,
@@ -699,6 +718,8 @@ pub struct Settings {
     pub web_tools: bool,
     /// Which file-edit tool models are offered.
     pub edit_tool: EditToolSetting,
+    /// How MCP tools are offered.
+    pub mcp_tools: McpTools,
     /// Switches for behaviour under measurement, from `RUNE_EXPERIMENT`.
     pub experiments: crate::experiment::Experiments,
     /// Whether sandboxed shell commands may use the network.
@@ -786,6 +807,7 @@ impl Default for Settings {
             post_tool_hook: None,
             web_tools: false,
             edit_tool: EditToolSetting::Auto,
+            mcp_tools: McpTools::Auto,
             experiments: crate::experiment::Experiments::default(),
             shell_network: false,
             sandbox_cache_roots: None,
@@ -1208,6 +1230,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "effort",
     "temperature",
     "edit_tool",
+    "mcp_tools",
     "fast_mode",
     "theme",
     "ascii",
@@ -1414,6 +1437,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(edit_tool) = user.edit_tool {
         settings.edit_tool = edit_tool;
         settings.sources.record("edit_tool", layer);
+    }
+    if let Some(mcp_tools) = user.mcp_tools {
+        settings.mcp_tools = mcp_tools;
+        settings.sources.record("mcp_tools", layer);
     }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
@@ -2436,6 +2463,31 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn mcp_tools_defaults_to_auto() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(load(None, None, &empty_env()).mcp_tools, McpTools::Auto);
+        for (text, expected) in [
+            ("auto", McpTools::Auto),
+            ("eager", McpTools::Eager),
+            ("deferred", McpTools::Deferred),
+        ] {
+            let user = write(&dir, "config.toml", &format!("mcp_tools = \"{text}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.mcp_tools, expected);
+            assert_eq!(settings.source_of("mcp_tools"), Layer::User);
+        }
+        let user = write(&dir, "config.toml", "mcp_tools = \"lazy\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(!settings.diagnostics.is_empty());
+        assert_eq!(settings.mcp_tools, McpTools::Auto);
     }
 
     #[test]

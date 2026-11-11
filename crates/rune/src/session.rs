@@ -62,6 +62,8 @@ pub struct SessionConfig {
     /// Tool registry.
     pub registry: Registry,
     subagent: Option<Arc<crate::subagent::Bridge>>,
+    /// The skill catalog the registry's search reads, for the MCP-aware one.
+    catalog: Arc<dyn rune_tools::skill::Catalog>,
     /// Rules in force.
     pub rules: RuleSet,
     /// Question bridge, enabled only while terminal input is being polled.
@@ -932,27 +934,13 @@ impl Host for SessionHost {
         if let Some(client) = &self.mcp
             && client.tools().iter().any(|tool| tool.name == name)
         {
-            self.cancellation.check()?;
-            self.context.check_cancelled()?;
-            let result = client.call_cancellable(name, arguments, &|| {
-                self.cancellation.is_cancelled() || self.context.is_cancelled()
-            });
-            self.cancellation.check()?;
-            self.context.check_cancelled()?;
-            return match result {
-                Ok(outcome) => Ok(ToolOutput {
-                    produced_bytes: outcome.text.len() as u64,
-                    text: outcome.text,
-                    is_error: outcome.is_error,
-                    plan_update: None,
-                    full_text: None,
-                    diff: None,
-                    image: None,
-                    check: None,
-                }),
-                Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
-                Err(error) => Ok(ToolOutput::from_error(&error)),
-            };
+            return crate::mcp::call_tool(
+                client,
+                name,
+                arguments,
+                &self.cancellation,
+                &self.context,
+            );
         }
         if name == "subagent"
             && let Some(subagent) = &self.subagent
@@ -1039,7 +1027,7 @@ impl Host for SessionHost {
     }
 
     fn decide_quietly(&self, name: &str, target: Option<&str>) -> Outcome {
-        turn::decide_call_in_workspace(
+        crate::mcp::decide_call(
             &lock_rules(&self.rules),
             self.mode(),
             name,
@@ -1067,7 +1055,7 @@ impl Host for SessionHost {
             return (decision.outcome, decision.explain());
         }
         let mode = self.mode();
-        let (outcome, reason) = turn::decide_call_in_workspace(
+        let (outcome, reason) = crate::mcp::decide_call(
             &lock_rules(&self.rules),
             mode,
             name,
@@ -2368,7 +2356,7 @@ impl SessionHost {
 ///
 /// Returns the exit code the process should use.
 pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
-    config: SessionConfig,
+    mut config: SessionConfig,
     input: R,
     output: W,
 ) -> Result<u8> {
@@ -2386,26 +2374,23 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let prompt = build_prompt(&config.workspace, &config.paths.config_root, &limits);
     let connection =
         crate::mcp::connect_interactive(&config.settings, &config.paths, &config.workspace)?;
-    let mut tools = inventory::advertisement(&config.registry);
     let (mcp, mcp_warnings) = match connection {
-        Some(connection) => {
-            for tool in connection.client.tools() {
-                if tools.iter().any(|existing| existing.name == tool.name) {
-                    return Err(RuneError::new(
-                        ErrorCode::AlreadyExists,
-                        format!("two tools are advertised as `{}`", tool.name),
-                    ));
-                }
-                tools.push(ToolSpec {
-                    name: tool.name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
-                });
-            }
-            (Some(connection.client), connection.warnings)
-        }
+        Some(connection) => (
+            crate::mcp::attach(
+                connection.client,
+                &config.settings,
+                &mut config.registry,
+                Arc::clone(&config.catalog),
+                config.questions.cancellation.clone(),
+            )?,
+            connection.warnings,
+        ),
         None => (None, Vec::new()),
     };
+    let mut tools = inventory::advertisement(&config.registry);
+    if let Some(client) = &mcp {
+        crate::mcp::append_tools(&mut tools, client)?;
+    }
 
     // A resumed session continues its stored conversation; a new one starts
     // empty and writes a fresh log.
@@ -6970,7 +6955,7 @@ pub fn prepare(
     let questions = Arc::new(TerminalQuestions::default());
     let rules = crate::permissions::validated(settings)?;
     let helper_usage = crate::helper_usage::HelperUsage::default();
-    let (registry, subagent) = session_registry(
+    let (registry, subagent, catalog) = session_registry(
         settings,
         paths,
         workspace,
@@ -6990,6 +6975,7 @@ pub fn prepare(
         dialect,
         registry,
         subagent: Some(subagent),
+        catalog,
         // The rules that ship with the harness, so a fresh install has a usable
         // starting point: reads and in-workspace edits proceed, outbound traffic
         // is refused, and an unknown command resolves to the mode's default
@@ -7011,7 +6997,7 @@ pub fn advertised_tools(
     let rules = crate::permissions::validated(settings)?;
     let questions = Arc::new(TerminalQuestions::default());
     let helper_usage = crate::helper_usage::HelperUsage::default();
-    let (registry, _) = session_registry(
+    let (registry, _, _) = session_registry(
         settings,
         paths,
         workspace,
@@ -7030,19 +7016,25 @@ fn session_registry(
     rules: &RuleSet,
     questions: &Arc<TerminalQuestions>,
     helper_usage: &crate::helper_usage::HelperUsage,
-) -> Result<(Registry, Arc<crate::subagent::Bridge>)> {
-    let catalog = rune_context::skills::discover(
-        workspace,
-        rune_core::paths::home_directory().as_deref(),
-        &paths.config_root,
-    )?;
+) -> Result<(
+    Registry,
+    Arc<crate::subagent::Bridge>,
+    Arc<dyn rune_tools::skill::Catalog>,
+)> {
+    let catalog: Arc<dyn rune_tools::skill::Catalog> = Arc::new(rune_tools::skill::Fixed::new(
+        rune_context::skills::discover(
+            workspace,
+            rune_core::paths::home_directory().as_deref(),
+            &paths.config_root,
+        )?,
+    ));
     let mut registry = inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         crate::web_client::backends(settings),
         questions.clone(),
-        Arc::new(rune_tools::skill::Fixed::new(catalog)),
+        Arc::clone(&catalog),
         crate::vision_client::backend(settings, paths, Some(helper_usage.clone()))?,
     )?;
     // Chosen once for the session, so the request prefix stays stable after `/model`.
@@ -7058,7 +7050,7 @@ fn session_registry(
     if let Some(text) = rune_tools::tool_text::from_env()? {
         registry.set_tool_text(text)?;
     }
-    Ok((registry, subagent))
+    Ok((registry, subagent, catalog))
 }
 
 #[cfg(test)]
@@ -12323,6 +12315,7 @@ mod tests {
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             registry: Registry::new(),
             subagent: None,
+            catalog: Arc::new(rune_tools::skill::Empty),
             rules: RuleSet::new(),
             questions: Arc::new(TerminalQuestions::default()),
         }

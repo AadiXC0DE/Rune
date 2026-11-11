@@ -327,7 +327,7 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `skill_description_bytes` | 256 | bytes | 0 to unbounded | Size of one skill description in the catalog. |
 | `skill_file_bytes` | 1048576 | bytes | 0 to unbounded | Largest skill file that may be loaded. |
 | `mcp_description_bytes` | 1024 | bytes | 0 to unbounded | Size of one MCP tool description. |
-| `mcp_search_result_bytes` | 16384 | bytes | 0 to unbounded | Size of MCP tool search results. |
+| `mcp_search_result_bytes` | 1048576 | bytes | 0 to unbounded | Bytes of one MCP server's tool listing read at connection. |
 | `mcp_server_instructions_bytes` | 2048 | bytes | 0 to unbounded | Instructions accepted from one MCP server. |
 | `mcp_selected_schema_bytes` | 65536 | bytes | 0 to unbounded | Schema size for one explicitly selected MCP tool. |
 | `project_instruction_file_bytes` | 65536 | bytes | 0 to unbounded | Size of one project instruction file. |

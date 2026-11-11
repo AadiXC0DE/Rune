@@ -399,7 +399,7 @@ impl LimitName {
             Self::SkillDescriptionBytes => Budget::Bounded(256),
             Self::SkillFileBytes => Budget::Bounded(1024 * 1024),
             Self::McpDescriptionBytes => Budget::Bounded(1024),
-            Self::McpSearchResultBytes => Budget::Bounded(16 * 1024),
+            Self::McpSearchResultBytes => Budget::Bounded(1024 * 1024),
             Self::McpServerInstructionsBytes => Budget::Bounded(2 * 1024),
             Self::McpSelectedSchemaBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionFileBytes => Budget::Bounded(64 * 1024),
@@ -558,7 +558,9 @@ impl LimitName {
             Self::SkillDescriptionBytes => "Size of one skill description in the catalog.",
             Self::SkillFileBytes => "Largest skill file that may be loaded.",
             Self::McpDescriptionBytes => "Size of one MCP tool description.",
-            Self::McpSearchResultBytes => "Size of MCP tool search results.",
+            Self::McpSearchResultBytes => {
+                "Bytes of one MCP server's tool listing read at connection."
+            }
             Self::McpServerInstructionsBytes => "Instructions accepted from one MCP server.",
             Self::McpSelectedSchemaBytes => "Schema size for one explicitly selected MCP tool.",
             Self::ProjectInstructionFileBytes => "Size of one project instruction file.",

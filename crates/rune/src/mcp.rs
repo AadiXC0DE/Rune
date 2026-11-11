@@ -4,15 +4,21 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
+use std::sync::Arc;
 
 use camino::Utf8Path;
-use rune_context::mcp::{Client, ServerConfig};
+use rune_agent::steering::Cancellation;
+use rune_context::mcp::{Client, ProjectedTool, ServerConfig};
 use rune_context::mcp_trust::{self, Decision};
 use rune_core::budget::LimitName;
-use rune_core::config::Settings;
+use rune_core::config::{McpTools, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
+use rune_core::tool::ToolSpec;
 use rune_policy::trust::{self, TrustStore, WorkspaceTrust};
+use rune_tools::mcp_tools::{McpCall, McpDirectory, McpEntry};
+use rune_tools::skill::{CapabilitySearch, Catalog};
+use rune_tools::{ExecutionContext, Registry, ToolOutput};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -125,6 +131,153 @@ pub fn connect_interactive(
         ));
     }
     Ok(Some(Connection { client, warnings }))
+}
+
+/// Combined schema bytes up to which `auto` advertises every MCP tool.
+pub const EAGER_SCHEMA_BYTES: usize = 2_048;
+
+/// Bytes the connected tools would add to every request, counted as the
+/// compact JSON of each name, description and schema.
+#[must_use]
+pub fn combined_schema_bytes(tools: &[ProjectedTool]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+            .to_string()
+            .len()
+        })
+        .sum()
+}
+
+/// Whether the connected tools are advertised one by one rather than found
+/// by search and called through `mcp_call`.
+#[must_use]
+pub fn is_eager(setting: McpTools, tools: &[ProjectedTool]) -> bool {
+    match setting {
+        McpTools::Eager => true,
+        McpTools::Deferred => false,
+        McpTools::Auto => combined_schema_bytes(tools) <= EAGER_SCHEMA_BYTES,
+    }
+}
+
+/// Offers the connected tools to the model, deciding once how.
+///
+/// Returns the client when its tools are advertised one by one, for the host
+/// to route them by name. Otherwise registers `mcp_call` and the MCP-aware
+/// `capability_search` over it and returns `None`; the registry then owns the
+/// client.
+pub fn attach(
+    client: Client,
+    settings: &Settings,
+    registry: &mut Registry,
+    catalog: Arc<dyn Catalog>,
+    cancellation: Cancellation,
+) -> Result<Option<Client>> {
+    if is_eager(settings.mcp_tools, &client.tools()) {
+        return Ok(Some(client));
+    }
+    let directory: Arc<dyn McpDirectory> = Arc::new(ClientDirectory(client, cancellation));
+    registry.insert(Box::new(McpCall::new(Arc::clone(&directory))))?;
+    registry.replace(Box::new(CapabilitySearch::with_mcp(
+        catalog,
+        directory,
+        settings.limits.get_usize(LimitName::McpSelectedSchemaBytes),
+    )));
+    Ok(None)
+}
+
+/// Appends every connected tool's schema to an advertisement.
+pub fn append_tools(tools: &mut Vec<ToolSpec>, client: &Client) -> Result<()> {
+    for tool in client.tools() {
+        if tools.iter().any(|existing| existing.name == tool.name) {
+            return Err(RuneError::new(
+                ErrorCode::AlreadyExists,
+                format!("two tools are advertised as `{}`", tool.name),
+            ));
+        }
+        tools.push(ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        });
+    }
+    Ok(())
+}
+
+/// Calls one tool by its advertised name, as a tool result.
+///
+/// Either flag stops the call: the run's, and the one of the context it runs in.
+pub fn call_tool(
+    client: &Client,
+    name: &str,
+    arguments: &Value,
+    cancellation: &Cancellation,
+    context: &ExecutionContext,
+) -> Result<ToolOutput> {
+    cancellation.check()?;
+    context.check_cancelled()?;
+    let result = client.call_cancellable(name, arguments, &|| {
+        cancellation.is_cancelled() || context.is_cancelled()
+    });
+    cancellation.check()?;
+    context.check_cancelled()?;
+    match result {
+        Ok(outcome) => Ok(ToolOutput {
+            produced_bytes: outcome.text.len() as u64,
+            text: outcome.text,
+            is_error: outcome.is_error,
+            plan_update: None,
+            full_text: None,
+            diff: None,
+            image: None,
+            check: None,
+        }),
+        Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
+        Err(error) => Ok(ToolOutput::from_error(&error)),
+    }
+}
+
+/// The tools of a live client, for `mcp_call` and the search, with the run's
+/// cancellation flag.
+pub struct ClientDirectory(pub Client, pub Cancellation);
+
+impl McpDirectory for ClientDirectory {
+    fn entries(&self) -> Vec<McpEntry> {
+        self.0
+            .tools()
+            .into_iter()
+            .map(|tool| McpEntry {
+                server: tool.server,
+                tool: tool.server_tool,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            })
+            .collect()
+    }
+
+    fn call(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: &Value,
+        context: &ExecutionContext,
+    ) -> Result<ToolOutput> {
+        let name = self
+            .0
+            .tools()
+            .into_iter()
+            .find(|projected| projected.server == server && projected.server_tool == tool)
+            .map(|projected| projected.name)
+            .ok_or_else(|| {
+                RuneError::new(ErrorCode::NotFound, format!("no MCP tool {server}/{tool}"))
+            })?;
+        call_tool(&self.0, &name, arguments, &self.1, context)
+    }
 }
 
 fn decision(trust: &TrustStore, workspace: &Utf8Path, name: &str) -> Decision {
@@ -525,4 +678,116 @@ fn redact(message: &str, secrets: &mut [String]) -> String {
     }
     // Keep untrusted diagnostics on one terminal line in the text view.
     message.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+/// Decides a call by the rules, holding a deferred `mcp_call` to any rule
+/// written for the tool's own name as well, so deferring a server never
+/// loosens what a user set. The stricter of the two answers wins.
+pub fn decide_call(
+    rules: &rune_policy::rules::RuleSet,
+    mode: rune_core::config::PermissionMode,
+    name: &str,
+    target: Option<&str>,
+    workspace: &Utf8Path,
+) -> (rune_policy::decision::Outcome, String) {
+    use rune_policy::decision::Outcome;
+    let decided = rune_agent::turn::decide_call_in_workspace(rules, mode, name, target, workspace);
+    let Some((server, tool)) = target
+        .filter(|_| name == "mcp_call")
+        .and_then(|target| target.strip_prefix("mcp:"))
+        .and_then(|target| target.split_once('/'))
+    else {
+        return decided;
+    };
+    let direct_name = rune_context::mcp::schema::wire_name(server, tool);
+    let fallback = rune_policy::decision::mode_default(mode);
+    if !rules
+        .evaluate_in_workspace(&direct_name, "", fallback, workspace)
+        .from_rule
+    {
+        return decided;
+    }
+    let direct =
+        rune_agent::turn::decide_call_in_workspace(rules, mode, &direct_name, None, workspace);
+    let rank = |outcome: Outcome| match outcome {
+        Outcome::Allow => 0,
+        Outcome::Ask => 1,
+        Outcome::Deny => 2,
+    };
+    if rank(direct.0) > rank(decided.0) {
+        direct
+    } else {
+        decided
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rule_for_the_direct_name_holds_a_deferred_call() {
+        use rune_core::config::PermissionMode;
+        use rune_policy::decision::{Layer, Outcome};
+        use rune_policy::rules::{Rule, RuleSet};
+        let workspace = Utf8Path::new("/tmp/rune-mcp-rules");
+        let mut rules = RuleSet::new();
+        rules.push(Rule::allow("mcp_call", "*", Layer::User));
+        rules.push(Rule::deny("mcp_github_delete_repo", "*", Layer::User));
+        let decide = |target: &str| {
+            decide_call(
+                &rules,
+                PermissionMode::Auto,
+                "mcp_call",
+                Some(target),
+                workspace,
+            )
+            .0
+        };
+        assert_eq!(decide("mcp:github/delete_repo"), Outcome::Deny);
+        // With no rule for the direct name, the rule for mcp_call stands.
+        assert_eq!(decide("mcp:github/list_issues"), Outcome::Allow);
+        // Other tools are decided as before.
+        assert_eq!(
+            decide_call(
+                &rules,
+                PermissionMode::Auto,
+                "mcp_github_delete_repo",
+                None,
+                workspace
+            )
+            .0,
+            Outcome::Deny
+        );
+    }
+
+    fn tool(server: &str, name: &str, schema_bytes: usize) -> ProjectedTool {
+        ProjectedTool {
+            name: format!("mcp_{server}_{name}"),
+            server: server.to_owned(),
+            server_tool: name.to_owned(),
+            description: String::new(),
+            input_schema: json!({ "type": "object", "description": "d".repeat(schema_bytes) }),
+        }
+    }
+
+    #[test]
+    fn the_mode_follows_the_setting_and_the_combined_schema_size() {
+        let small = [tool("one", "a", 850), tool("one", "b", 850)];
+        let combined = combined_schema_bytes(&small);
+        assert!((1_800..=2_048).contains(&combined), "{combined}");
+        assert!(is_eager(McpTools::Auto, &small));
+        assert!(!is_eager(McpTools::Deferred, &small));
+
+        let many: Vec<_> = (0..40)
+            .map(|index| tool("big", &format!("tool_{index}"), 40))
+            .collect();
+        assert!(combined_schema_bytes(&many) > EAGER_SCHEMA_BYTES);
+        assert!(!is_eager(McpTools::Auto, &many));
+
+        let huge = [tool("huge", "a", 200_000)];
+        assert!(is_eager(McpTools::Eager, &huge));
+        assert!(!is_eager(McpTools::Auto, &huge));
+        assert!(is_eager(McpTools::Auto, &[]));
+    }
 }

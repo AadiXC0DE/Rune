@@ -727,6 +727,8 @@ struct AskHost<'a> {
     /// How requests to the endpoint are shaped, per model.
     compat: crate::provider_setup::CompatSource,
     registry: Registry,
+    /// The connected MCP servers whose tools are advertised one by one.
+    mcp: Option<rune_context::mcp::Client>,
     /// Runs `subagent` calls; none for a review or a run without tools.
     subagent: Option<std::sync::Arc<crate::subagent::Bridge>>,
     read_only: bool,
@@ -1256,6 +1258,11 @@ impl Host for AskHost<'_> {
         arguments: &serde_json::Value,
         context: &ExecutionContext,
     ) -> Result<ToolOutput> {
+        if let Some(client) = &self.mcp
+            && client.tools().iter().any(|tool| tool.name == name)
+        {
+            return crate::mcp::call_tool(client, name, arguments, &self.cancellation, context);
+        }
         if name == "subagent"
             && let Some(subagent) = &self.subagent
         {
@@ -1278,7 +1285,7 @@ impl Host for AskHost<'_> {
             );
             return (decision.outcome, decision.explain());
         }
-        turn::decide_call_in_workspace(
+        crate::mcp::decide_call(
             &self.rules,
             self.settings.permission_mode,
             name,
@@ -1391,19 +1398,22 @@ pub fn run(
         .filter(|cap| *cap > 0);
     let rules = crate::permissions::validated(settings)?;
     let helper_usage = crate::helper_usage::HelperUsage::default();
-    let (registry, subagent) = if options.tool_loop {
-        let catalog = rune_context::skills::discover(
-            &crate::current_workspace()?,
-            rune_core::paths::home_directory().as_deref(),
-            &paths.config_root,
-        )?;
+    let cancellation = Cancellation::new();
+    let (registry, subagent, mcp) = if options.tool_loop {
+        let catalog: std::sync::Arc<dyn rune_tools::skill::Catalog> = std::sync::Arc::new(
+            rune_tools::skill::Fixed::new(rune_context::skills::discover(
+                &crate::current_workspace()?,
+                rune_core::paths::home_directory().as_deref(),
+                &paths.config_root,
+            )?),
+        );
         let mut registry = inventory::builtin_with_vision(
             &rune_tools::FileLimits::from_budget(&limits),
             &limits,
             &paths.managed_skills_dir(),
             crate::web_client::backends(settings),
             std::sync::Arc::new(rune_tools::ask_user::Unavailable),
-            std::sync::Arc::new(rune_tools::skill::Fixed::new(catalog)),
+            std::sync::Arc::clone(&catalog),
             crate::vision_client::backend(settings, paths, Some(helper_usage.clone()))?,
         )?;
         let workspace = crate::current_workspace()?;
@@ -1430,9 +1440,31 @@ pub fn run(
         if let Some(text) = rune_tools::tool_text::from_env()? {
             registry.set_tool_text(text)?;
         }
-        (registry, subagent)
+        // A review stays read-only, so it starts no server whose every call
+        // would be refused.
+        let connection = if options.read_only {
+            None
+        } else {
+            crate::mcp::connect_interactive(settings, paths, &workspace)?
+        };
+        let mcp = match connection {
+            Some(connection) => {
+                for warning in &connection.warnings {
+                    let _ = writeln!(std::io::stderr(), "warning: {warning}");
+                }
+                crate::mcp::attach(
+                    connection.client,
+                    settings,
+                    &mut registry,
+                    catalog,
+                    cancellation.clone(),
+                )?
+            }
+            None => None,
+        };
+        (registry, subagent, mcp)
     } else {
-        (Registry::new(), None)
+        (Registry::new(), None, None)
     };
     let mut history = History::new();
     let mut parts = vec![ContentPart::Text {
@@ -1466,7 +1498,10 @@ pub fn run(
         &paths.config_root,
         &settings.limits,
     );
-    let tools = inventory::advertisement(&registry);
+    let mut tools = inventory::advertisement(&registry);
+    if let Some(client) = &mcp {
+        crate::mcp::append_tools(&mut tools, client)?;
+    }
     let (goal, judge) = match &options.goal {
         Some(goal) => (Some(goal.clone()), options.judge),
         None if settings.experiments.goal_judge && options.tool_loop && !options.read_only => {
@@ -1489,12 +1524,13 @@ pub fn run(
         endpoint,
         compat,
         registry,
+        mcp,
         subagent,
         read_only: options.read_only,
         rules,
         context,
         steering: SteeringQueue::from_limits(&limits),
-        cancellation: Cancellation::new(),
+        cancellation,
         incomplete_tool_call: std::sync::atomic::AtomicBool::new(false),
         jsonl: options.jsonl,
         step: std::sync::atomic::AtomicU32::new(0),
