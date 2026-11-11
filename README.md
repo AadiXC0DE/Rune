@@ -778,6 +778,12 @@ so a team can ship a workflow with the code. Discovered project and user command
 appear alongside builtins in slash-command completion, with descriptions and
 argument hints. Up/Down selects a candidate; Tab or Enter completes a partial
 name. Enter on the complete name shows its expanded prompt for review.
+Arguments follow shell quoting, so `/fix "two words" three` passes two arguments.
+Files in `.claude/commands` load too. Of the frontmatter, `description`,
+`argument-hint` and `model` are honoured; `model` applies to the one turn the
+command prepares. Every other key, `` !`command` `` lines and `@file` references
+are ignored and never executed: they stay in the prompt as text, and `/help` and
+the first run of the command name what was ignored.
 Before each request of an interactive session or a `rune ask` run, Rune estimates
 the serialized input, including instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
