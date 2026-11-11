@@ -1322,10 +1322,7 @@ impl Host for SessionHost {
     ) -> (Outcome, String) {
         let preview = if name == "edit_file" {
             let pairs = edit_pairs(arguments);
-            let lines: Vec<(char, &str)> = pairs
-                .iter()
-                .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
-                .collect();
+            let lines = edit_changes(&pairs);
             // Plain text: the prompt measures its lines without escapes.
             rune_term::diff::render(
                 &lines,
@@ -3150,10 +3147,7 @@ impl SessionHost {
             let arguments: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_default();
             pairs = edit_pairs(&arguments);
-            pairs
-                .iter()
-                .flat_map(|(old, new)| rune_term::diff::changed_lines(old, new))
-                .collect()
+            edit_changes(&pairs)
         } else {
             return Vec::new();
         };
@@ -9693,6 +9687,21 @@ fn edit_pairs(arguments: &serde_json::Value) -> Vec<(String, String)> {
             .collect(),
         None => vec![(text(arguments, "old_string"), text(arguments, "new_string"))],
     }
+}
+
+/// The lines each replacement removes and adds, marked `-` and `+`, in the
+/// order of its hunks.
+fn edit_changes(pairs: &[(String, String)]) -> Vec<(char, &str)> {
+    pairs
+        .iter()
+        .flat_map(|(old, new)| rune_term::diff::hunks(old, new, 1))
+        .flat_map(|hunk| hunk.lines)
+        .filter_map(|line| match line.op {
+            rune_term::diff::Op::Removed => Some(('-', line.text)),
+            rune_term::diff::Op::Added => Some(('+', line.text)),
+            rune_term::diff::Op::Context => None,
+        })
+        .collect()
 }
 
 fn result_summary(name: &str, output: &ToolOutput, ascii: bool) -> String {
@@ -16732,6 +16741,17 @@ mod tests {
         assert!(shown.contains("- old line"), "{shown}");
         assert!(shown.contains("+ new line"), "{shown}");
         assert!(!shown.contains("keep too"), "{shown}");
+    }
+
+    #[test]
+    fn an_edit_preview_leaves_out_shared_lines_between_two_changes() {
+        let old = "first\nb\nc\nd\ne\nf\ng\nh\nlast";
+        let new = "FIRST\nb\nc\nd\ne\nf\ng\nh\nLAST";
+        let pairs = [(old.to_owned(), new.to_owned())];
+        assert_eq!(
+            edit_changes(&pairs),
+            [('-', "first"), ('+', "FIRST"), ('-', "last"), ('+', "LAST")]
+        );
     }
 
     #[test]
