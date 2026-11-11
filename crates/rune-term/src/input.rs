@@ -15,6 +15,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
+use crate::probe::Tri;
 
 /// Columns of the prompt marker until the session reports its layout.
 const DEFAULT_PROMPT_WIDTH: usize = 2;
@@ -206,6 +207,7 @@ pub struct KeyReader {
     prompt_width: usize,
     width: usize,
     menu_open: bool,
+    focus: Tri,
 }
 
 impl KeyReader {
@@ -241,6 +243,7 @@ impl KeyReader {
             prompt_width: DEFAULT_PROMPT_WIDTH,
             width: DEFAULT_WIDTH,
             menu_open: false,
+            focus: Tri::Unknown,
         }
     }
 
@@ -253,6 +256,7 @@ impl KeyReader {
             prompt_width: DEFAULT_PROMPT_WIDTH,
             width: DEFAULT_WIDTH,
             menu_open: false,
+            focus: Tri::Unknown,
         }
     }
 
@@ -265,6 +269,13 @@ impl KeyReader {
     /// Records whether a menu under the draft takes the vertical arrows.
     pub const fn set_menu_open(&mut self, open: bool) {
         self.menu_open = open;
+    }
+
+    /// Returns whether the terminal window has focus, as its last focus report
+    /// said: [`Tri::Unknown`] until one arrives.
+    #[must_use]
+    pub const fn focus(&self) -> Tri {
+        self.focus
     }
 
     /// Returns whether keys are being read directly.
@@ -418,11 +429,22 @@ impl KeyReader {
     }
 
     /// Polls viewer navigation, leaving the complete composer untouched.
-    pub fn poll_transcript(&self, timeout: Duration) -> Option<TranscriptAction> {
+    pub fn poll_transcript(&mut self, timeout: Duration) -> Option<TranscriptAction> {
         if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
             return None;
         }
-        crossterm::event::read().ok().as_ref().map(transcript_event)
+        let event = crossterm::event::read().ok()?;
+        self.note_focus(&event);
+        Some(transcript_event(&event))
+    }
+
+    /// Records a focus report.
+    const fn note_focus(&mut self, event: &Event) {
+        match event {
+            Event::FocusGained => self.focus = Tri::Yes,
+            Event::FocusLost => self.focus = Tri::No,
+            _ => {}
+        }
     }
 
     /// Applies one terminal event, returning `None` for one that is not input.
@@ -437,6 +459,11 @@ impl KeyReader {
             Event::Paste(text) => {
                 self.paste(&text);
                 Some(KeyAction::Ignored)
+            }
+            // A focus report is not input: it is recorded, never typed.
+            Event::FocusGained | Event::FocusLost => {
+                self.note_focus(&event);
+                None
             }
             _ => None,
         }
@@ -821,6 +848,23 @@ mod tests {
     }
 
     #[test]
+    fn focus_events_update_focus_and_are_not_keys() {
+        let mut reader = reader();
+        typed(&mut reader, "draft");
+        assert_eq!(reader.focus(), Tri::Unknown);
+        assert_eq!(reader.handle(Event::FocusLost), None);
+        assert_eq!(reader.focus(), Tri::No);
+        assert_eq!(reader.handle(Event::FocusGained), None);
+        assert_eq!(reader.focus(), Tri::Yes);
+        assert_eq!(reader.line(), "draft");
+        assert_eq!(reader.column(), 5);
+        // A key afterwards still edits the line and leaves focus as it was.
+        assert!(reader.handle(Event::Key(key(KeyCode::Char('s')))).is_some());
+        assert_eq!(reader.line(), "drafts");
+        assert_eq!(reader.focus(), Tri::Yes);
+    }
+
+    #[test]
     fn path_completion_preserves_unicode_suffix_and_is_one_undoable_edit() {
         let mut reader = reader();
         reader.replace("界 read fiOLD please e\u{301}");
@@ -975,6 +1019,7 @@ mod tests {
             prompt_width: DEFAULT_PROMPT_WIDTH,
             width: DEFAULT_WIDTH,
             menu_open: false,
+            focus: Tri::Unknown,
         }
     }
 

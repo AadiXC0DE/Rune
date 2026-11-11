@@ -710,6 +710,10 @@ pub struct UserConfig {
     /// Whether file targets are written as terminal hyperlinks: `auto`, `on`, or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlinks: Option<String>,
+    /// How the user is told a turn ended or input is needed while the
+    /// terminal is unfocused: `auto`, `bell`, or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
 
     /// Whether the window title shows the session and its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -952,6 +956,8 @@ pub struct Settings {
     pub reasoning: String,
     /// Terminal hyperlinks, `auto`, `on`, or `off`.
     pub hyperlinks: String,
+    /// Notifications while unfocused, `auto`, `bell`, or `off`.
+    pub notify: String,
     /// Whether the window title shows the session and its state.
     pub terminal_title: bool,
     /// Status row fields to show, highest priority first.
@@ -1032,6 +1038,7 @@ impl Default for Settings {
             motion: MOTION_VALUES[0].to_owned(),
             reasoning: REASONING_VALUES[0].to_owned(),
             hyperlinks: HYPERLINK_VALUES[0].to_owned(),
+            notify: NOTIFY_VALUES[0].to_owned(),
             terminal_title: true,
             statusline: STATUSLINE_FIELDS.map(str::to_owned).to_vec(),
             ascii: false,
@@ -1202,6 +1209,7 @@ impl Settings {
             ("motion", self.motion.clone()),
             ("reasoning", self.reasoning.clone()),
             ("hyperlinks", self.hyperlinks.clone()),
+            ("notify", self.notify.clone()),
             ("terminal_title", self.terminal_title.to_string()),
             ("statusline", listed(&self.statusline)),
             ("ascii", self.ascii.to_string()),
@@ -1512,6 +1520,8 @@ pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 pub const REASONING_VALUES: [&str; 3] = ["collapsed", "tail", "full"];
 /// The accepted `hyperlinks` values, the default first.
 pub const HYPERLINK_VALUES: [&str; 3] = ["auto", "on", "off"];
+/// The accepted `notify` values, the default first.
+pub const NOTIFY_VALUES: [&str; 3] = ["auto", "bell", "off"];
 
 /// The status row fields the `statusline` setting names, in the default order.
 pub const STATUSLINE_FIELDS: [&str; 12] = [
@@ -1552,6 +1562,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "motion",
     "reasoning",
     "hyperlinks",
+    "notify",
     "terminal_title",
     "statusline",
     "ascii",
@@ -1595,6 +1606,7 @@ pub const USER_KEYS: &[&str] = &[
     "motion",
     "reasoning",
     "hyperlinks",
+    "notify",
     "terminal_title",
     "statusline",
     "ascii",
@@ -1637,6 +1649,7 @@ pub const SCALAR_KEYS: &[&str] = &[
     "motion",
     "reasoning",
     "hyperlinks",
+    "notify",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1698,6 +1711,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         "motion" => ScalarKind::Choice(&MOTION_VALUES),
         "reasoning" => ScalarKind::Choice(&REASONING_VALUES),
         "hyperlinks" => ScalarKind::Choice(&HYPERLINK_VALUES),
+        "notify" => ScalarKind::Choice(&NOTIFY_VALUES),
         _ => ScalarKind::Text,
     })
 }
@@ -1821,6 +1835,10 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
     (
         "hyperlinks",
         "Link file targets in tool rows: auto, on or off.",
+    ),
+    (
+        "notify",
+        "Notify when a turn ends or input is needed while the terminal is unfocused: auto, bell or off.",
     ),
     (
         "terminal_title",
@@ -2521,6 +2539,22 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
                 )
                 .with_key("hyperlinks")
                 .with_hint("accepted values are auto, on, and off"),
+            );
+        }
+    }
+    if let Some(raw) = &user.notify {
+        let value = raw.trim().to_ascii_lowercase();
+        if NOTIFY_VALUES.contains(&value.as_str()) {
+            settings.notify = value;
+            settings.sources.record("notify", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    "notify must be auto, bell or off",
+                )
+                .with_key("notify"),
             );
         }
     }
@@ -3229,6 +3263,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "motion": settings.motion,
         "reasoning": settings.reasoning,
         "hyperlinks": settings.hyperlinks,
+        "notify": settings.notify,
         "terminal_title": settings.terminal_title,
         "statusline": settings.statusline,
         "ascii": settings.ascii,
@@ -5252,6 +5287,31 @@ max_agent_steps = 50
         assert!(settings.diagnostics.iter().any(|diagnostic| {
             diagnostic.key.as_deref() == Some("hyperlinks")
                 && diagnostic.code == ErrorCode::InvalidField
+        }));
+    }
+
+    #[test]
+    fn notify_setting_accepts_auto_bell_and_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().notify, "auto");
+        for (raw, expected) in [("auto", "auto"), ("Bell", "bell"), (" off ", "off")] {
+            let user = write(&dir, "config.toml", &format!("notify = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty(), "{raw}");
+            assert_eq!(settings.notify, expected);
+            assert_eq!(settings.source_of("notify"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["notify"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "notify = \"loud\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.notify, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("notify")
+                && diagnostic.code == ErrorCode::InvalidField
+                && diagnostic.message == "notify must be auto, bell or off"
         }));
     }
 

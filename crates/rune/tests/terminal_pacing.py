@@ -67,7 +67,8 @@ with tempfile.TemporaryDirectory(prefix="rune-pacing-") as directory:
     config = root / "config" / "rune"
     config.mkdir(parents=True, mode=0o700)
     config_file = config / "config.toml"
-    config_file.write_text("auto_upgrade = false\n")
+    # A long stream with no focus report would end in a bell; only frames are measured.
+    config_file.write_text("auto_upgrade = false\nnotify = \"off\"\n")
     config_file.chmod(0o600)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     server.daemon_threads = True
