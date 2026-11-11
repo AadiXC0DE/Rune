@@ -36,13 +36,20 @@ pub enum ApprovalOutcome {
     RunOnce,
     /// Run it and remember the scope for the rest of the session.
     RememberForSession,
+    /// Run it and save a rule that allows it in this project from now on.
+    AlwaysForProject,
     /// Do not run it.
     Deny,
 }
 
 impl ApprovalOutcome {
     /// Every outcome, in the order the prompt offers them.
-    pub const ALL: [Self; 3] = [Self::RunOnce, Self::RememberForSession, Self::Deny];
+    pub const ALL: [Self; 4] = [
+        Self::RunOnce,
+        Self::RememberForSession,
+        Self::AlwaysForProject,
+        Self::Deny,
+    ];
 
     /// Returns the wire representation.
     #[must_use]
@@ -50,6 +57,7 @@ impl ApprovalOutcome {
         match self {
             Self::RunOnce => "run_once",
             Self::RememberForSession => "remember_for_session",
+            Self::AlwaysForProject => "always_for_project",
             Self::Deny => "deny",
         }
     }
@@ -60,6 +68,7 @@ impl ApprovalOutcome {
         match self {
             Self::RunOnce => "Run once",
             Self::RememberForSession => "Remember for this session",
+            Self::AlwaysForProject => "Always allow in this project",
             Self::Deny => "Deny",
         }
     }
@@ -67,14 +76,14 @@ impl ApprovalOutcome {
     /// Returns true when the answer records a grant.
     #[must_use]
     pub const fn remembers(self) -> bool {
-        matches!(self, Self::RememberForSession)
+        matches!(self, Self::RememberForSession | Self::AlwaysForProject)
     }
 
     /// Applies the answer, recording a grant when the answer asks for one.
     pub fn apply(self, grants: &mut Grants, scope: &Scope) -> Outcome {
         match self {
             Self::RunOnce => Outcome::Allow,
-            Self::RememberForSession => {
+            Self::RememberForSession | Self::AlwaysForProject => {
                 grants.insert(scope.grant());
                 Outcome::Allow
             }
@@ -208,6 +217,18 @@ pub fn is_command_tool(tool: &str) -> bool {
     COMMAND_TOOLS.contains(&tool)
 }
 
+/// The pattern an "always allow in this project" answer saves: a safe prefix
+/// pattern for a command, or None when none may be saved, and the exact target
+/// for any other tool.
+#[must_use]
+pub fn project_pattern(tool: &str, target: &str) -> Option<String> {
+    if is_command_tool(tool) {
+        crate::command_pattern::pattern_for(target)
+    } else {
+        Some(target.to_owned())
+    }
+}
+
 /// The grants recorded for the current session.
 ///
 /// The list is not capped: the only way to add a grant is a person answering a
@@ -279,19 +300,30 @@ pub struct Prompt {
 
 impl Prompt {
     /// Builds the prompt for one scope.
+    ///
+    /// Saving a rule for the project is offered beside remembering for the
+    /// session, and for a command only when a safe pattern can be saved; its
+    /// label shows that pattern.
     #[must_use]
     pub fn new(scope: &Scope, decision: &Decision) -> Self {
+        let saved = project_pattern(scope.tool(), scope.target());
         Self {
             title: format!("Allow `{}` for the scope below?", scope.tool()),
             detail: scope.target().to_owned(),
             reason: decision.explain(),
             options: ApprovalOutcome::ALL
                 .iter()
+                .filter_map(|outcome| match outcome {
+                    ApprovalOutcome::AlwaysForProject => saved
+                        .as_ref()
+                        .map(|pattern| (format!("{}: {pattern}", outcome.label()), *outcome)),
+                    _ => Some((outcome.label().to_owned(), *outcome)),
+                })
                 .enumerate()
-                .map(|(position, outcome)| Choice {
+                .map(|(position, (label, outcome))| Choice {
                     index: u8::try_from(position.saturating_add(1)).unwrap_or(u8::MAX),
-                    label: outcome.label().to_owned(),
-                    outcome: *outcome,
+                    label,
+                    outcome,
                 })
                 .collect(),
         }
@@ -395,8 +427,58 @@ mod tests {
     }
 
     #[test]
+    fn always_for_project_is_offered_with_session_grants_only() {
+        let prompt = prompt_for("shell", "git status -s");
+        let labels: Vec<&str> = prompt
+            .options()
+            .iter()
+            .map(|choice| choice.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Run once",
+                "Remember for this session",
+                "Always allow in this project: git status*",
+                "Deny"
+            ]
+        );
+        assert_eq!(
+            prompt.choice(3).expect("third").outcome,
+            ApprovalOutcome::AlwaysForProject
+        );
+        assert_eq!(
+            ApprovalOutcome::AlwaysForProject.as_str(),
+            "always_for_project"
+        );
+        assert!(ApprovalOutcome::AlwaysForProject.remembers());
+        // No safe pattern for a command: the choice is not offered.
+        for target in [
+            "git -C x status",
+            "npm test && rm -rf x",
+            "sh -c 'npm test'",
+        ] {
+            let prompt = prompt_for("shell", target);
+            assert!(
+                prompt
+                    .options()
+                    .iter()
+                    .all(|choice| choice.outcome != ApprovalOutcome::AlwaysForProject),
+                "{target}"
+            );
+        }
+        // Another tool saves its exact target.
+        let prompt = prompt_for("write_file", "/outside/notes.md");
+        assert!(
+            prompt.options().iter().any(|choice| {
+                choice.label == "Always allow in this project: /outside/notes.md"
+            })
+        );
+    }
+
+    #[test]
     fn a_prompt_offers_exactly_three_labelled_choices() {
-        let prompt = prompt_for("shell", "npm test");
+        let prompt = prompt_for("shell", "npm test && npm run lint");
         let options = prompt.options();
         assert_eq!(options.len(), 3);
         assert_eq!(options[0].index, 1);
