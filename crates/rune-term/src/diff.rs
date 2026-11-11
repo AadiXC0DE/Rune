@@ -7,7 +7,7 @@
 //! without them draws the marks alone.
 
 use crate::transcript::sanitize;
-use crate::width::{str_width, truncate_to_width};
+use crate::width::{expand_tabs, str_width, truncate_to_width};
 
 /// Escape sequences for each kind of line; empty strings draw no colour.
 #[derive(Clone, Debug, Default)]
@@ -63,7 +63,7 @@ pub fn render(
         .iter()
         .take(max_lines)
         .map(|(mark, text)| {
-            let text = sanitize(&text.replace('\t', "    "));
+            let text = sanitize(&expand_tabs(text));
             let shown = if str_width(&text) > room {
                 let (cut, _) = truncate_to_width(&text, room.saturating_sub(str_width(ellipsis)));
                 format!("{cut}{ellipsis}")
@@ -119,5 +119,19 @@ mod tests {
         assert_eq!(out[0], "    <r>- one</>");
         assert_eq!(out[1], "    <g>+ two two two...</>");
         assert_eq!(out[2], "    <d>... 1 more changed line</>");
+    }
+
+    #[test]
+    fn a_tab_in_a_changed_line_expands_to_the_next_stop() {
+        let lines = [('+', "\tx"), ('-', "abc\ty")];
+        let style = DiffStyle {
+            added: "<g>".to_owned(),
+            removed: "<r>".to_owned(),
+            dim: "<d>".to_owned(),
+            reset: "</>".to_owned(),
+        };
+        let out = render(&lines, &style, 2, 40, true);
+        assert_eq!(out[0], "    <g>+         x</>");
+        assert_eq!(out[1], "    <r>- abc     y</>");
     }
 }

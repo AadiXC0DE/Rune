@@ -560,6 +560,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_tool_calls: Option<bool>,
 
+    /// Columns an East Asian ambiguous character occupies, 1 or 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguous_width: Option<i64>,
+
     /// Whether session titles are generated from the first prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_titles: Option<bool>,
@@ -768,6 +772,8 @@ pub struct Settings {
     pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,
+    /// Columns an East Asian ambiguous character occupies, 1 or 2.
+    pub ambiguous_width: u8,
     /// Whether session titles are generated.
     pub session_titles: bool,
     /// Whether project context is loaded.
@@ -827,6 +833,7 @@ impl Default for Settings {
             auto_upgrade: true,
             offline: false,
             collapse_tool_calls: false,
+            ambiguous_width: 1,
             session_titles: true,
             context: true,
             additional_directories: Vec::new(),
@@ -999,6 +1006,7 @@ impl Settings {
             ),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
+            ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
             ("context", self.context.to_string()),
             ("provider_strict", self.provider_strict.to_string()),
@@ -1237,6 +1245,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "auto_upgrade",
     "offline",
     "collapse_tool_calls",
+    "ambiguous_width",
     "session_titles",
     "additional_directories",
     "review_model",
@@ -1549,6 +1558,22 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(collapse) = user.collapse_tool_calls {
         settings.collapse_tool_calls = collapse;
         settings.sources.record("collapse_tool_calls", layer);
+    }
+    if let Some(columns) = user.ambiguous_width {
+        match u8::try_from(columns) {
+            Ok(columns @ (1 | 2)) => {
+                settings.ambiguous_width = columns;
+                settings.sources.record("ambiguous_width", layer);
+            }
+            _ => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    "ambiguous_width must be 1 or 2",
+                )
+                .with_key("ambiguous_width"),
+            ),
+        }
     }
     if let Some(titles) = user.session_titles {
         settings.session_titles = titles;
@@ -2191,6 +2216,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
+        "ambiguous_width": settings.ambiguous_width,
         "session_titles": settings.session_titles,
         "additional_directories": settings.additional_directories,
         "provider_order": settings.provider_order,
@@ -2954,6 +2980,48 @@ max_agent_steps = 50
         assert_eq!(settings.diagnostics.len(), 1);
         assert_eq!(settings.diagnostics[0].layer, Layer::User);
         assert_eq!(settings.permission_mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn ambiguous_width_accepts_one_or_two_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = load(None, None, &empty_env());
+        assert_eq!(settings.ambiguous_width, 1);
+        assert_eq!(settings.source_of("ambiguous_width"), Layer::Default);
+        for (body, expected) in [("ambiguous_width = 1\n", 1), ("ambiguous_width = 2\n", 2)] {
+            let user = write(&dir, "config.toml", body);
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.ambiguous_width, expected);
+            assert_eq!(settings.source_of("ambiguous_width"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["ambiguous_width"],
+                expected
+            );
+        }
+        for body in [
+            "ambiguous_width = 0\n",
+            "ambiguous_width = 3\n",
+            "ambiguous_width = -2\n",
+            "ambiguous_width = 258\n",
+        ] {
+            let user = write(&dir, "config.toml", body);
+            let settings = load(None, Some(&user), &empty_env());
+            assert_eq!(settings.ambiguous_width, 1, "{body}");
+            assert_eq!(settings.diagnostics.len(), 1, "{body}");
+            assert_eq!(settings.diagnostics[0].code, ErrorCode::InvalidField);
+            assert_eq!(
+                settings.diagnostics[0].message,
+                "ambiguous_width must be 1 or 2"
+            );
+        }
+        let project = write(&dir, ".rune.toml", "ambiguous_width = 2\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.ambiguous_width, 1);
     }
 
     #[test]

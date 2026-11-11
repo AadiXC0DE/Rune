@@ -2360,6 +2360,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     input: R,
     output: W,
 ) -> Result<u8> {
+    // Every width measured from here on, the first frame included, has to agree
+    // with how the terminal draws ambiguous characters.
+    rune_term::width::set_ambiguous_width(config.settings.ambiguous_width);
     let mut limits = config.settings.limits.clone();
     let model_limits = crate::model_limits::resolve(
         &config.settings,
