@@ -17,6 +17,16 @@ const MEASUREMENT_SAMPLES: usize = 31;
 
 /// Enforced release budget ceilings, distinct from measured build results.
 mod targets {
+    /// Scripted sessions replayed for prompt cache discipline, with the prefix
+    /// breaks each is expected to show.
+    pub const CACHE_SCENARIOS: &[(&str, usize)] = &[
+        ("cache_long_ask", 0),
+        ("nested_rules", 0),
+        ("cache_skill", 0),
+        ("cache_edited_agents", 0),
+        ("cache_one_checkpoint", 1),
+    ];
+
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -191,6 +201,10 @@ fn print_budget_help() {
     println!(
         "  request, total request bytes, request count and prefix breaks are checked against ceilings."
     );
+    println!(
+        "  Cache scenarios are replayed against the release binary; any prefix break beyond the"
+    );
+    println!("  expected count fails.");
 }
 
 /// The per-commit loop: format, lint, test.
@@ -874,6 +888,7 @@ fn budget() -> Result<(), String> {
     check_prompt(&binary)?;
     check_tools(&binary)?;
     check_scripted_session(&binary)?;
+    check_cache_scenarios(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
 }
@@ -966,6 +981,55 @@ fn check_scripted_session(binary: &Path) -> Result<(), String> {
     } else {
         Err(failures.join("; "))
     }
+}
+
+/// Replays the cache scenarios and fails on any prefix break beyond the
+/// expected count, or on a scenario that fails for another reason.
+fn check_cache_scenarios(binary: &Path) -> Result<(), String> {
+    let directory = workspace_root()?.join("crates/rune/tests/scenarios");
+    let mut results = Vec::new();
+    let mut other = Vec::new();
+    for (name, expected) in targets::CACHE_SCENARIOS {
+        let scenario = rune_testkit::scenario::load(&directory.join(format!("{name}.json")))?;
+        let report = rune_testkit::scenario::run(binary, &scenario);
+        // A wrong break count is reported by the count, not twice.
+        let failures: Vec<String> = rune_testkit::scenario::check(&scenario, &report)
+            .into_iter()
+            .filter(|failure| !failure.starts_with("prefix_breaks"))
+            .collect();
+        if !failures.is_empty() {
+            other.push(format!("cache scenario {name}: {}", failures.join("; ")));
+        }
+        results.push((*name, report.prefix_breaks, *expected));
+    }
+    let breaks: usize = results.iter().map(|(_, actual, _)| actual).sum();
+    let expected: usize = results.iter().map(|(_, _, expected)| expected).sum();
+    let unexpected: usize = results
+        .iter()
+        .map(|(_, actual, expected)| actual.abs_diff(*expected))
+        .sum();
+    println!(
+        "cache scenarios   {} run, {breaks} prefix breaks ({expected} expected), {unexpected} unexpected",
+        results.len()
+    );
+    let mut failures = cache_failures(&results);
+    failures.extend(other);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Names each scenario whose prefix breaks differ from the expected count.
+fn cache_failures(results: &[(&str, usize, usize)]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|(_, actual, expected)| actual != expected)
+        .map(|(name, actual, expected)| {
+            format!("cache scenario {name}: {actual} prefix breaks, expected {expected}")
+        })
+        .collect()
 }
 
 /// Returns the length of `body` with every path in `paths` replaced by `<workspace>`.
@@ -1648,9 +1712,23 @@ fn check_duplicate_dependencies() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn cache_failures_name_each_mismatch() {
+        let results = [("a", 0, 0), ("b", 2, 1), ("c", 0, 1)];
+        assert_eq!(
+            cache_failures(&results),
+            vec![
+                "cache scenario b: 2 prefix breaks, expected 1".to_owned(),
+                "cache scenario c: 0 prefix breaks, expected 1".to_owned(),
+            ]
+        );
+        assert!(cache_failures(&[("a", 1, 1)]).is_empty());
+    }
 
     #[test]
     fn the_perf_gate_allows_25_percent_and_fails_above() {

@@ -743,6 +743,8 @@ struct AskHost<'a> {
     stable_instructions_len: usize,
     /// Instruction files below the workspace root, sent on first touch.
     nested_rules: Vec<rune_context::InstructionFile>,
+    /// The instruction files the prompt was built from, to notice edits.
+    watched: std::sync::Mutex<crate::context_watch::Watched>,
     /// The tools offered, fixed for the run so the prefix never moves.
     tools: Vec<ToolSpec>,
     /// The instructions with the repository map, fixed for the run.
@@ -954,13 +956,29 @@ impl Host for AskHost<'_> {
         history: &History,
         results: &[turn::CallResult],
     ) -> Option<turn::Appendix> {
-        crate::context_watch::scoped_rules(
+        let workspace = self.context.workspace();
+        let lines: Vec<String> = lock(&self.watched)
+            .file_changes(workspace)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
+        let mut appendix = crate::context_watch::scoped_rules(
             history,
             results,
             &self.nested_rules,
-            self.context.workspace(),
+            workspace,
             &self.settings.limits,
         )
+        .unwrap_or_default();
+        if !lines.is_empty() {
+            let update = turn::context_update(&lines);
+            appendix.text = if appendix.text.is_empty() {
+                update
+            } else {
+                format!("{update}\n{}", appendix.text)
+            };
+        }
+        (!appendix.text.is_empty()).then_some(appendix)
     }
 
     fn instruction_sizes(&self) -> rune_agent::tokens::InstructionSizes {
@@ -1609,6 +1627,10 @@ pub fn run(
         instructions,
         stable_instructions_len,
         nested_rules,
+        watched: std::sync::Mutex::new(crate::context_watch::Watched::of(
+            context.workspace(),
+            &paths.config_root,
+        )),
         tools,
         mapped: rune_context::prompt::MappedInstructions::default(),
         instruction_sizes,

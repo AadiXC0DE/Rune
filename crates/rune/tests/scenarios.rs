@@ -47,6 +47,10 @@ const SCENARIOS: &[&str] = &[
     "stall_same_file",
     "checkpoint_same_prefix",
     "nested_rules",
+    "cache_long_ask",
+    "cache_skill",
+    "cache_edited_agents",
+    "cache_one_checkpoint",
     "goal_judge_continue",
     "goal_judge_same_reason",
     "goal_without_judge",
@@ -123,6 +127,26 @@ fn the_tool_list_is_byte_identical_across_runs() {
     assert_eq!(first.len(), 4);
     assert!(first.iter().all(|list| *list == first[0]));
     assert_eq!(first, second);
+}
+
+#[test]
+fn cache_long_ask() {
+    run_scenario("cache_long_ask");
+}
+
+#[test]
+fn cache_skill() {
+    run_scenario("cache_skill");
+}
+
+#[test]
+fn cache_edited_agents() {
+    run_scenario("cache_edited_agents");
+}
+
+#[test]
+fn cache_one_checkpoint() {
+    run_scenario("cache_one_checkpoint");
 }
 
 #[test]
