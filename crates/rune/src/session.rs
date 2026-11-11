@@ -14915,9 +14915,9 @@ mod tests {
         assert!(root.join("directory").is_dir());
     }
 
-    #[cfg(unix)]
     /// A host whose workspace is a git repository with checkpoints on.
     /// None when git is not installed.
+    #[cfg(unix)]
     fn checkpointed_host() -> Option<(tempfile::TempDir, Utf8PathBuf, SessionHost)> {
         let present = std::process::Command::new("git")
             .args(["--version"])
@@ -14960,6 +14960,7 @@ mod tests {
     }
 
     /// Runs one turn whose work is `change`, with both boundary snapshots.
+    #[cfg(unix)]
     fn checkpointed_turn(host: &SessionHost, turn: u64, change: impl FnOnce()) {
         let checkpoints = host.checkpoints.as_ref().expect("checkpoints");
         checkpoints.turn_started(turn);
@@ -14969,6 +14970,7 @@ mod tests {
         assert!(checkpoints.wait_idle(std::time::Duration::from_secs(30)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn undo_reports_outside_changes_and_writes_nothing() {
         let Some((_root, workspace, host)) = checkpointed_host() else {
@@ -15012,6 +15014,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn undo_then_redo_round_trips() {
         let Some((_root, workspace, host)) = checkpointed_host() else {
@@ -15070,6 +15073,7 @@ mod tests {
         assert_eq!(none, vec!["nothing to redo".to_owned()]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_pushes_a_context_update() {
         let Some((_root, workspace, host)) = checkpointed_host() else {
@@ -15116,6 +15120,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoints_off_create_no_store() {
         let present = std::process::Command::new("git")
