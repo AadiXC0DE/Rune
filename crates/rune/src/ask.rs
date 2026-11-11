@@ -1143,6 +1143,10 @@ impl Host for AskHost<'_> {
         })
     }
 
+    fn journal(&self, entry: &turn::JournalEntry) {
+        self.log(|log| log.append(vec![crate::session_log::journal_event(entry)]));
+    }
+
     fn observe_response(&self, outcome: &StreamOutcome) {
         self.add_spend(&outcome.usage);
         self.log(|log| log.response(outcome));
@@ -1655,6 +1659,19 @@ pub fn run(
     {
         let _ = writeln!(std::io::stderr(), "warning: {notice}");
     }
+    // The session log keeps the user's prompt; the run note is journaled apart.
+    if options.tool_loop && settings.experiments.run_note {
+        let note = if options.read_only {
+            REVIEW_RUN_CONTEXT
+        } else {
+            RUN_CONTEXT
+        };
+        host.journal(&turn::JournalEntry::Note {
+            at: 0,
+            placement: turn::NotePlacement::PromptSuffix,
+            text: note.to_owned(),
+        });
+    }
     let watchdog = options.timeout.map(|limit| {
         Watchdog::start(
             limit,
@@ -2090,22 +2107,7 @@ impl LiveLog {
 
     /// Records a completed response and its usage.
     fn response(&self, outcome: &StreamOutcome) -> Result<()> {
-        let mut parts = Vec::new();
-        let text = outcome.text();
-        if !text.is_empty() {
-            parts.push(ContentPart::Text { text });
-        }
-        let reasoning = outcome.reasoning();
-        if !reasoning.is_empty() {
-            parts.push(ContentPart::Reasoning { text: reasoning });
-        }
-        for (id, name, arguments) in outcome.tool_calls() {
-            parts.push(ContentPart::ToolCall {
-                id: rune_core::id::ToolCallId::new(id)?,
-                name,
-                arguments,
-            });
-        }
+        let (parts, _) = turn::assistant_parts(outcome);
         let mut message = rune_agent::history::Turn::assistant(0, parts);
         message.replay.clone_from(&outcome.replay);
         if !message.parts.is_empty() {

@@ -451,7 +451,7 @@ impl History {
     }
 
     /// Records that `key` was delivered on the turn `seq`.
-    pub(crate) fn mark_delivered(&mut self, key: String, seq: u64) {
+    pub fn mark_delivered(&mut self, key: String, seq: u64) {
         self.delivered.insert(key, seq);
     }
 
@@ -921,6 +921,108 @@ impl History {
     }
 }
 
+/// Journal entries waiting for the rebuilt history to reach their position.
+#[derive(Default, Debug)]
+pub struct JournalQueue {
+    entries: std::collections::VecDeque<crate::turn::JournalEntry>,
+}
+
+impl JournalQueue {
+    /// Queues an entry read from the journal.
+    pub fn push(&mut self, entry: crate::turn::JournalEntry) {
+        self.entries.push_back(entry);
+    }
+
+    /// Applies every entry, front first, whose `at` equals `history.len()`.
+    ///
+    /// A note joined to a user turn applies once that turn is in, at
+    /// `history.len() == at + 1`. An entry whose position the history has
+    /// already passed can never apply and is dropped.
+    pub fn apply_ready(&mut self, history: &mut History) {
+        use crate::turn::{JournalEntry, NotePlacement};
+        while let Some(entry) = self.entries.front() {
+            let len = u64::try_from(history.len()).unwrap_or(u64::MAX);
+            let ready = match entry {
+                JournalEntry::Note {
+                    at,
+                    placement:
+                        NotePlacement::PromptPrefix
+                        | NotePlacement::PromptSuffix
+                        | NotePlacement::UserPart,
+                    ..
+                } => at.saturating_add(1),
+                JournalEntry::Note { at, .. }
+                | JournalEntry::Checkpoint { at, .. }
+                | JournalEntry::ResultReplaced { at, .. } => *at,
+            };
+            if ready > len {
+                break;
+            }
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            if ready < len {
+                continue;
+            }
+            match entry {
+                JournalEntry::Note {
+                    placement, text, ..
+                } => history.apply_note(placement, text),
+                JournalEntry::Checkpoint {
+                    through, message, ..
+                } => history.replace_with_summary(message, through.saturating_add(1)),
+                JournalEntry::ResultReplaced {
+                    call_id, content, ..
+                } => {
+                    history.replace_result(&call_id, content);
+                }
+            }
+        }
+    }
+}
+
+impl History {
+    /// Puts a journaled note where it entered the conversation.
+    fn apply_note(&mut self, placement: crate::turn::NotePlacement, text: String) {
+        use crate::turn::NotePlacement;
+        match placement {
+            NotePlacement::UserTurn => {
+                self.push_user(text);
+            }
+            NotePlacement::AssistantTurn => {
+                self.push_assistant(vec![ContentPart::Text { text }]);
+            }
+            NotePlacement::UserPart => {
+                if let Some(turn) = self.turns.last_mut()
+                    && turn.role == Role::User
+                {
+                    turn.parts.push(ContentPart::Text { text });
+                }
+            }
+            NotePlacement::PromptPrefix | NotePlacement::PromptSuffix => {
+                let Some(turn) = self.turns.last_mut() else {
+                    return;
+                };
+                if turn.role != Role::User {
+                    return;
+                }
+                let Some(ContentPart::Text { text: prompt }) = turn
+                    .parts
+                    .iter_mut()
+                    .find(|part| matches!(part, ContentPart::Text { .. }))
+                else {
+                    return;
+                };
+                *prompt = if placement == NotePlacement::PromptPrefix {
+                    format!("{text}\n\n{prompt}")
+                } else {
+                    format!("{prompt}\n\n{text}")
+                };
+            }
+        }
+    }
+}
+
 /// Builds the error used when a history cannot form a valid request.
 #[must_use]
 pub fn invalid_history(err: &RuneError) -> RuneError {
@@ -934,6 +1036,102 @@ pub fn invalid_history(err: &RuneError) -> RuneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_journal_queue_applies_entries_at_their_position() {
+        use crate::turn::{JournalEntry, NotePlacement};
+        type Push<'a> = Box<dyn Fn(&mut History) + 'a>;
+        let call = ContentPart::ToolCall {
+            id: ToolCallId::new("c1").expect("id"),
+            name: "read_file".to_owned(),
+            arguments: "{}".to_owned(),
+        };
+        let result = ContentPart::ToolResult {
+            id: ToolCallId::new("c1").expect("id"),
+            name: "read_file".to_owned(),
+            content: "the whole file".to_owned(),
+            is_error: false,
+        };
+        let text = |text: &str| {
+            vec![ContentPart::Text {
+                text: text.to_owned(),
+            }]
+        };
+
+        // Built live, as the turn loop and the host change it.
+        let mut live = History::new();
+        live.push_user("PLAN\n\nfirst");
+        live.push_assistant(vec![call.clone()]);
+        live.push_tool_results(vec![result.clone()]);
+        live.push_assistant(text("done"));
+        live.push_user("REMINDER");
+        live.push_assistant(text("checked"));
+        assert!(live.replace_result("c1", "receipt".to_owned()));
+        live.replace_with_summary("CHECKPOINT", 5);
+        live.push_user("second");
+
+        // Rebuilt from the journal, whose entries come before the turns they
+        // follow, as a session writes them.
+        let mut queue = JournalQueue::default();
+        for entry in [
+            JournalEntry::Note {
+                at: 0,
+                placement: NotePlacement::PromptPrefix,
+                text: "PLAN".to_owned(),
+            },
+            JournalEntry::Note {
+                at: 4,
+                placement: NotePlacement::UserTurn,
+                text: "REMINDER".to_owned(),
+            },
+            JournalEntry::ResultReplaced {
+                at: 6,
+                call_id: "c1".to_owned(),
+                content: "receipt".to_owned(),
+            },
+            JournalEntry::Checkpoint {
+                at: 6,
+                through: 4,
+                message: "CHECKPOINT".to_owned(),
+            },
+        ] {
+            queue.push(entry);
+        }
+        let mut rebuilt = History::new();
+        let pushes: Vec<Push<'_>> = vec![
+            Box::new(|history| {
+                history.push_user("first");
+            }),
+            Box::new(|history| {
+                history.push_assistant(vec![call.clone()]);
+            }),
+            Box::new(|history| {
+                history.push_tool_results(vec![result.clone()]);
+            }),
+            Box::new(|history| {
+                history.push_assistant(text("done"));
+            }),
+            Box::new(|history| {
+                history.push_assistant(text("checked"));
+            }),
+            Box::new(|history| {
+                history.push_user("second");
+            }),
+        ];
+        queue.apply_ready(&mut rebuilt);
+        for push in pushes {
+            push(&mut rebuilt);
+            queue.apply_ready(&mut rebuilt);
+        }
+
+        assert_eq!(rebuilt.turns(), live.turns());
+        assert_eq!(
+            serde_json::to_string(&rebuilt.to_messages()).expect("rebuilt"),
+            serde_json::to_string(&live.to_messages()).expect("live")
+        );
+        assert_eq!(rebuilt.turns()[0].text(), "CHECKPOINT");
+        assert_eq!(rebuilt.turns().len(), 4);
+    }
 
     #[test]
     fn a_pin_after_the_freeze_is_not_in_the_front_message() {
