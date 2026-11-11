@@ -3387,7 +3387,7 @@ impl SessionHost {
             rows = answer_rows.take_through(answer, sealed);
             // A table is aligned once all its rows exist, as in a finished answer.
             let range = &answer[*committed..sealed];
-            let aligned = rune_term::markdown::align_tables(range, ascii);
+            let aligned = rune_term::markdown::align_tables(range, &markdown, ascii, width);
             if !in_code && !*raw_table && aligned != range {
                 let aligned = aligned.strip_suffix('\n').unwrap_or(&aligned);
                 rows = transcript::AssistantRows::with_markdown(markdown)
@@ -3459,7 +3459,12 @@ impl SessionHost {
             answer_rows.set_markdown(&markdown);
             answer_rows.rows_with_ascii(answer, width, self.ascii)
         } else {
-            let aligned = rune_term::markdown::align_tables(&answer[*committed..], self.ascii);
+            let aligned = rune_term::markdown::align_tables(
+                &answer[*committed..],
+                &markdown,
+                self.ascii,
+                width,
+            );
             transcript::AssistantRows::with_markdown(markdown)
                 .rows_with_ascii(&aligned, width, self.ascii)
         };
@@ -3750,10 +3755,11 @@ impl SessionHost {
         let sgr = |slot| self.theme().sgr(slot, self.depth);
         rune_term::markdown::MarkdownStyle {
             enabled: true,
-            heading: format!("\u{1b}[1m{}", sgr(Slot::Accent)),
+            heading: format!("\u{1b}[1m{}", sgr(Slot::Heading)),
             bold: "\u{1b}[1m".to_owned(),
             italic: "\u{1b}[3m".to_owned(),
             code: sgr(Slot::String),
+            strike: rune_term::markdown::STRIKE.to_owned(),
             link: format!("{}\u{1b}[4m", sgr(Slot::Link)),
             dim: sgr(Slot::Dim),
             reset: rune_term::engine::Style::RESET.to_owned(),
@@ -20415,6 +20421,18 @@ mod tests {
             false,
             |key: &str| (key == "INSIDE_EMACS").then(|| "29.1,comint".to_owned())
         ));
+    }
+
+    #[test]
+    fn answer_headings_are_bold_in_the_heading_slot() {
+        let mut host = test_host();
+        let mut theme = Theme::dark();
+        theme.set(Slot::Heading, rune_term::engine::Color::Rgb(1, 2, 3));
+        host.theme = Mutex::new(theme);
+        host.depth = ColorDepth::TrueColor;
+        let style = host.markdown_style();
+        assert_eq!(style.heading, "\u{1b}[1m\u{1b}[38;2;1;2;3m");
+        assert_eq!(style.strike, "\u{1b}[9m");
     }
 
     #[test]
