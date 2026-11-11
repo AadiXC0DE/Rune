@@ -253,6 +253,8 @@ struct SessionHost {
     /// request attempt, so the lock is not on the streaming path.
     model: Mutex<String>,
     instructions: String,
+    /// Leading bytes of the instructions that are the same in every workspace.
+    stable_instructions_len: usize,
     /// The instructions with the repository map, fixed until compaction.
     mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
@@ -461,6 +463,10 @@ impl Host for SessionHost {
             }
         }
         instructions
+    }
+
+    fn stable_instructions_len(&self) -> usize {
+        self.stable_instructions_len
     }
 
     fn objective_tokens_remaining(&self) -> Option<u64> {
@@ -2325,6 +2331,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
         instructions: prompt.instructions,
+        stable_instructions_len: prompt.stable_len,
         mapped: prompt::MappedInstructions::default(),
         tools,
         rules: Mutex::new(config.rules),
@@ -6546,9 +6553,11 @@ fn render_entries(entries: &[Entry], host: &SessionHost) -> Vec<String> {
 
 /// Builds the prompt for a session.
 fn build_prompt(workspace: &Utf8Path, config_root: &Utf8Path, limits: &BudgetSet) -> Prompt {
-    let instructions = prompt::base_instructions_for(workspace, config_root, limits);
+    let (instructions, stable_len) =
+        prompt::base_instructions_split(workspace, config_root, limits);
     Prompt {
         instructions,
+        stable_len,
         included: Vec::new(),
         omissions: Vec::new(),
     }
@@ -11849,6 +11858,7 @@ mod tests {
             model: Mutex::new("test".to_owned()),
             instructions: String::new(),
             mapped: prompt::MappedInstructions::default(),
+            stable_instructions_len: 0,
             tools: Vec::new(),
             rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
             mode: Mutex::new(PermissionMode::Auto),

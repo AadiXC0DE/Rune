@@ -77,6 +77,26 @@ fn fix_one_file() {
 }
 
 #[test]
+fn the_tool_list_is_byte_identical_across_runs() {
+    let tools = |report: &scenario::Report| -> Vec<String> {
+        report
+            .requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_str(&request.body).expect("request JSON");
+                body["tools"].to_string()
+            })
+            .collect()
+    };
+    let first = tools(&run_scenario("fix_one_file"));
+    let second = tools(&run_scenario("fix_one_file"));
+    assert_eq!(first.len(), 4);
+    assert!(first.iter().all(|list| *list == first[0]));
+    assert_eq!(first, second);
+}
+
+#[test]
 fn deepseek_thinking_tools() {
     run_scenario("deepseek_thinking_tools");
 }

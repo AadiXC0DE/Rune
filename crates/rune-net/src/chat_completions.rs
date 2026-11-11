@@ -217,6 +217,13 @@ impl Provider for ChatCompletions {
                 &mut messages[..]
             };
             mark_cache_breakpoints(marked, !plan.instructions.is_empty());
+            if let [stable, rest] = plan.system_blocks()[..] {
+                let marker = serde_json::json!({ "type": "ephemeral" });
+                messages[0]["content"] = serde_json::json!([
+                    { "type": "text", "text": stable, "cache_control": marker },
+                    { "type": "text", "text": rest, "cache_control": marker },
+                ]);
+            }
         }
 
         Ok(serde_json::Value::Object(body))
@@ -2652,6 +2659,35 @@ mod tests {
             assert_ne!(call, long, "{shape:?}");
             assert_eq!(body["messages"][3]["tool_call_id"], call, "{shape:?}");
         }
+    }
+
+    #[test]
+    fn anthropic_markers_split_the_system_message() {
+        let mut plan = default_body_plan();
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        plan.compat.cache_control = CacheMarkers::Anthropic;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "stable rules", "cache_control": marker },
+                { "type": "text", "text": "workspace rules", "cache_control": marker },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_plain_endpoint_gets_one_system_string() {
+        let mut plan = default_body_plan();
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "stable rules\n\nworkspace rules"
+        );
     }
 
     #[test]

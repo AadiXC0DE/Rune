@@ -287,7 +287,16 @@ pub trait Host {
     fn instructions(&self) -> String;
 
     /// Returns the tools available for this turn.
+    ///
+    /// Must return the same list, in the same order and with the same bytes,
+    /// for every request of a session.
     fn tools(&self) -> Vec<ToolSpec>;
+
+    /// Returns how many leading bytes of the instructions are the same in
+    /// every workspace; zero when the instructions are not split.
+    fn stable_instructions_len(&self) -> usize {
+        0
+    }
 
     /// Returns the registered tool's activity for event presentation.
     ///
@@ -1594,6 +1603,7 @@ fn request_origin(host: &dyn Host) -> String {
 pub(crate) fn request_plan(host: &dyn Host, history: &mut History) -> RequestPlan {
     let mut plan = RequestPlan::new(host.model());
     plan.instructions = host.instructions();
+    plan.stable_instructions_len = host.stable_instructions_len();
     plan.messages = history.to_messages();
     (plan.compat, plan.traits) = host.compat(&plan.model);
     plan.origin = request_origin(host);

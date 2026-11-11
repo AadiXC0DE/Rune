@@ -66,6 +66,8 @@ pub struct Omission {
 pub struct Prompt {
     /// The instruction text placed above the conversation.
     pub instructions: String,
+    /// Bytes of `instructions` that are the same in every workspace.
+    pub stable_len: usize,
     /// Sections that contributed.
     pub included: Vec<IncludedSection>,
     /// Sections that were shortened or dropped.
@@ -136,6 +138,7 @@ pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
             guidance.trim(),
         );
     }
+    let stable_len = instructions.len();
 
     let catalog_limit = limits.get_usize(LimitName::SkillCatalogBytes);
     let description_limit = limits.get_usize(LimitName::SkillDescriptionBytes);
@@ -210,8 +213,15 @@ pub fn assemble(inputs: &Inputs<'_>, limits: &BudgetSet) -> Result<Prompt> {
         instructions.push_str(notice.trim_end());
     }
 
+    debug_assert!(
+        included
+            .windows(2)
+            .all(|pair| pair[0].section < pair[1].section),
+        "sections are pushed in stability order"
+    );
     Ok(Prompt {
         instructions,
+        stable_len,
         included,
         omissions,
     })
@@ -304,6 +314,16 @@ pub fn base_instructions_for(
     config_root: &Utf8Path,
     limits: &BudgetSet,
 ) -> String {
+    base_instructions_split(workspace, config_root, limits).0
+}
+
+/// Builds the base instructions and returns how many leading bytes are the
+/// same in every workspace.
+pub fn base_instructions_split(
+    workspace: &Utf8Path,
+    config_root: &Utf8Path,
+    limits: &BudgetSet,
+) -> (String, usize) {
     let home = rune_core::paths::home_directory();
     instructions_under(workspace, home.as_deref(), config_root, limits)
 }
@@ -370,7 +390,7 @@ fn instructions_under(
     home: Option<&Utf8Path>,
     config_root: &Utf8Path,
     limits: &BudgetSet,
-) -> String {
+) -> (String, usize) {
     let skills = crate::skills::discover(workspace, home, config_root).unwrap_or_default();
     let project = crate::instructions::Options::new(workspace, home, config_root)
         .discover()
@@ -386,7 +406,10 @@ fn instructions_under(
         host_instructions: environment.as_deref(),
         project: &project,
     };
-    assemble(&inputs, limits).map_or_else(|_| system.to_owned(), |prompt| prompt.instructions)
+    assemble(&inputs, limits).map_or_else(
+        |_| (system.to_owned(), 0),
+        |prompt| (prompt.instructions, prompt.stable_len),
+    )
 }
 
 /// Describes the machine a command will run on, in one line.
@@ -883,7 +906,8 @@ mod tests {
             Some(&home),
             &root.join("config"),
             &BudgetSet::new(),
-        );
+        )
+        .0;
 
         assert!(text.contains("repository rules"), "{text}");
         assert!(text.contains("user-skill"), "{text}");
@@ -1057,6 +1081,44 @@ mod tests {
     fn no_project_files_adds_nothing() {
         assert_eq!(detect(&[]), None);
         assert_eq!(detect(&[("README.md", "test:\n")]), None);
+    }
+
+    #[test]
+    fn the_stable_block_ends_after_the_tool_guidance() {
+        let project = [InstructionFile {
+            path: "/w/AGENTS.md".into(),
+            scope: "/w".into(),
+            content: "project rule".to_owned(),
+            declared_bytes: 12,
+        }];
+        let inputs = Inputs {
+            system: SYSTEM_PROMPT,
+            tool_guidance: Some("Use the tools."),
+            host_instructions: Some("Environment line."),
+            project: &project,
+            ..Inputs::default()
+        };
+        let prompt = assemble(&inputs, &BudgetSet::new()).expect("assembled");
+        let stable = &prompt.instructions[..prompt.stable_len];
+        assert!(stable.contains(SYSTEM_PROMPT));
+        assert!(stable.ends_with("Use the tools."));
+        assert!(!stable.contains("<project-instructions"));
+        assert!(prompt.instructions[prompt.stable_len..].contains("project rule"));
+    }
+
+    #[test]
+    fn the_stable_block_is_identical_across_workspaces() {
+        let build = |file: &str| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+            std::fs::write(root.join("AGENTS.md"), file).expect("write");
+            let config = root.join("config");
+            std::fs::create_dir_all(&config).expect("config");
+            let (text, stable_len) = instructions_under(&root, None, &config, &BudgetSet::new());
+            assert!(stable_len < text.len());
+            text[..stable_len].to_owned()
+        };
+        assert_eq!(build("first rule"), build("a different rule"));
     }
 
     #[test]

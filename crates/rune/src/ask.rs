@@ -639,6 +639,10 @@ struct AskHost<'a> {
     /// State paths, where an overflow's bound is saved for later runs.
     paths: &'a Paths,
     instructions: String,
+    /// Leading bytes of the instructions that are the same in every workspace.
+    stable_instructions_len: usize,
+    /// The tools offered, fixed for the run so the prefix never moves.
+    tools: Vec<ToolSpec>,
     /// The instructions with the repository map, fixed for the run.
     mapped: rune_context::prompt::MappedInstructions,
     dialect: Box<dyn Provider>,
@@ -781,7 +785,11 @@ impl Host for AskHost<'_> {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        inventory::advertisement(&self.registry)
+        self.tools.clone()
+    }
+
+    fn stable_instructions_len(&self) -> usize {
+        self.stable_instructions_len
     }
 
     fn tool_activity(&self, name: &str) -> Option<rune_tools::Activity> {
@@ -1317,16 +1325,20 @@ pub fn run(
     context
         .additional_roots
         .clone_from(&settings.additional_directories);
+    let (instructions, stable_instructions_len) = rune_context::prompt::base_instructions_split(
+        context.workspace(),
+        &paths.config_root,
+        &settings.limits,
+    );
+    let tools = inventory::advertisement(&registry);
     let host = AskHost {
         effort,
         cache_key: std::sync::OnceLock::new(),
         settings,
         paths,
-        instructions: rune_context::prompt::base_instructions_for(
-            context.workspace(),
-            &paths.config_root,
-            &settings.limits,
-        ),
+        instructions,
+        stable_instructions_len,
+        tools,
         mapped: rune_context::prompt::MappedInstructions::default(),
         dialect,
         endpoint,

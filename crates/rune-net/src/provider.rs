@@ -84,6 +84,9 @@ pub struct RequestPlan {
     pub origin: String,
     /// Which cache markers a dialect that places them may add.
     pub cache_markers: MarkerPolicy,
+    /// Leading bytes of `instructions` that are the same in every workspace;
+    /// zero when the instructions are not split.
+    pub stable_instructions_len: usize,
 }
 
 /// Which cache markers a dialect that places them may add.
@@ -124,7 +127,23 @@ impl RequestPlan {
             sampling: crate::compat::Sampling::default(),
             origin: String::new(),
             cache_markers: MarkerPolicy::Full,
+            stable_instructions_len: 0,
         }
+    }
+
+    /// Returns the instructions as one block, or as a workspace-independent
+    /// block and the rest when `stable_instructions_len` splits them.
+    #[must_use]
+    pub fn system_blocks(&self) -> Vec<&str> {
+        let cut = self.stable_instructions_len;
+        if cut > 0 && cut < self.instructions.len() && self.instructions.is_char_boundary(cut) {
+            let (stable, rest) = self.instructions.split_at(cut);
+            let (stable, rest) = (stable.trim_end(), rest.trim_start());
+            if !stable.is_empty() && !rest.is_empty() {
+                return vec![stable, rest];
+            }
+        }
+        vec![&self.instructions]
     }
 
     /// Returns true when the request advertises tools.
@@ -521,6 +540,7 @@ mod routing_tests {
             sampling: crate::compat::Sampling::default(),
             origin: String::new(),
             cache_markers: MarkerPolicy::Full,
+            stable_instructions_len: 0,
         }
     }
 

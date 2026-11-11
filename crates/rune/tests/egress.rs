@@ -84,6 +84,7 @@ fn send(endpoint: &Endpoint, dialect: &dyn Dialect) -> Result<(), rune_core::err
         sampling: rune_net::compat::Sampling::default(),
         origin: String::new(),
         cache_markers: rune_net::provider::MarkerPolicy::Full,
+        stable_instructions_len: 0,
     };
     rune_net::transport::stream_completion(
         &rune_net::transport::agent(),

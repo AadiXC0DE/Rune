@@ -160,16 +160,18 @@ impl Provider for Anthropic {
         }
 
         if !plan.instructions.is_empty() {
-            body.insert(
-                "system".to_owned(),
-                serde_json::json!([{
-                    "type": "text",
-                    "text": plan.instructions,
-                }]),
-            );
-            if plan.cache_markers != MarkerPolicy::None {
-                body["system"][0]["cache_control"] = cache_control();
-            }
+            let blocks = plan
+                .system_blocks()
+                .into_iter()
+                .map(|text| {
+                    let mut block = serde_json::json!({ "type": "text", "text": text });
+                    if plan.cache_markers != MarkerPolicy::None {
+                        block["cache_control"] = cache_control();
+                    }
+                    block
+                })
+                .collect();
+            body.insert("system".to_owned(), serde_json::Value::Array(blocks));
         }
 
         if plan.has_tools() {
@@ -203,6 +205,7 @@ impl Provider for Anthropic {
         }
 
         mark_cache_breakpoints(&mut body, plan.cache_markers, newest_blocks);
+        debug_assert!(marker_count(&body) <= 4, "at most four cache markers");
         Ok(serde_json::Value::Object(body))
     }
 }
@@ -473,6 +476,36 @@ fn mark_cache_breakpoints(
     if let Some(block) = block {
         block.insert("cache_control".to_owned(), cache_control());
     }
+}
+
+/// Counts the cache markers in a request body, wherever a marker may go.
+fn marker_count(body: &serde_json::Map<String, serde_json::Value>) -> usize {
+    let marked = |blocks: Option<&serde_json::Value>| {
+        blocks
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, |blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("cache_control").is_some())
+                    .count()
+            })
+    };
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .map(|message| marked(message.get("content")))
+                .sum()
+        });
+    [
+        marked(body.get("tools")),
+        marked(body.get("system")),
+        messages,
+    ]
+    .into_iter()
+    .sum()
 }
 
 /// Returns true for a content block the endpoint accepts a cache marker on.
@@ -1020,8 +1053,10 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_the_instructions_and_the_newest_turn_are_marked_cacheable() {
+    fn four_markers_cover_tools_both_system_blocks_and_the_newest_turn() {
         let mut plan = plan_with_user("first");
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
         plan.messages
             .push(Message::assistant(vec![ContentPart::Text {
                 text: "answer".to_owned(),
@@ -1044,7 +1079,10 @@ mod tests {
 
         assert_eq!(body["tools"][1]["cache_control"], ephemeral);
         assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["system"][0]["text"], "stable rules");
         assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        assert_eq!(body["system"][1]["text"], "workspace rules");
+        assert_eq!(body["system"][1]["cache_control"], ephemeral);
         // Only the newest message carries a marker; the endpoint reads the
         // earlier prefix back from the previous request's marker.
         assert_eq!(
@@ -1058,8 +1096,32 @@ mod tests {
                     .is_none()
             );
         }
-        let markers = body.to_string().matches("cache_control").count();
-        assert!(markers <= 4, "the endpoint accepts at most four markers");
+        assert_eq!(body.to_string().matches("cache_control").count(), 4);
+        assert_eq!(marker_count(body.as_object().expect("object")), 4);
+    }
+
+    #[test]
+    fn one_system_block_when_no_split_is_given() {
+        let mut plan = plan_with_user("first");
+        plan.instructions = "all of the rules".to_owned();
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["system"].as_array().expect("blocks").len(), 1);
+        assert_eq!(body["system"][0]["text"], "all of the rules");
+
+        // A split that is not a character boundary keeps one block.
+        plan.instructions = "caf\u{e9} rules".to_owned();
+        plan.stable_instructions_len = 4;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["system"].as_array().expect("blocks").len(), 1);
+    }
+
+    #[test]
+    fn no_tools_means_three_markers() {
+        let mut plan = plan_with_user("first");
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
     }
 
     #[test]
