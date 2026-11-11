@@ -3268,11 +3268,13 @@ impl SessionHost {
         }
         if !answer[*committed..].trim().is_empty() {
             answer_rows.set_markdown(&self.markdown_style());
-            rows.extend(answer_rows.rows_with_ascii(
-                answer,
-                width.saturating_sub(2).max(1),
-                self.ascii,
-            ));
+            let width = width.saturating_sub(2).max(1);
+            rows.extend(
+                answer_rows
+                    .rows_with_ascii(answer, width, self.ascii)
+                    .into_iter()
+                    .map(|row| fit_live_row(row, width, self.ascii)),
+            );
         }
 
         // Every row of the answer is handed over. The renderer owns the region
@@ -3763,6 +3765,7 @@ impl SessionHost {
                 function: sgr(Slot::Function),
                 reset: rune_term::engine::Style::RESET.to_owned(),
             },
+            code_bg: sgr(Slot::CodeBg),
             links: rune_term::markdown::LinkContext {
                 hyperlinks: self.hyperlinks,
                 workspace: Some(self.context.workspace().to_owned()),
@@ -10608,6 +10611,22 @@ fn plan_rows(
     rows
 }
 
+/// Cuts a live answer row wider than `width` to end in an ellipsis. Rows in
+/// scrollback are written whole; only the region that is repainted must fit.
+fn fit_live_row(row: String, width: usize, ascii: bool) -> String {
+    if rune_term::width::str_width(&row) <= width {
+        return row;
+    }
+    let (kept, _) = rune_term::width::truncate_to_width(&row, width.saturating_sub(1));
+    let reset = if kept.contains('\u{1b}') {
+        rune_term::engine::Style::RESET
+    } else {
+        ""
+    };
+    let ellipsis = if ascii { ">" } else { "\u{2026}" };
+    format!("{kept}{reset}{ellipsis}")
+}
+
 /// Returns whether file targets are written as hyperlinks.
 ///
 /// `auto` leaves them out where a terminal is known to show the escape as
@@ -14649,6 +14668,13 @@ mod tests {
     fn streamed_fenced_code_matches_the_finished_transcript_across_resize() {
         let host = test_host();
         host.width.store(20, std::sync::atomic::Ordering::Relaxed);
+        // A live row wider than the answer is cut to end in an ellipsis; the
+        // finished row is written whole.
+        let live = |rows: Vec<String>, width: usize| -> Vec<String> {
+            rows.into_iter()
+                .map(|row| fit_live_row(row, width.saturating_sub(2), false))
+                .collect()
+        };
         let mut text = String::new();
         for ch in "```rust\n    call(\"alpha  beta\",  gamma);\n```\nafter".chars() {
             text.push(ch);
@@ -14657,21 +14683,29 @@ mod tests {
             host.streaming.lock().expect("streaming").answer.push(ch);
             assert_eq!(
                 host.streaming_rows().join("\n").trim_end(),
-                render_entries(&[Entry::assistant(&text)], &host).join("\n"),
+                live(render_entries(&[Entry::assistant(&text)], &host), 20).join("\n"),
                 "streamed and finished code disagree at {text:?}"
             );
         }
         assert!(
             host.streaming_rows()
                 .iter()
-                .any(|row| row.starts_with("    ↪ "))
+                .any(|row| row.ends_with('\u{2026}'))
+        );
+        assert!(
+            render_entries(&[Entry::assistant(&text)], &host)
+                .iter()
+                .any(|row| row.contains("    call(\"alpha  beta\",  gamma);"))
         );
         for width in [12, 40, 20] {
             host.width
                 .store(width, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(
                 host.streaming_rows(),
-                render_entries(&[Entry::assistant(&text)], &host)
+                live(
+                    render_entries(&[Entry::assistant(&text)], &host),
+                    usize::from(width)
+                )
             );
         }
         host.clear_streaming();
@@ -19777,9 +19811,15 @@ mod tests {
         let streaming = host.streaming_rows();
         let entries = [Entry::assistant(text), Entry::tool("read_file\none\ntwo")];
         let settled = render_entries(&entries, &host);
-        assert_eq!(streaming, render_entries(&entries[..1], &host));
+        let live: Vec<String> = render_entries(&entries[..1], &host)
+            .into_iter()
+            .map(|row| fit_live_row(row, 10, true))
+            .collect();
+        assert_eq!(streaming, live);
+        assert!(streaming.iter().all(|row| row.is_ascii()));
+        assert!(streaming.iter().any(|row| row.ends_with('>')));
         assert!(settled.iter().all(|row| row.is_ascii()));
-        assert!(settled.iter().any(|row| row.starts_with("    > ")));
+        assert!(settled.iter().any(|row| row == "    abcdefghijklmnop"));
         assert!(
             full_transcript_rows(&entries, 12, host.ascii)
                 .iter()

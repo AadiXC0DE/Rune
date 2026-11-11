@@ -458,8 +458,10 @@ impl Inline {
             }
         }
 
+        // A settled line is written whole: the terminal wraps a long one, so
+        // copying it from scrollback gives the line as it was written.
         for line in settled {
-            out.push_str(&self.clip(line));
+            out.push_str(line);
             out.push_str("\r\n");
         }
 
@@ -784,6 +786,28 @@ mod tests {
         assert!(text.contains("first line\r\n"), "{text:?}");
         assert!(text.contains("> "), "{text:?}");
         assert!(text.contains("status"), "{text:?}");
+    }
+
+    #[test]
+    fn a_long_settled_line_is_written_whole_and_wraps_in_the_terminal() {
+        let mut inline = Inline::new(10);
+        let long = format!("{}END", "x".repeat(14));
+        let bytes = frame(
+            &mut inline,
+            &rows(&[long.as_str()]),
+            None,
+            &rows(&["status"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains(&format!("{long}\r\n")), "{text:?}");
+        let mut grid = crate::Grid::new(10, 6).expect("grid");
+        grid.feed(text.as_bytes()).expect("replay");
+        assert_eq!(grid.row_text(0), "xxxxxxxxxx");
+        assert_eq!(grid.row_text(1), "xxxxEND");
+        assert_eq!(grid.row_text(2), "status");
     }
 
     #[test]

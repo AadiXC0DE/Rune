@@ -667,14 +667,13 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
 }
 
 #[test]
-fn fenced_code_continuations_are_stable_while_streaming_and_when_finished() {
+fn long_code_rows_are_written_whole_and_copy_clean() {
     let captures: Vec<Capture> =
         serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some("code")))
             .expect("code captures");
     let mut grid = Grid::new(32, 24).expect("grid");
     let mut scrollback = Vec::new();
-    let first_row = "    abcdefghijklmnopqrstuvwxyz";
-    let continuation = "    ↪ 0123456789  END-CODE";
+    let line = "    abcdefghijklmnopqrstuvwxyz0123456789  END-CODE";
     assert_eq!(captures.len(), 3);
     for capture in captures {
         for byte in capture.bytes {
@@ -690,18 +689,34 @@ fn fenced_code_continuations_are_stable_while_streaming_and_when_finished() {
             .map(String::as_str)
             .chain(screen.lines())
             .collect();
-        assert!(rows.contains(&first_row), "{}: {rows:?}", capture.stage);
-        let expected = if capture.stage == "code-started" {
-            "    ↪ 0123456789"
-        } else {
-            continuation
-        };
-        assert!(rows.contains(&expected), "{}: {rows:?}", capture.stage);
+        assert!(
+            rows.iter().all(|row| !row.contains('\u{21aa}')),
+            "{}: {rows:?}",
+            capture.stage
+        );
+        if capture.stage == "code-started" {
+            // The live row is cut to the region and says that it goes on.
+            assert!(
+                rows.iter()
+                    .any(|row| row.starts_with("    abcdefghij") && row.ends_with('\u{2026}')),
+                "{rows:?}"
+            );
+        }
         if capture.stage == "code-finished" {
             assert!(rows.contains(&"AFTER-CODE"), "{rows:?}");
-            assert_eq!(rows.iter().filter(|row| **row == first_row).count(), 1);
-            assert_eq!(rows.iter().filter(|row| **row == continuation).count(), 1);
-            assert_eq!(rows.iter().filter(|row| **row == "```").count(), 1);
+            assert!(rows.iter().all(|row| !row.starts_with("```")), "{rows:?}");
+            let start = rows
+                .windows(2)
+                .position(|pair| format!("{}{}", pair[0], pair[1]) == line)
+                .unwrap_or_else(|| panic!("the code line is not whole: {rows:?}"));
+            assert_eq!(rows[start.saturating_sub(1)], "rust", "{rows:?}");
+            assert_eq!(
+                rows.windows(2)
+                    .filter(|pair| format!("{}{}", pair[0], pair[1]) == line)
+                    .count(),
+                1,
+                "{rows:?}"
+            );
         }
     }
 }

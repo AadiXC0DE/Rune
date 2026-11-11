@@ -434,10 +434,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert not prompts, prompts
         elif scenario == "code":
             # The provider pauses until each live frame has been captured,
-            # proving wrapping before the closing fence or turn completion.
-            capture("code-started", b"code\r", "↪ 0123456789")
+            # proving the live row is cut before the closing fence or turn completion.
+            capture("code-started", b"code\r", "wxy\u2026")
             code_steps[0].set()
-            capture("code-continued", expected="END-CODE")
+            # The live row is already cut to the region, so the second delta
+            # draws nothing new; the stage only lets the closing fence follow.
+            capture("code-continued", expected="")
             code_steps[1].set()
             capture("code-finished", expected="AFTER-CODE\r\n")
             assert prompts == ["code"], prompts

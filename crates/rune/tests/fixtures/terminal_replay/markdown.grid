@@ -1,4 +1,4 @@
-markdown-streaming: 80x24, caret 2,16
+markdown-streaming: 80x24, caret 2,15
 00|session ************|
 01||
 02|▌ markdown|
@@ -8,14 +8,14 @@ markdown-streaming: 80x24, caret 2,16
 06|• first item|
 07|• second item|
 08||
-09|```rust|
+09|rust|
 10|fn main() {|
 11|    println!("hi");|
 12|}|
-13|```|
-14|ctrl-c interrupt   enter steer   tab queue|
-15|replay-fixture | full access | ctx ~###k (request bytes)|
-16|>|
+13|ctrl-c interrupt   enter steer   tab queue|
+14|replay-fixture | full access | ctx ~###k (request bytes)|
+15|>|
+16||
 17||
 18||
 19||
@@ -23,7 +23,7 @@ markdown-streaming: 80x24, caret 2,16
 21||
 22||
 23||
-markdown-finished: 80x24, caret 2,23
+markdown-finished: 80x24, caret 2,22
 00|session ************|
 01||
 02|▌ markdown|
@@ -33,18 +33,18 @@ markdown-finished: 80x24, caret 2,23
 06|• first item|
 07|• second item|
 08||
-09|```rust|
+09|rust|
 10|fn main() {|
 11|    println!("hi");|
 12|}|
-13|```|
-14||
-15|name │ size|
-16|─────┼─────|
-17|a    │ 1|
-18|bb   │ 22|
-19||
-20|MARKDOWN-END|
-21|/ commands   shift-tab mode   ctrl-j newline|
-22|replay-fixture | full access | ctx ~###k (request bytes)|
-23|>|
+13||
+14|name │ size|
+15|─────┼─────|
+16|a    │ 1|
+17|bb   │ 22|
+18||
+19|MARKDOWN-END|
+20|/ commands   shift-tab mode   ctrl-j newline|
+21|replay-fixture | full access | ctx ~###k (request bytes)|
+22|>|
+23||
