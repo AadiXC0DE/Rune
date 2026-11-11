@@ -19,9 +19,11 @@ const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// Starts bracketed paste.
 const PASTE_ON: &[u8] = b"\x1b[?2004h";
 /// Pops the keyboard enhancement flags.
-const KEYBOARD_POP: &[u8] = b"\x1b[<u";
+const KEYBOARD_POP: &[u8] = crate::probe::KITTY_POP.as_bytes();
 /// Turns modifyOtherKeys off.
-const MODIFY_OTHER_KEYS_OFF: &[u8] = b"\x1b[>4m";
+const MODIFY_OTHER_KEYS_OFF: &[u8] = crate::probe::MODIFY_OTHER_KEYS_RESET.as_bytes();
+/// Puts the modified key format back to its default.
+const FORMAT_OTHER_KEYS_OFF: &[u8] = crate::probe::FORMAT_OTHER_KEYS_RESET.as_bytes();
 /// Turns line wrapping back on.
 const WRAP_ON: &[u8] = b"\x1b[?7h";
 /// Clears a progress indicator.
@@ -45,8 +47,11 @@ pub struct ModeState {
     pub bracketed_paste: bool,
     /// Keyboard enhancement flags were pushed.
     pub keyboard_flags: bool,
-    /// modifyOtherKeys was turned on.
+    /// modifyOtherKeys was turned on: mode 2 with [`ModeState::format_other_keys`],
+    /// else mode 1.
     pub modify_other_keys: bool,
+    /// Modified keys were asked for in the `CSI u` format.
+    pub format_other_keys: bool,
     /// Focus reports were turned on.
     pub focus: bool,
     /// The window title was pushed.
@@ -62,6 +67,7 @@ const NONE: ModeState = ModeState {
     bracketed_paste: false,
     keyboard_flags: false,
     modify_other_keys: false,
+    format_other_keys: false,
     focus: false,
     title_pushed: false,
     progress_sent: false,
@@ -100,11 +106,12 @@ pub fn restore_bytes(state: &ModeState) -> Vec<u8> {
     out.extend_from_slice(END_SYNC);
     out.extend_from_slice(RESET_STYLE);
     out.extend_from_slice(CLOSE_LINK);
-    let marked: [(bool, &[u8]); 4] = [
+    let marked: [(bool, &[u8]); 5] = [
         (state.focus, FOCUS_OFF),
         (state.bracketed_paste, PASTE_OFF),
         (state.keyboard_flags, KEYBOARD_POP),
         (state.modify_other_keys, MODIFY_OTHER_KEYS_OFF),
+        (state.format_other_keys, FORMAT_OTHER_KEYS_OFF),
     ];
     for (on, bytes) in marked {
         if on {
@@ -124,6 +131,54 @@ pub fn restore_bytes(state: &ModeState) -> Vec<u8> {
     }
     out.extend_from_slice(SHOW_CURSOR);
     out
+}
+
+/// Returns the bytes that turn on the keyboard reporting `state` marks.
+fn keyboard_bytes(state: &ModeState) -> Vec<u8> {
+    use crate::probe::{
+        FORMAT_OTHER_KEYS_CSI_U, KITTY_PUSH_DISAMBIGUATE, MODIFY_OTHER_KEYS_1, MODIFY_OTHER_KEYS_2,
+    };
+    let mut out = Vec::new();
+    if state.keyboard_flags {
+        out.extend_from_slice(KITTY_PUSH_DISAMBIGUATE.as_bytes());
+    }
+    if state.format_other_keys {
+        out.extend_from_slice(FORMAT_OTHER_KEYS_CSI_U.as_bytes());
+    }
+    if state.modify_other_keys {
+        let mode = if state.format_other_keys {
+            MODIFY_OTHER_KEYS_2
+        } else {
+            MODIFY_OTHER_KEYS_1
+        };
+        out.extend_from_slice(mode.as_bytes());
+    }
+    out
+}
+
+/// Asks the terminal to report modified keys the way `protocol` names, and
+/// records it, so every way out turns it off again. Nothing is written for
+/// [`KeyProtocol::Legacy`].
+pub fn push_keyboard(protocol: crate::probe::KeyProtocol) {
+    use crate::probe::KeyProtocol;
+    let mut state = ModeState::default();
+    match protocol {
+        KeyProtocol::Kitty => state.keyboard_flags = true,
+        KeyProtocol::ModifyOtherKeysTmux => state.modify_other_keys = true,
+        KeyProtocol::ModifyOtherKeysXterm => {
+            state.modify_other_keys = true;
+            state.format_other_keys = true;
+        }
+        KeyProtocol::Legacy => return,
+    }
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&keyboard_bytes(&state));
+    let _ = stdout.flush();
+    mark(|modes| {
+        modes.keyboard_flags = state.keyboard_flags;
+        modes.modify_other_keys = state.modify_other_keys;
+        modes.format_other_keys = state.format_other_keys;
+    });
 }
 
 /// Writes `state`'s restore bytes in one write and leaves raw mode. A failed
@@ -170,17 +225,23 @@ fn pause_keeping(keep_alternate: bool) {
 /// Turns back on the modes in force before [`pause`], or keeps the current
 /// ones on. Returns whether anything was turned on.
 pub fn reapply() -> bool {
-    let (state, left_alternate) = PAUSED
+    let paused = PAUSED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-        .unwrap_or_else(|| (current(), false));
+        .take();
+    let resumed = paused.is_some();
+    let (state, left_alternate) = paused.unwrap_or_else(|| (current(), false));
     let mut out = Vec::new();
     if state.raw {
         let _ = crossterm::terminal::enable_raw_mode();
     }
     if state.bracketed_paste {
         out.extend_from_slice(PASTE_ON);
+    }
+    // Kitty flags are a stack, so they are pushed again only after a pause
+    // popped them.
+    if resumed {
+        out.extend_from_slice(&keyboard_bytes(&state));
     }
     if left_alternate {
         out.extend_from_slice(ALTERNATE_ON);
@@ -276,6 +337,7 @@ mod tests {
             bracketed_paste: true,
             keyboard_flags: true,
             modify_other_keys: true,
+            format_other_keys: true,
             focus: true,
             title_pushed: true,
             progress_sent: true,
@@ -290,6 +352,7 @@ mod tests {
             PASTE_OFF,
             KEYBOARD_POP,
             MODIFY_OTHER_KEYS_OFF,
+            FORMAT_OTHER_KEYS_OFF,
             WRAP_ON,
             PROGRESS_OFF,
             TITLE_POP,
@@ -323,6 +386,7 @@ mod tests {
             KEYBOARD_POP,
             FOCUS_OFF,
             MODIFY_OTHER_KEYS_OFF,
+            FORMAT_OTHER_KEYS_OFF,
             TITLE_POP,
             ALTERNATE_OFF,
             PROGRESS_OFF,
@@ -332,5 +396,40 @@ mod tests {
         for part in [END_SYNC, RESET_STYLE, CLOSE_LINK, WRAP_ON, SHOW_CURSOR] {
             assert!(find(&bytes, part).is_some(), "{part:?}");
         }
+    }
+
+    #[test]
+    fn each_keyboard_protocol_is_undone_by_its_own_inverse() {
+        let kitty = ModeState {
+            keyboard_flags: true,
+            ..ModeState::default()
+        };
+        assert_eq!(keyboard_bytes(&kitty), b"\x1b[>1u");
+        let bytes = restore_bytes(&kitty);
+        assert!(find(&bytes, KEYBOARD_POP).is_some());
+        assert!(find(&bytes, MODIFY_OTHER_KEYS_OFF).is_none());
+
+        let tmux = ModeState {
+            modify_other_keys: true,
+            ..ModeState::default()
+        };
+        assert_eq!(keyboard_bytes(&tmux), b"\x1b[>4;1m");
+        let bytes = restore_bytes(&tmux);
+        assert!(find(&bytes, MODIFY_OTHER_KEYS_OFF).is_some());
+        assert!(find(&bytes, KEYBOARD_POP).is_none());
+        assert!(find(&bytes, FORMAT_OTHER_KEYS_OFF).is_none());
+
+        let xterm = ModeState {
+            modify_other_keys: true,
+            format_other_keys: true,
+            ..ModeState::default()
+        };
+        assert_eq!(keyboard_bytes(&xterm), b"\x1b[>4;1f\x1b[>4;2m");
+        let bytes = restore_bytes(&xterm);
+        let reset = find(&bytes, MODIFY_OTHER_KEYS_OFF).expect("modifyOtherKeys reset");
+        let format = find(&bytes, FORMAT_OTHER_KEYS_OFF).expect("format reset");
+        assert!(reset < format);
+
+        assert!(keyboard_bytes(&ModeState::default()).is_empty());
     }
 }
