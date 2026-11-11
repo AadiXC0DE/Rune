@@ -65,7 +65,7 @@ def interactive(scenario, root, environment):
     result = {}
     try:
         if scenario == "disabled":
-            wait_for(b"ctrl-c cance")
+            wait_for(b"/ commands")
             drain()
             assert QUERY not in transcript, transcript
         else:
@@ -80,7 +80,7 @@ def interactive(scenario, root, environment):
                 os.write(master, b"hello")
                 time.sleep(0.02)
                 os.write(master, REPLIES)
-            wait_for(b"ctrl-c cance")
+            wait_for(b"/ commands")
             result["wait"] = time.monotonic() - asked
             drain()
             assert transcript.count(QUERY) == 1, transcript
@@ -174,7 +174,7 @@ def piped_stdout(root, environment):
     transcript = bytearray()
     wait_for, drain = reader(read_end, transcript, child)
     try:
-        wait_for(b"ctrl-c cance")
+        wait_for(b"/ commands")
         drain()
         start = len(transcript)
         os.write(master, b"/status\r")

@@ -17,7 +17,7 @@ import threading
 import time
 
 SAMPLES = 11
-MARKER = b"ctrl-c cancel"
+MARKER = b"/ commands"
 
 
 class Provider(http.server.BaseHTTPRequestHandler):

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,11 @@ pub struct Client {
     limits: BudgetSet,
     variables: Arc<dyn Variables>,
     state: Mutex<State>,
+    /// Servers connected, recorded whenever a connection changes, so a count
+    /// can be read while a tool call holds the state.
+    connected: AtomicUsize,
+    /// Servers configured and enabled.
+    configured: AtomicUsize,
 }
 
 /// Resolves the environment values a transport's credentials come from.
@@ -219,7 +225,31 @@ impl Client {
             limits: limits.clone(),
             variables,
             state: Mutex::new(State::default()),
+            connected: AtomicUsize::new(0),
+            configured: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns the servers connected and the servers configured, without
+    /// waiting for a call in progress.
+    #[must_use]
+    pub fn server_count(&self) -> (usize, usize) {
+        (
+            self.connected.load(Ordering::Relaxed),
+            self.configured.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Records the connection counts of a state.
+    fn record_counts(&self, state: &State) {
+        let connected = state
+            .servers
+            .iter()
+            .filter(|entry| entry.session.is_some())
+            .count();
+        self.connected.store(connected, Ordering::Relaxed);
+        self.configured
+            .store(state.servers.len(), Ordering::Relaxed);
     }
 
     /// Connects every enabled server supplied by the host, without an offline check.
@@ -231,7 +261,9 @@ impl Client {
             .filter(|config| config.enabled)
             .map(|config| ServerEntry::new(config.clone()))
             .collect();
-        self.connect_state(&mut state)
+        let report = self.connect_state(&mut state);
+        self.record_counts(&state);
+        report
     }
 
     /// Returns every tool the connected servers expose.
@@ -327,7 +359,9 @@ impl Client {
         // The parameters are built once so a retry replays the exact call the
         // server rejected rather than one rebuilt from the same arguments.
         let params = json!({ "name": server_tool, "arguments": arguments });
-        self.call_entry(entry, &params, cancelled)
+        let outcome = self.call_entry(entry, &params, cancelled);
+        self.record_counts(&state);
+        outcome
     }
 
     /// Reconnects every configured server from scratch.
@@ -350,7 +384,9 @@ impl Client {
                 .collect()
         };
         state.servers = cached.into_iter().map(ServerEntry::new).collect();
-        self.connect_state(&mut state)
+        let report = self.connect_state(&mut state);
+        self.record_counts(&state);
+        report
     }
 
     /// Stops every session, terminating every child process.
@@ -364,6 +400,7 @@ impl Client {
                 entry.close();
             }
             state.shutdown = true;
+            self.record_counts(&state);
         }
     }
 
@@ -1999,6 +2036,7 @@ mod tests {
         let client = Client::new(&BudgetSet::new());
         assert!(client.tools().is_empty());
         assert!(client.status().is_empty());
+        assert_eq!(client.server_count(), (0, 0));
         assert_eq!(
             client
                 .call("mcp_x_y", &json!({}))

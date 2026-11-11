@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         finally:
             os.close(slave)
         transcript = bytearray()
-        wait_for("ctrl-c cancel" if cols == 80 else "resume-fixt")
+        wait_for("/ commands" if cols == 80 else "resume-fixt")
         drain()
 
     def wait_for(text, start=0):

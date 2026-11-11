@@ -28,7 +28,8 @@ fn two_provider_failures_show_pending_and_active_retries_in_one_status_row() {
     for (status, bytes) in captures {
         grid.feed(&bytes).expect("replay");
         let screen = grid.text();
-        assert_eq!(screen.matches("ctrl-c cancel").count(), 1, "{screen}");
+        let hints = screen.matches("/ commands").count() + screen.matches("enter steer").count();
+        assert_eq!(hints, 1, "{screen}");
         assert_eq!(screen.matches("| auto |").count(), 1, "{screen}");
         if status == "completed" {
             assert!(!screen.contains("provider retry"), "{screen}");

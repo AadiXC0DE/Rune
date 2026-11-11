@@ -164,13 +164,13 @@ with tempfile.TemporaryDirectory(prefix="rune-picker-") as directory:
         capture("picker-everywhere")
         send(b"\t", "sessions in this workspace")
         capture("picker-back")
-        send(b"\r", "ctrl-c cancel")
+        send(b"\r", "/ commands")
         capture("resumed")
         assert len(requests) == 3, "choosing a session must not send a request"
         stop()
 
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         drain()
         send(b"/resume\r", "sessions in this workspace")
         send(b"alpha", "> alpha")

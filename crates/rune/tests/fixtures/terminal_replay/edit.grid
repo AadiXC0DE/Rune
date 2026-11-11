@@ -14,7 +14,7 @@ edit-finished: 80x24, caret 2,17
 12||
 13|EDIT-CHECKED|
 14|  1 call · 1 file changed · unverified · <t>|
-15|ctrl-c cancel  /help commands  esc clear|
+15|/ commands|
 16|replay-fixture | full access | ctx ~###k (request bytes)|
 17|>|
 18||

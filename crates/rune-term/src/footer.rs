@@ -33,8 +33,108 @@ pub const DEFAULT_MINIMUM_ROWS: u16 = 6;
 /// The share of the context window at which the reading is marked as a problem.
 pub const CONTEXT_WARN_PERCENT: u8 = 80;
 
-/// The key hints on the row above the status line.
-pub const HINTS: &str = "ctrl-c cancel  /help commands  esc clear";
+/// Space between two key hints.
+const HINT_GAP: &str = "   ";
+
+/// What the interface is doing, which decides the keys the hint row names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UiState {
+    /// Waiting at the prompt.
+    #[default]
+    Idle,
+    /// A turn is running.
+    Running,
+    /// A completion menu, path menu or picker is open.
+    Menu,
+    /// An approval or question picker is open.
+    Approval,
+}
+
+/// Returns the key hints that work in an interface state.
+#[must_use]
+pub const fn hints(ui: UiState) -> &'static str {
+    match ui {
+        UiState::Idle => "/ commands",
+        UiState::Running => "ctrl-c interrupt   enter steer",
+        UiState::Menu => "up/down select   tab complete   esc close",
+        UiState::Approval => "up/down select   enter confirm   esc cancel",
+    }
+}
+
+/// One field of the status row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusField {
+    /// The model name.
+    Model,
+    /// The permission mode, or plan mode.
+    Mode,
+    /// Commands run without a sandbox.
+    Unsandboxed,
+    /// Context window usage.
+    Context,
+    /// Messages waiting for the running turn.
+    Queued,
+    /// Reasoning effort, when one is set.
+    Effort,
+    /// Commands may use the network.
+    Net,
+    /// The repository branch.
+    Branch,
+    /// Connected and configured MCP servers.
+    Mcp,
+    /// Estimated spend.
+    Cost,
+    /// The working directory.
+    Workspace,
+    /// The short session identifier.
+    Session,
+}
+
+impl StatusField {
+    /// Every field, highest priority first, which is also the display order.
+    pub const ALL: [Self; 12] = [
+        Self::Model,
+        Self::Mode,
+        Self::Unsandboxed,
+        Self::Context,
+        Self::Queued,
+        Self::Effort,
+        Self::Net,
+        Self::Branch,
+        Self::Mcp,
+        Self::Cost,
+        Self::Workspace,
+        Self::Session,
+    ];
+
+    /// Returns the name the `statusline` setting uses.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Mode => "mode",
+            Self::Unsandboxed => "unsandboxed",
+            Self::Context => "context",
+            Self::Queued => "queued",
+            Self::Effort => "effort",
+            Self::Net => "net",
+            Self::Branch => "branch",
+            Self::Mcp => "mcp",
+            Self::Cost => "cost",
+            Self::Workspace => "workspace",
+            Self::Session => "session",
+        }
+    }
+
+    /// Returns the field a name stands for, ignoring case.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|field| field.name().eq_ignore_ascii_case(name))
+    }
+}
 
 /// Everything the status line displays.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -62,6 +162,24 @@ pub struct FooterState {
     pub session_id: String,
     /// Estimated spend so far, already formatted, when prices are known.
     pub cost: Option<String>,
+    /// What the interface is doing, which picks the hints.
+    pub ui: UiState,
+    /// Hints after the idle set, lowest priority last; each is shown only when
+    /// it fits whole.
+    pub idle_hints: Vec<&'static str>,
+    /// Fields shown, highest priority first; `None` shows every field in the
+    /// default order.
+    pub fields: Option<Vec<StatusField>>,
+    /// Repository branch, or a shortened commit when detached.
+    pub branch: Option<String>,
+    /// Reasoning effort level, absent when it is automatic.
+    pub effort: Option<String>,
+    /// Messages queued for the running turn.
+    pub queued: usize,
+    /// Whether commands may use the network.
+    pub net: bool,
+    /// Connected and configured MCP servers.
+    pub mcp: Option<(usize, usize)>,
 }
 
 /// The provider attempt shown in the renderer-owned status row.
@@ -198,8 +316,8 @@ pub fn render(
         return vec![fit(too_small_row(state, layout, theme, depth), width)];
     }
     vec![
-        fit(hint_row(theme, depth), width),
-        fit(status_row(state, theme, depth), width),
+        fit(hint_row(state, theme, depth, width), width),
+        fit(status_row(state, theme, depth, width), width),
     ]
 }
 
@@ -224,60 +342,139 @@ fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, depth: Col
 }
 
 /// Returns the hint row.
-fn hint_row(theme: &Theme, depth: ColorDepth) -> String {
+fn hint_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize) -> String {
+    let mut text = hints(state.ui).to_owned();
+    if state.ui == UiState::Idle {
+        for hint in &state.idle_hints {
+            let wider = str_width(&text)
+                .saturating_add(HINT_GAP.len())
+                .saturating_add(str_width(hint));
+            if wider > width {
+                break;
+            }
+            text.push_str(HINT_GAP);
+            text.push_str(hint);
+        }
+    }
     let mut row = paint(theme, Slot::Dim, depth, flag::DIM);
-    row.push_str(HINTS);
+    row.push_str(&text);
     row.push_str(&reset(theme));
     row
 }
 
-/// Returns the status line.
-fn status_row(state: &FooterState, theme: &Theme, depth: ColorDepth) -> String {
+/// Returns the status line, dropping whole fields from the lowest priority
+/// until it fits `width`.
+///
+/// The retry field and the highest-priority field are never dropped; only
+/// when they alone are wider does the row get clipped.
+fn status_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize) -> String {
+    let retry = state
+        .provider_retry
+        .map(|retry| retry_field(retry, theme, depth));
+    let mut shown: Vec<(StatusField, String)> = state
+        .fields
+        .as_deref()
+        .unwrap_or(&StatusField::ALL)
+        .iter()
+        .filter_map(|&field| field_text(state, field, theme, depth).map(|text| (field, text)))
+        .collect();
+    loop {
+        let row = join_fields(retry.as_deref(), &shown, theme, depth);
+        if shown.len() <= 1 || str_width(&row) <= width {
+            return row;
+        }
+        shown.pop();
+    }
+}
+
+/// Joins fields with dividers; the session identifier takes a single space.
+fn join_fields(
+    retry: Option<&str>,
+    shown: &[(StatusField, String)],
+    theme: &Theme,
+    depth: ColorDepth,
+) -> String {
     let mut row = String::new();
-    if let Some(retry) = state.provider_retry {
-        row.push_str(&retry_field(retry, theme, depth));
-        row.push_str(&divider(theme, depth));
+    let mut first = true;
+    if let Some(retry) = retry {
+        row.push_str(retry);
+        first = false;
     }
-    if !state.model.is_empty() {
-        row.push_str(&paint(theme, Slot::Accent, depth, flag::BOLD));
-        row.push_str(&state.model);
-        row.push_str(&reset(theme));
-        row.push_str(&divider(theme, depth));
-    }
-    row.push_str(&paint(theme, Slot::Dim, depth, 0));
-    row.push_str(if state.planning {
-        "plan"
-    } else {
-        state.permission_mode.label()
-    });
-    row.push_str(&reset(theme));
-    if state.unsandboxed {
-        row.push_str(&divider(theme, depth));
-        row.push_str(&paint(theme, Slot::Dim, depth, 0));
-        row.push_str("unsandboxed");
-        row.push_str(&reset(theme));
-    }
-    row.push_str(&divider(theme, depth));
-    row.push_str(&context_field(state, theme, depth));
-    if let Some(cost) = &state.cost {
-        row.push_str(&divider(theme, depth));
-        row.push_str(&paint(theme, Slot::Dim, depth, 0));
-        row.push_str(cost);
-        row.push_str(&reset(theme));
-    }
-    if !state.workspace.is_empty() {
-        row.push_str(&divider(theme, depth));
-        row.push_str(&paint(theme, Slot::Dim, depth, 0));
-        row.push_str(state.workspace.trim_end_matches('/'));
-        row.push_str(&reset(theme));
-    }
-    if !state.session_id.is_empty() {
-        row.push(' ');
-        row.push_str(&paint(theme, Slot::Dim, depth, flag::DIM));
-        row.push_str(state.short_session());
-        row.push_str(&reset(theme));
+    for (field, text) in shown {
+        if !first {
+            if *field == StatusField::Session {
+                row.push(' ');
+            } else {
+                row.push_str(&divider(theme, depth));
+            }
+        }
+        row.push_str(text);
+        first = false;
     }
     row
+}
+
+/// Returns one field's styled text, or `None` when it has nothing to show.
+fn field_text(
+    state: &FooterState,
+    field: StatusField,
+    theme: &Theme,
+    depth: ColorDepth,
+) -> Option<String> {
+    let styled = |slot: Slot, bits: u16, text: &str| {
+        let mut out = paint(theme, slot, depth, bits);
+        out.push_str(text);
+        out.push_str(&reset(theme));
+        out
+    };
+    match field {
+        StatusField::Model => {
+            (!state.model.is_empty()).then(|| styled(Slot::Accent, flag::BOLD, &state.model))
+        }
+        StatusField::Mode => Some(styled(
+            Slot::Dim,
+            0,
+            if state.planning {
+                "plan"
+            } else {
+                state.permission_mode.label()
+            },
+        )),
+        StatusField::Unsandboxed => state
+            .unsandboxed
+            .then(|| styled(Slot::Warning, 0, "unsandboxed")),
+        StatusField::Context => Some(context_field(state, theme, depth)),
+        StatusField::Queued => {
+            (state.queued > 0).then(|| styled(Slot::Dim, 0, &format!("queued {}", state.queued)))
+        }
+        StatusField::Effort => state
+            .effort
+            .as_ref()
+            .map(|level| styled(Slot::Dim, 0, &format!("effort {level}"))),
+        StatusField::Net => state.net.then(|| styled(Slot::Dim, 0, "net")),
+        StatusField::Branch => state
+            .branch
+            .as_ref()
+            .map(|branch| styled(Slot::Dim, 0, branch)),
+        StatusField::Mcp => {
+            state
+                .mcp
+                .filter(|&(_, configured)| configured > 0)
+                .map(|(connected, configured)| {
+                    let slot = if connected < configured {
+                        Slot::Warning
+                    } else {
+                        Slot::Dim
+                    };
+                    styled(slot, 0, &format!("mcp {connected}/{configured}"))
+                })
+        }
+        StatusField::Cost => state.cost.as_ref().map(|cost| styled(Slot::Dim, 0, cost)),
+        StatusField::Workspace => (!state.workspace.is_empty())
+            .then(|| styled(Slot::Dim, 0, state.workspace.trim_end_matches('/'))),
+        StatusField::Session => (!state.session_id.is_empty())
+            .then(|| styled(Slot::Dim, flag::DIM, state.short_session())),
+    }
 }
 
 /// Puts the attempt and pending delay first so they survive width clipping.
@@ -422,6 +619,7 @@ mod tests {
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
             cost: None,
+            ..FooterState::default()
         }
     }
 
@@ -633,7 +831,7 @@ mod tests {
             100,
             ColorDepth::TrueColor,
         ));
-        assert!(rows[0].contains("ctrl-c cancel"), "{:?}", rows[0]);
+        assert!(rows[0].contains("/ commands"), "{:?}", rows[0]);
         assert!(rows[1].contains("claude-sonnet-4"), "{:?}", rows[1]);
     }
 
@@ -768,6 +966,146 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn hint_of(state: &FooterState, width: usize) -> String {
+        let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
+        let rows = strip(&render(
+            state,
+            &layout,
+            &Theme::dark(),
+            width,
+            ColorDepth::TrueColor,
+        ));
+        rows.first().expect("hint row").clone()
+    }
+
+    fn full() -> FooterState {
+        FooterState {
+            model: "replay-model-01".to_owned(),
+            context_used: 2_700,
+            context_source: Some("request bytes"),
+            context_limit: 0,
+            queued: 2,
+            effort: Some("high".to_owned()),
+            net: true,
+            branch: Some("main".to_owned()),
+            mcp: Some((1, 1)),
+            cost: Some("$0.0123".to_owned()),
+            ..state()
+        }
+    }
+
+    #[test]
+    fn hints_follow_the_interface_state() {
+        let mut state = state();
+        for (ui, expected) in [
+            (UiState::Idle, "/ commands"),
+            (UiState::Running, "ctrl-c interrupt   enter steer"),
+            (UiState::Menu, "up/down select   tab complete   esc close"),
+            (
+                UiState::Approval,
+                "up/down select   enter confirm   esc cancel",
+            ),
+        ] {
+            state.ui = ui;
+            assert_eq!(hints(ui), expected);
+            assert_eq!(hint_of(&state, 100), expected);
+        }
+        state.idle_hints = vec!["ctrl-j newline"];
+        state.ui = UiState::Idle;
+        assert_eq!(hint_of(&state, 100), "/ commands   ctrl-j newline");
+        assert_eq!(hint_of(&state, 20), "/ commands");
+        state.ui = UiState::Running;
+        assert_eq!(hint_of(&state, 100), "ctrl-c interrupt   enter steer");
+        state.ui = UiState::Idle;
+        assert_eq!(hint_of(&state, 12), "/ commands");
+    }
+
+    #[test]
+    fn low_priority_fields_drop_whole_on_narrow_rows() {
+        let state = full();
+        assert_eq!(
+            status_of(&state, 200),
+            "replay-model-01 | auto | ctx ~2.7k (request bytes) | queued 2 | effort high | net \
+             | main | mcp 1/1 | $0.0123 | /Users/dev/rune 9f2c1a7b"
+        );
+        assert_eq!(
+            status_of(&state, 120),
+            "replay-model-01 | auto | ctx ~2.7k (request bytes) | queued 2 | effort high | net \
+             | main | mcp 1/1 | $0.0123"
+        );
+        assert_eq!(
+            status_of(&state, 60),
+            "replay-model-01 | auto | ctx ~2.7k (request bytes)"
+        );
+        assert_eq!(status_of(&state, 32), "replay-model-01 | auto");
+        assert_eq!(status_of(&state, 16), "replay-model-01");
+        assert_eq!(status_of(&state, 9), "replay-mo");
+        let mut retried = state;
+        retried.provider_retry = Some(ProviderRetry {
+            attempt: 2,
+            max_attempts: 3,
+            delay: None,
+        });
+        assert_eq!(
+            status_of(&retried, 40),
+            "provider retry 2/3 | replay-model-01"
+        );
+    }
+
+    #[test]
+    fn statusline_setting_orders_and_limits_fields() {
+        let mut state = full();
+        state.fields = Some(vec![StatusField::Session]);
+        assert_eq!(status_of(&state, 120), "9f2c1a7b");
+        state.fields = Some(vec![
+            StatusField::Context,
+            StatusField::Branch,
+            StatusField::Model,
+        ]);
+        assert_eq!(
+            status_of(&state, 120),
+            "ctx ~2.7k (request bytes) | main | replay-model-01"
+        );
+        assert_eq!(status_of(&state, 34), "ctx ~2.7k (request bytes) | main");
+        assert_eq!(status_of(&state, 30), "ctx ~2.7k (request bytes)");
+        state.fields = Some(Vec::new());
+        assert_eq!(status_of(&state, 120), "");
+        let names: Vec<&str> = StatusField::ALL.iter().map(|field| field.name()).collect();
+        assert_eq!(names, rune_core::config::STATUSLINE_FIELDS);
+        assert_eq!(
+            StatusField::from_name(" Branch "),
+            Some(StatusField::Branch)
+        );
+        assert_eq!(StatusField::from_name("retry"), None);
+    }
+
+    #[test]
+    fn mcp_field_warns_when_a_server_is_missing() {
+        let theme = Theme::dark();
+        let depth = ColorDepth::TrueColor;
+        let layout = solve((100, 40), 1, false, DEFAULT_MINIMUM_ROWS);
+        let row_of = |mcp: Option<(usize, usize)>| {
+            let state = FooterState { mcp, ..state() };
+            render(&state, &layout, &theme, 200, depth)
+                .pop()
+                .expect("status row")
+        };
+        let warning = paint(&theme, Slot::Warning, depth, 0);
+        let dim = paint(&theme, Slot::Dim, depth, 0);
+        assert_ne!(warning, dim);
+        let missing = row_of(Some((1, 2)));
+        assert!(
+            missing.contains(&format!("{warning}mcp 1/2")),
+            "{missing:?}"
+        );
+        let all = row_of(Some((2, 2)));
+        assert!(all.contains(&format!("{dim}mcp 2/2")), "{all:?}");
+        for none in [None, Some((0, 0))] {
+            let row = strip(&[row_of(none)]).remove(0);
+            assert!(!row.contains("mcp"), "{row}");
         }
     }
 

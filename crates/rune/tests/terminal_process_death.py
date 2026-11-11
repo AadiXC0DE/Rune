@@ -160,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"slow\r")
         wait_for("STREAM-03", start)
@@ -180,7 +180,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         session_id = log.parent.name
 
         launch("resume", "last")
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         replay = transcript.decode(errors="replace")
         assert f"session {session_id}" in replay, replay
         for line in partial.splitlines():
@@ -206,7 +206,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         # Replaying again after a completed continuation must still preserve the
         # old partial exactly once, and discard the completed reply's deltas.
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         replay = transcript.decode(errors="replace")
         for text in [*partial.splitlines(), "AFTER_RESUME_OK", "[interrupted]"]:
             assert replay.count(text) == 1, replay

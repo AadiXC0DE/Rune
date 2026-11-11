@@ -80,10 +80,10 @@ with tempfile.TemporaryDirectory(prefix="rune-undo-") as directory:
         mark = len(transcript)
         os.write(master, line.encode() + b"\r")
         seen = wait_for(expected, mark)
-        return wait_for("ctrl-c cancel", seen)
+        return wait_for("/ commands", seen)
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         command("make the file", "Made.")
         assert made.read_text() == "x\n"
         command("/undo preview", "A made-by-command")

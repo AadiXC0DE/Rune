@@ -152,9 +152,9 @@ with tempfile.TemporaryDirectory(prefix="rune-newline-") as directory:
     try:
         wait_for(QUERY)
         os.write(master, replies)
-        wait_for(b"ctrl-c cance")
+        wait_for(b"/ commands")
         drain()
-        hint = transcript.index(b"ctrl-c cance")
+        hint = transcript.index(b"/ commands")
         if push is None:
             for sequence in [b"\x1b[>1u", b"\x1b[>4;", b"\x1b[<u", b"\x1b[>4m"]:
                 assert sequence not in transcript, transcript

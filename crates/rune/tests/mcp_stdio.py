@@ -259,7 +259,7 @@ def run_fixture(scenario, terminal=False):
                         if select.select([master], [], [], 0.05)[0]:
                             transcript.extend(os.read(master, 65536))
 
-                wait_for(b"ctrl-c cancel")
+                wait_for(b"/ commands")
                 os.write(master, b"echo through MCP\r")
                 if scenario == "cancel":
                     deadline = time.monotonic() + 10

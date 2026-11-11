@@ -123,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
         captures.append((stage, list(transcript)))
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         if tagged_model:
             capture("empty-catalog", b"/model\r", "no match for ``")
             # Empty and malformed IDs must leave the picker open. Typing a
@@ -136,7 +136,10 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             assert all(request["model"] == "qwen3:latest" for request in requests), requests
             assert 'qwen3:latest' in config_file.read_text(), "choice was not saved"
         elif custom_completion:
+            start = len(transcript)
             capture("custom-menu-tab", b"/audit", "> /audit-command")
+            # The hint row names the menu's keys while the menu is open.
+            wait_for("up/down select   tab complete   esc close", start)
             capture("custom-tab", b"\t", "> /audit-command")
             capture("custom-menu-enter", b"\x15/audit", "> /audit-command")
             capture("custom-enter", b"\r", "> /audit-command")

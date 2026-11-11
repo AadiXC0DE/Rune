@@ -108,7 +108,7 @@ def capture(binary, root, environment, arguments):
             transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for(b"ctrl-c cancel")
+        wait_for(b"/ commands")
         wait_for(b"ascii-fixture")
         start = len(transcript)
         os.write(master, b"/mod")

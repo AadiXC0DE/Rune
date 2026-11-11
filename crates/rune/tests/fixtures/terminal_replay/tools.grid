@@ -8,7 +8,7 @@ tools-finished: 80x24, caret 2,11
 06||
 07|TOOLS-DONE|
 08|  2 calls · <t>|
-09|ctrl-c cancel  /help commands  esc clear|
+09|/ commands|
 10|replay-fixture | full access | ctx ~###k (request bytes)|
 11|>|
 12||

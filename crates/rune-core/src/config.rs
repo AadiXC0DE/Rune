@@ -708,6 +708,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<bool>,
 
+    /// Status row fields to show, highest priority first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline: Option<Vec<String>>,
+
     /// Whether terminal decorations use only ASCII.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ascii: Option<bool>,
@@ -939,6 +943,8 @@ pub struct Settings {
     pub motion: String,
     /// Whether the window title shows the session and its state.
     pub terminal_title: bool,
+    /// Status row fields to show, highest priority first.
+    pub statusline: Vec<String>,
     /// Whether terminal decorations use only ASCII.
     pub ascii: bool,
     /// Whether automatic update checks run.
@@ -1014,6 +1020,7 @@ impl Default for Settings {
             color: COLOR_VALUES[0].to_owned(),
             motion: MOTION_VALUES[0].to_owned(),
             terminal_title: true,
+            statusline: STATUSLINE_FIELDS.map(str::to_owned).to_vec(),
             ascii: false,
             auto_upgrade: true,
             offline: false,
@@ -1181,6 +1188,7 @@ impl Settings {
             ("color", self.color.clone()),
             ("motion", self.motion.clone()),
             ("terminal_title", self.terminal_title.to_string()),
+            ("statusline", listed(&self.statusline)),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("edit_tool", self.edit_tool.to_string()),
@@ -1485,6 +1493,22 @@ pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
 /// The accepted `motion` values, the default first.
 pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 
+/// The status row fields the `statusline` setting names, in the default order.
+pub const STATUSLINE_FIELDS: [&str; 12] = [
+    "model",
+    "mode",
+    "unsandboxed",
+    "context",
+    "queued",
+    "effort",
+    "net",
+    "branch",
+    "mcp",
+    "cost",
+    "workspace",
+    "session",
+];
+
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
@@ -1507,6 +1531,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "color",
     "motion",
     "terminal_title",
+    "statusline",
     "ascii",
     "auto_upgrade",
     "offline",
@@ -1547,6 +1572,7 @@ pub const USER_KEYS: &[&str] = &[
     "color",
     "motion",
     "terminal_title",
+    "statusline",
     "ascii",
     "auto_upgrade",
     "collapse_tool_calls",
@@ -1763,6 +1789,10 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
     (
         "terminal_title",
         "Show the session and whether it is idle, working or waiting in the window title.",
+    ),
+    (
+        "statusline",
+        "Status row fields to show, highest priority first.",
     ),
     ("ascii", "Draw terminal decorations with ASCII only."),
     (
@@ -2387,6 +2417,30 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(title) = user.terminal_title {
         settings.terminal_title = title;
         settings.sources.record("terminal_title", layer);
+    }
+    if let Some(names) = &user.statusline {
+        let mut fields: Vec<String> = Vec::with_capacity(names.len());
+        for raw in names {
+            let name = raw.trim().to_ascii_lowercase();
+            if !STATUSLINE_FIELDS.contains(&name.as_str()) {
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("statusline names an unknown field `{raw}`"),
+                    )
+                    .with_key("statusline")
+                    .with_hint(format!(
+                        "accepted fields are {}",
+                        STATUSLINE_FIELDS.join(", ")
+                    )),
+                );
+            } else if !fields.contains(&name) {
+                fields.push(name);
+            }
+        }
+        settings.statusline = fields;
+        settings.sources.record("statusline", layer);
     }
     if let Some(ascii) = user.ascii {
         settings.ascii = ascii;
@@ -3064,6 +3118,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "color": settings.color,
         "motion": settings.motion,
         "terminal_title": settings.terminal_title,
+        "statusline": settings.statusline,
         "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
@@ -5079,6 +5134,41 @@ max_agent_steps = 50
         let project = write(&dir, ".rune.toml", "color = \"none\"\n");
         let settings = load(Some(&project), None, &empty_env());
         assert_eq!(settings.color, "auto");
+    }
+
+    #[test]
+    fn statusline_setting_lists_known_fields_from_the_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().statusline, STATUSLINE_FIELDS);
+        let user = write(
+            &dir,
+            "config.toml",
+            "statusline = [\"Session\", \"model\", \"bogus\", \"model\"]\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.statusline, ["session", "model"]);
+        assert_eq!(settings.source_of("statusline"), Layer::User);
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("statusline")
+                && diagnostic.message == "statusline names an unknown field `bogus`"
+                && diagnostic
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("model, mode, unsandboxed"))
+        }));
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "statusline")
+            .expect("statusline is explained");
+        assert_eq!(row.value, "session,model");
+        assert_eq!(
+            to_status_json(&settings, Utf8Path::new("/w"))["statusline"],
+            serde_json::json!(["session", "model"])
+        );
+        let project = write(&dir, ".rune.toml", "statusline = [\"model\"]\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.statusline, STATUSLINE_FIELDS);
     }
 
     #[test]

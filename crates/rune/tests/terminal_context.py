@@ -67,11 +67,11 @@ with tempfile.TemporaryDirectory(prefix="rune-context-view-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"hello\r")
         wait_for("First.")
-        mark = len(transcript)
-        wait_for("ctrl-c cancel", mark)
+        mark = transcript.find(b"First.")
+        wait_for("/ commands", mark)
         os.write(master, b"/context\r")
         wait_for("tool schemas", mark)
         view = transcript[mark:].decode(errors="replace")
