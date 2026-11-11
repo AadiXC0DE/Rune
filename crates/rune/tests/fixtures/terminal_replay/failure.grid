@@ -1,0 +1,25 @@
+failure-reported: 80x24, caret 2,7
+00|session ************|
+01|> fail|
+02|[the turn failed: the endpoint returned HTTP 401: invalid api key]|
+03||
+04|[the provider refused the credential; run `rune connect` to store a new key]|
+05|ctrl-c cancel  /help commands  esc clear|
+06|replay-fixture | auto | ctx ~###k (request bytes)|
+07|>|
+08||
+09||
+10||
+11||
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||
