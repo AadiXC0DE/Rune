@@ -704,11 +704,18 @@ pub const MIN_WIDTH: usize = 1;
 ///
 /// Complete source lines keep their rows and fence state. Only the unfinished
 /// line is rewrapped, so completing a fence or appending code cannot move an
-/// earlier line. A width change or a cleared source resets the cache.
+/// earlier line. A width change rewraps from the committed base; a cleared
+/// source resets the cache.
 #[derive(Clone, Debug, Default)]
 pub struct AssistantRows {
-    finished: Vec<String>,
+    /// Rows of each complete line after `base`, with the line's end offset and
+    /// the fence state after it.
+    finished: Vec<(usize, Vec<String>, Option<Fence>)>,
     covered: usize,
+    /// Bytes of the source already handed out by `take_through`.
+    base: usize,
+    /// The fence state at `base`.
+    base_fence: Option<Fence>,
     width: Option<usize>,
     ascii: bool,
     fence: Option<Fence>,
@@ -719,7 +726,8 @@ impl AssistantRows {
     /// Draws Markdown prose with `style` from now on, rewrapping if it changed.
     pub fn set_markdown(&mut self, markdown: &crate::markdown::MarkdownStyle) {
         if &self.markdown != markdown {
-            *self = Self::with_markdown(markdown.clone());
+            self.markdown = markdown.clone();
+            self.rewrap();
         }
     }
 
@@ -744,26 +752,25 @@ impl AssistantRows {
     }
 
     /// Returns wrapped rows using ASCII continuation markers when requested.
+    ///
+    /// Only the text after the committed base is drawn.
     #[must_use]
     pub fn rows_with_ascii(&mut self, text: &str, width: usize, ascii: bool) -> Vec<String> {
         let width = width.max(MIN_WIDTH);
-        if text.len() < self.covered || self.width != Some(width) || self.ascii != ascii {
+        if text.len() < self.covered {
             *self = Self::with_markdown(std::mem::take(&mut self.markdown));
         }
-        self.width = Some(width);
-        self.ascii = ascii;
-        let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
-        for line in text[self.covered..sealed].split_inclusive('\n') {
-            self.finished.extend(assistant_line(
-                line.strip_suffix('\n').unwrap_or(line),
-                width,
-                &mut self.fence,
-                ascii,
-                &self.markdown,
-            ));
+        if self.width != Some(width) || self.ascii != ascii {
+            self.width = Some(width);
+            self.ascii = ascii;
+            self.rewrap();
         }
-        self.covered = sealed;
-        let mut rows = self.finished.clone();
+        let sealed = self.cover(text);
+        let mut rows: Vec<String> = self
+            .finished
+            .iter()
+            .flat_map(|(_, rows, _)| rows.iter().cloned())
+            .collect();
         // A partial closing fence must not change the cached state until its
         // newline arrives: the next delta may still make it ordinary code.
         let mut fence = self.fence;
@@ -775,6 +782,81 @@ impl AssistantRows {
             &self.markdown,
         ));
         rows
+    }
+
+    /// Hands out the rows for `text[base..offset]` and moves the base to
+    /// `offset`, so they are never drawn again.
+    ///
+    /// `offset` is a line start, or a point inside the unfinished line, whose
+    /// part before `offset` is then drawn as a complete line.
+    #[must_use]
+    pub fn take_through(&mut self, text: &str, offset: usize) -> Vec<String> {
+        let width = self.width.unwrap_or(MIN_WIDTH);
+        let offset = offset.min(text.len());
+        if offset <= self.base {
+            return Vec::new();
+        }
+        self.cover(&text[..offset]);
+        let keep = self
+            .finished
+            .iter()
+            .take_while(|(end, _, _)| *end <= offset)
+            .count();
+        let mut rows = Vec::new();
+        for (_, line, fence) in self.finished.drain(..keep) {
+            rows.extend(line);
+            self.base_fence = fence;
+        }
+        if offset > self.covered {
+            let line = &text[self.covered..offset];
+            rows.extend(assistant_line(
+                line,
+                width,
+                &mut self.fence,
+                self.ascii,
+                &self.markdown,
+            ));
+            self.base_fence = self.fence;
+            self.covered = offset;
+        }
+        self.base = offset;
+        rows
+    }
+
+    /// Whether the committed base is inside a code fence.
+    #[must_use]
+    pub const fn base_in_code(&self) -> bool {
+        self.base_fence.is_some()
+    }
+
+    /// Wraps the complete lines after `covered`, returning the new `covered`.
+    fn cover(&mut self, text: &str) -> usize {
+        let width = self.width.unwrap_or(MIN_WIDTH);
+        let start = self.covered.min(text.len());
+        let sealed = text[start..]
+            .rfind('\n')
+            .map_or(start, |at| start.saturating_add(at).saturating_add(1));
+        let mut end = start;
+        for line in text[start..sealed].split_inclusive('\n') {
+            end = end.saturating_add(line.len());
+            let rows = assistant_line(
+                line.strip_suffix('\n').unwrap_or(line),
+                width,
+                &mut self.fence,
+                self.ascii,
+                &self.markdown,
+            );
+            self.finished.push((end, rows, self.fence));
+        }
+        self.covered = sealed.max(self.covered);
+        self.covered
+    }
+
+    /// Drops the cached rows so they are wrapped again from the base.
+    fn rewrap(&mut self) {
+        self.finished.clear();
+        self.covered = self.base;
+        self.fence = self.base_fence;
     }
 }
 
