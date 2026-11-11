@@ -24,6 +24,18 @@ pub enum Speaker {
     Notice,
 }
 
+/// How serious a harness note is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Severity {
+    /// Something the reader may want to know.
+    #[default]
+    Info,
+    /// Something that went wrong but did not stop the work.
+    Warning,
+    /// Something that stopped the work.
+    Error,
+}
+
 /// One entry in a transcript.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -33,6 +45,10 @@ pub struct Entry {
     pub text: String,
     /// Whether the text may be expanded rather than summarized.
     pub expandable: bool,
+    /// How serious a notice is.
+    pub severity: Severity,
+    /// What the reader can do about an error.
+    pub hint: Option<String>,
 }
 
 impl Entry {
@@ -43,6 +59,8 @@ impl Entry {
             speaker: Speaker::User,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -53,6 +71,8 @@ impl Entry {
             speaker: Speaker::Assistant,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -63,6 +83,8 @@ impl Entry {
             speaker: Speaker::Tool,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -73,6 +95,8 @@ impl Entry {
             speaker: Speaker::Reasoning,
             text: text.into(),
             expandable: false,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -83,6 +107,29 @@ impl Entry {
             speaker: Speaker::Notice,
             text: text.into(),
             expandable: false,
+            severity: Severity::Info,
+            hint: None,
+        }
+    }
+
+    /// Builds a harness note about something that went wrong but did not stop
+    /// the work.
+    #[must_use]
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::notice(text)
+        }
+    }
+
+    /// Builds a harness note about something that stopped the work, with what
+    /// the reader can do about it.
+    #[must_use]
+    pub fn error(text: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            hint,
+            ..Self::notice(text)
         }
     }
 }
@@ -101,9 +148,16 @@ pub fn accessible_lines(entries: &[Entry]) -> Vec<String> {
                 Speaker::Tool => "Tool",
                 Speaker::Notice => "Notice",
             };
+            let warning = if entry.severity == Severity::Warning {
+                "warning: "
+            } else {
+                ""
+            };
+            let hint = entry.hint.as_deref().map(sanitize).unwrap_or_default();
             sanitize(&entry.text)
                 .lines()
-                .map(|line| format!("{label}: {line}"))
+                .map(|line| format!("{label}: {warning}{line}"))
+                .chain(hint.lines().map(|line| format!("{label}: {line}")))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -492,6 +546,14 @@ pub struct Lanes {
     pub reset: String,
     /// How Markdown in the answer is drawn. Off by default.
     pub markdown: crate::markdown::MarkdownStyle,
+    /// Opens the marker beside a user message.
+    pub user_rail: String,
+    /// Opens a secondary row: an informational notice or an error's hint.
+    pub dim: String,
+    /// Opens the `warning:` label.
+    pub warning: String,
+    /// Opens the `error:` label.
+    pub error: String,
 }
 
 impl Default for Lanes {
@@ -500,8 +562,28 @@ impl Default for Lanes {
             reasoning: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
             markdown: crate::markdown::MarkdownStyle::default(),
+            user_rail: String::new(),
+            dim: String::new(),
+            warning: String::new(),
+            error: String::new(),
         }
     }
+}
+
+/// Wraps `text` in `open` and `reset`, or leaves it bare when there is no style.
+fn painted(open: &str, text: &str, reset: &str) -> String {
+    if open.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{open}{text}{reset}")
+    }
+}
+
+/// Writes one row without trailing spaces: a row is never padded, so what is
+/// copied from scrollback ends where the text does.
+fn push_row(out: &mut String, row: &str) {
+    out.push_str(row.trim_end_matches(' '));
+    out.push('\n');
 }
 
 /// Renders a transcript with caller-supplied lane styling.
@@ -528,13 +610,15 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     let text = sanitize(&entry.text);
     let body = if entry.speaker == Speaker::Assistant {
         // A finished answer is whole, so its tables can be measured and aligned.
-        let text = if lanes.markdown.enabled {
-            crate::markdown::align_tables(&text, display.ascii)
+        let aligned;
+        let source = if lanes.markdown.enabled {
+            aligned = crate::markdown::align_tables(&text, display.ascii);
+            &aligned
         } else {
-            text
+            &text
         };
         AssistantRows::with_markdown(lanes.markdown.clone()).rows_with_ascii(
-            &text,
+            source,
             width,
             display.ascii,
         )
@@ -542,42 +626,73 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
         wrap(&text, width)
     };
 
+    let reset = lanes.reset.as_str();
     match entry.speaker {
         Speaker::User => {
-            let _ = writeln!(out, "> {}", body.first().map_or("", String::as_str));
+            let marker = if display.ascii { ">" } else { "\u{258c}" };
+            let rail = painted(&lanes.user_rail, marker, reset);
+            let first = body.first().map_or("", String::as_str);
+            push_row(out, &format!("{rail} {first}"));
             for line in body.iter().skip(1) {
-                let _ = writeln!(out, "  {line}");
+                push_row(out, &format!("  {line}"));
             }
         }
         Speaker::Assistant => {
             for line in &body {
-                let _ = writeln!(out, "{line}");
+                push_row(out, line);
             }
         }
         // Reasoning is drawn in a secondary colour and indented, so it is
         // visually a separate lane from the answer rather than mixed into it.
         Speaker::Reasoning => {
             for line in &body {
-                let _ = writeln!(out, "{}  {line}{}", lanes.reasoning, lanes.reset);
+                push_row(out, &format!("{}  {line}{}", lanes.reasoning, lanes.reset));
             }
         }
         Speaker::Tool => {
             let keep = display.tool_lines.min(body.len());
             for line in body.iter().take(keep) {
-                let _ = writeln!(out, "  {line}");
+                push_row(out, &format!("  {line}"));
             }
             if keep < body.len() {
-                let _ = writeln!(
+                push_row(
                     out,
-                    "  ... {} more line(s)",
-                    body.len().saturating_sub(keep)
+                    &format!("  ... {} more line(s)", body.len().saturating_sub(keep)),
                 );
             }
         }
-        Speaker::Notice => {
-            for line in &body {
-                let _ = writeln!(out, "[{line}]");
+        Speaker::Notice => match entry.severity {
+            Severity::Info => {
+                for line in &body {
+                    push_row(out, &painted(&lanes.dim, &format!("[{line}]"), reset));
+                }
             }
+            Severity::Warning => labelled(out, "warning:", &lanes.warning, &text, display, reset),
+            Severity::Error => {
+                labelled(out, "error:", &lanes.error, &text, display, reset);
+                let hint = entry.hint.as_deref().map(sanitize).unwrap_or_default();
+                let width = display.width.saturating_sub(2).max(MIN_WIDTH);
+                for line in wrap(&hint, width) {
+                    if !line.trim().is_empty() {
+                        push_row(out, &painted(&lanes.dim, &format!("  {line}"), reset));
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Writes a notice under a word naming its severity: the label on the first
+/// row, the rest indented under the text.
+fn labelled(out: &mut String, label: &str, open: &str, text: &str, display: Display, reset: &str) {
+    let indent = str_width(label).saturating_add(1);
+    let width = display.width.saturating_sub(indent).max(MIN_WIDTH);
+    let label = painted(open, label, reset);
+    for (index, line) in wrap(text, width).iter().enumerate() {
+        if index == 0 {
+            push_row(out, &format!("{label} {line}"));
+        } else {
+            push_row(out, &format!("{:indent$}{line}", ""));
         }
     }
 }
@@ -1012,7 +1127,7 @@ mod tests {
         assert!(expanded.contains("TOOL-199"));
         assert!(!expanded.contains("TOOL-200"));
         assert!(expanded.contains("100 more line(s)"));
-        assert!(expanded.starts_with("> before"));
+        assert!(expanded.starts_with("\u{258c} before"));
         assert!(expanded.ends_with("after"));
         details.toggle();
         assert_eq!(details.rows(display), collapsed);
@@ -1231,7 +1346,7 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            "before\n```rust\n    abcdef\n    ↪ ghij\n    ↪ kl  \n    ↪ mnop\n\n```\nafter"
+            "before\n```rust\n    abcdef\n    ↪ ghij\n    ↪ kl\n    ↪ mnop\n\n```\nafter"
         );
     }
 
@@ -1344,7 +1459,10 @@ mod tests {
         let expected: Vec<String> = wrap(text, 12)
             .into_iter()
             .enumerate()
-            .map(|(index, row)| format!("{}{row}", if index == 0 { "> " } else { "  " }))
+            .map(|(index, row)| {
+                let row = format!("{}{row}", if index == 0 { "\u{258c} " } else { "  " });
+                row.trim_end_matches(' ').to_owned()
+            })
             .collect();
         assert_eq!(render(&[Entry::user(text)], display), expected.join("\n"));
     }
@@ -1379,7 +1497,7 @@ mod tests {
     #[test]
     fn a_user_line_is_marked_so_it_is_distinguishable() {
         let rendered = render(&[Entry::user("hello")], Display::default());
-        assert_eq!(rendered, "> hello");
+        assert_eq!(rendered, "\u{258c} hello");
     }
 
     #[test]
@@ -1391,7 +1509,7 @@ mod tests {
         let rendered = render(&[Entry::user("a".repeat(60))], display);
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines.len() > 1, "{rendered}");
-        assert!(lines[0].starts_with("> "));
+        assert!(lines[0].starts_with("\u{258c} "));
         for line in lines.iter().skip(1) {
             assert!(
                 line.starts_with("  "),
@@ -1450,7 +1568,7 @@ mod tests {
             &[Entry::user("hi"), Entry::assistant("hello")],
             Display::default(),
         );
-        assert_eq!(rendered, "> hi\n\nhello");
+        assert_eq!(rendered, "\u{258c} hi\n\nhello");
     }
 
     #[test]
@@ -1639,7 +1757,7 @@ mod tests {
 
     #[test]
     fn an_empty_entry_renders_its_marker_only() {
-        assert_eq!(render(&[Entry::user("")], Display::default()), ">");
+        assert_eq!(render(&[Entry::user("")], Display::default()), "\u{258c}");
     }
 
     #[test]
@@ -1717,6 +1835,161 @@ mod tests {
                 let (row, caret) = render_prompt_at("> ", input, column, width);
                 assert!(str_width(&row) <= width, "{row:?} at width {width}");
                 assert!(caret < width.max(1), "caret {caret} at width {width}");
+            }
+        }
+    }
+
+    fn styled_lanes() -> Lanes {
+        Lanes {
+            reset: "<reset>".to_owned(),
+            user_rail: "<rail>".to_owned(),
+            dim: "<dim>".to_owned(),
+            warning: "<warning>".to_owned(),
+            error: "<error>".to_owned(),
+            ..Lanes::default()
+        }
+    }
+
+    #[test]
+    fn a_user_message_wraps_whole_under_its_rail() {
+        let first = "alpha ".repeat(30);
+        let second = "omega ".repeat(21);
+        let text = format!("{}\n{}", first.trim_end(), second.trim_end());
+        assert!(text.chars().count() >= 300, "{}", text.len());
+        let rendered = render_lanes(&[Entry::user(&text)], Display::default(), &styled_lanes());
+        let rows: Vec<&str> = rendered.lines().collect();
+        assert!((4..=5).contains(&rows.len()), "{rendered}");
+        assert!(
+            rows[0].starts_with("<rail>\u{258c}<reset> alpha"),
+            "{rendered}"
+        );
+        for row in rows.iter().skip(1) {
+            assert!(
+                row.starts_with("  ") && !row.contains('\u{258c}'),
+                "{rendered}"
+            );
+        }
+        let words: Vec<&str> = rows
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .skip(1)
+            .collect();
+        assert_eq!(
+            words.join(" "),
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| str_width(&row.replace("<rail>", "").replace("<reset>", "")) <= 80),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ascii_user_rail_is_a_marker() {
+        let display = Display {
+            ascii: true,
+            width: 12,
+            ..Display::default()
+        };
+        let rendered = render(&[Entry::user("one two three four")], display);
+        assert_eq!(rendered, "> one two\n  three four");
+        assert!(!rendered.contains('\u{258c}'), "{rendered}");
+        let colourless = render(&[Entry::user("hi")], Display::default());
+        assert_eq!(
+            colourless, "\u{258c} hi",
+            "the shape carries the rail without colour"
+        );
+    }
+
+    #[test]
+    fn warning_and_error_entries_are_labelled_words() {
+        let display = Display {
+            width: 24,
+            ..Display::default()
+        };
+        let lanes = styled_lanes();
+        let warning = render_lanes(
+            &[Entry::warning("the server did not start in time")],
+            display,
+            &lanes,
+        );
+        let rows: Vec<&str> = warning.lines().collect();
+        assert_eq!(rows[0], "<warning>warning:<reset> the server did");
+        assert!(rows.len() > 1, "{warning}");
+        for row in rows.iter().skip(1) {
+            assert!(row.starts_with(&" ".repeat(9)), "{warning}");
+            assert!(!row.starts_with(&" ".repeat(10)), "{warning}");
+        }
+        let error = render_lanes(
+            &[Entry::error("the turn failed: no route", None)],
+            display,
+            &lanes,
+        );
+        let rows: Vec<&str> = error.lines().collect();
+        assert_eq!(rows[0], "<error>error:<reset> the turn failed:");
+        assert_eq!(rows[1], "       no route");
+        let info = render_lanes(&[Entry::notice("cancelled")], display, &lanes);
+        assert_eq!(info, "<dim>[cancelled]<reset>");
+        let plain = render(&[Entry::error("stopped", None)], Display::default());
+        assert_eq!(
+            plain, "error: stopped",
+            "the label is a word without colour"
+        );
+        assert_eq!(
+            render(&[Entry::warning("slow")], Display::default()),
+            "warning: slow"
+        );
+    }
+
+    #[test]
+    fn an_error_hint_is_its_own_dim_row() {
+        let entry = Entry::error(
+            "the turn failed: the endpoint returned HTTP 401",
+            Some("run `rune connect` to store a new key".to_owned()),
+        );
+        let rendered = render_lanes(
+            std::slice::from_ref(&entry),
+            Display::default(),
+            &styled_lanes(),
+        );
+        assert_eq!(
+            rendered,
+            "<error>error:<reset> the turn failed: the endpoint returned HTTP 401\n\
+             <dim>  run `rune connect` to store a new key<reset>"
+        );
+        assert_eq!(
+            accessible_lines(&[entry]),
+            [
+                "Notice: the turn failed: the endpoint returned HTTP 401",
+                "Notice: run `rune connect` to store a new key",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_rendered_row_ends_with_a_space() {
+        let entries = [
+            Entry::user("first line \n\n   \nlast "),
+            Entry::user(""),
+            Entry::assistant("answer  \n```\ncode   \n```\n"),
+            Entry::reasoning("thinking "),
+            Entry::tool("out \n\n"),
+            Entry::notice(" "),
+            Entry::warning("warned \n"),
+            Entry::error("failed ", Some("hint \n\nmore ".to_owned())),
+        ];
+        for ascii in [false, true] {
+            let display = Display {
+                ascii,
+                width: 10,
+                ..Display::default()
+            };
+            for lanes in [Lanes::default(), styled_lanes()] {
+                let rendered = render_lanes(&entries, display, &lanes);
+                for row in rendered.lines() {
+                    assert!(!row.ends_with(' '), "{row:?} in {rendered:?}");
+                }
             }
         }
     }

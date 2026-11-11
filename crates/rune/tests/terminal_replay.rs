@@ -471,14 +471,19 @@ fn failed_turn_grids() {
     let rows = stage_rows(&actual, "failure-reported");
     let failed = rows
         .iter()
-        .position(|row| row.contains("[the turn failed: "))
+        .position(|row| row.starts_with("error: the turn failed: "))
         .expect("failure row");
-    let hint = rows
-        .iter()
-        .skip(failed.saturating_add(1))
-        .find(|row| !row.is_empty())
-        .expect("hint row");
-    assert!(hint.starts_with('[') && hint.ends_with(']'), "{actual}");
+    assert!(rows.contains(&"\u{258c} fail"), "{actual}");
+    assert_eq!(
+        failed.checked_sub(1).and_then(|row| rows.get(row)).copied(),
+        Some(""),
+        "{actual}"
+    );
+    let hint = rows.get(failed.saturating_add(1)).expect("hint row");
+    assert!(
+        hint.starts_with("  ") && !hint.trim().is_empty() && !hint.contains('['),
+        "{actual}"
+    );
 }
 
 #[test]
@@ -554,7 +559,7 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
         match capture.stage.as_str() {
             "draft" => draft = Some(grid.clone()),
             "opened" => {
-                assert!(text.contains("> inspect"), "{text}");
+                assert!(text.contains("\u{258c} inspect"), "{text}");
                 assert!(text.contains("read_file"), "{text}");
                 opened = Some(grid.clone());
             }
@@ -575,7 +580,7 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
                 assert!(text.contains("expanded"), "{text}");
                 assert!(text.contains("TOOL-20"), "{text}");
             }
-            "tool-surrounding-start" => assert!(text.contains("> inspect"), "{text}"),
+            "tool-surrounding-start" => assert!(text.contains("\u{258c} inspect"), "{text}"),
             "tool-surrounding-end" => assert!(text.contains("REPLY-40"), "{text}"),
             "closed" => assert_eq!(Some(&grid), draft.as_ref(), "draft screen or caret changed"),
             "edited" => assert!(text.contains("draft Z界 tail"), "{text}"),

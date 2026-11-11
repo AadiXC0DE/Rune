@@ -183,7 +183,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         os.write(master, b"die\r")
         wait_for("STREAM-03", start)
         cut_stream.set()
-        wait_for("[the turn failed: the response stream ended without a completion event]", start)
+        wait_for("error: the turn failed: the response stream ended without a completion event\r\n", start)
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
             {"kind": "assistant_message", "turn": 1, "text": partial},

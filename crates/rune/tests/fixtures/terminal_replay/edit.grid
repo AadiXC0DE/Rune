@@ -1,22 +1,22 @@
-edit-finished: 80x24, caret 2,13
+edit-finished: 80x24, caret 2,17
 00|session ************|
-01|> edit|
-02|  ✓ edit_file app.txt · +2 -1|
-03|    - beta|
-04|    + BETA|
-05|    + beta two|
-06|EDIT-DONE|
-07||
-08|[files changed with no check since; asked for one before finishing]|
-09|EDIT-CHECKED|
-10|  1 call · 1 file changed · unverified · <t>|
-11|ctrl-c cancel  /help commands  esc clear|
-12|replay-fixture | full access | ctx ~###k (request bytes)|
-13|>|
-14||
-15||
-16||
-17||
+01||
+02|▌ edit|
+03||
+04|  ✓ edit_file app.txt · +2 -1|
+05|    - beta|
+06|    + BETA|
+07|    + beta two|
+08||
+09|EDIT-DONE|
+10||
+11|[files changed with no check since; asked for one before finishing]|
+12||
+13|EDIT-CHECKED|
+14|  1 call · 1 file changed · unverified · <t>|
+15|ctrl-c cancel  /help commands  esc clear|
+16|replay-fixture | full access | ctx ~###k (request bytes)|
+17|>|
 18||
 19||
 20||
