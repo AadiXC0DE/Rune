@@ -406,8 +406,16 @@ impl Inline {
         // to the first row that has to be written rather than rewriting them.
         // Without this step the write lands at the region's top and overwrites
         // the rows it was meant to leave alone.
+        //
+        // A first change past the rows on screen is a row the region gains. A
+        // cursor move stops at the screen's bottom, so that row is reached with
+        // a newline, which scrolls instead of landing on the last row shown.
         if first_changed > 0 {
-            down(&mut out, u16::try_from(first_changed).unwrap_or(u16::MAX));
+            let on_screen = first_changed.min(self.shown.len().saturating_sub(1));
+            down(&mut out, u16::try_from(on_screen).unwrap_or(u16::MAX));
+            for _ in on_screen..first_changed {
+                out.push_str("\r\n");
+            }
         }
 
         for (index, row) in rows.iter().enumerate().skip(first_changed) {
@@ -594,6 +602,29 @@ mod tests {
             assert_eq!(grid.row_text(grid.cursor().row), prompt[usize::from(row)]);
             assert_eq!(grid.cursor().col, 2);
         }
+    }
+
+    #[test]
+    fn a_draft_row_added_at_screen_bottom_scrolls_rather_than_overwriting() {
+        let mut inline = Inline::new(20);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        grid.feed(b"\r\n\r\n\r\n\r\n\r\n").expect("bottom");
+        let footer = vec!["status".to_owned()];
+        let first = rows(&["> first"]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &first, &[], (0, 7)))
+            .expect("feed");
+        let grown = rows(&["> first", "  "]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &grown, &[], (1, 2)))
+            .expect("feed");
+        let caret = grid.cursor();
+        assert_eq!((caret.row, caret.col), (5, 2), "{}", grid.text());
+        assert_eq!(grid.row_text(4), "> first", "{}", grid.text());
+        assert_eq!(grid.row_text(3), "status", "{}", grid.text());
+        let typed = rows(&["> first", "  second"]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &typed, &[], (1, 8)))
+            .expect("feed");
+        assert_eq!(grid.row_text(4), "> first", "{}", grid.text());
+        assert_eq!(grid.row_text(5), "  second", "{}", grid.text());
     }
 
     /// Every control sequence in a byte string, in order.
