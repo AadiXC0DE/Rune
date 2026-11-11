@@ -1129,6 +1129,34 @@ cache root. `rune sandbox explain` lists the roots and what added each.
 commands run without one, and the footer and `rune status` say so. It never
 turns off a backend that works, and a project file cannot set it.
 
+### Permissions
+
+Rules in `[[permission.rules]]` decide actions. `tool` names a tool, `shell` for
+commands or `*` for any; `match` is a command pattern for `shell` and a path glob
+for file tools; `decision` is `allow`, `ask` or `deny`:
+
+```toml
+[[permission.rules]]
+tool = "shell"
+match = "make lint*"
+decision = "allow"
+
+[[permission.rules]]
+tool = "write_file"
+match = "migrations/*"
+decision = "ask"
+```
+
+The most specific matching rule wins, so a `deny` for `rm *` refuses `rm -rf x`
+and leaves every other built-in allow in place. A user rule with
+`workspace = "/abs/path"` applies only in that workspace. A project file may add
+`deny` and `ask` rules freely; its `allow` rules apply only after
+`rune projects approve`, and a change to them needs approval again. A project
+rule cannot set `workspace` or `saved`, and an empty `match` is reported and the
+rule ignored. `rune permissions --explain shell:'npm test'` names the deciding
+rule and where it came from: the user file, a prompt, the project file or the
+built-in set.
+
 ## Hooks
 
 Hooks are programs Rune runs at points of a session. Configure them in the user

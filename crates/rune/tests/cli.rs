@@ -1083,7 +1083,7 @@ fn permissions_explanations_preserve_positional_and_text_output() {
     assert_eq!(flagged.stdout, positional.stdout);
     assert_eq!(
         flagged.stdout,
-        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer)\n"
+        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer); source: built in\n"
     );
 
     let json = run(&["permissions", "shell", "pwd", "--json"]);
@@ -2774,6 +2774,74 @@ const PROJECT_HOOKS: &str = "[[hooks]]\nevent = 'pre_tool'\nname = 'guard'\n\
 fn write_project_hooks(workspace: &std::path::Path, body: &str) {
     std::fs::create_dir_all(workspace.join(".rune")).expect("project directory");
     std::fs::write(workspace.join(".rune/hooks.toml"), body).expect("hooks file");
+}
+
+fn explain_in(workspace: &std::path::Path, action: &str) -> serde_json::Value {
+    let output = Command::new(binary())
+        .isolated_env()
+        .args(["permissions", "--explain", action, "--json"])
+        .env("HOME", workspace)
+        .env("RUNE_HOME", workspace.join("state"))
+        .env("XDG_CONFIG_HOME", workspace.join("config"))
+        .env("XDG_DATA_HOME", workspace.join("data"))
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run binary");
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).expect("JSON")
+}
+
+#[test]
+fn projects_approve_lists_and_approves_project_allow_rules() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join(".rune.toml"),
+        "[[permission.rules]]\ntool = 'shell'\nmatch = 'curl*'\ndecision = 'allow'\n\n\
+         [[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n",
+    )
+    .expect("project file");
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project allow rules: not approved\n  allow shell \"curl*\"\n"),
+        "{}",
+        status.stdout
+    );
+    assert!(!status.stdout.contains("rm *"), "{}", status.stdout);
+    // The deny applies at once; the allow does not.
+    assert_eq!(explain_in(dir.path(), "shell:rm -rf x")["outcome"], "deny");
+    let curl = explain_in(dir.path(), "shell:curl https://example.com");
+    assert_eq!(curl["outcome"], "ask", "{curl}");
+
+    let refused = projects(dir.path(), &["approve"]);
+    assert_eq!(refused.status, Some(0), "{}", refused.stderr);
+    assert!(
+        refused.stdout.contains(
+            "project allow rules not approved: pass --yes to approve them without a prompt"
+        ),
+        "{}",
+        refused.stdout
+    );
+    let approved = projects(dir.path(), &["approve", "--yes"]);
+    assert_eq!(approved.status, Some(0), "{}", approved.stderr);
+    assert!(
+        approved
+            .stdout
+            .contains("approved the allow rules in .rune.toml"),
+        "{}",
+        approved.stdout
+    );
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status.stdout.contains("project allow rules: approved\n"),
+        "{}",
+        status.stdout
+    );
+    let curl = explain_in(dir.path(), "shell:curl https://example.com");
+    assert_eq!(curl["outcome"], "allow", "{curl}");
+    assert_eq!(curl["source"], "project", "{curl}");
 }
 
 #[test]

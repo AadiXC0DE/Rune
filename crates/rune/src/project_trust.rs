@@ -81,7 +81,6 @@ impl Approvals {
     }
 
     /// Whether the rules file with this digest is approved for the workspace.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rules_approved(&self, workspace: &Utf8Path, digest: &str) -> bool {
         self.workspaces
             .get(&key(workspace))
@@ -90,7 +89,6 @@ impl Approvals {
     }
 
     /// Approves the rules file with this digest for the workspace.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn approve_rules(&mut self, workspace: &Utf8Path, digest: &str) {
         self.workspaces.entry(key(workspace)).or_default().rules = Some(digest.to_owned());
     }
