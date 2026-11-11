@@ -461,6 +461,10 @@ pub trait Host {
         None
     }
 
+    /// Called as each history change a resume must repeat happens. The default
+    /// journals nothing.
+    fn journal(&self, _entry: &JournalEntry) {}
+
     /// Records delegated provider usage without adding child conversation events.
     fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
 
@@ -645,6 +649,56 @@ pub trait Host {
 pub fn lowest_accepted_effort(host: &dyn Host) -> Effort {
     let (_, traits) = host.compat(&host.model());
     crate::compaction::lowest_effort(traits.efforts, host.dialect())
+}
+
+/// Where a harness note entered the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotePlacement {
+    /// Joined before the user turn at `at`: `{text}\n\n{prompt}`.
+    PromptPrefix,
+    /// Joined after the user turn at `at`: `{prompt}\n\n{text}`.
+    PromptSuffix,
+    /// Another text part of the user turn at `at`.
+    UserPart,
+    /// Its own user turn at position `at`.
+    UserTurn,
+    /// Its own assistant turn at position `at`.
+    AssistantTurn,
+}
+
+/// A change to the history the host must journal for resume to rebuild it exactly.
+///
+/// `at` is the number of turns the history held when the change happened; a
+/// note joined to a user turn names that turn's position minus one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalEntry {
+    /// A harness note entered the conversation.
+    Note {
+        /// Position, as above.
+        at: u64,
+        /// Where the note went.
+        placement: NotePlacement,
+        /// The note's text.
+        text: String,
+    },
+    /// A checkpoint replaced the first `through` turns.
+    Checkpoint {
+        /// Position, as above.
+        at: u64,
+        /// Turns the checkpoint replaced.
+        through: u64,
+        /// The checkpoint turn's text.
+        message: String,
+    },
+    /// A tool result's content was replaced in place.
+    ResultReplaced {
+        /// Position, as above.
+        at: u64,
+        /// Call whose result was replaced.
+        call_id: String,
+        /// The result's new content.
+        content: String,
+    },
 }
 
 /// Text a host appends to the last tool result of a step, with keys marking what it
@@ -990,7 +1044,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
 
     let instructions = host.instructions();
     history.set_instructions(instructions);
-    crate::prune::unload_skills(history, host.dialect());
+    crate::prune::unload_skills(history, host);
     history.validate()?;
 
     let client = host.fetch();
@@ -1113,7 +1167,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             && u64::from(steps).saturating_add(1) == step_limit
             && !host.tools().is_empty();
         if last_step {
-            history.push_harness_note(LAST_STEP_NOTE);
+            push_note(history, host, LAST_STEP_NOTE);
         }
 
         steps = steps.saturating_add(1);
@@ -1178,7 +1232,6 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             }
             reasoning.push_str(&step_reasoning);
         }
-        let tool_calls = outcome.tool_calls();
         let finish = outcome.finish.unwrap_or(FinishReason::Stop);
         if finish != FinishReason::MaxTokens {
             continuations = 0;
@@ -1187,58 +1240,29 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             cut_continuations = 0;
         }
 
-        // Record the assistant turn, including any replay state the provider
-        // requires on the next request.
-        let mut parts: Vec<ContentPart> = Vec::new();
-        let mut pending_calls = Vec::new();
         // Text from a new step starts a new entry, even with no call between.
         let mut new_step = true;
         for event in &outcome.events {
             match event {
                 // The host already received this delta as it arrived; here it is
-                // only assembled into the turn's record.
+                // only assembled into the turn's narration.
                 rune_net::stream::ProviderEvent::TextDelta { delta } => {
                     match narration.last_mut() {
                         Some(Narration::Text(said)) if !new_step => said.push_str(delta),
                         _ => narration.push(Narration::Text(delta.clone())),
                     }
                     new_step = false;
-                    parts.push(ContentPart::Text {
-                        text: delta.clone(),
-                    });
                 }
-                // Reasoning is assembled too, so it outlives the turn. A
-                // provider that requires its own reasoning replayed would
-                // otherwise be sent a conversation with the thinking removed.
-                rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
-                    parts.push(ContentPart::Reasoning {
-                        text: delta.clone(),
-                    });
-                }
-                rune_net::stream::ProviderEvent::ToolCallEnd { id, arguments } => {
-                    let name = tool_calls
-                        .iter()
-                        .find(|(call_id, _, _)| call_id == &id.to_string())
-                        .map(|(_, name, _)| name.clone())
-                        .unwrap_or_default();
-                    parts.push(ContentPart::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    });
+                rune_net::stream::ProviderEvent::ToolCallEnd { id, .. } => {
                     narration.push(Narration::Call(id.to_string()));
-                    pending_calls.push(PreparedCall {
-                        id: id.to_string(),
-                        name,
-                        arguments: arguments.clone(),
-                    });
                 }
                 _ => {}
             }
         }
 
-        // Merge adjacent text parts so the transcript has one entry per run.
-        let parts = coalesce_text(parts);
+        // Record the assistant turn, including any replay state the provider
+        // requires on the next request.
+        let (parts, pending_calls) = assistant_parts(&outcome);
         let recorded = !parts.is_empty() || !pending_calls.is_empty();
         if recorded {
             // The replay value travels with the turn that produced it, because
@@ -1256,7 +1280,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             // step's text is joined to it.
             if outcome.interrupted && !last_step && host.objective_tokens_remaining() != Some(0) {
                 carried = text.clone();
-                history.push_user(INTERRUPTED_CONTINUE);
+                push_user_note(history, host, INTERRUPTED_CONTINUE);
                 continue;
             }
             // Steering that arrived while the last request was streaming gets a
@@ -1282,11 +1306,16 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             {
                 limit_retry = false;
                 if !recorded {
+                    host.journal(&JournalEntry::Note {
+                        at: position(history.len()),
+                        placement: NotePlacement::AssistantTurn,
+                        text: NO_REPLY.to_owned(),
+                    });
                     history.push_assistant(vec![ContentPart::Text {
-                        text: "[no reply: the output limit was reached]".to_owned(),
+                        text: NO_REPLY.to_owned(),
                     }]);
                 }
-                history.push_user(OUTPUT_LIMIT_RETRY);
+                push_user_note(history, host, OUTPUT_LIMIT_RETRY);
                 continue;
             }
             // A reply cut off after it said something is continued where it
@@ -1299,7 +1328,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             {
                 continuations = continuations.saturating_add(1);
                 carried = text.clone();
-                history.push_harness_note(CONTINUE_NOTE);
+                push_note(history, host, CONTINUE_NOTE);
                 continue;
             }
             // A turn that changed files and stopped of its own accord is told
@@ -1316,7 +1345,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 && host.objective_tokens_remaining() != Some(0)
             {
                 question_nudged = true;
-                history.push_harness_note(QUESTION_NUDGE);
+                push_note(history, host, QUESTION_NUDGE);
                 continue;
             }
             if !last_step
@@ -1329,13 +1358,13 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                     && let Some(record) = verify::summarize(&calls, stall_noted).last_check
                 {
                     failure_noted = true;
-                    history.push_harness_note(&check_failed_note(&record));
+                    push_note(history, host, &check_failed_note(&record));
                     host.emit(Event::VerificationRequested);
                     continue;
                 }
                 if verdict == Verification::Unverified && reminders > 0 {
                     reminders = reminders.saturating_sub(1);
-                    history.push_user(VERIFICATION_REMINDER);
+                    push_user_note(history, host, VERIFICATION_REMINDER);
                     host.emit(Event::VerificationRequested);
                     continue;
                 }
@@ -1410,7 +1439,11 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                     && report.rounds < JUDGE_MAX_ROUNDS
                     && judge_same < JUDGE_SAME_REASON
                 {
-                    history.push_harness_note(&judge_continue_note(&verdict.reason, &verdict.next));
+                    push_note(
+                        history,
+                        host,
+                        &judge_continue_note(&verdict.reason, &verdict.next),
+                    );
                     continue;
                 }
                 // Steering that arrived during the judge request would
@@ -3650,6 +3683,87 @@ fn bound_result(content: String, remaining: usize) -> String {
 
 /// Merges adjacent text parts into one, so a delta-per-character stream does not
 /// produce one transcript entry per character.
+/// Builds an assistant turn's parts from a response, in the order its events
+/// arrived with adjacent text merged, and the calls it asked for.
+///
+/// Reasoning is kept, so a provider that requires its own reasoning replayed
+/// is never sent a conversation with the thinking removed.
+#[must_use]
+pub fn assistant_parts(outcome: &StreamOutcome) -> (Vec<ContentPart>, Vec<PreparedCall>) {
+    let tool_calls = outcome.tool_calls();
+    let mut parts: Vec<ContentPart> = Vec::new();
+    let mut pending_calls = Vec::new();
+    for event in &outcome.events {
+        match event {
+            rune_net::stream::ProviderEvent::TextDelta { delta } => {
+                parts.push(ContentPart::Text {
+                    text: delta.clone(),
+                });
+            }
+            rune_net::stream::ProviderEvent::ReasoningDelta { delta } => {
+                parts.push(ContentPart::Reasoning {
+                    text: delta.clone(),
+                });
+            }
+            rune_net::stream::ProviderEvent::ToolCallEnd { id, arguments } => {
+                let name = tool_calls
+                    .iter()
+                    .find(|(call_id, _, _)| call_id == &id.to_string())
+                    .map(|(_, name, _)| name.clone())
+                    .unwrap_or_default();
+                parts.push(ContentPart::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+                pending_calls.push(PreparedCall {
+                    id: id.to_string(),
+                    name,
+                    arguments: arguments.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    (coalesce_text(parts), pending_calls)
+}
+
+/// The placeholder assistant turn for a reply cut off before any answer.
+const NO_REPLY: &str = "[no reply: the output limit was reached]";
+
+/// Converts a history length to a journal position.
+fn position(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// Adds a harness note as [`History::push_harness_note`] does and journals it.
+fn push_note(history: &mut History, host: &dyn Host, text: &str) {
+    let len = position(history.len());
+    let joins = history
+        .last()
+        .is_some_and(|turn| turn.role == rune_net::message::Role::User);
+    history.push_harness_note(text);
+    host.journal(&JournalEntry::Note {
+        at: if joins { len.saturating_sub(1) } else { len },
+        placement: if joins {
+            NotePlacement::UserPart
+        } else {
+            NotePlacement::UserTurn
+        },
+        text: text.to_owned(),
+    });
+}
+
+/// Adds a harness note as its own user turn and journals it.
+fn push_user_note(history: &mut History, host: &dyn Host, text: &str) {
+    host.journal(&JournalEntry::Note {
+        at: position(history.len()),
+        placement: NotePlacement::UserTurn,
+        text: text.to_owned(),
+    });
+    history.push_user(text);
+}
+
 fn coalesce_text(parts: Vec<ContentPart>) -> Vec<ContentPart> {
     let mut out: Vec<ContentPart> = Vec::with_capacity(parts.len());
     for part in parts {

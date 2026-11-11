@@ -141,6 +141,34 @@ pub enum SessionEvent {
         /// Summary that replaces the covered range.
         summary: String,
     },
+    /// A harness note entered the conversation at history position `at`.
+    HarnessNote {
+        /// Turns the history held when the note entered it; for a note joined
+        /// to a user turn, that turn's position minus one.
+        at: u64,
+        /// Where the note went.
+        placement: NotePlacement,
+        /// The note's text.
+        text: String,
+    },
+    /// A checkpoint replaced the first `through` history turns; `message` is its full text.
+    Checkpoint {
+        /// Turns the history held when the checkpoint was installed.
+        at: u64,
+        /// Turns the checkpoint replaced.
+        through: u64,
+        /// The checkpoint turn's text.
+        message: String,
+    },
+    /// A tool result's content was replaced in place (a receipt or a removed skill body).
+    ResultReplaced {
+        /// Turns the history held when the result was replaced.
+        at: u64,
+        /// Call whose result was replaced.
+        call_id: String,
+        /// The result's new content.
+        content: String,
+    },
     /// A provider reported token usage.
     UsageRecorded {
         /// Input tokens.
@@ -209,6 +237,22 @@ pub enum SessionEvent {
     },
 }
 
+/// Where a harness note entered the conversation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotePlacement {
+    /// Joined before the user turn at `at`: `{text}\n\n{prompt}`.
+    PromptPrefix,
+    /// Joined after the user turn at `at`: `{prompt}\n\n{text}`.
+    PromptSuffix,
+    /// Another text part of the user turn at `at`.
+    UserPart,
+    /// Its own user turn at position `at`.
+    UserTurn,
+    /// Its own assistant turn at position `at`.
+    AssistantTurn,
+}
+
 impl SessionEvent {
     /// Returns the wire name of this event kind.
     #[must_use]
@@ -228,6 +272,9 @@ impl SessionEvent {
             Self::ToolCallRepaired { .. } => "tool_call_repaired",
             Self::ToolResult { .. } => "tool_result",
             Self::Compaction { .. } => "compaction",
+            Self::HarnessNote { .. } => "harness_note",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::ResultReplaced { .. } => "result_replaced",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
             Self::ObjectiveSet { .. } => "objective_set",
@@ -803,6 +850,21 @@ mod tests {
             SessionEvent::Compaction {
                 through: 4,
                 summary: "summary".to_owned(),
+            },
+            SessionEvent::HarnessNote {
+                at: 2,
+                placement: NotePlacement::PromptPrefix,
+                text: "note".to_owned(),
+            },
+            SessionEvent::Checkpoint {
+                at: 6,
+                through: 4,
+                message: "<conversation-checkpoint>".to_owned(),
+            },
+            SessionEvent::ResultReplaced {
+                at: 6,
+                call_id: "call_1".to_owned(),
+                content: "receipt".to_owned(),
             },
             SessionEvent::UsageRecorded {
                 input_tokens: 10,

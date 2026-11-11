@@ -5196,8 +5196,7 @@ fn a_repeated_read_runs_again_after_its_result_was_pruned() {
     run_turn(&mut history, &host).expect("first turn");
 
     history.push_user(format!("now read it again {}", "x".repeat(130_000)));
-    let report =
-        rune_agent::prune::prune(&mut history, &rune_net::chat_completions::ChatCompletions);
+    let report = rune_agent::prune::prune(&mut history, &host);
     assert_eq!(report.results, 1);
     assert!(history.is_pruned("first"));
 

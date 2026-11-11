@@ -180,6 +180,17 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+/// The delivery key of a nested instruction file: its path as the rendered
+/// `from` attribute shows it, relative to the workspace, so a resumed session
+/// can find it in a rebuilt result.
+fn rules_key(file: &rune_context::InstructionFile, workspace: &Utf8Path) -> String {
+    let path = file
+        .path
+        .strip_prefix(workspace)
+        .map_or_else(|_| file.path.to_string(), ToString::to_string);
+    format!("rules:{path}")
+}
+
 /// Returns the nested instruction files the step's calls touched for the
 /// first time, rendered for its last result, with their delivery keys.
 ///
@@ -203,7 +214,7 @@ pub fn scoped_rules(
     for result in results.iter().filter(|result| result.executed) {
         for target in call_targets(&result.call.name, &result.call.arguments, workspace) {
             for file in rune_context::resolve_for_target(nested, &target) {
-                let delivered = history.is_delivered(&format!("rules:{}", file.path));
+                let delivered = history.is_delivered(&rules_key(file, workspace));
                 if !delivered && !chosen.iter().any(|known| known.path == file.path) {
                     chosen.push(file);
                 }
@@ -230,7 +241,7 @@ pub fn scoped_rules(
     let mut keys = Vec::new();
     for (index, file) in chosen.iter().enumerate().filter(|(index, _)| kept[*index]) {
         text.push(rendered[index].as_str());
-        keys.push(format!("rules:{}", file.path));
+        keys.push(rules_key(file, workspace));
     }
     (!text.is_empty()).then(|| rune_agent::turn::Appendix {
         text: text.join("\n"),
@@ -326,10 +337,7 @@ mod tests {
             appendix.text
         );
         assert!(!appendix.text.contains("Use spaces in b."));
-        assert_eq!(
-            appendix.keys,
-            vec![format!("rules:{}", workspace.join("a/AGENTS.md"))]
-        );
+        assert_eq!(appendix.keys, vec!["rules:a/AGENTS.md".to_owned()]);
 
         // A deep path gets every file on the way, the widest first.
         let deep = deliver(&[call(

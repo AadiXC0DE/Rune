@@ -806,6 +806,17 @@ impl Host for SessionHost {
         }
     }
 
+    fn journal(&self, entry: &turn::JournalEntry) {
+        if let Some(recorder) = &self.recorder {
+            let mut recorder = recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = recorder.journal(entry) {
+                recorder.journal_failed(error);
+            }
+        }
+    }
+
     fn emit(&self, event: Event) {
         // Text is accumulated as it arrives and drawn straight away, which is
         // what makes an answer appear while it is being written rather than
@@ -3238,20 +3249,32 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // the prefix the provider has cached stays as it was.
                 host.watch_before_prompt();
                 let updates = host.take_updates();
-                let composed = if updates.is_empty() {
-                    text.clone()
-                } else {
-                    format!("{text}\n\n{}", turn::context_update(&updates))
-                };
                 recorder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .user_message(&composed)?;
-                if host.planning.load(std::sync::atomic::Ordering::Relaxed) {
-                    history.push_user(format!("{PLAN_MODE_NOTE}\n\n{composed}"));
-                } else {
-                    history.push_user(composed);
+                    .user_message(&text)?;
+                // The notes are journaled apart from the user's words, so a
+                // resumed session rebuilds this exact message.
+                let at = u64::try_from(history.len()).unwrap_or(u64::MAX);
+                let mut composed = text.clone();
+                if !updates.is_empty() {
+                    let update = turn::context_update(&updates);
+                    composed = format!("{composed}\n\n{update}");
+                    host.journal(&turn::JournalEntry::Note {
+                        at,
+                        placement: turn::NotePlacement::PromptSuffix,
+                        text: update,
+                    });
                 }
+                if host.planning.load(std::sync::atomic::Ordering::Relaxed) {
+                    composed = format!("{PLAN_MODE_NOTE}\n\n{composed}");
+                    host.journal(&turn::JournalEntry::Note {
+                        at,
+                        placement: turn::NotePlacement::PromptPrefix,
+                        text: PLAN_MODE_NOTE.to_owned(),
+                    });
+                }
+                history.push_user(composed);
                 host.transcript
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

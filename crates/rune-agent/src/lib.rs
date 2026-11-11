@@ -18,7 +18,7 @@ pub mod turn;
 pub mod verify;
 
 pub use compaction::{CompactionStats, Plan, Trigger};
-pub use history::{History, Turn};
+pub use history::{History, JournalQueue, Turn};
 pub use steering::{Boundary, Cancellation, Steering, SteeringQueue};
 pub use subagent::{
     Admission, AdmissionVerdict, Authority, AuthoritySource, Child, ChildBrief, ChildId, ChildKind,

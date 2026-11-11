@@ -218,6 +218,15 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         stdout.contains("compacted 1 earlier turn(s); 5 turn(s) remain"),
         "{stdout}"
     );
+    // Each checkpoint is journaled after what was there, so a resume rebuilds it.
+    let compacted = std::fs::read(&log).expect("journal after compaction");
+    assert!(compacted.starts_with(&before));
+    let appended = String::from_utf8(compacted[before.len()..].to_vec()).expect("utf8");
+    assert_eq!(
+        appended.matches("\"kind\":\"checkpoint\"").count(),
+        2,
+        "{appended}"
+    );
     // The removed prefix is gone; only the user's own words are carried.
     let second = requests[1].to_string();
     assert!(
@@ -275,5 +284,5 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         "question",
     ]);
     assert!(!conflict.status.success(), "{conflict:?}");
-    assert_eq!(std::fs::read(log).expect("journal after"), before);
+    assert_eq!(std::fs::read(log).expect("journal after"), compacted);
 }
