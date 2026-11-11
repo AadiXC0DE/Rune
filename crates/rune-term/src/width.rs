@@ -362,7 +362,13 @@ pub fn file_uri(path: &str) -> String {
     } else {
         format!("/{path}")
     };
-    format!("file://{}{path}", HOST.get_or_init(host_name))
+    format!("file://{}{path}", host())
+}
+
+/// Returns this machine's host name as `file://` links name it.
+#[must_use]
+pub fn host() -> &'static str {
+    HOST.get_or_init(host_name)
 }
 
 /// Returns this machine's host name, empty when unknown.
