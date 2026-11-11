@@ -90,10 +90,25 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             if scenario == "tools":
-                self.answer_choices(tool_step(
-                    tool_call(0, "read_file", {"path": "notes.txt"}),
-                    tool_call(1, "read_file", {"path": "missing.txt"}),
-                ) if len(prompts) == 1 else text_step("TOOLS-DONE"))
+                if len(prompts) == 1:
+                    self.answer_choices(tool_step(
+                        tool_call(0, "read_file", {"path": "notes.txt"}),
+                        tool_call(1, "read_file", {"path": "missing.txt"}),
+                    ))
+                elif len(prompts) == 2:
+                    # Four reads in one step fold into one row.
+                    self.answer_choices(tool_step(*(
+                        tool_call(index, "read_file", {"path": f"part-{index}.txt"})
+                        for index in range(4)
+                    )))
+                else:
+                    self.answer_choices(text_step("TOOLS-DONE"))
+                return
+            if scenario == "shell-tail":
+                self.answer_choices(tool_step(tool_call(0, "shell", {
+                    "action": "run",
+                    "command": "for i in 1 2 3 4; do echo TAIL-$i; sleep 0.3; done",
+                })) if len(prompts) == 1 else text_step("SHELL-DONE"))
                 return
             if scenario == "edit":
                 self.answer_choices(tool_step(tool_call(0, "edit_file", {
@@ -218,7 +233,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "shell-tail", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -232,6 +247,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         )
     if scenario == "tools":
         (root / "notes.txt").write_text("first note\nsecond note\nthird note\n")
+        for index in range(4):
+            (root / f"part-{index}.txt").write_text(f"part {index}\n")
     if scenario == "edit":
         (root / "app.txt").write_text("alpha\nbeta\ngamma\n")
     if scenario.startswith("help-"):
@@ -268,7 +285,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
-    if scenario in {"transcript", "tools", "edit", "markdown"}:
+    if scenario in {"transcript", "tools", "shell-tail", "edit", "markdown"}:
         environment["RUNE_PERMISSION_MODE"] = "full-access"
     if scenario == "approval":
         environment["RUNE_PERMISSION_MODE"] = "ask"
@@ -276,7 +293,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                   "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
                   "transcript": (80, 24), "compact": (80, 4),
                   "help-40": (40, 24), "help-80": (80, 24),
-                  "tools": (80, 24), "edit": (80, 24), "failure": (80, 24),
+                  "tools": (80, 24), "shell-tail": (80, 24),
+                  "edit": (80, 24), "failure": (80, 24),
                   "approval": (80, 24), "markdown": (80, 24),
                   "reasoning": (80, 24), "reasoning-full": (80, 24)}[scenario]
     master, slave = pty.openpty()
@@ -446,6 +464,21 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert len(prompts) == 4, prompts
         elif scenario == "tools":
             capture("tools-finished", b"tools\r", "TOOLS-DONE\r\n")
+            assert len(prompts) == 3, prompts
+        elif scenario == "shell-tail":
+            # The command prints a line every 0.3 s. The frame that draws the
+            # second one is recorded while the command still runs, without
+            # waiting for the spinner to go quiet.
+            start = len(transcript)
+            os.write(master, b"tail\r")
+            wait_for("    TAIL-2", start)
+            drawn = transcript.index(b"    TAIL-2", start)
+            wait_for("\x1b[?25h", drawn)
+            end = transcript.index(b"\x1b[?25h", drawn) + len(b"\x1b[?25h")
+            captures.append({"stage": "shell-running", "cols": cols, "rows": rows,
+                             "bytes": list(transcript[offset:end])})
+            offset = end
+            capture("shell-finished", expected="SHELL-DONE\r\n")
             assert len(prompts) == 2, prompts
         elif scenario == "edit":
             # The turn asks for a check once after the edit, so it ends on the

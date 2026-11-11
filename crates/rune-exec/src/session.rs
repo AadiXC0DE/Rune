@@ -129,6 +129,43 @@ impl Buffer {
         )
     }
 
+    /// Returns up to `count` of the newest non-empty lines, read from at most
+    /// the last `max_bytes` retained bytes, oldest first.
+    ///
+    /// The unfinished last line is included. A line cut by the byte window is
+    /// left out, since its start was not read.
+    #[must_use]
+    pub fn last_lines(&self, count: usize, max_bytes: usize) -> Vec<String> {
+        let state = lock(&self.state);
+        let window: Vec<u8> = if state.tail.is_empty() {
+            let start = state.bytes.len().saturating_sub(max_bytes);
+            state.bytes.get(start..).unwrap_or_default().to_vec()
+        } else {
+            let skip = state.tail.len().saturating_sub(max_bytes);
+            state.tail.iter().skip(skip).copied().collect()
+        };
+        let whole = if state.tail.is_empty() {
+            window.len() == state.bytes.len()
+        } else {
+            u64::try_from(window.len()).unwrap_or(u64::MAX) == state.produced
+        };
+        drop(state);
+        let text = String::from_utf8_lossy(&window);
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        if !whole && lines.len() > 1 {
+            lines.remove(0);
+        }
+        let mut newest: Vec<String> = lines
+            .iter()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(count)
+            .map(|line| (*line).to_owned())
+            .collect();
+        newest.reverse();
+        newest
+    }
+
     /// Returns the retained byte count and the number of bytes produced.
     ///
     /// Read without copying, so a caller polling a running command is cheap.
@@ -1400,6 +1437,23 @@ mod tests {
         // One chunk longer than the tail replaces it outright.
         buffer.append(b"uvwxyz");
         assert_eq!(buffer.tail().0, b"yz");
+    }
+
+    #[test]
+    fn last_lines_returns_the_newest_complete_and_partial_lines() {
+        let buffer = Buffer::new(64);
+        assert!(buffer.last_lines(3, 4096).is_empty(), "nothing printed yet");
+        buffer.append(b"one\ntwo\n\nthree\nfour\nfi");
+        assert_eq!(buffer.last_lines(3, 4096), ["three", "four", "fi"]);
+        assert_eq!(buffer.last_lines(1, 4096), ["fi"]);
+        // The window starts inside `three`, so that cut line is left out.
+        assert_eq!(buffer.last_lines(3, 10), ["four", "fi"]);
+
+        // Past the head the newest bytes come from the tail.
+        let full = Buffer::new(40);
+        full.append(&[b'h'; 40]);
+        full.append(b"x\nlast\nend");
+        assert_eq!(full.last_lines(3, 4096), ["last", "end"]);
     }
 
     #[cfg(unix)]
