@@ -78,6 +78,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "summarize older turns, or preview record counts without changes",
     },
     Builtin {
+        name: "reload",
+        arguments: "",
+        summary: "re-read instructions, skills and the repository map now",
+    },
+    Builtin {
         name: "pin",
         arguments: "[constraint]",
         summary: "pin a user constraint across compaction, or list current pins",

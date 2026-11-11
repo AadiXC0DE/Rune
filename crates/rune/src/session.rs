@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::io::{BufRead, Write as _};
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::context_watch;
 use crate::session_log::{self, Recorder};
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
@@ -256,9 +257,16 @@ struct SessionHost {
     /// while a turn reads it on the turn's own thread. It is read once per
     /// request attempt, so the lock is not on the streaming path.
     model: Mutex<String>,
-    instructions: String,
+    /// Base instructions, rebuilt only at a checkpoint or on `/reload`.
+    instructions: Mutex<String>,
     /// Leading bytes of the instructions that are the same in every workspace.
-    stable_instructions_len: usize,
+    stable_instructions_len: std::sync::atomic::AtomicUsize,
+    /// The objective written into the instructions, fixed with them.
+    frozen_objective: Mutex<FrozenObjective>,
+    /// Changes the model has not been told about yet, in the order they happened.
+    pending_updates: Mutex<Vec<PendingUpdate>>,
+    /// What the instructions were built from, to notice when it changes.
+    watched: Mutex<context_watch::Watched>,
     /// The instructions with the repository map, fixed until compaction.
     mapped: prompt::MappedInstructions,
     tools: Vec<ToolSpec>,
@@ -454,25 +462,51 @@ impl Host for SessionHost {
     }
 
     fn instructions(&self) -> String {
+        let base = lock_value(&self.instructions).clone();
         let mut instructions = self.mapped.get(
-            &self.instructions,
+            &base,
             self.context.workspace(),
             &crate::ask::map_limits(&self.limits, self.permission_settings.experiments),
         );
-        if let Some(recorder) = &self.recorder {
-            let recorder = recorder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(objective) = recorder.objective() {
-                instructions.push_str("\n\nActive session objective:\n");
-                instructions.push_str(objective);
+        // Fixed with the rest of the prefix: a goal set later reaches the
+        // model as an update, and is written here at the next rebuild.
+        let objective = {
+            let mut frozen = lock_value(&self.frozen_objective);
+            if *frozen == FrozenObjective::Unread {
+                *frozen = FrozenObjective::Fixed(
+                    self.recorder
+                        .as_ref()
+                        .and_then(|recorder| lock_value(recorder).objective().map(str::to_owned)),
+                );
             }
+            match &*frozen {
+                FrozenObjective::Fixed(objective) => objective.clone(),
+                FrozenObjective::Unread => None,
+            }
+        };
+        if let Some(objective) = objective {
+            instructions.push_str("\n\nActive session objective:\n");
+            instructions.push_str(&objective);
         }
         instructions
     }
 
     fn stable_instructions_len(&self) -> usize {
         self.stable_instructions_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn step_appendix(
+        &self,
+        _history: &History,
+        _results: &[turn::CallResult],
+    ) -> Option<turn::Appendix> {
+        self.watch_instruction_files();
+        let lines = self.take_updates();
+        (!lines.is_empty()).then(|| turn::Appendix {
+            text: turn::context_update(&lines),
+            keys: Vec::new(),
+        })
     }
 
     fn goal_judge(&self) -> Option<String> {
@@ -670,8 +704,8 @@ impl Host for SessionHost {
 
     fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
         // The history prefix changed, so the cache is already lost; this is
-        // where a fresh map costs nothing extra.
-        self.mapped.refresh();
+        // where a fresh map and fresh instructions cost nothing extra.
+        self.rebuild_prefix();
         self.forget_context();
         self.transcript_history_len
             .store(report.remaining_turns, std::sync::atomic::Ordering::Relaxed);
@@ -1141,6 +1175,61 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Queues a line telling the model about a change.
+    fn queue_update(&self, line: String) {
+        queue(&self.pending_updates, PendingUpdate::other(line));
+    }
+
+    /// Takes every queued line, oldest first.
+    fn take_updates(&self) -> Vec<String> {
+        std::mem::take(&mut *lock_value(&self.pending_updates))
+            .into_iter()
+            .map(|update| update.line)
+            .collect()
+    }
+
+    /// Queues a line for each instruction file that changed on disk.
+    fn watch_instruction_files(&self) {
+        let workspace = self.context.workspace().to_owned();
+        for (path, line) in lock_value(&self.watched).file_changes(&workspace) {
+            queue(&self.pending_updates, PendingUpdate::file(path, line));
+        }
+    }
+
+    /// Queues lines for everything a new prompt should hear about.
+    fn watch_before_prompt(&self) {
+        self.watch_instruction_files();
+        let Some(paths) = &self.usage_paths else {
+            return;
+        };
+        let workspace = self.context.workspace().to_owned();
+        let mut watched = lock_value(&self.watched);
+        for line in watched.skill_changes(&workspace, &paths.config_root) {
+            queue(&self.pending_updates, PendingUpdate::skill(line));
+        }
+        if let Some(line) = watched.test_command_change(&workspace) {
+            queue(&self.pending_updates, PendingUpdate::other(line));
+        }
+    }
+
+    /// Re-derives the instructions, the map and the objective from what is
+    /// on disk now, and drops queued news they already carry.
+    fn rebuild_prefix(&self) {
+        self.mapped.refresh();
+        *lock_value(&self.frozen_objective) = FrozenObjective::Unread;
+        let Some(paths) = &self.usage_paths else {
+            return;
+        };
+        let workspace = self.context.workspace().to_owned();
+        let (text, stable_len) =
+            prompt::base_instructions_split(&workspace, &paths.config_root, &self.limits);
+        *lock_value(&self.instructions) = text;
+        self.stable_instructions_len
+            .store(stable_len, std::sync::atomic::Ordering::Relaxed);
+        *lock_value(&self.watched) = context_watch::Watched::of(&workspace, &paths.config_root);
+        lock_value(&self.pending_updates).retain(|update| update.kind == UpdateKind::Other);
+    }
+
     /// Waits for a terminal answer while allowing cancellation to wake us.
     fn request_approval(&self, tool: &str, target: &str, reason: String) -> (Outcome, String) {
         if self
@@ -2330,6 +2419,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         recorder.set_workspace(&config.workspace)?;
         (recorder, History::new())
     };
+    // Pins added from here on reach the model as updates, not in the prefix.
+    history.freeze_pins();
     let results_notice = attach_results(&mut history, &config.paths, &recorder.id());
 
     // Opened once. A history that failed to load is not fatal: recall is a
@@ -2385,8 +2476,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         compat: crate::provider_setup::CompatSource::from_settings(&config.settings),
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
-        instructions: prompt.instructions,
-        stable_instructions_len: prompt.stable_len,
+        instructions: Mutex::new(prompt.instructions),
+        stable_instructions_len: std::sync::atomic::AtomicUsize::new(prompt.stable_len),
+        frozen_objective: Mutex::new(FrozenObjective::Unread),
+        pending_updates: Mutex::new(Vec::new()),
+        watched: Mutex::new(context_watch::Watched::of(
+            &config.workspace,
+            &config.paths.config_root,
+        )),
         mapped: prompt::MappedInstructions::default(),
         tools,
         rules: Mutex::new(config.rules),
@@ -2722,6 +2819,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         flush_lines(&host, sink, &host.preview_undo())?;
                         return Ok(Step::Continue);
                     }
+                    Handled::Reload => {
+                        host.rebuild_prefix();
+                        history.freeze_pins();
+                        host.forget_context();
+                        note(
+                            "instructions reloaded; the next request rebuilds the cached prefix"
+                                .to_owned(),
+                        );
+                    }
                     Handled::Compact => {
                         // Handled here because this closure already mutably
                         // borrows the conversation, and a second borrower would
@@ -2740,6 +2846,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .pin_constraint(&constraint)?;
                                 history = candidate;
+                                host.queue_update(format!("Pinned constraint: {constraint}"));
                                 host.forget_context();
                                 host.estimate_context(&history)?;
                             }
@@ -2774,6 +2881,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 } else {
                                     recorder.set_objective(objective)?;
                                 }
+                                host.queue_update(format!("Session objective: {objective}"));
                             }
                             refused = request.judge && recorder.objective().is_none();
                             host.goal_judge.store(
@@ -2898,14 +3006,23 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     );
                     let _ = history.record(entry);
                 }
+                // Changes since the last request ride on this message, so
+                // the prefix the provider has cached stays as it was.
+                host.watch_before_prompt();
+                let updates = host.take_updates();
+                let composed = if updates.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text}\n\n{}", turn::context_update(&updates))
+                };
                 recorder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .user_message(&text)?;
+                    .user_message(&composed)?;
                 if host.planning.load(std::sync::atomic::Ordering::Relaxed) {
-                    history.push_user(format!("{PLAN_MODE_NOTE}\n\n{text}"));
+                    history.push_user(format!("{PLAN_MODE_NOTE}\n\n{composed}"));
                 } else {
-                    history.push_user(text.clone());
+                    history.push_user(composed);
                 }
                 host.transcript
                     .lock()
@@ -5368,7 +5485,16 @@ fn set_network(host: &SessionHost, requested: Option<&str>) -> String {
         }
         Some(choice @ ("on" | "off")) => {
             let on = choice == "on";
-            host.network.store(on, Ordering::Relaxed);
+            if host.network.swap(on, Ordering::Relaxed) != on {
+                host.queue_update(
+                    if on {
+                        "Commands now have network access."
+                    } else {
+                        "Commands no longer have network access."
+                    }
+                    .to_owned(),
+                );
+            }
             format!("shell network: {} for this session", state(on))
         }
         Some(_) => "usage: /network on|off".to_owned(),
@@ -5464,6 +5590,12 @@ fn set_permissions(host: &SessionHost, requested: Option<&str>) -> String {
         .mode
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+    let name = match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::Auto => "auto",
+        PermissionMode::FullAccess => "full-access",
+    };
+    host.queue_update(format!("Permission mode is now {name}."));
     if rank(mode) < rank(current)
         && let Ok(mut grants) = host.grants.lock()
     {
@@ -5719,6 +5851,77 @@ struct Running {
     started: std::time::Instant,
 }
 
+/// The objective the instructions carry, read once per prefix.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum FrozenObjective {
+    /// Not read since the prefix was last rebuilt.
+    Unread,
+    /// Read, and fixed until the next rebuild.
+    Fixed(Option<String>),
+}
+
+/// What a queued update is about, so a rebuild can drop the ones it covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateKind {
+    /// An instruction file, keyed by its path.
+    Instructions,
+    /// The skill catalog.
+    Skills,
+    /// Anything else.
+    Other,
+}
+
+/// One line the model has not been told yet.
+#[derive(Clone, Debug)]
+struct PendingUpdate {
+    kind: UpdateKind,
+    /// For an instruction file, its path: a later change replaces the line.
+    path: Option<Utf8PathBuf>,
+    line: String,
+}
+
+impl PendingUpdate {
+    fn other(line: String) -> Self {
+        Self {
+            kind: UpdateKind::Other,
+            path: None,
+            line,
+        }
+    }
+
+    fn skill(line: String) -> Self {
+        Self {
+            kind: UpdateKind::Skills,
+            path: None,
+            line,
+        }
+    }
+
+    fn file(path: Utf8PathBuf, line: String) -> Self {
+        Self {
+            kind: UpdateKind::Instructions,
+            path: Some(path),
+            line,
+        }
+    }
+}
+
+/// Queues `update`, replacing an earlier line about the same file.
+fn queue(pending: &Mutex<Vec<PendingUpdate>>, update: PendingUpdate) {
+    let mut pending = lock_value(pending);
+    if update.path.is_some() {
+        pending.retain(|queued| queued.path != update.path);
+    }
+    pending.push(update);
+}
+
+/// Locks a mutex, recovering the value when a holder panicked.
+fn lock_value<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// What handling a slash command decided.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Handled {
@@ -5756,6 +5959,8 @@ enum Handled {
     CompactPreview,
     /// Pin an explicit user constraint, or list current pins.
     Pin(Option<String>),
+    /// Rebuild the instructions, skills and repository map now.
+    Reload,
     /// Put the last reply on the terminal's clipboard.
     Copy,
     /// Start a fresh conversation in this terminal.
@@ -6102,6 +6307,7 @@ fn handle_command<W: std::io::Write>(
         )),
         "compact" if arguments.trim() == "preview" => Ok(Handled::CompactPreview),
         "compact" => Ok(Handled::Compact),
+        "reload" => Ok(Handled::Reload),
         "pin" => Ok(Handled::Pin(
             (!arguments.trim().is_empty()).then(|| arguments.to_owned()),
         )),
@@ -6872,7 +7078,7 @@ mod tests {
         let id = SessionId::generate();
         let recorder = Recorder::create(&paths, &id).expect("create");
         let mut host = test_host();
-        host.instructions = "Workspace instructions".to_owned();
+        host.instructions = Mutex::new("Workspace instructions".to_owned());
         host.recorder = Some(Arc::new(Mutex::new(recorder)));
         assert_eq!(host.instructions(), "Workspace instructions");
         host.recorder
@@ -6882,6 +7088,9 @@ mod tests {
             .expect("lock")
             .set_objective("Fix café parsing")
             .expect("goal");
+        // The prefix is fixed until it is rebuilt, which writes the objective in.
+        assert_eq!(host.instructions(), "Workspace instructions");
+        host.rebuild_prefix();
         let expected = "Workspace instructions\n\nActive session objective:\nFix café parsing";
         assert_eq!(host.instructions(), expected);
         assert_eq!(host.instructions(), expected);
@@ -6889,11 +7098,111 @@ mod tests {
         host.recorder = Some(Arc::new(Mutex::new(
             Recorder::open(&paths, &id).expect("restart"),
         )));
+        host.rebuild_prefix();
         assert_eq!(host.instructions(), expected);
         host.recorder = None;
         let fresh = Recorder::create(&paths, &SessionId::generate()).expect("new session");
         host.recorder = Some(Arc::new(Mutex::new(fresh)));
+        host.rebuild_prefix();
         assert_eq!(host.instructions(), "Workspace instructions");
+    }
+
+    #[test]
+    fn setting_a_goal_leaves_the_instructions_unchanged() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let paths = Paths {
+            config_root: base.join("config"),
+            state_root: base.join("state"),
+            data_root: base.join("data"),
+        };
+        let recorder = Recorder::create(&paths, &SessionId::generate()).expect("create");
+        let mut host = test_host();
+        host.instructions = Mutex::new("Workspace instructions".to_owned());
+        host.recorder = Some(Arc::new(Mutex::new(recorder)));
+        let before = host.instructions();
+        lock_value(host.recorder.as_ref().expect("recorder"))
+            .set_objective("Ship it")
+            .expect("goal");
+        assert_eq!(host.instructions(), before);
+    }
+
+    fn appendix_text(host: &SessionHost) -> Option<String> {
+        host.step_appendix(&History::new(), &[])
+            .map(|appendix| appendix.text)
+    }
+
+    #[test]
+    fn a_permission_switch_queues_one_update_line() {
+        let host = test_host();
+        let reply = set_permissions(&host, Some("full-access"));
+        assert!(reply.starts_with("permissions set to"), "{reply}");
+        assert_eq!(
+            appendix_text(&host).as_deref(),
+            Some("<context-update>\nPermission mode is now full-access.\n</context-update>")
+        );
+        assert_eq!(appendix_text(&host), None);
+        assert!(set_permissions(&host, Some("nonsense")).contains("is not a permission mode"));
+        assert_eq!(appendix_text(&host), None);
+    }
+
+    fn watched_workspace(rules: &str) -> (tempfile::TempDir, Utf8PathBuf, SessionHost) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let workspace = base.join("work");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace");
+        std::fs::create_dir_all(base.join("config")).expect("config");
+        std::fs::write(workspace.join("AGENTS.md"), rules).expect("rules");
+        let host = test_host();
+        *lock_value(&host.watched) = context_watch::Watched::of(&workspace, &base.join("config"));
+        (root, workspace, host)
+    }
+
+    #[test]
+    fn an_edited_instruction_file_is_sent_once_in_full() {
+        let (_root, workspace, host) = watched_workspace("Use tabs.\n");
+        assert_eq!(appendix_text(&host), None);
+        std::fs::write(workspace.join("AGENTS.md"), "Use spaces, four of them.\n").expect("edit");
+        let text = appendix_text(&host).expect("an update");
+        assert!(
+            text.contains("AGENTS.md changed on disk. Its rules are now:"),
+            "{text}"
+        );
+        assert!(text.contains("Use spaces, four of them."), "{text}");
+        assert!(!text.contains("Use tabs."), "{text}");
+        assert_eq!(appendix_text(&host), None);
+
+        std::fs::remove_file(workspace.join("AGENTS.md")).expect("delete");
+        let text = appendix_text(&host).expect("an update");
+        assert!(
+            text.contains("was deleted; its rules no longer apply."),
+            "{text}"
+        );
+        assert_eq!(appendix_text(&host), None);
+    }
+
+    #[test]
+    fn a_large_edited_instruction_file_is_named_only() {
+        let (_root, workspace, host) = watched_workspace("Short.\n");
+        let large = "rule line\n".repeat(1_000);
+        std::fs::write(workspace.join("AGENTS.md"), &large).expect("edit");
+        let text = appendix_text(&host).expect("an update");
+        assert!(
+            text.contains("changed on disk; read it before relying on its rules."),
+            "{text}"
+        );
+        assert!(!text.contains("rule line"), "{text}");
+    }
+
+    #[test]
+    fn two_edits_of_one_file_queue_one_line_with_the_latest_text() {
+        let (_root, workspace, host) = watched_workspace("One.\n");
+        std::fs::write(workspace.join("AGENTS.md"), "Two two.\n").expect("edit");
+        host.watch_instruction_files();
+        std::fs::write(workspace.join("AGENTS.md"), "Three three three.\n").expect("edit");
+        let text = appendix_text(&host).expect("an update");
+        assert_eq!(text.matches("changed on disk").count(), 1, "{text}");
+        assert!(text.contains("Three three three."), "{text}");
     }
 
     fn goal(objective: Option<&str>, budget: Option<u64>, judge: bool) -> Handled {
@@ -12183,9 +12492,12 @@ mod tests {
             compat: crate::provider_setup::CompatSource::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),
-            instructions: String::new(),
+            instructions: Mutex::new(String::new()),
             mapped: prompt::MappedInstructions::default(),
-            stable_instructions_len: 0,
+            stable_instructions_len: std::sync::atomic::AtomicUsize::new(0),
+            frozen_objective: Mutex::new(FrozenObjective::Unread),
+            pending_updates: Mutex::new(Vec::new()),
+            watched: Mutex::new(context_watch::Watched::default()),
             tools: Vec::new(),
             rules: Mutex::new(crate::permissions::validated(&Settings::default()).expect("rules")),
             mode: Mutex::new(PermissionMode::Auto),

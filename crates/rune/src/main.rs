@@ -19,6 +19,7 @@ mod cli;
 mod compaction_archive;
 mod completion;
 mod connect_flow;
+mod context_watch;
 mod diagnostics;
 mod help;
 mod helper_usage;
