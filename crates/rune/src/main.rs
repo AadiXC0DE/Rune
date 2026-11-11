@@ -14,6 +14,7 @@ mod ask;
 mod attachments;
 mod auto_review;
 mod bench;
+mod cache_warming;
 mod capabilities;
 mod cli;
 mod compaction_archive;
