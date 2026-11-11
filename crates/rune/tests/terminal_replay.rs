@@ -705,3 +705,58 @@ fn fenced_code_continuations_are_stable_while_streaming_and_when_finished() {
         }
     }
 }
+
+/// Replays a scenario byte by byte, returning each stage with the rows that
+/// scrolled off the screen so far followed by the screen.
+fn rows_by_stage(scenario: &str) -> Vec<(String, Vec<String>)> {
+    let captures: Vec<Capture> =
+        serde_json::from_slice(&record(include_str!("terminal_replay.py"), Some(scenario)))
+            .expect("captures");
+    let first = captures.first().expect("at least one capture");
+    let mut grid = Grid::new(first.cols, first.rows).expect("grid");
+    let mut scrollback = Vec::new();
+    let mut stages = Vec::new();
+    for capture in captures {
+        for byte in capture.bytes {
+            let top = grid.row_text(0);
+            let stats = grid.feed(&[byte]).expect("replay byte");
+            if stats.scrolled {
+                assert_eq!(stats.scroll_rows, 1, "one byte scrolled multiple rows");
+                scrollback.push(top);
+            }
+        }
+        let mut rows = scrollback.clone();
+        rows.extend(grid.text().lines().map(str::to_owned));
+        stages.push((capture.stage, rows));
+    }
+    stages
+}
+
+fn occurrences(rows: &[String], text: &str) -> usize {
+    rows.iter().filter(|row| row.as_str() == text).count()
+}
+
+#[test]
+fn a_streamed_answer_is_readable_from_its_first_line() {
+    let stages = rows_by_stage("progressive");
+    assert_eq!(stages.len(), 2);
+    let (stage, paused) = &stages[0];
+    assert_eq!(stage, "progressive-paused");
+    for index in 1..=149 {
+        let para = format!("PARA-{index:03}");
+        assert_eq!(
+            occurrences(paused, &para),
+            1,
+            "{para} at the pause: {paused:?}"
+        );
+    }
+    let (_, finished) = &stages[1];
+    for index in 1..=300 {
+        let para = format!("PARA-{index:03}");
+        assert_eq!(
+            occurrences(finished, &para),
+            1,
+            "{para} at the end: {finished:?}"
+        );
+    }
+}

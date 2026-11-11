@@ -117,6 +117,45 @@ struct StreamingText {
     /// of the response, which is what made a long answer stutter.
     answer_rows: transcript::AssistantRows,
     reasoning_rows: LazyRows,
+    /// Where the answer's finished blocks end.
+    sealer: transcript::Sealer,
+    /// Bytes of the answer already printed to scrollback.
+    committed: usize,
+    /// Blank rows at the end of what was printed, held back until more of
+    /// the answer follows them, as a finished answer drops its trailing ones.
+    held_blanks: usize,
+}
+
+impl StreamingText {
+    /// Forgets the answer and everything derived from it.
+    fn reset_answer(&mut self) {
+        self.answer.clear();
+        self.answer_rows = transcript::AssistantRows::default();
+        self.sealer.reset();
+        self.committed = 0;
+        self.held_blanks = 0;
+    }
+}
+
+/// Trims committed answer rows as a finished answer's rows are trimmed.
+///
+/// Trailing blank rows are held in `held` and written before the next rows
+/// that have text, so a streamed answer and a finished one leave the same rows.
+fn answer_chunk(rows: Vec<String>, held: &mut usize) -> Vec<String> {
+    let mut rows: Vec<String> = rows
+        .into_iter()
+        .map(|row| row.trim_end_matches(' ').to_owned())
+        .collect();
+    let Some(last) = rows.iter().rposition(|row| !row.trim().is_empty()) else {
+        *held = held.saturating_add(rows.len());
+        return Vec::new();
+    };
+    let trailing = rows.len().saturating_sub(last).saturating_sub(1);
+    rows.truncate(last.saturating_add(1));
+    let mut out = vec![String::new(); *held];
+    out.extend(rows);
+    *held = trailing;
+    out
 }
 
 /// Wrapped rows derived from a growing string.
@@ -993,10 +1032,33 @@ impl Host for SessionHost {
                 if let Some(summary) = self.settle_reasoning() {
                     self.commit(&[summary]);
                 }
-                if let Ok(mut streaming) = self.streaming.lock() {
-                    streaming.answer.push_str(&delta);
+                let mut reasoning = String::new();
+                let rows = match self.streaming.lock() {
+                    Ok(mut streaming) => {
+                        streaming.answer.push_str(&delta);
+                        let rows = self.sealed_answer_rows(&mut streaming);
+                        // Reasoning shown in full is above the answer, so it
+                        // reaches scrollback first.
+                        if !rows.is_empty()
+                            && *lock_value(&self.reasoning_mode) == ReasoningMode::Full
+                        {
+                            reasoning = std::mem::take(&mut streaming.reasoning);
+                            streaming.reasoning_rows = LazyRows::default();
+                        }
+                        rows
+                    }
+                    Err(_) => Vec::new(),
+                };
+                if rows.is_empty() {
+                    self.request_frame();
+                } else {
+                    let mut lines = Vec::new();
+                    if !reasoning.trim().is_empty() {
+                        lines = self.entry_rows(&[Entry::reasoning(reasoning)]);
+                    }
+                    lines.extend(self.spaced(RowKind::Assistant, &rows));
+                    self.commit_lines(&lines);
                 }
-                self.request_frame();
             }
             Event::ReasoningDelta { delta } => {
                 lock_value(&self.reasoning_started).get_or_insert_with(std::time::Instant::now);
@@ -1009,6 +1071,10 @@ impl Host for SessionHost {
                 if !self.journal_text(None) {
                     return;
                 }
+                let committed = self
+                    .streaming
+                    .lock()
+                    .is_ok_and(|streaming| streaming.committed > 0);
                 self.clear_streaming();
                 if let Some(retry) = self
                     .provider_retry
@@ -1018,12 +1084,20 @@ impl Host for SessionHost {
                 {
                     retry.delay = None;
                 }
-                self.request_frame();
+                if committed {
+                    // What reached scrollback stays there: it was shown and is
+                    // true of the attempt that failed.
+                    self.commit(&[Entry::notice(
+                        "the response restarted; the text above is from the failed attempt",
+                    )]);
+                } else {
+                    self.request_frame();
+                }
             }
             Event::ToolStarted { call, activity } => {
                 // What the model said before calling a tool is finished, so it
                 // moves into scrollback ahead of the call it led to.
-                let mut entries = self.take_narration();
+                let lines = self.narration_rows();
                 lock_value(&self.live_tail).clear();
                 if let Ok(mut running) = self.running.lock() {
                     running.push(Running {
@@ -1033,8 +1107,11 @@ impl Host for SessionHost {
                         tail: call.name == "shell",
                     });
                 }
-                entries.retain(|entry| !entry.text.trim().is_empty());
-                self.commit(&entries);
+                if lines.is_empty() {
+                    self.draw_stream();
+                } else {
+                    self.commit_lines(&lines);
+                }
             }
             Event::ToolFinished {
                 call,
@@ -1070,10 +1147,11 @@ impl Host for SessionHost {
                 }
             }
             Event::ToolDenied { call, reason } => {
-                let mut entries = self.take_narration();
-                entries.retain(|entry| !entry.text.trim().is_empty());
-                entries.push(Entry::notice(format!("refused {}: {reason}", call.name)));
-                self.commit(&entries);
+                let mut lines = self.narration_rows();
+                lines.extend(
+                    self.entry_rows(&[Entry::notice(format!("refused {}: {reason}", call.name))]),
+                );
+                self.commit_lines(&lines);
             }
             Event::PlanUpdated { update } => {
                 if self.accessible {
@@ -1113,12 +1191,11 @@ impl Host for SessionHost {
             Event::CallRepaired { .. } | Event::ToolRewritten { .. } => {}
             // Said in scrollback, so the reader knows why the turn went on.
             Event::VerificationRequested => {
-                let mut entries = self.take_narration();
-                entries.retain(|entry| !entry.text.trim().is_empty());
-                entries.push(Entry::notice(
+                let mut lines = self.narration_rows();
+                lines.extend(self.entry_rows(&[Entry::notice(
                     "files changed with no check since; asked for one before finishing",
-                ));
-                self.commit(&entries);
+                )]));
+                self.commit_lines(&lines);
             }
         }
         if let Ok(mut events) = self.events.lock() {
@@ -1298,11 +1375,11 @@ impl Host for SessionHost {
                     (Outcome::Allow, format!("{reason}; cleared by review"))
                 }
                 ReviewOutcome::Unavailable { reason: failure } => {
-                    let mut entries = self.take_narration();
-                    entries.push(Entry::notice(format!(
+                    let mut lines = self.narration_rows();
+                    lines.extend(self.entry_rows(&[Entry::notice(format!(
                         "the safety reviewer could not answer ({failure}); asking you instead"
-                    )));
-                    self.commit(&entries);
+                    ))]));
+                    self.commit_lines(&lines);
                     self.request_approval(name, target.unwrap_or(name), reason)
                 }
                 other => (
@@ -2844,10 +2921,9 @@ impl SessionHost {
     }
 
     fn checkpoint_notice(&self, line: String) {
-        let mut entries = self.take_narration();
-        entries.retain(|entry| !entry.text.trim().is_empty());
-        entries.push(Entry::notice(line));
-        self.commit(&entries);
+        let mut lines = self.narration_rows();
+        lines.extend(self.entry_rows(&[Entry::notice(line)]));
+        self.commit_lines(&lines);
     }
 
     /// Draws one notice above the input, keeping the line being typed.
@@ -2900,6 +2976,8 @@ impl SessionHost {
             reasoning,
             answer_rows,
             reasoning_rows,
+            committed,
+            ..
         } = &mut *streaming;
 
         // Reasoning comes first, drawn apart from the answer, in a secondary
@@ -2911,7 +2989,7 @@ impl SessionHost {
                 rows.push(format!("{dim}  {line}{reset}"));
             }
         }
-        if !answer.trim().is_empty() {
+        if !answer[*committed..].trim().is_empty() {
             answer_rows.set_markdown(&self.markdown_style());
             rows.extend(answer_rows.rows_with_ascii(
                 answer,
@@ -2952,15 +3030,17 @@ impl SessionHost {
     fn clear_streaming(&self) {
         *lock_value(&self.reasoning_started) = None;
         if let Ok(mut streaming) = self.streaming.lock() {
-            streaming.answer.clear();
+            streaming.reset_answer();
             streaming.reasoning.clear();
-            streaming.answer_rows = transcript::AssistantRows::default();
             streaming.reasoning_rows = LazyRows::default();
         }
     }
 
     /// Takes the current step's reasoning and narration as transcript entries,
     /// leaving the live text empty.
+    ///
+    /// An answer that has begun to reach scrollback is left for
+    /// [`Self::take_answer_rows`], so no part of it is printed twice.
     fn take_narration(&self) -> Vec<Entry> {
         let summary = self.settle_reasoning();
         *lock_value(&self.reasoning_started) = None;
@@ -2971,10 +3051,92 @@ impl SessionHost {
             || std::mem::take(&mut streaming.reasoning),
             |entry| entry.text,
         );
-        let answer = std::mem::take(&mut streaming.answer);
-        streaming.answer_rows = transcript::AssistantRows::default();
         streaming.reasoning_rows = LazyRows::default();
+        if streaming.committed > 0 {
+            return vec![Entry::reasoning(reasoning)];
+        }
+        let answer = std::mem::take(&mut streaming.answer);
+        streaming.reset_answer();
         vec![Entry::reasoning(reasoning), Entry::assistant(answer)]
+    }
+
+    /// Returns the rows that print the step's reasoning and narration, spaced
+    /// for scrollback, leaving the live text empty.
+    fn narration_rows(&self) -> Vec<String> {
+        let answer = self.take_answer_rows();
+        let mut entries = self.take_narration();
+        entries.retain(|entry| !entry.text.trim().is_empty());
+        let mut rows = self.entry_rows(&entries);
+        if let Some(answer) = answer {
+            rows.extend(self.spaced(RowKind::Assistant, &answer));
+        }
+        rows
+    }
+
+    /// Takes the answer rows that can no longer change, once a delta was
+    /// appended. Empty in accessible mode, which prints an answer whole.
+    fn sealed_answer_rows(&self, streaming: &mut StreamingText) -> Vec<String> {
+        if self.accessible {
+            return Vec::new();
+        }
+        let width = usize::from(self.width()).saturating_sub(2).max(1);
+        let markdown = self.markdown_style();
+        let StreamingText {
+            answer,
+            answer_rows,
+            sealer,
+            committed,
+            held_blanks,
+            ..
+        } = streaming;
+        let sealed = sealer.advance(answer);
+        if sealed <= *committed {
+            return Vec::new();
+        }
+        answer_rows.set_markdown(&markdown);
+        let _ = answer_rows.rows_with_ascii(answer, width, self.ascii);
+        let in_code = answer_rows.base_in_code();
+        let mut rows = answer_rows.take_through(answer, sealed);
+        // A table is aligned once all its rows exist, as in a finished answer.
+        let range = &answer[*committed..sealed];
+        let aligned = rune_term::markdown::align_tables(range, self.ascii);
+        if !in_code && aligned != range {
+            let aligned = aligned.strip_suffix('\n').unwrap_or(&aligned);
+            rows = transcript::AssistantRows::with_markdown(markdown)
+                .rows_with_ascii(aligned, width, self.ascii);
+        }
+        *committed = sealed;
+        answer_chunk(rows, held_blanks)
+    }
+
+    /// Takes the rest of an answer that has begun to reach scrollback, and
+    /// resets the streaming answer. None when nothing of it was printed yet.
+    fn take_answer_rows(&self) -> Option<Vec<String>> {
+        let width = usize::from(self.width()).saturating_sub(2).max(1);
+        let markdown = self.markdown_style();
+        let mut streaming = self.streaming.lock().ok()?;
+        if streaming.committed == 0 {
+            return None;
+        }
+        let StreamingText {
+            answer,
+            answer_rows,
+            committed,
+            held_blanks,
+            ..
+        } = &mut *streaming;
+        let rows = if answer_rows.base_in_code() {
+            answer_rows.set_markdown(&markdown);
+            answer_rows.rows_with_ascii(answer, width, self.ascii)
+        } else {
+            let aligned = rune_term::markdown::align_tables(&answer[*committed..], self.ascii);
+            transcript::AssistantRows::with_markdown(markdown)
+                .rows_with_ascii(&aligned, width, self.ascii)
+        };
+        let mut held = *held_blanks;
+        let rows = answer_chunk(rows, &mut held);
+        streaming.reset_answer();
+        Some(rows)
     }
 
     /// Ends a step's hidden reasoning: returns its one `thought for` row and
@@ -10408,25 +10570,34 @@ fn report_turn(
     // finished, so what remains is the last step: its reasoning, shown in its
     // own lane above the answer, and the answer itself.
     host.flush_held();
+    // An answer that began to reach scrollback while it streamed ends with
+    // only the rows not printed yet.
+    let answer = host.take_answer_rows();
     let mut entries = event_entries(host);
     if !reasoning.trim().is_empty() {
         entries.push(Entry::reasoning(reasoning.to_owned()));
     }
 
-    if !outcome.text.is_empty() {
+    if answer.is_none() && !outcome.text.is_empty() {
         entries.push(Entry::assistant(outcome.text.clone()));
     }
 
+    let mut notices = Vec::new();
     match outcome.stop_reason {
         StopReason::ObjectiveBudget => {
-            entries.push(Entry::notice("exhausted the objective token budget"));
+            notices.push(Entry::notice("exhausted the objective token budget"));
         }
-        StopReason::StepLimit => entries.push(Entry::notice("reached the model step limit")),
-        StopReason::Cancelled => entries.push(Entry::notice("cancelled")),
+        StopReason::StepLimit => notices.push(Entry::notice("reached the model step limit")),
+        StopReason::Cancelled => notices.push(Entry::notice("cancelled")),
         _ => {}
     }
 
-    Ok(host.entry_rows(&entries))
+    let mut rows = host.entry_rows(&entries);
+    if let Some(answer) = answer {
+        rows.extend(host.spaced(RowKind::Assistant, &answer));
+    }
+    rows.extend(host.entry_rows(&notices));
+    Ok(rows)
 }
 
 /// Renders a turn that ended in an error rather than an outcome.
@@ -10440,23 +10611,30 @@ fn report_failed_turn(
     diagnostic: Option<&str>,
 ) -> Vec<String> {
     host.flush_held();
-    let mut entries = event_entries(host);
+    let answer = host.take_answer_rows();
+    let entries = event_entries(host);
+    let mut after = Vec::new();
     let partial = host.partial_answer();
-    if !partial.trim().is_empty() {
-        entries.push(Entry::assistant(partial));
+    if answer.is_none() && !partial.trim().is_empty() {
+        after.push(Entry::assistant(partial));
     }
     if let Some(diagnostic) = diagnostic {
-        entries.push(Entry::notice(diagnostic));
+        after.push(Entry::notice(diagnostic));
     }
     if err.code() == ErrorCode::Cancelled {
-        entries.push(Entry::notice("cancelled"));
+        after.push(Entry::notice("cancelled"));
     } else {
-        entries.push(Entry::error(
+        after.push(Entry::error(
             format!("the turn failed: {}", err.message()),
             err.hint().map(str::to_owned),
         ));
     }
-    host.entry_rows(&entries)
+    let mut rows = host.entry_rows(&entries);
+    if let Some(answer) = answer {
+        rows.extend(host.spaced(RowKind::Assistant, &answer));
+    }
+    rows.extend(host.entry_rows(&after));
+    rows
 }
 
 /// Keeps only the answer bytes the turn has not already added to history.
@@ -11792,6 +11970,134 @@ mod tests {
         host.draw_stream();
         assert!(!replay(&mut grid).contains("provider retry"));
         assert!(event_entries(&host).is_empty());
+    }
+
+    /// A host that writes to a sink, for answers streamed into it.
+    fn streaming_host() -> (SessionHost, Arc<Mutex<Vec<u8>>>) {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let host = test_host();
+        *host.live_out.lock().expect("lock") =
+            Some(Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))));
+        (host, sink)
+    }
+
+    fn stream(host: &SessionHost, text: &str) {
+        host.emit(Event::TextDelta {
+            delta: text.to_owned(),
+        });
+    }
+
+    /// Keeps paced frames from drawing, so only commits write.
+    fn hold_frames(host: &SessionHost) {
+        *host.last_frame.lock().expect("last frame") =
+            std::time::Instant::now().checked_add(std::time::Duration::from_secs(60));
+    }
+
+    fn completed(text: &str) -> turn::TurnOutcome {
+        turn::TurnOutcome {
+            error: None,
+            judge: None,
+            stop_reason: StopReason::Completed,
+            text: text.to_owned(),
+            narration: Vec::new(),
+            reasoning: String::new(),
+            usage: rune_net::stream::Usage::default(),
+            last_request: rune_net::stream::Usage::default(),
+            steps: 1,
+            verification: turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
+            calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
+        }
+    }
+
+    fn screen(sink: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+        let mut grid = rune_term::Grid::new(80, 24).expect("grid");
+        grid.feed(&sink.lock().expect("lock")).expect("feed");
+        (0..24).map(|row| grid.row_text(row)).collect()
+    }
+
+    #[test]
+    fn sealed_paragraphs_reach_scrollback_before_the_step_ends() {
+        let (host, sink) = streaming_host();
+        stream(&host, "PARA-ONE\n\nPARA-TWO");
+        let live = host.streaming_rows().join("\n");
+        assert!(live.contains("PARA-TWO"), "{live:?}");
+        assert!(!live.contains("PARA-ONE"), "{live:?}");
+        assert!(written(&sink).contains("PARA-ONE"));
+        assert_eq!(host.partial_answer(), "PARA-ONE\n\nPARA-TWO");
+    }
+
+    #[test]
+    fn the_finished_turn_prints_only_what_was_not_committed() {
+        let (host, sink) = streaming_host();
+        stream(&host, "PARA-ONE\n\n");
+        stream(&host, "PARA-TWO\n\n");
+        hold_frames(&host);
+        stream(&host, "PARA-THREE");
+        let text = "PARA-ONE\n\nPARA-TWO\n\nPARA-THREE";
+        let reasoning: String = host
+            .take_narration()
+            .into_iter()
+            .filter(|entry| entry.speaker == transcript::Speaker::Reasoning)
+            .map(|entry| entry.text)
+            .collect();
+        let lines = report_turn(&completed(text), &host, &reasoning).expect("reported");
+        let joined = lines.join("\n");
+        assert!(joined.contains("PARA-THREE"), "{lines:?}");
+        assert!(!joined.contains("PARA-ONE") && !joined.contains("PARA-TWO"));
+        host.commit_lines(&lines);
+        let out = written(&sink);
+        for para in ["PARA-ONE", "PARA-TWO", "PARA-THREE"] {
+            assert_eq!(out.matches(para).count(), 1, "{para} in {out:?}");
+        }
+        // The rows read as the finished answer's rows would.
+        let rows = screen(&sink);
+        let at = rows
+            .iter()
+            .position(|row| row == "PARA-ONE")
+            .expect("first paragraph");
+        assert_eq!(
+            rows[at..at + 5],
+            ["PARA-ONE", "", "PARA-TWO", "", "PARA-THREE"]
+        );
+        assert_eq!(render_entries(&[Entry::assistant(text)], &host).len(), 5);
+    }
+
+    #[test]
+    fn a_sealed_table_is_committed_aligned() {
+        let (host, sink) = streaming_host();
+        let table = "| a | b |\n| - | - |\n| long cell | 2 |";
+        stream(&host, &format!("{table}\nafter\nmore"));
+        let expected = render_entries(&[Entry::assistant(table)], &host);
+        assert_eq!(expected.len(), 3, "{expected:?}");
+        let out = written(&sink);
+        for row in &expected {
+            assert!(out.contains(row.as_str()), "{row:?} in {out:?}");
+        }
+        let live = host.streaming_rows().join("\n");
+        assert!(!live.contains("long cell"), "{live:?}");
+        assert!(live.contains("after"), "{live:?}");
+    }
+
+    #[test]
+    fn a_restarted_step_after_a_commit_says_so() {
+        let (host, sink) = streaming_host();
+        stream(&host, "FAILED-ATTEMPT\n\n");
+        host.emit(Event::StepRestarted { step: 1 });
+        let out = written(&sink);
+        let notice = "[the response restarted; the text above is from the failed attempt]";
+        assert!(out.contains(notice), "{out:?}");
+        assert!(out.find("FAILED-ATTEMPT") < out.find(notice));
+        stream(&host, "NEW-ATTEMPT");
+        assert_eq!(host.partial_answer(), "NEW-ATTEMPT");
+        assert!(host.take_answer_rows().is_none());
+        // A restart before anything was committed says nothing.
+        let (host, sink) = streaming_host();
+        stream(&host, "unsealed");
+        host.emit(Event::StepRestarted { step: 1 });
+        assert!(!written(&sink).contains("restarted"));
     }
 
     /// A host showing reasoning in `mode`, a turn under way, and what it writes.
