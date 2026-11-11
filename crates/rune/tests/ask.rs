@@ -2232,6 +2232,22 @@ fn ask_judge_needs_a_goal() {
 }
 
 #[test]
+fn ask_context_report_needs_a_json_output() {
+    let dir = tempfile::tempdir().expect("isolated state");
+    let output = isolated_command(&dir)
+        .args(["ask", "--context-report", "hello"])
+        .output()
+        .expect("ask");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--context-report needs --json or --jsonl"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn ask_max_steps_rejects_a_non_number() {
     let dir = tempfile::tempdir().expect("isolated state");
     let output = isolated_command(&dir)
