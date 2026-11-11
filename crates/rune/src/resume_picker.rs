@@ -287,7 +287,10 @@ pub fn pick_styled(
                 picker = picker_for(&listed, everywhere, usize::from(cols));
                 picker.set_query(reader.line());
             }
-            KeyAction::Transcript | KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+            KeyAction::Transcript
+            | KeyAction::ExternalEditor
+            | KeyAction::HistorySearch
+            | KeyAction::CycleReasoning => {}
             KeyAction::Ignored => picker.set_query(reader.line()),
         }
     };

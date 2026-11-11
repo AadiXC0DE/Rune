@@ -704,6 +704,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<String>,
 
+    /// How reasoning is shown: `collapsed`, `tail` or `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
     /// Whether the window title shows the session and its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<bool>,
@@ -937,6 +941,8 @@ pub struct Settings {
     pub color: String,
     /// Spinner motion, `full` or `reduced`.
     pub motion: String,
+    /// How reasoning is shown, `collapsed`, `tail` or `full`.
+    pub reasoning: String,
     /// Whether the window title shows the session and its state.
     pub terminal_title: bool,
     /// Whether terminal decorations use only ASCII.
@@ -1013,6 +1019,7 @@ impl Default for Settings {
             theme: None,
             color: COLOR_VALUES[0].to_owned(),
             motion: MOTION_VALUES[0].to_owned(),
+            reasoning: REASONING_VALUES[0].to_owned(),
             terminal_title: true,
             ascii: false,
             auto_upgrade: true,
@@ -1180,6 +1187,7 @@ impl Settings {
             ),
             ("color", self.color.clone()),
             ("motion", self.motion.clone()),
+            ("reasoning", self.reasoning.clone()),
             ("terminal_title", self.terminal_title.to_string()),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
@@ -1485,6 +1493,9 @@ pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
 /// The accepted `motion` values, the default first.
 pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 
+/// The accepted `reasoning` values, the default first.
+pub const REASONING_VALUES: [&str; 3] = ["collapsed", "tail", "full"];
+
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
@@ -1506,6 +1517,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "reasoning",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1546,6 +1558,7 @@ pub const USER_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "reasoning",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1585,6 +1598,7 @@ pub const SCALAR_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "reasoning",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1644,6 +1658,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         ]),
         "color" => ScalarKind::Choice(&COLOR_VALUES),
         "motion" => ScalarKind::Choice(&MOTION_VALUES),
+        "reasoning" => ScalarKind::Choice(&REASONING_VALUES),
         _ => ScalarKind::Text,
     })
 }
@@ -1759,6 +1774,10 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
     (
         "motion",
         "Spinner motion: full, or reduced for a static glyph.",
+    ),
+    (
+        "reasoning",
+        "How reasoning is shown: collapsed to one line, tail with its newest line, or full.",
     ),
     (
         "terminal_title",
@@ -2381,6 +2400,23 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
                 Diagnostic::new(layer, ErrorCode::InvalidField, format!("motion is `{raw}`"))
                     .with_key("motion")
                     .with_hint("accepted values are full and reduced"),
+            );
+        }
+    }
+    if let Some(raw) = &user.reasoning {
+        let value = raw.trim().to_ascii_lowercase();
+        if REASONING_VALUES.contains(&value.as_str()) {
+            settings.reasoning = value;
+            settings.sources.record("reasoning", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("reasoning is `{raw}`"),
+                )
+                .with_key("reasoning")
+                .with_hint("accepted values are collapsed, tail, and full"),
             );
         }
     }
@@ -3063,6 +3099,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "theme": settings.theme,
         "color": settings.color,
         "motion": settings.motion,
+        "reasoning": settings.reasoning,
         "terminal_title": settings.terminal_title,
         "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
