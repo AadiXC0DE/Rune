@@ -268,6 +268,8 @@ struct SessionHost {
     frozen_objective: Mutex<FrozenObjective>,
     /// Changes the model has not been told about yet, in the order they happened.
     pending_updates: Mutex<Vec<PendingUpdate>>,
+    /// Commands the user ran with `!` since the last prompt, oldest first.
+    user_shell: Mutex<Vec<String>>,
     /// What the instructions were built from, to notice when it changes.
     watched: Mutex<context_watch::Watched>,
     /// Instruction files below the workspace root, sent on first touch.
@@ -1302,6 +1304,59 @@ impl SessionHost {
     /// Queues a line telling the model about a change.
     fn queue_update(&self, line: String) {
         queue(&self.pending_updates, PendingUpdate::other(line));
+    }
+
+    /// Takes the commands the user ran since the last prompt as one block to
+    /// put before it, or `None` when there were none.
+    fn take_user_shell(&self) -> Option<String> {
+        let blocks = std::mem::take(&mut *lock_value(&self.user_shell));
+        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+    }
+
+    /// Runs a command the user typed through the same policy and tool as the
+    /// model's commands, and keeps what it printed for the next prompt.
+    fn run_user_shell(&self, command: &str) {
+        let arguments = serde_json::json!({ "action": "run", "command": command });
+        let call = turn::PreparedCall {
+            id: String::from("user-shell"),
+            name: String::from("shell"),
+            arguments: arguments.to_string(),
+        };
+        let (outcome, reason) = self.decide_with_arguments("shell", Some(command), &arguments);
+        match outcome {
+            Outcome::Allow => {}
+            Outcome::Deny => {
+                self.emit(Event::ToolDenied { call, reason });
+                return;
+            }
+            Outcome::Ask => {
+                self.emit(Event::ToolDenied {
+                    call,
+                    reason: format!("{reason}; nothing in this session could approve it"),
+                });
+                return;
+            }
+        }
+        self.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: rune_tools::Activity::Execute,
+        });
+        let started = std::time::Instant::now();
+        let (output, ran) = match self.execute("shell", &arguments) {
+            Ok(output) => (output, true),
+            Err(err) if err.code() == ErrorCode::Cancelled => {
+                (ToolOutput::failure("interrupted"), false)
+            }
+            Err(err) => (ToolOutput::from_error(&err), false),
+        };
+        self.emit(Event::ToolFinished {
+            call,
+            output: output.clone(),
+            elapsed: started.elapsed(),
+        });
+        if ran {
+            lock_value(&self.user_shell).push(user_shell_block(command, &output));
+        }
     }
 
     /// Takes every queued line, oldest first.
@@ -2807,6 +2862,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         stable_instructions_len: std::sync::atomic::AtomicUsize::new(opening.stable_len),
         frozen_objective: Mutex::new(FrozenObjective::Unread),
         pending_updates: Mutex::new(Vec::new()),
+        user_shell: Mutex::new(Vec::new()),
         watched: Mutex::new(opening.watched),
         nested_rules: Mutex::new(nested_rules),
         instruction_sizes: Mutex::new(instruction_sizes),
@@ -3525,6 +3581,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // resumed session rebuilds this exact message.
                 let at = u64::try_from(history.len()).unwrap_or(u64::MAX);
                 let mut composed = text.clone();
+                if let Some(shell) = host.take_user_shell() {
+                    composed = format!("{shell}\n\n{composed}");
+                    host.journal(&turn::JournalEntry::Note {
+                        at,
+                        placement: turn::NotePlacement::PromptPrefix,
+                        text: shell,
+                    });
+                }
                 if !updates.is_empty() {
                     let update = turn::context_update(&updates);
                     composed = format!("{composed}\n\n{update}");
@@ -3697,6 +3761,82 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 )?;
                 Ok(Step::Continue)
             }
+            Input::Shell(command) => {
+                if command.is_empty() {
+                    flush_lines(&host, sink, &[String::from("usage: !<command>")])?;
+                    return Ok(Step::Continue);
+                }
+                let shown = format!("! {command}");
+                let echo = if host.accessible {
+                    transcript::accessible_lines(&[Entry::user(&shown)])
+                } else {
+                    vec![transcript::render_prompt_with_ascii(
+                        rune_term::shell::prompt(),
+                        &shown,
+                        usize::from(host.width()),
+                        host.ascii,
+                    )]
+                };
+                let (prompt_row, caret) = host.idle_prompt();
+                let painted = host.paint(&echo, None, &prompt_row, &[], caret)?;
+                sink.write_all(&painted)?;
+                sink.flush()?;
+                host.transcript
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Entry::user(shown));
+                let job = |_: &mut History| {
+                    host.run_user_shell(&command);
+                    Ok(())
+                };
+                let steered = if let Some(input) = line_input {
+                    run_accessible(&mut history, &host, input, job)
+                } else {
+                    run_steerable(&mut history, &host, reader, gesture, job)
+                };
+                host.clear_events();
+                let mut lines: Vec<String> = steered.diagnostic.into_iter().collect();
+                if let Err(err) = &steered.outcome {
+                    lines.push(err.message().to_owned());
+                }
+                close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
+                Ok(Step::Continue)
+            }
+            Input::Memory(note) => {
+                if note.is_empty() {
+                    flush_lines(&host, sink, &[String::from("usage: # <note>")])?;
+                    return Ok(Step::Continue);
+                }
+                flush_lines(&host, sink, &[format!("add to AGENTS.md: - {note}")])?;
+                let question = "add to AGENTS.md? y/n";
+                let confirmed = if let Some(input) = line_input {
+                    host.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                        Entry::notice(question),
+                    ])));
+                    input.next_line()?.is_some_and(|line| {
+                        let line = line.trim();
+                        line.eq_ignore_ascii_case("y") || line.eq_ignore_ascii_case("yes")
+                    })
+                } else {
+                    confirm_choice(reader, &host, &sink.stream, question)?
+                };
+                let reply = if confirmed {
+                    match append_memory_note(&config.workspace, &note) {
+                        Ok(path) => {
+                            host.queue_update(format!(
+                                "The user added a note to AGENTS.md: {note}"
+                            ));
+                            lock_value(&host.watched).refresh(&path);
+                            String::from("added to AGENTS.md")
+                        }
+                        Err(err) => err.message().to_owned(),
+                    }
+                } else {
+                    String::from("AGENTS.md unchanged")
+                };
+                flush_lines(&host, sink, &[reply])?;
+                Ok(Step::Continue)
+            }
             Input::Empty => Ok(Step::Continue),
         }
     };
@@ -3855,7 +3995,20 @@ fn run_turn_accessible(
     history: &mut History,
     host: &SessionHost,
     input: &mut dyn InputSource,
-) -> SteeredTurn {
+) -> Steered<turn::TurnOutcome> {
+    run_accessible(history, host, input, |taken| {
+        turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict)
+    })
+}
+
+/// Runs `work` on its own thread, answering approvals and questions from
+/// canonical line input meanwhile.
+fn run_accessible<T: Send>(
+    history: &mut History,
+    host: &SessionHost,
+    input: &mut dyn InputSource,
+    work: impl FnOnce(&mut History) -> Result<T> + Send,
+) -> Steered<T> {
     host.cancellation.reset();
     let (requests, pending) = mpsc::channel();
     *host
@@ -3868,41 +4021,37 @@ fn run_turn_accessible(
         .requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(questions);
-    let (outcome, diagnostic) = run_on_worker(
-        history,
-        |taken| turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict),
-        || {
-            if let Ok(request) = pending.try_recv() {
-                let mut lines = approval_lines(&request, usize::MAX);
-                lines.push(if request.rememberable {
+    let (outcome, diagnostic) = run_on_worker(history, work, || {
+        if let Ok(request) = pending.try_recv() {
+            let mut lines = approval_lines(&request, usize::MAX);
+            lines.push(if request.rememberable {
                     "type yes to run once, or always to allow it for this session; any other answer denies"
                         .to_owned()
                 } else {
                     "type yes to run once; any other answer denies".to_owned()
                 });
-                host.show(&transcript::append_lines(&transcript::accessible_lines(&[
-                    Entry::notice(lines.join("\n")),
-                ])));
-                let answer = match input.next_line() {
-                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => {
-                        ApprovalOutcome::RunOnce
-                    }
-                    Ok(Some(line))
-                        if request.rememberable && line.trim().eq_ignore_ascii_case("always") =>
-                    {
-                        ApprovalOutcome::RememberForSession
-                    }
-                    _ => ApprovalOutcome::Deny,
-                };
-                let _ = request.answer.send(answer);
-            } else if let Ok(request) = pending_questions.try_recv() {
-                let answer = collect_accessible_questions(&request.questions, host, input);
-                let _ = request.answer.send(answer);
-            } else {
-                std::thread::sleep(rune_term::shell::POLL_INTERVAL);
-            }
-        },
-    );
+            host.show(&transcript::append_lines(&transcript::accessible_lines(&[
+                Entry::notice(lines.join("\n")),
+            ])));
+            let answer = match input.next_line() {
+                Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => {
+                    ApprovalOutcome::RunOnce
+                }
+                Ok(Some(line))
+                    if request.rememberable && line.trim().eq_ignore_ascii_case("always") =>
+                {
+                    ApprovalOutcome::RememberForSession
+                }
+                _ => ApprovalOutcome::Deny,
+            };
+            let _ = request.answer.send(answer);
+        } else if let Ok(request) = pending_questions.try_recv() {
+            let answer = collect_accessible_questions(&request.questions, host, input);
+            let _ = request.answer.send(answer);
+        } else {
+            std::thread::sleep(rune_term::shell::POLL_INTERVAL);
+        }
+    });
     *host
         .approval_requests
         .lock()
@@ -3912,7 +4061,7 @@ fn run_turn_accessible(
         .requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    SteeredTurn {
+    Steered {
         outcome,
         diagnostic,
         applied: Vec::new(),
@@ -3981,12 +4130,26 @@ fn run_turn_steerable(
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
     gesture: &mut rune_term::shell::EscapeGesture,
-) -> SteeredTurn {
+) -> Steered<turn::TurnOutcome> {
+    run_steerable(history, host, reader, gesture, |taken| {
+        turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict)
+    })
+}
+
+/// Runs `work` on its own thread while the keyboard stays live, with the
+/// same steering, cancellation and approval handling as a turn.
+fn run_steerable<T: Send>(
+    history: &mut History,
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+    gesture: &mut rune_term::shell::EscapeGesture,
+    work: impl FnOnce(&mut History) -> Result<T> + Send,
+) -> Steered<T> {
     if !reader.is_active() {
-        // Without a terminal there are no keys to read, so the turn runs here
+        // Without a terminal there are no keys to read, so the work runs here
         // and the steering path is simply unused.
-        return SteeredTurn {
-            outcome: turn::run_turn(history, host).and_then(turn::TurnOutcome::into_strict),
+        return Steered {
+            outcome: work(history),
             diagnostic: None,
             applied: Vec::new(),
             unsent: Vec::new(),
@@ -4012,103 +4175,99 @@ fn run_turn_steerable(
         *slot = Some(questions);
     }
 
-    let (result, diagnostic) = run_on_worker(
-        history,
-        |taken| turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict),
-        || {
-            if let Ok(request) = pending.try_recv() {
+    let (result, diagnostic) = run_on_worker(history, work, || {
+        if let Ok(request) = pending.try_recv() {
+            gesture.disarm();
+            let answer = collect_approval(&request, host, reader);
+            let _ = request.answer.send(answer);
+            host.draw_stream_with(reader.line(), reader.column());
+            return;
+        }
+        if let Ok(request) = pending_questions.try_recv() {
+            gesture.disarm();
+            let answer = collect_questions(&request.questions, host, reader);
+            let _ = request.answer.send(answer);
+            host.draw_stream_with(reader.line(), reader.column());
+            return;
+        }
+        sync_layout(reader, host, rune_term::shell::prompt());
+        let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
+            host.flush_frame();
+            host.tick();
+            return;
+        };
+        match key {
+            KeyAction::ExternalEditor => {
                 gesture.disarm();
-                let answer = collect_approval(&request, host, reader);
-                let _ = request.answer.send(answer);
+                edit_draft(reader, host);
                 host.draw_stream_with(reader.line(), reader.column());
-                return;
             }
-            if let Ok(request) = pending_questions.try_recv() {
+            KeyAction::Transcript => {
                 gesture.disarm();
-                let answer = collect_questions(&request.questions, host, reader);
-                let _ = request.answer.send(answer);
+                let _ = view_transcript(reader, host);
                 host.draw_stream_with(reader.line(), reader.column());
-                return;
             }
-            sync_layout(reader, host, rune_term::shell::prompt());
-            let Some(key) = reader.poll_key(rune_term::shell::POLL_INTERVAL) else {
-                host.flush_frame();
-                host.tick();
-                return;
-            };
-            match key {
-                KeyAction::ExternalEditor => {
-                    gesture.disarm();
-                    edit_draft(reader, host);
-                    host.draw_stream_with(reader.line(), reader.column());
+            // Enter submits what has been typed as steering rather than as
+            // a new turn, so a correction reaches the running turn instead
+            // of queueing behind it.
+            KeyAction::Submit => {
+                let text = reader.line().trim().to_owned();
+                reader.clear();
+                gesture.disarm();
+                if text.is_empty() {
+                    host.draw_stream_with("", 0);
+                    return;
                 }
-                KeyAction::Transcript => {
-                    gesture.disarm();
-                    let _ = view_transcript(reader, host);
-                    host.draw_stream_with(reader.line(), reader.column());
-                }
-                // Enter submits what has been typed as steering rather than as
-                // a new turn, so a correction reaches the running turn instead
-                // of queueing behind it.
-                KeyAction::Submit => {
-                    let text = reader.line().trim().to_owned();
+                let notice = match host.steering.submit(text.clone()) {
+                    Ok(()) => {
+                        submitted.push(text);
+                        String::from("steering queued for the next boundary")
+                    }
+                    Err(err) => err.message().to_owned(),
+                };
+                // Drawn with the emptied line, so the submitted text does
+                // not stay on screen as though it were still being typed.
+                host.draw_notice_with(&notice, "", 0);
+            }
+            // Escape arms on the first press and cancels on the second.
+            // The first press also clears a partly typed correction, which
+            // is what the key does everywhere else.
+            KeyAction::Escape => {
+                if gesture.record() {
+                    host.cancellation.cancel();
+                    host.draw_notice("cancelling the turn");
+                } else if reader.line().is_empty() {
+                    host.draw_notice("press Escape again to cancel");
+                } else {
                     reader.clear();
-                    gesture.disarm();
-                    if text.is_empty() {
-                        host.draw_stream_with("", 0);
-                        return;
-                    }
-                    let notice = match host.steering.submit(text.clone()) {
-                        Ok(()) => {
-                            submitted.push(text);
-                            String::from("steering queued for the next boundary")
-                        }
-                        Err(err) => err.message().to_owned(),
-                    };
-                    // Drawn with the emptied line, so the submitted text does
-                    // not stay on screen as though it were still being typed.
-                    host.draw_notice_with(&notice, "", 0);
-                }
-                // Escape arms on the first press and cancels on the second.
-                // The first press also clears a partly typed correction, which
-                // is what the key does everywhere else.
-                KeyAction::Escape => {
-                    if gesture.record() {
-                        host.cancellation.cancel();
-                        host.draw_notice("cancelling the turn");
-                    } else if reader.line().is_empty() {
-                        host.draw_notice("press Escape again to cancel");
-                    } else {
-                        reader.clear();
-                        host.draw_stream_with("", 0);
-                    }
-                }
-                // Control-C clears a typed correction first, then cancels. The
-                // session is left from the prompt the cancelled turn returns
-                // to, so a press here never abandons a turn still writing.
-                KeyAction::Cancel => {
-                    gesture.disarm();
-                    if reader.line().is_empty() {
-                        host.cancellation.cancel();
-                        host.draw_notice("cancelling the turn");
-                    } else {
-                        reader.clear();
-                        host.draw_stream_with("", 0);
-                    }
-                }
-                // Anything else is an edit, so a half-finished cancel gesture
-                // is abandoned rather than left armed, and the line is redrawn
-                // with the text that has been typed so far.
-                _ => {
-                    gesture.disarm();
-                    // The reader's line is passed rather than read back from
-                    // the host, so the keystroke that just landed is drawn and
-                    // not the state before it.
-                    host.draw_stream_with(reader.line(), reader.column());
+                    host.draw_stream_with("", 0);
                 }
             }
-        },
-    );
+            // Control-C clears a typed correction first, then cancels. The
+            // session is left from the prompt the cancelled turn returns
+            // to, so a press here never abandons a turn still writing.
+            KeyAction::Cancel => {
+                gesture.disarm();
+                if reader.line().is_empty() {
+                    host.cancellation.cancel();
+                    host.draw_notice("cancelling the turn");
+                } else {
+                    reader.clear();
+                    host.draw_stream_with("", 0);
+                }
+            }
+            // Anything else is an edit, so a half-finished cancel gesture
+            // is abandoned rather than left armed, and the line is redrawn
+            // with the text that has been typed so far.
+            _ => {
+                gesture.disarm();
+                // The reader's line is passed rather than read back from
+                // the host, so the keystroke that just landed is drawn and
+                // not the state before it.
+                host.draw_stream_with(reader.line(), reader.column());
+            }
+        }
+    });
     if let Ok(mut slot) = host.approval_requests.lock() {
         *slot = None;
     }
@@ -4126,7 +4285,7 @@ fn run_turn_steerable(
         .collect();
     let applied_count = submitted.len().saturating_sub(unsent.len());
     submitted.truncate(applied_count);
-    SteeredTurn {
+    Steered {
         outcome: result,
         diagnostic,
         applied: submitted,
@@ -4387,13 +4546,14 @@ fn draw_choice(
 /// and every later request would then be refused.
 /// The panic is an internal failure, with its diagnostic returned separately
 /// for the closing frame.
-fn run_on_worker<T, B>(
+fn run_on_worker<R, T, B>(
     history: &mut History,
     turn: T,
     mut between: B,
-) -> (Result<turn::TurnOutcome>, Option<String>)
+) -> (Result<R>, Option<String>)
 where
-    T: FnOnce(&mut History) -> Result<turn::TurnOutcome> + Send,
+    R: Send,
+    T: FnOnce(&mut History) -> Result<R> + Send,
     B: FnMut(),
 {
     let before = history.clone();
@@ -4431,10 +4591,10 @@ where
     (result, diagnostic)
 }
 
-/// What a steerable turn produced beside its outcome.
-struct SteeredTurn {
-    /// The turn's own result.
-    outcome: Result<turn::TurnOutcome>,
+/// What steerable work produced beside its outcome.
+struct Steered<T> {
+    /// The work's own result.
+    outcome: Result<T>,
     /// A caught worker panic, settled once through the renderer.
     diagnostic: Option<String>,
     /// Corrections the turn took in, in the order they were typed.
@@ -5118,6 +5278,62 @@ fn sync_layout(reader: &mut rune_term::input::KeyReader, host: &SessionHost, mar
     let width = usize::from(host.width());
     let prompt_width = rune_term::width::str_width(marker).min(width.saturating_sub(1));
     reader.set_layout(prompt_width, width);
+}
+
+/// Asks a yes or no question under the input row.
+///
+/// `y` answers yes; `n`, Escape, Control-C and Control-D answer no; other
+/// keys are ignored. The draft is set aside while the question is open.
+fn confirm_choice(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    question: &str,
+) -> Result<bool> {
+    if !reader.is_active() {
+        return Ok(false);
+    }
+    let hint = [String::from("y yes   n no")];
+    reader.with_temporary_line(|answer| {
+        loop {
+            {
+                let mut sink = out.lock().map_err(|_| {
+                    RuneError::new(ErrorCode::Internal, "the output lock was poisoned")
+                })?;
+                let (rows, caret) = transcript::render_draft_at(
+                    rune_term::shell::prompt(),
+                    "",
+                    0,
+                    usize::from(host.width()),
+                );
+                let painted =
+                    host.paint_with_menu(&[], Some(question), &rows, &[], &hint, caret, false)?;
+                if !painted.is_empty() {
+                    sink.write_all(&painted)?;
+                    sink.flush()?;
+                }
+            }
+            match answer.read_key() {
+                KeyAction::Ignored => {
+                    let typed = answer.line().to_owned();
+                    answer.clear();
+                    match typed.as_str() {
+                        "y" | "Y" => return Ok(true),
+                        "n" | "N" => return Ok(false),
+                        _ => {}
+                    }
+                }
+                KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => return Ok(false),
+                KeyAction::Submit
+                | KeyAction::Up
+                | KeyAction::Down
+                | KeyAction::Complete
+                | KeyAction::Transcript
+                | KeyAction::ExternalEditor
+                | KeyAction::HistorySearch => {}
+            }
+        }
+    })
 }
 
 /// Runs an inline picker and returns the chosen entry.
@@ -7626,6 +7842,79 @@ fn plan_summary(update: &rune_tools::PlanUpdate) -> String {
     )
 }
 
+/// Output bytes of a command the user ran that the next prompt carries.
+const USER_SHELL_TAIL_BYTES: usize = 4_096;
+
+/// Describes a command the user ran for the model: the command, the end of
+/// what it printed, and how it exited.
+fn user_shell_block(command: &str, output: &ToolOutput) -> String {
+    let mut lines: Vec<&str> = output.text.lines().collect();
+    if lines
+        .first()
+        .is_some_and(|line| line.strip_prefix("$ ") == Some(command))
+    {
+        lines.remove(0);
+    }
+    let state = lines
+        .last()
+        .filter(|line| line.starts_with('[') && line.ends_with(']'))
+        .map(|line| (*line).to_owned());
+    if state.is_some() {
+        lines.pop();
+    }
+    let status = match output.check.as_ref().and_then(|check| check.exit_code) {
+        Some(code) => format!("[exit {code}]"),
+        None => state.unwrap_or_else(|| String::from("[no exit status]")),
+    };
+    let body = lines.join("\n");
+    let mut block = format!("The user ran a command in the workspace:\n$ {command}\n");
+    if body.len() > USER_SHELL_TAIL_BYTES {
+        let mut start = body.len().saturating_sub(USER_SHELL_TAIL_BYTES);
+        while !body.is_char_boundary(start) {
+            start = start.saturating_add(1);
+        }
+        let _ = writeln!(block, "[... {start} bytes left out]");
+        block.push_str(&body[start..]);
+        block.push('\n');
+    } else if !body.is_empty() {
+        block.push_str(&body);
+        block.push('\n');
+    }
+    block.push_str(&status);
+    block
+}
+
+/// Appends `- {note}` to the workspace `AGENTS.md`, creating it with a heading
+/// when missing, and returns the file written.
+///
+/// The path is resolved inside the workspace alone, so a link that leads out
+/// of it is refused rather than followed.
+fn append_memory_note(workspace: &Utf8Path, note: &str) -> Result<Utf8PathBuf> {
+    let context = ExecutionContext::new(workspace.to_owned());
+    let path = rune_tools::resolve(&context, "AGENTS.md")?.path;
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::from("# Notes\n\n"),
+        Err(err) => {
+            return Err(RuneError::new(
+                ErrorCode::IoFailure,
+                format!("could not read {path}: {err}"),
+            ));
+        }
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = writeln!(text, "- {note}");
+    std::fs::write(&path, text).map_err(|err| {
+        RuneError::new(
+            ErrorCode::IoFailure,
+            format!("could not write {path}: {err}"),
+        )
+    })?;
+    Ok(path)
+}
+
 /// Builds the scrollback row for a finished call: status, tool, target, and
 /// what it produced.
 ///
@@ -9539,7 +9828,7 @@ mod tests {
         host.draw_stream_with(reader.line(), reader.column());
         let mut history = History::new();
         history.push_user("panic fixture");
-        let (result, diagnostic) = run_on_worker(
+        let (result, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
             &mut history,
             |_| {
                 host.emit(Event::TextDelta {
@@ -9561,7 +9850,7 @@ mod tests {
         close_turn(&host, &mut sink, &mut reader, &lines, None, &[]).expect("closed");
         // A subsequent worker and frame must still be usable, and redraws must
         // not settle the diagnostic a second time.
-        let (_, diagnostic) = run_on_worker(
+        let (_, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
             &mut history,
             |_| Err(rune_agent::steering::cancelled_error()),
             || {},
@@ -9588,7 +9877,7 @@ mod tests {
         let host = test_host();
         let mut history = History::new();
         history.push_user("panic fixture");
-        let (result, diagnostic) = run_on_worker(
+        let (result, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
             &mut history,
             |_| {
                 host.emit(Event::TextDelta {
@@ -9626,7 +9915,7 @@ mod tests {
         }]);
         history.push_user("second question");
 
-        let (result, diagnostic) = run_on_worker(
+        let (result, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
             &mut history,
             |taken| {
                 // Stopped partway: an assistant turn holding a call with no
@@ -9661,7 +9950,7 @@ mod tests {
     fn a_finished_turn_hands_back_what_it_added() {
         let mut history = History::new();
         history.push_user("question");
-        let (result, diagnostic) = run_on_worker(
+        let (result, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
             &mut history,
             |taken| {
                 taken.push_assistant(vec![rune_net::message::ContentPart::Text {
@@ -14855,6 +15144,7 @@ mod tests {
             stable_instructions_len: std::sync::atomic::AtomicUsize::new(0),
             frozen_objective: Mutex::new(FrozenObjective::Unread),
             pending_updates: Mutex::new(Vec::new()),
+            user_shell: Mutex::new(Vec::new()),
             watched: Mutex::new(context_watch::Watched::default()),
             nested_rules: Mutex::new(Vec::new()),
             instruction_sizes: Mutex::new(rune_agent::tokens::InstructionSizes::default()),
@@ -14928,6 +15218,80 @@ mod tests {
             warm_interval: std::time::Duration::from_millis(50),
             pending_model: Mutex::new(None),
             ignored_reported: Mutex::new(std::collections::BTreeSet::new()),
+        }
+    }
+
+    fn exited(text: String, code: i32) -> ToolOutput {
+        let mut output = if code == 0 {
+            ToolOutput::success(text)
+        } else {
+            ToolOutput::failure(text)
+        };
+        output.check = Some(rune_tools::contract::CheckRun {
+            exit_code: Some(code),
+            ..rune_tools::contract::CheckRun::default()
+        });
+        output
+    }
+
+    #[test]
+    fn user_shell_blocks_prefix_the_next_prompt() {
+        let host = test_host();
+        assert_eq!(host.take_user_shell(), None);
+        let first = exited("$ echo one\none\n[exited with status 0]\n".to_owned(), 0);
+        let long = "x".repeat(5_000);
+        let second = exited(format!("$ make\n{long}\n[exited with status 2]\n"), 2);
+        lock_value(&host.user_shell).push(user_shell_block("echo one", &first));
+        lock_value(&host.user_shell).push(user_shell_block("make", &second));
+
+        let prefix = host.take_user_shell().expect("two blocks");
+        assert_eq!(
+            prefix,
+            format!(
+                "The user ran a command in the workspace:\n$ echo one\none\n[exit 0]\n\n\
+                 The user ran a command in the workspace:\n$ make\n\
+                 [... 904 bytes left out]\n{}\n[exit 2]",
+                "x".repeat(USER_SHELL_TAIL_BYTES)
+            )
+        );
+        assert_eq!(host.take_user_shell(), None, "a block rides on one prompt");
+    }
+
+    #[test]
+    fn memory_line_appends_a_bullet() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let file = workspace.join("AGENTS.md");
+
+        let written = append_memory_note(&workspace, "always use tabs").expect("created");
+        assert_eq!(
+            std::fs::read_to_string(&written).expect("read"),
+            "# Notes\n\n- always use tabs\n"
+        );
+
+        std::fs::write(&file, "# Rules\n\nkeep it short").expect("write");
+        append_memory_note(&workspace, "small commits").expect("appended");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "# Rules\n\nkeep it short\n- small commits\n"
+        );
+
+        append_memory_note(&workspace, "no emojis").expect("appended");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "# Rules\n\nkeep it short\n- small commits\n- no emojis\n"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().expect("tempdir");
+            let target = outside.path().join("AGENTS.md");
+            std::fs::write(&target, "outside\n").expect("write");
+            std::fs::remove_file(&file).expect("remove");
+            std::os::unix::fs::symlink(&target, &file).expect("link");
+            let err = append_memory_note(&workspace, "leak").expect_err("refused");
+            assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+            assert_eq!(std::fs::read_to_string(&target).expect("read"), "outside\n");
         }
     }
 }

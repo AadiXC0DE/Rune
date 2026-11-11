@@ -119,6 +119,21 @@ impl Watched {
         lines
     }
 
+    /// Records `path` as it is on disk now, so a change the model was already
+    /// told about is not reported again.
+    pub fn refresh(&mut self, path: &Utf8Path) {
+        let wanted = path.canonicalize_utf8().ok();
+        for file in &mut self.files {
+            if file.path != path && file.path.canonicalize_utf8().ok() != wanted {
+                continue;
+            }
+            let metadata = std::fs::metadata(&file.path).ok();
+            file.digest = std::fs::read(&file.path).ok().map(|bytes| digest(&bytes));
+            file.len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+            file.modified = metadata.and_then(|metadata| metadata.modified().ok());
+        }
+    }
+
     /// Returns a line for each skill installed or removed since last seen.
     pub fn skill_changes(&mut self, workspace: &Utf8Path, config_root: &Utf8Path) -> Vec<String> {
         let home = rune_core::paths::home_directory();
@@ -372,6 +387,31 @@ mod tests {
             output: rune_tools::contract::ToolOutput::success("ok"),
             executed: true,
         }
+    }
+
+    #[test]
+    fn a_refreshed_file_is_not_reported_again() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(root.path().to_owned()).expect("utf8");
+        let workspace = base.join("work");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let path = workspace.join("AGENTS.md");
+        std::fs::write(&path, "# Notes\n").expect("write");
+        let mut watched = Watched::of(&workspace, &base.join("config"));
+        let changed = |watched: &mut Watched| {
+            watched
+                .file_changes(&workspace)
+                .into_iter()
+                .filter(|(changed, _)| changed.ends_with("AGENTS.md"))
+                .count()
+        };
+
+        std::fs::write(&path, "# Notes\n\n- use tabs\n").expect("write");
+        watched.refresh(&path);
+        assert_eq!(changed(&mut watched), 0);
+
+        std::fs::write(&path, "# Notes\n\n- use tabs\n- small commits\n").expect("write");
+        assert_eq!(changed(&mut watched), 1);
     }
 
     #[test]
