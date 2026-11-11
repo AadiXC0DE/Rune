@@ -111,6 +111,27 @@ fn an_explicit_goal_is_identical_after_process_restart_and_queries_do_not_write(
 }
 
 #[test]
+fn the_judge_follows_the_goal_command_and_is_not_saved() {
+    let fixture = Fixture::new();
+    let usage = "usage: /goal --judge [--budget <positive tokens>] <objective>";
+    let none = fixture.run("/goal --judge\n/quit\n");
+    assert!(none.contains(usage), "{none}");
+    assert!(!none.contains("no active objective"), "{none}");
+    assert!(!none.contains("judge: on"), "{none}");
+
+    let set = fixture.run("/goal --judge First\n/goal\n/goal Second\n/goal\n/quit\n");
+    assert_eq!(set.matches("judge: on").count(), 2, "{set}");
+    assert_eq!(set.matches("active objective: Second").count(), 2, "{set}");
+
+    let restarted = fixture.run("/goal\n/quit\n");
+    assert!(!restarted.contains("judge: on"), "{restarted}");
+
+    let enabled = fixture.run("/goal --judge\n/goal\n/quit\n");
+    assert_eq!(enabled.matches("judge: on").count(), 2, "{enabled}");
+    assert!(enabled.contains("active objective: Second"), "{enabled}");
+}
+
+#[test]
 fn an_ordinary_prompt_creates_no_objective_even_when_it_mentions_a_goal() {
     let fixture = Fixture::new();
     let output = fixture.run("Please set a goal to fix this parser\n/goal\n/quit\n");

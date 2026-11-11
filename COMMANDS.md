@@ -49,6 +49,8 @@ Run one bounded turn without an interactive session
 | `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
 | `--timeout <seconds>` | Stop the run after this many seconds and report what it did. |
 | `--max-cost <usd>` | Stop the run once its estimated cost reaches this many dollars. |
+| `--goal <objective>` | Work toward this objective; it is added to the instructions. |
+| `--judge` | With --goal, check the result against the objective before finishing. |
 
 ```text
 Exit status:

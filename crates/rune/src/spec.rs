@@ -229,6 +229,15 @@ pub const RUN: &[CommandSpec] = &[
                 "usd",
                 "Stop the run once its estimated cost reaches this many dollars.",
             ),
+            option(
+                "--goal",
+                "objective",
+                "Work toward this objective; it is added to the instructions.",
+            ),
+            flag(
+                "--judge",
+                "With --goal, check the result against the objective before finishing.",
+            ),
         ],
         requirements: Requirements::FULL,
         supports_json: true,

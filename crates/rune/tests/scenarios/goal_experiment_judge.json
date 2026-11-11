@@ -1,0 +1,30 @@
+{
+  "prompt": "Say hello.",
+  "workspace": "workspaces/goal_check.json",
+  "env": {
+    "RUNE_EXPERIMENT": "goal=judge"
+  },
+  "turns": [
+    {
+      "text": "Hello."
+    },
+    {
+      "text": "{\"status\":\"done\",\"reason\":\"it said hello.\",\"next\":\"\"}"
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Hello.",
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 1,
+        "text": "Active session objective:"
+      },
+      {
+        "request": 2,
+        "text": "Objective: Say hello."
+      }
+    ]
+  }
+}
