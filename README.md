@@ -1128,6 +1128,64 @@ cache root. `rune sandbox explain` lists the roots and what added each.
 commands run without one, and the footer and `rune status` say so. It never
 turns off a backend that works, and a project file cannot set it.
 
+## Hooks
+
+Hooks are programs Rune runs at points of a session. Configure them in the user
+file as `[[hooks]]` tables; project files cannot set them. Hooks of the same
+event run in file order, after the `pre_tool_hook` and `post_tool_hook` tables
+above.
+
+```toml
+[[hooks]]
+event = "turn_end"
+name = "tests ran"
+argv = ["/usr/local/bin/check-tests-ran"]
+timeout_ms = 5000
+```
+
+| Key | Meaning |
+| --- | --- |
+| `event` | `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `turn_end`, `pre_compact`, `notification` or `session_end` |
+| `name` | Shown in warnings, denials and notes |
+| `argv` | The program and its arguments, run without a shell |
+| `timeout_ms` | Deadline, 1 to 60,000; default 5,000 |
+| `on_error` | `deny` or `allow`: what a failing hook means |
+| `tools` | Tool names a `pre_tool` or `post_tool` hook applies to; absent means all |
+
+Hooks run as you, outside the sandbox, with a minimal environment.
+
+Each hook gets one JSON object on standard input, at most 256 KiB, and
+`RUNE_HOOK_EVENT` set to the event name. The object has `event`, `session_id`
+(empty when the session is not saved), `cwd` (the workspace, also the hook's
+working directory), `turn`, and the event's own fields:
+
+| Event | Fields | Accepted reply |
+| --- | --- | --- |
+| `session_start` | `resumed` | ignored |
+| `user_prompt` | `prompt` | `{}`, `{"context": "text"}` or `{"decision": "block", "reason": "..."}` |
+| `pre_tool` | `id`, `name`, `arguments` | `{"decision": "allow"}`, `{"decision": "deny", "reason": "..."}` or `{"decision": "rewrite", "arguments": {...}}` |
+| `post_tool` | `id`, `name`, `arguments`, `output`, `output_truncated`, `is_error`, `executed` | `{}`, `{"append": "text"}` or `{"replace": "text"}` |
+| `turn_end` | `text`, `continues` | `{}` or `{"decision": "continue", "message": "..."}` |
+| `pre_compact` | `automatic` | ignored |
+| `notification` | `kind` (`approval_needed`, `turn_finished` or `turn_failed`), `message` | ignored |
+| `session_end` | `reason` (`exit` or `error`) | ignored |
+
+An empty reply is the same as `{}`. A reply is at most 16 KiB; `context`,
+`append` and the `turn_end` message are at most 4 KiB each. `user_prompt`
+context from every hook is added to the prompt in a `<hook-context>` block
+named for the hook; a block stops the prompt, and `rune ask` then exits with
+status 2. A rewritten tool call is checked by policy again. `turn_end` runs
+when a turn is about to end by itself and can continue it at most three times
+in a row; a tool call resets the count. `turn_end` text and `post_tool` output
+are cut at 16 KiB and have credentials removed. Notification hooks run in the
+background in an interactive session, so a slow one never delays the terminal.
+
+A hook fails when it cannot start, passes its deadline, exits nonzero, prints
+something that is not an accepted reply, or prints too much. A failure denies
+the call or blocks the prompt when `on_error` is `deny`, the default for
+`pre_tool` and `user_prompt`; for every other event the default is `allow`,
+and a failure only shows a warning.
+
 ## Embedding
 
 `rune acp` serves the Agent Client Protocol over standard input and output.

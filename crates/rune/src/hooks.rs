@@ -24,6 +24,7 @@ const MAX_LEGACY_INPUT_BYTES: usize = 32 * 1024;
 const MAX_LEGACY_RESULT_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_FIELD_BYTES: usize = 16 * 1024;
 const MAX_APPEND_BYTES: usize = 4 * 1024;
+const MAX_TURN_TEXT_BYTES: usize = 16 * 1024;
 
 /// Fields common to every hook payload.
 pub struct Envelope<'a> {
@@ -34,7 +35,6 @@ pub struct Envelope<'a> {
 
 /// Runs one hook with `payload` on standard input and returns its parsed reply.
 /// An empty standard output is `Ok(None)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn run(
     hook: &Hook,
     envelope: &Envelope<'_>,
@@ -355,6 +355,280 @@ impl ToolHooks<'_> {
             _ => Ok(Some(reply)),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Block {
+    Block,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserPromptReply {
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    decision: Option<Block>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Continue {
+    Continue,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnEndReply {
+    #[serde(default)]
+    decision: Option<Continue>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// What `user_prompt` hooks decided about a prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    /// Send the prompt, with this context appended when there is any.
+    Send(Option<String>),
+    /// Do not send it.
+    Blocked { hook: String, reason: String },
+}
+
+/// What a host needs to run the hooks of session events.
+pub struct EventHooks<'a> {
+    pub hooks: &'a [Hook],
+    pub envelope: Envelope<'a>,
+    pub cancellation: &'a Cancellation,
+    /// Receives a safe message when a hook failure has no effect.
+    pub warn: &'a dyn Fn(&str),
+    /// Provider credential removed from everything a hook sees.
+    pub credential: &'a str,
+}
+
+impl EventHooks<'_> {
+    fn of(&self, event: HookEvent) -> impl Iterator<Item = &Hook> {
+        self.hooks.iter().filter(move |hook| hook.event == event)
+    }
+
+    fn failure(&self, hook: &Hook, error: &RuneError) -> String {
+        redact(
+            &format!("hook {} failed: {error}", hook.name),
+            self.credential,
+        )
+    }
+
+    /// Runs every `user_prompt` hook in order. The first block wins; context
+    /// from every hook is kept, in configuration order.
+    pub fn user_prompt(&self, prompt: &str) -> PromptOutcome {
+        let mut blocks = Vec::new();
+        for hook in self.of(HookEvent::UserPrompt) {
+            let mut payload = Map::new();
+            payload.insert("prompt".to_owned(), Value::from(prompt));
+            let reply =
+                run(hook, &self.envelope, payload, self.cancellation).and_then(parse_user_prompt);
+            match reply {
+                Ok(UserPromptReply {
+                    decision: Some(Block::Block),
+                    reason,
+                    ..
+                }) => {
+                    let reason = reason
+                        .filter(|reason| !reason.trim().is_empty())
+                        .unwrap_or_else(|| "no reason given".to_owned());
+                    return PromptOutcome::Blocked {
+                        hook: hook.name.clone(),
+                        reason,
+                    };
+                }
+                Ok(UserPromptReply {
+                    context: Some(text),
+                    ..
+                }) => blocks.push(format!(
+                    "<hook-context name=\"{}\">\n{text}\n</hook-context>",
+                    hook.name
+                )),
+                Ok(_) => {}
+                Err(error) => match hook.on_error() {
+                    OnError::Deny => {
+                        return PromptOutcome::Blocked {
+                            hook: hook.name.clone(),
+                            reason: self.failure(hook, &error),
+                        };
+                    }
+                    OnError::Allow => (self.warn)(&self.failure(hook, &error)),
+                },
+            }
+        }
+        PromptOutcome::Send((!blocks.is_empty()).then(|| blocks.join("\n")))
+    }
+
+    /// Runs `turn_end` hooks in order and returns the first that asks the
+    /// model to continue, with its message.
+    pub fn turn_end(&self, text: &str, continues: u32) -> Option<(String, String)> {
+        let text = redact(text, self.credential);
+        let text = cut(&text, MAX_TURN_TEXT_BYTES);
+        for hook in self.of(HookEvent::TurnEnd) {
+            let mut payload = Map::new();
+            payload.insert("text".to_owned(), Value::from(text));
+            payload.insert("continues".to_owned(), Value::from(continues));
+            let reply =
+                run(hook, &self.envelope, payload, self.cancellation).and_then(parse_turn_end);
+            match reply {
+                Ok(Some(message)) => return Some((hook.name.clone(), message)),
+                Ok(None) => {}
+                Err(error) if error.code() == ErrorCode::Cancelled => return None,
+                Err(error) => (self.warn)(&self.failure(hook, &error)),
+            }
+        }
+        None
+    }
+
+    /// Runs the hooks of an event whose output is ignored.
+    pub fn observe(&self, event: HookEvent, payload: &Map<String, Value>) {
+        for hook in self.of(event) {
+            if let Err(error) = run(hook, &self.envelope, payload.clone(), self.cancellation)
+                && error.code() != ErrorCode::Cancelled
+            {
+                (self.warn)(&self.failure(hook, &error));
+            }
+        }
+    }
+}
+
+fn parse_user_prompt(reply: Option<Value>) -> Result<UserPromptReply> {
+    let Some(reply) = reply else {
+        return Ok(UserPromptReply {
+            context: None,
+            decision: None,
+            reason: None,
+        });
+    };
+    let reply: UserPromptReply = serde_json::from_value(reply)?;
+    match (&reply.context, &reply.decision, &reply.reason) {
+        (Some(_), Some(_), _) => Err(RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "a user_prompt reply sets both context and decision",
+        )),
+        (None, None, Some(_)) => Err(RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "a user_prompt reply gives a reason without a decision",
+        )),
+        (Some(text), None, _) if text.len() > MAX_APPEND_BYTES => Err(RuneError::new(
+            ErrorCode::TooLarge,
+            format!("hook context exceeds {MAX_APPEND_BYTES} bytes"),
+        )),
+        _ => Ok(reply),
+    }
+}
+
+fn parse_turn_end(reply: Option<Value>) -> Result<Option<String>> {
+    let Some(reply) = reply else {
+        return Ok(None);
+    };
+    let reply: TurnEndReply = serde_json::from_value(reply)?;
+    match (reply.decision, reply.message) {
+        (None, None) => Ok(None),
+        (Some(Continue::Continue), Some(message)) if message.len() > MAX_APPEND_BYTES => {
+            Err(RuneError::new(
+                ErrorCode::TooLarge,
+                format!("hook message exceeds {MAX_APPEND_BYTES} bytes"),
+            ))
+        }
+        (Some(Continue::Continue), Some(message)) if !message.trim().is_empty() => {
+            Ok(Some(message))
+        }
+        (Some(Continue::Continue), _) => Err(RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "a turn_end continue needs a message",
+        )),
+        (None, Some(_)) => Err(RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "a turn_end reply gives a message without a decision",
+        )),
+    }
+}
+
+/// The owned parts of an [`EventHooks`], for hooks run on another thread.
+pub struct Detached {
+    pub hooks: Vec<Hook>,
+    pub session_id: String,
+    pub cwd: camino::Utf8PathBuf,
+    pub turn: u64,
+    pub credential: String,
+}
+
+impl Detached {
+    /// Borrows these parts as [`EventHooks`].
+    pub fn events<'a>(
+        &'a self,
+        cancellation: &'a Cancellation,
+        warn: &'a dyn Fn(&str),
+    ) -> EventHooks<'a> {
+        EventHooks {
+            hooks: &self.hooks,
+            envelope: Envelope {
+                session_id: &self.session_id,
+                cwd: &self.cwd,
+                turn: self.turn,
+            },
+            cancellation,
+            warn,
+            credential: &self.credential,
+        }
+    }
+
+    /// Runs the hooks of an event whose output is ignored, each bounded by
+    /// its own deadline and not by any cancellation.
+    pub fn observe(&self, event: HookEvent, payload: &Map<String, Value>, warn: &dyn Fn(&str)) {
+        self.events(&Cancellation::new(), warn)
+            .observe(event, payload);
+    }
+
+    /// Runs `notification` hooks on their own thread, so a slow hook never
+    /// delays the caller. Each hook is still bounded by its own deadline.
+    pub fn notify(self, kind: &str, message: &str, warn: impl Fn(&str) + Send + 'static) {
+        if !self
+            .hooks
+            .iter()
+            .any(|hook| hook.event == HookEvent::Notification)
+        {
+            return;
+        }
+        let payload = notification_payload(kind, &redact(message, &self.credential));
+        let spawned = std::thread::Builder::new()
+            .name("rune-notification-hook".to_owned())
+            .spawn(move || self.observe(HookEvent::Notification, &payload, &warn));
+        drop(spawned);
+    }
+}
+
+/// The payload of a `notification` hook.
+pub fn notification_payload(kind: &str, message: &str) -> Map<String, Value> {
+    let mut payload = payload("kind", kind);
+    payload.insert("message".to_owned(), Value::from(message));
+    payload
+}
+
+/// Builds the payload object of an event from one field.
+pub fn payload(key: &str, value: impl Into<Value>) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert(key.to_owned(), value.into());
+    payload
+}
+
+fn cut(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &text[..end]
 }
 
 /// Removes the credential and known secret shapes from text.
@@ -794,6 +1068,175 @@ mod tests {
         assert_eq!(payload["executed"], true);
         assert_eq!(payload["is_error"], false);
         assert_eq!(payload["output_truncated"], false);
+    }
+
+    fn events<'a>(
+        fixture: &'a Fixture,
+        hooks: &'a [Hook],
+        warn: &'a dyn Fn(&str),
+    ) -> EventHooks<'a> {
+        EventHooks {
+            hooks,
+            envelope: Envelope {
+                session_id: "fixture-session",
+                cwd: fixture.cwd(),
+                turn: 2,
+            },
+            cancellation: &fixture.cancellation,
+            warn,
+            credential: "fixture-key",
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_prompt_context_is_appended() {
+        let fixture = Fixture::new();
+        let mut first = hook(
+            HookEvent::UserPrompt,
+            "cat > prompt.json; printf '{\"context\":\"branch is main\"}'",
+            5_000,
+        );
+        first.name = "branch".to_owned();
+        let quiet = hook(HookEvent::UserPrompt, "cat > /dev/null", 5_000);
+        let mut second = hook(
+            HookEvent::UserPrompt,
+            "printf '%s' '{\"context\":\"two\\nlines\"}'",
+            5_000,
+        );
+        second.name = "notes".to_owned();
+        let mut failing = hook(HookEvent::UserPrompt, "exit 4", 5_000);
+        failing.on_error = Some(OnError::Allow);
+        let other = hook(HookEvent::TurnEnd, "exit 9", 5_000);
+        let hooks = [first, quiet, failing, second, other];
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let warn = |message: &str| warnings.lock().expect("warnings").push(message.to_owned());
+        let outcome = events(&fixture, &hooks, &warn).user_prompt("fix the build");
+        assert_eq!(
+            outcome,
+            PromptOutcome::Send(Some(
+                "<hook-context name=\"branch\">\nbranch is main\n</hook-context>\n\
+                 <hook-context name=\"notes\">\ntwo\nlines\n</hook-context>"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            *warnings.lock().expect("warnings"),
+            ["hook fixture hook failed: permission_denied: hook exited with status 4"]
+        );
+        let payload: Value =
+            serde_json::from_slice(&std::fs::read(fixture.path("prompt.json")).expect("payload"))
+                .expect("JSON");
+        assert_eq!(payload["event"], "user_prompt");
+        assert_eq!(payload["prompt"], "fix the build");
+        assert_eq!(payload["turn"], 2);
+        // No hook, or no context, sends the prompt as it is.
+        let outcome = events(&fixture, &hooks[1..2], &warn).user_prompt("plain");
+        assert_eq!(outcome, PromptOutcome::Send(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_prompt_block_stops_the_prompt() {
+        let fixture = Fixture::new();
+        let warn = |_: &str| {};
+        let mut blocking = hook(
+            HookEvent::UserPrompt,
+            "printf '{\"decision\":\"block\",\"reason\":\"no secrets\"}'",
+            5_000,
+        );
+        blocking.name = "guard".to_owned();
+        let later = hook(HookEvent::UserPrompt, "touch later", 5_000);
+        let hooks = [blocking, later];
+        let outcome = events(&fixture, &hooks, &warn).user_prompt("print the key");
+        assert_eq!(
+            outcome,
+            PromptOutcome::Blocked {
+                hook: "guard".to_owned(),
+                reason: "no secrets".to_owned()
+            }
+        );
+        assert!(!fixture.path("later").exists());
+        // A hook that times out blocks by default.
+        let mut slow = hook(HookEvent::UserPrompt, "sleep 5", 150);
+        slow.name = "slow".to_owned();
+        let outcome = events(&fixture, std::slice::from_ref(&slow), &warn).user_prompt("hello");
+        assert_eq!(
+            outcome,
+            PromptOutcome::Blocked {
+                hook: "slow".to_owned(),
+                reason: "hook slow failed: limit_exceeded: hook exceeded its deadline".to_owned()
+            }
+        );
+        // A reply that is not one of the accepted shapes is a failure.
+        let odd = hook(
+            HookEvent::UserPrompt,
+            "printf '{\"decision\":\"allow\"}'",
+            5_000,
+        );
+        let outcome = events(&fixture, std::slice::from_ref(&odd), &warn).user_prompt("hello");
+        assert!(
+            matches!(outcome, PromptOutcome::Blocked { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_end_hooks_ask_to_continue() {
+        let fixture = Fixture::new();
+        let warn = |_: &str| {};
+        let quiet = hook(HookEvent::TurnEnd, "cat > turn.json; printf '{}'", 5_000);
+        let mut asking = hook(
+            HookEvent::TurnEnd,
+            "printf '{\"decision\":\"continue\",\"message\":\"run the tests\"}'",
+            5_000,
+        );
+        asking.name = "tests".to_owned();
+        let hooks = [quiet, asking];
+        let reply = events(&fixture, &hooks, &warn).turn_end("done with fixture-key", 1);
+        assert_eq!(
+            reply,
+            Some(("tests".to_owned(), "run the tests".to_owned()))
+        );
+        let payload: Value =
+            serde_json::from_slice(&std::fs::read(fixture.path("turn.json")).expect("payload"))
+                .expect("JSON");
+        assert_eq!(payload["continues"], 1);
+        assert_eq!(payload["text"], "done with [redacted]");
+        assert_eq!(events(&fixture, &hooks[..1], &warn).turn_end("x", 0), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notifications_do_not_wait_for_the_hook() {
+        let fixture = Fixture::new();
+        let slow = hook(
+            HookEvent::Notification,
+            "cat > note.json; sleep 2; touch finished",
+            5_000,
+        );
+        let started = Instant::now();
+        Detached {
+            hooks: vec![slow],
+            session_id: "fixture-session".to_owned(),
+            cwd: fixture.cwd().to_owned(),
+            turn: 1,
+            credential: String::new(),
+        }
+        .notify("approval_needed", "approve shell: ls", |_| {});
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!fixture.path("finished").exists());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fixture.path("finished").exists() {
+            assert!(Instant::now() < deadline, "the hook did not run");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let payload: Value =
+            serde_json::from_slice(&std::fs::read(fixture.path("note.json")).expect("payload"))
+                .expect("JSON");
+        assert_eq!(payload["kind"], "approval_needed");
+        assert_eq!(payload["message"], "approve shell: ls");
     }
 
     #[cfg(unix)]

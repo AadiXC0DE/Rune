@@ -1,0 +1,4 @@
+{
+  "README.md": "x\n",
+  "continue.sh": "cat > /dev/null\nif [ -e continued ]; then\n  printf '{}'\nelse\n  touch continued\n  printf '{\"decision\":\"continue\",\"message\":\"say what the file holds in full\"}'\nfi\n"
+}
