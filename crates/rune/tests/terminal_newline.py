@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -22,6 +23,13 @@ KITTY_REPLIES = b"\x1b[?1u\x1b[?62;22c"
 PLAIN_REPLIES = b"\x1b[?62;22c"
 prompts = []
 errors = []
+ESCAPE = re.compile(rb"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\))")
+
+
+def words(data):
+    """Returns the printed text with escapes removed and every run of white space as one space,
+    so a message is found even where the screen wrapped it."""
+    return b" ".join(ESCAPE.sub(b"", bytes(data)).split())
 
 
 def event(text=None, finish=None):
@@ -89,9 +97,11 @@ def session(environment, root, replies):
                 return
             transcript.extend(data)
 
-    def wait_for(text, start=0):
+    def wait_for(text, start=0, wrapped=False):
         deadline = time.monotonic() + 10
-        while text not in transcript[start:]:
+        while (words(text) not in words(transcript[start:])) if wrapped else (
+            text not in transcript[start:]
+        ):
             assert time.monotonic() < deadline, (
                 f"timed out waiting for {text!r}:\n" + transcript[-4000:].decode(errors="replace")
             )
@@ -173,7 +183,7 @@ with tempfile.TemporaryDirectory(prefix="rune-newline-") as directory:
             keys(b"x")
             assert not keymap.exists()
             keys(b"y")
-            wait_for(b"restart the terminal or reload its settings", start)
+            wait_for(b"restart the terminal or reload its settings", start, wrapped=True)
             drain()
             written = json.loads(keymap.read_text())
             assert written[0]["bindings"]["shift-enter"][1] == "\x1b[13;2u", written
