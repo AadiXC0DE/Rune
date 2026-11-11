@@ -178,6 +178,14 @@ pub struct History {
     /// tokens, with the model it was sent to.
     #[serde(skip)]
     window_bound: Option<(String, u64)>,
+    /// What a host delivered on a tool result, by key, with the turn that
+    /// carries it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    delivered: std::collections::BTreeMap<String, u64>,
+    /// How many pins the front message carries, once a host has frozen it;
+    /// pins added later reach the model another way. `None`: every pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pinned_frozen: Option<usize>,
 }
 
 /// Reads whose file digest is kept; past this, one is dropped to make room.
@@ -210,6 +218,8 @@ impl Default for History {
             reasoning_summary_refused: false,
             temperature_noticed: false,
             window_bound: None,
+            delivered: std::collections::BTreeMap::new(),
+            pinned_frozen: None,
         }
     }
 }
@@ -236,6 +246,8 @@ impl History {
             reasoning_summary_refused: false,
             temperature_noticed: false,
             window_bound: None,
+            delivered: std::collections::BTreeMap::new(),
+            pinned_frozen: None,
         }
     }
 
@@ -424,6 +436,31 @@ impl History {
         &self.pinned_constraints
     }
 
+    /// Fixes the front message at the pins held now. A pin added later is
+    /// left out of it until the next freeze, so the start of every request
+    /// stays the same; the host tells the model about it another way.
+    pub fn freeze_pins(&mut self) {
+        self.pinned_frozen = Some(self.pinned_constraints.len());
+    }
+
+    /// Returns true when something under `key` was delivered and is still in
+    /// the conversation.
+    #[must_use]
+    pub fn is_delivered(&self, key: &str) -> bool {
+        self.delivered.contains_key(key)
+    }
+
+    /// Records that `key` was delivered on the turn `seq`.
+    pub(crate) fn mark_delivered(&mut self, key: String, seq: u64) {
+        self.delivered.insert(key, seq);
+    }
+
+    /// Forgets deliveries made on turns before `seq`, so they are made again.
+    pub fn forget_delivered_before(&mut self, seq: u64) {
+        self.delivered
+            .retain(|_, delivered_at| *delivered_at >= seq);
+    }
+
     /// Returns every turn.
     #[must_use]
     pub fn turns(&self) -> &[Turn] {
@@ -555,13 +592,18 @@ impl History {
     /// every dialect places instructions in its own field. Pinned constraints
     /// precede the turns as user content and are never replaced by a summary.
     pub fn to_messages(&self) -> Vec<Message> {
-        let pinned = (!self.pinned_constraints.is_empty()).then(|| Message {
+        let front = &self.pinned_constraints[..self
+            .pinned_frozen
+            .map_or(self.pinned_constraints.len(), |frozen| {
+                frozen.min(self.pinned_constraints.len())
+            })];
+        let pinned = (!front.is_empty()).then(|| Message {
             role: Role::User,
             parts: std::iter::once(ContentPart::Text {
                 text: "Explicit user constraints (preserve verbatim across context compaction):\n"
                     .to_owned(),
             })
-            .chain(self.pinned_constraints.iter().cloned().flat_map(|text| {
+            .chain(front.iter().cloned().flat_map(|text| {
                 [
                     ContentPart::Text { text },
                     ContentPart::Text {
@@ -659,6 +701,15 @@ impl History {
         };
         *content = receipt;
         self.pruned.insert(id.to_owned());
+        // A delivery on that result went with its text.
+        if let Some(seq) = self.turns.iter().find_map(|turn| {
+            turn.parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::ToolResult { id: held, .. } if held.as_str() == id))
+                .then_some(turn.seq)
+        }) {
+            self.delivered.retain(|_, delivered_at| *delivered_at != seq);
+        }
         self.clear_anchor();
         true
     }
@@ -669,6 +720,9 @@ impl History {
     pub fn truncate_to(&mut self, count: usize) {
         self.clear_anchor();
         self.turns.truncate(count);
+        let last = self.turns.last().map_or(0, |turn| turn.seq);
+        self.delivered
+            .retain(|_, delivered_at| *delivered_at <= last);
     }
 
     /// Keeps only turns from `start` onward, renumbering from one.
@@ -692,9 +746,19 @@ impl History {
     /// Sequence numbers are positions, not identities, so they stay contiguous
     /// after a history is modified. A gap would look like a corrupt log.
     fn renumber(&mut self) {
+        let mut moved = std::collections::BTreeMap::new();
         for (index, turn) in self.turns.iter_mut().enumerate() {
-            turn.seq = u64::try_from(index).unwrap_or(0).saturating_add(1);
+            let seq = u64::try_from(index).unwrap_or(0).saturating_add(1);
+            if turn.seq != 0 {
+                moved.insert(turn.seq, seq);
+            }
+            turn.seq = seq;
         }
+        // Deliveries follow their turn; those whose turn is gone are forgotten.
+        self.delivered = std::mem::take(&mut self.delivered)
+            .into_iter()
+            .filter_map(|(key, seq)| moved.get(&seq).map(|moved| (key, *moved)))
+            .collect();
         self.next_seq = u64::try_from(self.turns.len())
             .unwrap_or(0)
             .saturating_add(1);
@@ -715,6 +779,10 @@ impl History {
     /// recent turns verbatim.
     pub fn replace_with_summary(&mut self, summary: impl Into<String>, keep_from_seq: u64) {
         self.clear_anchor();
+        self.forget_delivered_before(keep_from_seq);
+        if self.pinned_frozen.is_some() {
+            self.freeze_pins();
+        }
         let mut retained: Vec<Turn> = self
             .turns
             .iter()
@@ -723,7 +791,7 @@ impl History {
             .collect();
 
         let mut turns = vec![Turn::new(
-            1,
+            0,
             Role::User,
             vec![ContentPart::Text {
                 text: summary.into(),
@@ -804,6 +872,13 @@ impl History {
             reasoning_summary_refused: self.reasoning_summary_refused,
             temperature_noticed: self.temperature_noticed,
             window_bound: self.window_bound.clone(),
+            delivered: self
+                .delivered
+                .iter()
+                .filter(|(_, delivered_at)| **delivered_at <= seq)
+                .map(|(key, delivered_at)| (key.clone(), *delivered_at))
+                .collect(),
+            pinned_frozen: self.pinned_frozen,
         }
     }
 
@@ -859,6 +934,30 @@ pub fn invalid_history(err: &RuneError) -> RuneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pin_after_the_freeze_is_not_in_the_front_message() {
+        let front = |history: &History| history.to_messages()[0].text();
+        let mut history = History::new();
+        history.pin_constraint("first rule").expect("pin");
+        history.push_user("hello");
+        history.freeze_pins();
+        history.pin_constraint("second rule").expect("pin");
+        assert!(front(&history).contains("first rule"));
+        assert!(!front(&history).contains("second rule"));
+        assert_eq!(history.pinned_constraints().len(), 2);
+
+        // A checkpoint freezes again, so the front then holds both.
+        let keep = history.next_seq();
+        history.replace_with_summary("summary", keep);
+        assert!(front(&history).contains("second rule"));
+
+        // Without a freeze every pin is in front, as before.
+        let mut open = History::new();
+        open.pin_constraint("rule").expect("pin");
+        open.push_user("hello");
+        assert!(front(&open).contains("rule"));
+    }
 
     #[test]
     fn a_window_bound_keeps_the_smaller_value_per_model() {

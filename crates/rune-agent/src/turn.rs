@@ -449,6 +449,12 @@ pub trait Host {
     /// no report carries, so the host can still count what they cost.
     fn compaction_abandoned(&self, _usage: &Usage) {}
 
+    /// Returns what to append to this step's last tool result. Called once per step after
+    /// every result is final. The default appends nothing.
+    fn step_appendix(&self, _history: &History, _results: &[CallResult]) -> Option<Appendix> {
+        None
+    }
+
     /// Records delegated provider usage without adding child conversation events.
     fn record_child_usage(&self, _model: &str, _usage: &Usage) {}
 
@@ -633,6 +639,28 @@ pub trait Host {
 pub fn lowest_accepted_effort(host: &dyn Host) -> Effort {
     let (_, traits) = host.compat(&host.model());
     crate::compaction::lowest_effort(traits.efforts, host.dialect())
+}
+
+/// Text a host appends to the last tool result of a step, with keys marking what it
+/// delivered so the history can forget the delivery when the turn carrying it is summarised.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Appendix {
+    /// The text added after the result, following a blank line.
+    pub text: String,
+    /// What the text delivered, for `History::is_delivered`.
+    pub keys: Vec<String>,
+}
+
+/// Renders changes for the model as one `<context-update>` block, one line each.
+#[must_use]
+pub fn context_update(lines: &[String]) -> String {
+    let mut block = String::from("<context-update>\n");
+    for line in lines {
+        block.push_str(line);
+        block.push('\n');
+    }
+    block.push_str("</context-update>");
+    block
 }
 
 /// One entry of what a turn said and did, in the order it happened.
@@ -1484,9 +1512,20 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             stall_noted = true;
         }
 
-        let mut result_parts = Vec::new();
         for result in &results {
             host.post_tool(result);
+        }
+        let appendix = host
+            .step_appendix(history, &results)
+            .filter(|appendix| !appendix.text.is_empty());
+        if let Some(appendix) = &appendix
+            && let Some(last) = results.last_mut()
+        {
+            last.output.text.push_str("\n\n");
+            last.output.text.push_str(&appendix.text);
+        }
+        let mut result_parts = Vec::new();
+        for result in &results {
             let id = match rune_core::id::ToolCallId::new(result.call.id.clone()) {
                 Ok(id) => id,
                 Err(err) => fail!(err),
@@ -1509,6 +1548,11 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             settled_now |= !was_settled && history.ledger().settled;
         }
         let seq = history.push_tool_results(result_parts);
+        if let Some(appendix) = appendix {
+            for key in appendix.keys {
+                history.mark_delivered(key, seq);
+            }
+        }
         if settled_now {
             history.set_settled_turn(seq);
         }

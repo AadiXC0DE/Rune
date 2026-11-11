@@ -119,6 +119,8 @@ struct TestHost {
     cancel_before_judge: bool,
     /// The efforts the model is described as accepting.
     efforts: Option<&'static [Effort]>,
+    /// What every step appends to its last tool result.
+    appendix: Option<rune_agent::turn::Appendix>,
 }
 
 impl TestHost {
@@ -170,6 +172,7 @@ impl TestHost {
             steer_after_judge: Mutex::new(None),
             cancel_before_judge: false,
             efforts: None,
+            appendix: None,
         }
     }
 
@@ -451,6 +454,14 @@ impl Host for TestHost {
             .expect("hook calls")
             .push(call.id.clone());
         Ok(self.hook_veto.clone())
+    }
+
+    fn step_appendix(
+        &self,
+        _history: &rune_agent::History,
+        _results: &[rune_agent::turn::CallResult],
+    ) -> Option<rune_agent::turn::Appendix> {
+        self.appendix.clone()
     }
 
     fn post_tool(&self, result: &rune_agent::turn::CallResult) {
@@ -6785,4 +6796,75 @@ fn the_lowest_effort_is_one_the_model_and_dialect_accept() {
         rune_agent::turn::lowest_accepted_effort(&host),
         Effort::Auto
     );
+}
+
+fn appended_host(workspace: &tempfile::TempDir, scripts: Vec<Script>) -> TestHost {
+    let mut host = file_host(workspace, scripts);
+    host.appendix = Some(rune_agent::turn::Appendix {
+        text: rune_agent::turn::context_update(&["Permission mode is now auto.".to_owned()]),
+        keys: vec!["rules:a/AGENTS.md".to_owned()],
+    });
+    host
+}
+
+#[test]
+fn a_step_appendix_is_added_to_the_last_result() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.rs"), "one\n").expect("fixture");
+    std::fs::write(workspace.path().join("b.rs"), "two\n").expect("fixture");
+    let host = appended_host(
+        &workspace,
+        vec![two_reads("r1", "r2"), Script::text("done")],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("read them");
+    let outcome = run_turn(&mut history, &host).expect("turn");
+    let block = "<context-update>\nPermission mode is now auto.\n</context-update>";
+    assert!(
+        outcome.calls[1]
+            .output
+            .text
+            .ends_with(&format!("\n\n{block}"))
+    );
+    assert!(!outcome.calls[0].output.text.contains(block));
+    let body = host
+        .server
+        .as_ref()
+        .expect("server")
+        .last_body()
+        .expect("body");
+    let tools: Vec<&serde_json::Value> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(tools[1]["content"].as_str().expect("text").ends_with(block));
+    assert!(!tools[0]["content"].as_str().expect("text").contains(block));
+    assert!(history.is_delivered("rules:a/AGENTS.md"));
+}
+
+#[test]
+fn delivered_keys_are_forgotten_by_a_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("a.rs"), "one\n").expect("fixture");
+    let host = appended_host(
+        &workspace,
+        vec![read_call("read", "a.rs"), Script::text("done")],
+    );
+    let mut history = rune_agent::History::new();
+    history.push_user("read it");
+    run_turn(&mut history, &host).expect("turn");
+    assert!(history.is_delivered("rules:a/AGENTS.md"));
+
+    // A checkpoint that keeps the delivering turn keeps the delivery.
+    let mut kept = history.clone();
+    kept.replace_with_summary("summary", 2);
+    assert!(kept.is_delivered("rules:a/AGENTS.md"));
+
+    // One that summarises it forgets the delivery, so it is made again.
+    let last = history.next_seq();
+    history.replace_with_summary("summary", last);
+    assert!(!history.is_delivered("rules:a/AGENTS.md"));
 }
