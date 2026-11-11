@@ -3235,6 +3235,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         keyed && !config.accessible && std::env::var("RUNE_NO_PROBE").as_deref() != Ok("1"),
     );
     reader.type_ahead(&probe.typed);
+    rune_term::modes::push_keyboard(probe.caps.key_protocol());
 
     // Resolved before the host literal because the registry is moved into it,
     // and because the reasoning lane's colour has to be read off the theme
@@ -3706,6 +3707,27 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 Err(err) => note(format!("could not copy: {err}")),
                             },
                             None => note("there is no reply to copy yet".to_owned()),
+                        }
+                    }
+                    Handled::TerminalSetup if host.accessible => {
+                        note("terminal setup needs the interactive terminal".to_owned());
+                    }
+                    Handled::TerminalSetup => {
+                        let setup = crate::terminal_setup::plan(
+                            &host.caps,
+                            rune_core::paths::home_directory().as_deref(),
+                            crate::terminal_setup::Os::current(),
+                        );
+                        flush_lines(&host, sink, &setup.lines())?;
+                        if let crate::terminal_setup::Setup::Write { path, .. } = &setup {
+                            let question = format!("write this to {path}?");
+                            let reply = if confirm_choice(reader, &host, &sink.stream, &question)? {
+                                crate::terminal_setup::apply(&setup)
+                                    .unwrap_or_else(|err| err.message().to_owned())
+                            } else {
+                                format!("left {path} unchanged")
+                            };
+                            note(reply);
                         }
                     }
                     Handled::NewSession => {
@@ -8031,6 +8053,8 @@ enum Handled {
     Resume(Option<String>),
     /// Set an explicit objective, or inspect the current one without changes.
     Goal(Option<GoalRequest>),
+    /// Configure this terminal so Shift-Enter inserts a newline.
+    TerminalSetup,
 }
 
 /// What a `/goal` command with arguments asks for.
@@ -8491,6 +8515,7 @@ fn handle_command<W: std::io::Write>(
             Ok(Handled::Continue)
         }
         "copy" => Ok(Handled::Copy),
+        "terminal-setup" => Ok(Handled::TerminalSetup),
         "new" => Ok(Handled::NewSession),
         "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
         "undo" if arguments.trim() == "confirm" => Ok(Handled::UndoConfirm),
@@ -14600,6 +14625,24 @@ mod tests {
             .expect("handled");
             assert_eq!(action, expected, "/{name}");
         }
+    }
+
+    #[test]
+    fn terminal_setup_is_a_listed_command() {
+        assert!(rune_term::commands::find("terminal-setup").is_some());
+        let mut output = Vec::new();
+        let action = handle_command(
+            "terminal-setup",
+            "",
+            &empty_commands(),
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut output,
+        )
+        .expect("handled");
+        assert_eq!(action, Handled::TerminalSetup);
+        assert!(output.is_empty());
     }
 
     #[test]
