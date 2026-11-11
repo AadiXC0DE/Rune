@@ -441,6 +441,12 @@ fn encode(event: &Event) -> serde_json::Value {
             "to": to,
             "repairs": repairs,
         }),
+        Event::ToolRewritten { call, hook } => json!({
+            "kind": "tool_rewritten",
+            "id": call.id,
+            "name": call.name,
+            "hook": hook,
+        }),
         Event::ToolStarted { call, activity } => json!({
             "kind": "tool_started",
             "id": call.id,
