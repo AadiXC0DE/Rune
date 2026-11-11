@@ -31,6 +31,10 @@ pub const MODIFY_OTHER_KEYS_RESET: &str = "\u{1b}[>4m";
 pub const FORMAT_OTHER_KEYS_CSI_U: &str = "\u{1b}[>4;1f";
 /// Puts the modified key format back to its default.
 pub const FORMAT_OTHER_KEYS_RESET: &str = "\u{1b}[>4f";
+/// Asks the terminal to report when its window gains or loses focus.
+pub const FOCUS_ON: &str = "\u{1b}[?1004h";
+/// Stops focus reports.
+pub const FOCUS_OFF: &str = "\u{1b}[?1004l";
 
 /// How long a terminal that has said nothing is waited for.
 const FIRST_REPLY: Duration = Duration::from_millis(100);
@@ -69,6 +73,7 @@ pub struct TerminalEnv {
     pub alacritty_window_id: Option<String>,
     pub wezterm_executable: Option<String>,
     pub colorfgbg: Option<String>,
+    pub lc_terminal: Option<String>,
 }
 
 impl TerminalEnv {
@@ -89,6 +94,7 @@ impl TerminalEnv {
             alacritty_window_id: get("ALACRITTY_WINDOW_ID"),
             wezterm_executable: get("WEZTERM_EXECUTABLE"),
             colorfgbg: get("COLORFGBG"),
+            lc_terminal: get("LC_TERMINAL"),
         }
     }
 }
@@ -225,6 +231,8 @@ pub fn is_light(rgb: (u8, u8, u8)) -> bool {
 pub struct Probe {
     pub caps: TerminalCaps,
     pub typed: String,
+    /// Whether the queries were written.
+    pub ran: bool,
 }
 
 /// What one call of [`parse`] found.
@@ -504,12 +512,14 @@ pub fn run(env: TerminalEnv, enabled: bool) -> Probe {
         return Probe {
             caps,
             typed: String::new(),
+            ran: false,
         };
     }
     let typed = exchange(&mut caps);
     Probe {
         caps,
         typed: type_ahead(&typed),
+        ran: true,
     }
 }
 

@@ -13,7 +13,9 @@ const RESET_STYLE: &[u8] = b"\x1b[0m";
 /// Closes any open hyperlink.
 const CLOSE_LINK: &[u8] = b"\x1b]8;;\x1b\\";
 /// Stops focus reports.
-const FOCUS_OFF: &[u8] = b"\x1b[?1004l";
+const FOCUS_OFF: &[u8] = crate::probe::FOCUS_OFF.as_bytes();
+/// Starts focus reports.
+const FOCUS_ON: &[u8] = crate::probe::FOCUS_ON.as_bytes();
 /// Stops bracketed paste.
 const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// Starts bracketed paste.
@@ -181,6 +183,15 @@ pub fn push_keyboard(protocol: crate::probe::KeyProtocol) {
     });
 }
 
+/// Asks the terminal to report focus changes, and records it, so every way
+/// out turns the reports off again.
+pub fn enable_focus() {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(FOCUS_ON);
+    let _ = stdout.flush();
+    mark(|modes| modes.focus = true);
+}
+
 /// Writes `state`'s restore bytes in one write and leaves raw mode. A failed
 /// write is ignored: after a hang-up the terminal is gone.
 fn put_back(state: &ModeState) {
@@ -231,21 +242,10 @@ pub fn reapply() -> bool {
         .take();
     let resumed = paused.is_some();
     let (state, left_alternate) = paused.unwrap_or_else(|| (current(), false));
-    let mut out = Vec::new();
     if state.raw {
         let _ = crossterm::terminal::enable_raw_mode();
     }
-    if state.bracketed_paste {
-        out.extend_from_slice(PASTE_ON);
-    }
-    // Kitty flags are a stack, so they are pushed again only after a pause
-    // popped them.
-    if resumed {
-        out.extend_from_slice(&keyboard_bytes(&state));
-    }
-    if left_alternate {
-        out.extend_from_slice(ALTERNATE_ON);
-    }
+    let out = reapply_bytes(&state, resumed, left_alternate);
     if !out.is_empty() {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(&out);
@@ -253,6 +253,27 @@ pub fn reapply() -> bool {
     }
     *modes() = state;
     state != NONE
+}
+
+/// Returns the bytes that turn `state`'s modes on again, after a pause when
+/// `resumed`, entering the alternate screen again when the pause left it.
+fn reapply_bytes(state: &ModeState, resumed: bool, left_alternate: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if state.bracketed_paste {
+        out.extend_from_slice(PASTE_ON);
+    }
+    // Kitty flags are a stack, so they are pushed again only after a pause
+    // popped them.
+    if resumed {
+        out.extend_from_slice(&keyboard_bytes(state));
+    }
+    if state.focus {
+        out.extend_from_slice(FOCUS_ON);
+    }
+    if left_alternate {
+        out.extend_from_slice(ALTERNATE_ON);
+    }
+    out
 }
 
 /// Asks for the whole screen to be drawn again.
@@ -396,6 +417,23 @@ mod tests {
         for part in [END_SYNC, RESET_STYLE, CLOSE_LINK, WRAP_ON, SHOW_CURSOR] {
             assert!(find(&bytes, part).is_some(), "{part:?}");
         }
+    }
+
+    #[test]
+    fn focus_reports_are_turned_on_again_after_a_pause() {
+        let focused = ModeState {
+            raw: true,
+            focus: true,
+            ..ModeState::default()
+        };
+        assert!(find(&reapply_bytes(&focused, true, false), FOCUS_ON).is_some());
+        assert!(find(&reapply_bytes(&focused, false, false), FOCUS_ON).is_some());
+        let unfocused = ModeState {
+            raw: true,
+            ..ModeState::default()
+        };
+        assert!(find(&reapply_bytes(&unfocused, true, false), FOCUS_ON).is_none());
+        assert!(find(&restore_bytes(&focused), FOCUS_OFF).is_some());
     }
 
     #[test]

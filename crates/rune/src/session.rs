@@ -32,7 +32,8 @@ use rune_policy::rules::RuleSet;
 use rune_session::usage::{HelperKind, Ledger, UsageRecord, now_ms};
 use rune_term::footer::{self, FooterState, ProviderRetry, StatusField, UiState};
 use rune_term::input::KeyAction;
-use rune_term::probe::TerminalEnv;
+use rune_term::notify::Channel;
+use rune_term::probe::{TerminalEnv, Tri};
 use rune_term::shell::ExitReason;
 use rune_term::shell::{Action, Input, InputSource, Shell};
 use rune_term::theme::{ColorDepth, Slot, Theme, detect_depth};
@@ -461,6 +462,8 @@ struct SessionHost {
     live_tail: Arc<Mutex<Vec<String>>>,
     /// Whether file targets are written as terminal hyperlinks.
     hyperlinks: bool,
+    /// How the user is notified while the terminal is unfocused.
+    notify_channel: Channel,
     /// When the live region was last redrawn by the turn's idle tick.
     last_tick: Mutex<Option<std::time::Instant>>,
     /// Whether the stream changed since the last frame was written.
@@ -2267,6 +2270,38 @@ impl SessionHost {
         })
     }
 
+    /// How long the turn now running has run.
+    fn turn_elapsed(&self) -> std::time::Duration {
+        self.turn_started
+            .lock()
+            .ok()
+            .and_then(|started| *started)
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Raises a desktop notification with `body` when the user is not looking
+    /// at the terminal. Written on its own, outside any frame.
+    fn notify_unfocused(&self, focus: Tri, ran: std::time::Duration, body: &str) {
+        if self.notify_channel == Channel::None || !should_notify(focus, ran) {
+            return;
+        }
+        self.show(&rune_term::notify::sequence(
+            self.notify_channel,
+            "rune",
+            body,
+            self.caps.tmux,
+        ));
+    }
+
+    /// Notifies an unfocused user that the turn ended, `finished` or `failed`.
+    fn notify_turn_end(&self, focus: Tri, ran: std::time::Duration, how: &str) {
+        let directory = Utf8Path::new(&self.workspace)
+            .file_name()
+            .unwrap_or_default();
+        self.notify_unfocused(focus, ran, &format!("{how} in {directory}"));
+    }
+
     fn turn_number(&self) -> u64 {
         self.recorder.as_ref().map_or(0, |recorder| {
             recorder
@@ -3590,6 +3625,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     );
     reader.type_ahead(&probe.typed);
     rune_term::modes::push_keyboard(probe.caps.key_protocol());
+    if probe.ran {
+        rune_term::modes::enable_focus();
+    }
 
     // Resolved before the host literal because the registry is moved into it,
     // and because the reasoning lane's colour has to be read off the theme
@@ -3707,6 +3745,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         config.accessible,
         |key| std::env::var(key).ok(),
     );
+    let notify_channel = if keyed && !config.accessible && std::io::stdout().is_terminal() {
+        rune_term::notify::channel(
+            rune_term::notify::Notify::from_setting(&config.settings.notify),
+            &probe.caps,
+        )
+    } else {
+        Channel::None
+    };
     let host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
@@ -3821,6 +3867,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         collapse: config.settings.collapse_tool_calls,
         live_tail,
         hyperlinks,
+        notify_channel,
         last_tick: Mutex::new(None),
         frame_dirty: std::sync::atomic::AtomicBool::new(false),
         last_frame: Mutex::new(None),
@@ -4661,6 +4708,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         }
                         host.set_progress(2);
                         host.set_title_state("idle");
+                        let how = if err.code() == ErrorCode::Cancelled {
+                            "finished"
+                        } else {
+                            "failed"
+                        };
+                        host.notify_turn_end(reader.focus(), host.turn_elapsed(), how);
                         let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
                         host.clear_events();
                         host.clear_streaming();
@@ -4721,6 +4774,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal: the region below is redrawn in place.
                 host.set_progress(0);
                 host.set_title_state("idle");
+                host.notify_turn_end(reader.focus(), elapsed.unwrap_or_default(), "finished");
                 let mut lines = report_turn(&outcome, &host, &reasoning)?;
                 if !host.accessible
                     && let Some(segments) = summary_segments(
@@ -5315,6 +5369,11 @@ fn collect_approval(
     reader: &mut rune_term::input::KeyReader,
 ) -> ApprovalOutcome {
     host.set_title_state("waiting for you");
+    host.notify_unfocused(
+        reader.focus(),
+        host.turn_elapsed(),
+        &format!("waiting for approval: {}", request.tool),
+    );
     let outcome = collect_approval_inner(request, host, reader);
     host.set_title_state("working");
     outcome
@@ -5400,6 +5459,11 @@ fn collect_questions(
     reader: &mut rune_term::input::KeyReader,
 ) -> Result<Answer> {
     host.set_title_state("waiting for you");
+    host.notify_unfocused(
+        reader.focus(),
+        host.turn_elapsed(),
+        "waiting for your answer",
+    );
     let answer = collect_questions_inner(questions, host, reader);
     host.set_title_state("working");
     answer
@@ -5776,7 +5840,7 @@ impl Drop for TranscriptScreen<'_> {
 
 /// Reads a stable snapshot on the alternate screen. The reader's composer is
 /// never replaced, so its caret, recall state and kill buffer survive intact.
-fn view_transcript(reader: &rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
+fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
     use rune_term::input::TranscriptAction;
 
     let mut entries = host
@@ -9788,6 +9852,19 @@ fn supports_progress(lookup: impl Fn(&str) -> Option<String>) -> bool {
         || lookup("ConEmuANSI").as_deref() == Some("ON")
         || (program == "iTerm.app"
             && lookup("TERM_FEATURES").is_some_and(|features| features.contains('P')))
+}
+
+/// How long a turn runs before an unknown focus counts as looking away.
+const NOTIFY_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Returns whether a notification is sent, given the terminal's focus and how
+/// long the turn has run. Without focus reports only a long turn notifies.
+fn should_notify(focus: Tri, ran: std::time::Duration) -> bool {
+    match focus {
+        Tri::No => true,
+        Tri::Unknown => ran > NOTIFY_AFTER,
+        Tri::Yes => false,
+    }
 }
 
 /// Returns the window title for a session in a state, without control
@@ -18578,6 +18655,76 @@ mod tests {
     }
 
     #[test]
+    fn should_notify_rules() {
+        let seconds = std::time::Duration::from_secs;
+        assert!(should_notify(Tri::No, seconds(0)));
+        assert!(should_notify(Tri::No, seconds(60)));
+        assert!(!should_notify(Tri::Yes, seconds(0)));
+        assert!(!should_notify(Tri::Yes, seconds(60)));
+        assert!(!should_notify(Tri::Unknown, seconds(5)));
+        assert!(!should_notify(Tri::Unknown, seconds(20)));
+        assert!(should_notify(Tri::Unknown, seconds(25)));
+    }
+
+    #[test]
+    fn waits_and_turn_ends_notify_only_when_the_user_is_away() {
+        let mut host = test_host();
+        host.notify_channel = Channel::Osc9;
+        let bytes = capture_output(&host);
+        let sent = || {
+            String::from_utf8_lossy(&std::mem::take(&mut *bytes.lock().expect("bytes")))
+                .into_owned()
+        };
+        let notices = |text: &str| text.matches("\u{1b}]9;").count();
+        // No focus report has arrived, so only a turn past 20 seconds notifies.
+        *host.turn_started.lock().expect("started") =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        host.cancellation.cancel();
+        let (answer, _response) = mpsc::sync_channel(1);
+        let request = ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: "printf SECRET_PROMPT".to_owned(),
+            reason: "no rule allows it".to_owned(),
+            rememberable: true,
+            preview: Vec::new(),
+            answer,
+        };
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        assert_eq!(
+            collect_approval(&request, &host, &mut reader),
+            ApprovalOutcome::Deny
+        );
+        let approval = sent();
+        assert!(
+            approval.contains("\u{1b}]9;rune: waiting for approval: shell\u{1b}\\"),
+            "{approval:?}"
+        );
+        assert_eq!(notices(&approval), 1);
+        assert!(
+            !approval[approval.find("\u{1b}]9;").expect("notice")..]
+                .split("\u{1b}\\")
+                .next()
+                .expect("body")
+                .contains("SECRET_PROMPT")
+        );
+        let _ = collect_questions(&[fixture_question()], &host, &mut reader);
+        let question = sent();
+        assert!(
+            question.contains("\u{1b}]9;rune: waiting for your answer\u{1b}\\"),
+            "{question:?}"
+        );
+        let seconds = std::time::Duration::from_secs;
+        host.notify_turn_end(Tri::Unknown, seconds(5), "finished");
+        host.notify_turn_end(Tri::Yes, seconds(60), "finished");
+        assert_eq!(sent(), "");
+        host.notify_turn_end(Tri::No, seconds(0), "failed");
+        assert_eq!(sent(), "\u{1b}]9;rune: failed in tmp\u{1b}\\");
+        host.notify_channel = Channel::None;
+        host.notify_turn_end(Tri::No, seconds(60), "finished");
+        assert_eq!(sent(), "");
+    }
+
+    #[test]
     fn hyperlinks_auto_is_off_inside_tmux_and_on_elsewhere() {
         let caps = |term: &str, vte: Option<&str>, tmux: bool| {
             let env = TerminalEnv {
@@ -18856,6 +19003,7 @@ mod tests {
             collapse: true,
             live_tail: Arc::new(Mutex::new(Vec::new())),
             hyperlinks: false,
+            notify_channel: Channel::None,
             last_tick: Mutex::new(None),
             frame_dirty: std::sync::atomic::AtomicBool::new(false),
             last_frame: Mutex::new(None),
