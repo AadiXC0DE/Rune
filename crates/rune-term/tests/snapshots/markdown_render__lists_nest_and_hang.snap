@@ -1,0 +1,47 @@
+---
+source: crates/rune-term/tests/markdown_render.rs
+expression: "rows_at(text, &MarkdownStyle::attributes(), &[20, 40, 80])"
+---
+width 20
+|\e[2m•\e[0m first level
+|  \e[2m•\e[0m second level
+|    \e[2m•\e[0m third level
+|1. ordered one
+|2) ordered two
+|  10. nested number
+|      that also
+|      runs long
+|      enough to wrap
+|[ ] open task
+|\e[2m[x]\e[0m \e[2mdone task\e[0m
+|\e[2m[x]\e[0m \e[2malso done\e[0m
+|\e[2m•\e[0m a long item whose
+|  text runs well
+|  past the narrow
+|  width and wraps
+|  under itself
+width 40
+|\e[2m•\e[0m first level
+|  \e[2m•\e[0m second level
+|    \e[2m•\e[0m third level
+|1. ordered one
+|2) ordered two
+|  10. nested number that also runs long
+|      enough to wrap
+|[ ] open task
+|\e[2m[x]\e[0m \e[2mdone task\e[0m
+|\e[2m[x]\e[0m \e[2malso done\e[0m
+|\e[2m•\e[0m a long item whose text runs well past
+|  the narrow width and wraps under
+|  itself
+width 80
+|\e[2m•\e[0m first level
+|  \e[2m•\e[0m second level
+|    \e[2m•\e[0m third level
+|1. ordered one
+|2) ordered two
+|  10. nested number that also runs long enough to wrap
+|[ ] open task
+|\e[2m[x]\e[0m \e[2mdone task\e[0m
+|\e[2m[x]\e[0m \e[2malso done\e[0m
+|\e[2m•\e[0m a long item whose text runs well past the narrow width and wraps under itself

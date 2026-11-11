@@ -55,12 +55,48 @@ impl MarkdownStyle {
     }
 }
 
+/// One styled source line, ready to wrap.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct StyledLine {
+    /// Written before the first wrapped row, such as a list marker.
+    pub first: String,
+    /// Columns of the hanging indent that wrapped rows start with.
+    pub indent: usize,
+    /// Written before each wrapped row after the first: `indent` columns.
+    pub continuation: String,
+    /// The styled text, wrapped to the width left after the indent.
+    pub body: String,
+}
+
+impl StyledLine {
+    fn plain(body: String) -> Self {
+        Self {
+            body,
+            ..Self::default()
+        }
+    }
+}
+
 /// Styles one line of prose. `width` bounds a horizontal rule.
 #[must_use]
-pub fn style_line(line: &str, style: &MarkdownStyle, ascii: bool, width: usize) -> String {
+pub fn style_line(line: &str, style: &MarkdownStyle, ascii: bool, width: usize) -> StyledLine {
     if !style.enabled {
-        return line.to_owned();
+        return StyledLine::plain(line.to_owned());
     }
+    let lead = line
+        .len()
+        .saturating_sub(line.trim_start_matches([' ', '\t']).len());
+    let expanded;
+    let line = if line[..lead].contains('\t') {
+        expanded = format!(
+            "{}{}",
+            crate::width::expand_tabs(&line[..lead]),
+            &line[lead..]
+        );
+        expanded.as_str()
+    } else {
+        line
+    };
     let indent_len = line
         .len()
         .saturating_sub(line.trim_start_matches(' ').len());
@@ -69,37 +105,99 @@ pub fn style_line(line: &str, style: &MarkdownStyle, ascii: bool, width: usize) 
     if indent_len <= 3 && is_rule(rest) {
         let glyph = if ascii { "-" } else { "\u{2500}" };
         let length = width.clamp(3, 48);
-        return format!("{}{}{}", style.dim, glyph.repeat(length), style.reset);
+        return StyledLine::plain(format!(
+            "{}{}{}",
+            style.dim,
+            glyph.repeat(length),
+            style.reset
+        ));
     }
     if indent_len <= 3
         && let Some(text) = heading(rest)
     {
-        return format!("{}{}{}", style.heading, inline(text, style), style.reset);
+        return StyledLine::plain(format!(
+            "{}{}{}",
+            style.heading,
+            inline(text, style),
+            style.reset
+        ));
     }
     if indent_len <= 3
         && let Some(text) = rest.strip_prefix('>')
     {
         let bar = if ascii { "|" } else { "\u{2502}" };
         let text = text.strip_prefix(' ').unwrap_or(text);
-        return format!(
-            "{}{bar}{} {}{}{}",
-            style.dim,
-            style.reset,
-            style.dim,
-            inline(text, style),
-            style.reset
-        );
+        let prefix = format!("{}{bar}{} ", style.dim, style.reset);
+        return StyledLine {
+            first: prefix.clone(),
+            indent: 2,
+            continuation: prefix,
+            body: format!("{}{}{}", style.dim, inline(text, style), style.reset),
+        };
     }
+    let level = indent_len / 2;
+    let pad = " ".repeat(level.saturating_mul(2));
     if let Some(text) = bullet(rest) {
+        if let Some((done, text)) = task(text) {
+            let first = if done {
+                format!("{pad}{}[x]{} ", style.dim, style.reset)
+            } else {
+                format!("{pad}[ ] ")
+            };
+            let body = if done {
+                format!("{}{}{}", style.dim, inline(text, style), style.reset)
+            } else {
+                inline(text, style)
+            };
+            return hanging(first, pad.len().saturating_add(4), body);
+        }
         let marker = if ascii { "-" } else { "\u{2022}" };
-        return format!(
-            "{indent}{}{marker}{} {}",
-            style.dim,
-            style.reset,
-            inline(text, style)
-        );
+        let first = format!("{pad}{}{marker}{} ", style.dim, style.reset);
+        return hanging(first, pad.len().saturating_add(2), inline(text, style));
     }
-    format!("{indent}{}", inline(rest, style))
+    if let Some((marker, text)) = ordered(rest) {
+        let first = format!("{pad}{marker} ");
+        let indent = pad.len().saturating_add(marker.len()).saturating_add(1);
+        return hanging(first, indent, inline(text, style));
+    }
+    StyledLine::plain(format!("{indent}{}", inline(rest, style)))
+}
+
+/// A list line whose wrapped rows start under its text.
+fn hanging(first: String, indent: usize, body: String) -> StyledLine {
+    StyledLine {
+        first,
+        indent,
+        continuation: " ".repeat(indent),
+        body,
+    }
+}
+
+/// Returns whether a list item is a task, whether it is done, and its text.
+fn task(text: &str) -> Option<(bool, &str)> {
+    let done = match text.get(..3)? {
+        "[ ]" => false,
+        "[x]" | "[X]" => true,
+        _ => return None,
+    };
+    let rest = &text[3..];
+    if rest.is_empty() {
+        return Some((done, rest));
+    }
+    rest.strip_prefix(' ').map(|rest| (done, rest))
+}
+
+/// Returns the marker and text of an ordered list item: up to nine digits,
+/// `.` or `)`, then a space.
+pub(crate) fn ordered(text: &str) -> Option<(&str, &str)> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=9).contains(&digits) || !matches!(text.as_bytes().get(digits), Some(b'.' | b')')) {
+        return None;
+    }
+    let end = digits.saturating_add(1);
+    text[end..]
+        .strip_prefix(' ')
+        .map(|rest| (&text[..end], rest))
 }
 
 /// Returns true for a thematic break: three or more of one of `-`, `*`, `_`.
@@ -406,13 +504,17 @@ mod tests {
     }
 
     fn styled(line: &str) -> String {
-        style_line(line, &marked(), false, 10)
+        let line = style_line(line, &marked(), false, 10);
+        format!("{}{}", line.first, line.body)
     }
 
     #[test]
     fn disabled_styling_leaves_the_line_as_written() {
         let line = "## **raw** `text`";
-        assert_eq!(style_line(line, &MarkdownStyle::default(), false, 80), line);
+        assert_eq!(
+            style_line(line, &MarkdownStyle::default(), false, 80).body,
+            line
+        );
     }
 
     #[test]
@@ -445,8 +547,8 @@ mod tests {
     #[test]
     fn ascii_output_uses_ascii_markers() {
         let line = style_line("- item", &marked(), true, 10);
-        assert!(line.is_ascii(), "{line}");
-        assert!(style_line("***", &marked(), true, 4).is_ascii());
+        assert!(line.first.is_ascii(), "{line:?}");
+        assert!(style_line("***", &marked(), true, 4).body.is_ascii());
     }
 
     #[test]
