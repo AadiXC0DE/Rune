@@ -35,6 +35,8 @@ pub struct MarkdownStyle {
     pub reset: String,
     /// How fenced code is coloured.
     pub code_block: crate::highlight::CodeStyle,
+    /// Selects the background of fenced code rows; empty draws none.
+    pub code_bg: String,
     /// How links and file paths are written.
     pub links: LinkContext,
 }
@@ -66,6 +68,7 @@ impl MarkdownStyle {
             dim: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
             code_block: crate::highlight::CodeStyle::default(),
+            code_bg: String::new(),
             links: LinkContext::default(),
         }
     }
@@ -705,6 +708,7 @@ mod tests {
             dim: "<d>".to_owned(),
             reset: "</>".to_owned(),
             code_block: crate::highlight::CodeStyle::default(),
+            code_bg: String::new(),
             links: LinkContext::default(),
         }
     }

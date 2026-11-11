@@ -128,10 +128,11 @@ def capture(binary, root, environment, arguments):
         # Tool summaries are settled after stream completion and journal writes.
         # A quiet PTY after a streamed delta is not a completion signal.
         wait_for(b"read_file")
-        wait_for(b"    > ")
+        wait_for(b"    " + b"C" * 180)
         drain()
         assert b"read_file" in transcript, "tool summary was not displayed"
-        assert b"    > " in transcript, "code continuation was not displayed"
+        # The long code row is written whole, so it copies as one line.
+        assert b"    " + b"C" * 180 in transcript, "code row was not written whole"
         start = len(transcript)
         os.write(master, b"\x12")
         wait_for(b"> fixture / second", start)

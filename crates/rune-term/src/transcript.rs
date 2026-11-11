@@ -743,9 +743,8 @@ impl AssistantRows {
     /// Returns all rows for text that grows by appending deltas.
     ///
     /// Prose uses ordinary word wrapping. Inside backtick or tilde fences,
-    /// whitespace is preserved, tabs expand to eight-column stops, and soft
-    /// breaks repeat the source indentation followed by `↪ `. On narrow
-    /// terminals the repeated indentation shrinks to leave room for code.
+    /// whitespace is preserved, tabs expand to eight-column stops, and each
+    /// source line is one row, however wide, so it copies as written.
     #[must_use]
     pub fn rows(&mut self, text: &str, width: usize) -> Vec<String> {
         self.rows_with_ascii(text, width, false)
@@ -902,32 +901,42 @@ fn assistant_line(
     markdown: &crate::markdown::MarkdownStyle,
     complete: bool,
 ) -> Vec<String> {
-    // A fence line is syntax rather than content, so styled output dims it.
-    let delimiter = |line: &str| {
-        if markdown.enabled {
-            wrap(&format!("{}{line}{}", markdown.dim, markdown.reset), width)
-        } else {
-            wrap(line, width)
-        }
-    };
+    // A fence line is syntax rather than content, so styled output leaves it
+    // out; copying a code block from scrollback then gives only the code.
     let candidate = fence_start(line);
     if let Some(open) = *fence {
         if candidate.is_some_and(|(close, rest)| {
             close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
         }) {
             *fence = None;
-            return delimiter(line);
+            return if markdown.enabled {
+                Vec::new()
+            } else {
+                wrap(line, width)
+            };
         }
-        return wrap_code(line, width, ascii)
-            .into_iter()
-            .map(|row| crate::highlight::highlight(&row, open.language, &markdown.code_block))
-            .collect();
+        return vec![code_row(line, open.language, markdown)];
     }
     if let Some((open, rest)) = candidate
         && (open.marker != b'`' || !rest.contains('`'))
     {
         *fence = Some(open);
-        return delimiter(line);
+        if !markdown.enabled {
+            return wrap(line, width);
+        }
+        let indent = line
+            .len()
+            .saturating_sub(line.trim_start_matches(' ').len());
+        return rest
+            .split_whitespace()
+            .next()
+            .map(|language| {
+                vec![format!(
+                    "{:indent$}{}{language}{}",
+                    "", markdown.dim, markdown.reset
+                )]
+            })
+            .unwrap_or_default();
     }
     let styled = if complete {
         crate::markdown::style_line(line, markdown, ascii, width)
@@ -1128,38 +1137,30 @@ fn ordered_item(text: &str) -> bool {
         && text.as_bytes().get(digits.saturating_add(1)) == Some(&b' ')
 }
 
-/// Hard wraps code by grapheme, retaining every space instead of word breaks.
-fn wrap_code(source: &str, width: usize, ascii: bool) -> Vec<String> {
-    let expanded = expand_tabs(source);
-    let indent = expanded.bytes().take_while(|byte| *byte == b' ').count();
-    let marker = match (ascii, width >= 3) {
-        (true, true) => "> ",
-        (true, false) => ">",
-        (false, true) => "↪ ",
-        (false, false) => "↪",
-    };
-    // Leave at least two cells for a wide grapheme whenever possible.
-    let prefix = " ".repeat(indent.min(width.saturating_sub(4))) + marker;
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut used = 0_usize;
-    let mut has_source = false;
-    for cluster in graphemes(&expanded) {
-        let columns = grapheme_width(cluster);
-        if has_source && used.saturating_add(columns) > width {
-            rows.push(std::mem::take(&mut row));
-            // Below three columns the marker may need to shrink or disappear
-            // to accommodate a wide glyph without clipping its code bytes.
-            let (shown, columns_used) = truncate_to_width(&prefix, width.saturating_sub(columns));
-            shown.clone_into(&mut row);
-            used = columns_used;
-        }
-        row.push_str(cluster);
-        used = used.saturating_add(columns);
-        has_source = true;
+/// Erases from the cursor to the end of the row in the current background.
+const ERASE_TO_END: &str = "\u{1b}[K";
+
+/// Draws one line of fenced code whole: tabs expanded, highlighted, on the
+/// code background when there is one. It is never wrapped, so the terminal
+/// soft-wraps a long row and copying it gives the line as written.
+fn code_row(
+    source: &str,
+    language: crate::highlight::Language,
+    markdown: &crate::markdown::MarkdownStyle,
+) -> String {
+    let row = crate::highlight::highlight(&expand_tabs(source), language, &markdown.code_block);
+    let bg = markdown.code_bg.as_str();
+    if bg.is_empty() {
+        return row;
     }
-    rows.push(row);
-    rows
+    // Each token's reset would end the background, so it is reopened.
+    let close = markdown.code_block.reset.as_str();
+    let row = if close.is_empty() {
+        row
+    } else {
+        row.replace(close, &format!("{close}{bg}"))
+    };
+    format!("{bg}{row}{ERASE_TO_END}{}", crate::engine::Style::RESET)
 }
 
 /// Removes control sequences a terminal would act on.
@@ -1648,61 +1649,96 @@ mod tests {
             assert!(rendered.contains("more line(s)"));
             assert!(render_grouped(&entries, display).is_ascii());
             let rows = AssistantRows::default().rows_with_ascii(&entries[0].text, width, true);
-            assert!(
-                rows.iter()
-                    .all(|row| row.is_ascii() && str_width(row) <= width)
-            );
+            assert!(rows.iter().all(|row| row.is_ascii()));
+            assert!(rows.iter().any(|row| row == "    abcdefghijkl  mnop"));
         }
-        let display = Display {
-            width: 12,
-            ascii: true,
-            ..Display::default()
-        };
-        assert!(render(&entries, display).contains("    > "));
         let text = "```\n    界↪éabcdefghij\n```";
         let rows = AssistantRows::default().rows_with_ascii(text, 10, true);
-        let code: String = rows[1..rows.len() - 1]
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                if index == 0 {
-                    row.as_str()
-                } else {
-                    row.trim_start().strip_prefix("> ").unwrap_or(row)
-                }
-            })
-            .collect();
-        assert_eq!(code, "    界↪éabcdefghij", "source Unicode must survive");
+        assert_eq!(rows[1], "    界↪éabcdefghij", "source Unicode must survive");
     }
 
     #[test]
     fn switching_ascii_markers_invalidates_finished_streaming_rows() {
-        let text = "```\n    abcdefghijklmnop\n```\n";
-        let mut cache = AssistantRows::default();
-        assert!(cache.rows(text, 10).iter().any(|row| row.contains('↪')));
+        let text = "- item\n  - nested\n";
+        let style = crate::markdown::MarkdownStyle::attributes();
+        let mut cache = AssistantRows::with_markdown(style.clone());
+        assert!(
+            cache
+                .rows(text, 10)
+                .iter()
+                .any(|row| row.contains('\u{2022}'))
+        );
         let ascii = cache.rows_with_ascii(text, 10, true);
-        assert!(ascii.iter().all(|row| row.is_ascii()));
-        assert!(ascii.iter().any(|row| row.starts_with("    > ")));
+        assert!(ascii.iter().all(|row| row.is_ascii()), "{ascii:?}");
         assert_eq!(
             cache.rows(text, 10),
-            AssistantRows::default().rows(text, 10)
+            AssistantRows::with_markdown(style).rows(text, 10)
         );
     }
 
     #[test]
-    fn fenced_code_preserves_spaces_and_indents_its_continuations() {
+    fn code_rows_are_never_wrapped() {
         let text = "before\n```rust\n    abcdefghijkl  mnop\n\n```\nafter";
-        let rendered = render(
-            &[Entry::assistant(text)],
-            Display {
-                width: 12,
-                ..Display::default()
-            },
-        );
+        for width in [4, 12, 80] {
+            let rendered = render(
+                &[Entry::assistant(text)],
+                Display {
+                    width,
+                    ..Display::default()
+                },
+            );
+            assert!(
+                rendered.contains("\n    abcdefghijkl  mnop\n\n"),
+                "{rendered:?}"
+            );
+            assert!(!rendered.contains('\u{21aa}'), "{rendered:?}");
+        }
+        let styled = AssistantRows::with_markdown(crate::markdown::MarkdownStyle::attributes())
+            .rows("```\n\tlet x = 1;\n```", 6);
+        assert_eq!(styled, ["        let x = 1;"]);
+    }
+
+    #[test]
+    fn fence_lines_are_hidden_and_the_language_is_a_dim_row() {
+        let style = crate::markdown::MarkdownStyle::attributes();
+        let rows = AssistantRows::with_markdown(style.clone())
+            .rows("intro\n```rust ignore\nlet x = 1;\n```\nafter", 40);
         assert_eq!(
-            rendered,
-            "before\n```rust\n    abcdef\n    ↪ ghij\n    ↪ kl\n    ↪ mnop\n\n```\nafter"
+            rows,
+            ["intro", "\u{1b}[2mrust\u{1b}[0m", "let x = 1;", "after"]
         );
+        // Without an info string the fence leaves no row at all.
+        let rows = AssistantRows::with_markdown(style.clone()).rows("```\ncode\n```", 40);
+        assert_eq!(rows, ["code"]);
+        // An unclosed fence still draws its rows as code.
+        let rows = AssistantRows::with_markdown(style.clone()).rows("~~~py\n  x  = 1\n", 40);
+        assert_eq!(rows, ["\u{1b}[2mpy\u{1b}[0m", "  x  = 1", ""]);
+        // A fence inside a list item keeps the item's indent.
+        let rows = AssistantRows::with_markdown(style).rows("- item\n  ```sh\n  ls -l\n  ```", 40);
+        assert_eq!(
+            rows[1..],
+            ["  \u{1b}[2msh\u{1b}[0m".to_owned(), "  ls -l".to_owned()]
+        );
+    }
+
+    #[test]
+    fn code_rows_carry_the_code_background_at_truecolor() {
+        let mut style = crate::markdown::MarkdownStyle::attributes();
+        style.code_block.keyword = "\u{1b}[38;2;1;2;3m".to_owned();
+        style.code_block.reset = "\u{1b}[0m".to_owned();
+        style.code_bg = "\u{1b}[48;2;28;28;28m".to_owned();
+        let rows = AssistantRows::with_markdown(style.clone()).rows("```rust\nlet x = 1;\n```", 40);
+        assert_eq!(
+            rows[1],
+            "\u{1b}[48;2;28;28;28m\u{1b}[38;2;1;2;3mlet\u{1b}[0m\u{1b}[48;2;28;28;28m x = 1;\u{1b}[K\u{1b}[0m"
+        );
+        let mut grid = crate::Grid::new(20, 2).unwrap();
+        grid.feed(rows[1].as_bytes()).unwrap();
+        assert_eq!(grid.row_text(0), "let x = 1;");
+        // At sixteen colours there is no background, so rows stay plain.
+        style.code_bg = String::new();
+        let rows = AssistantRows::with_markdown(style).rows("```rust\nlet x = 1;\n```", 40);
+        assert_eq!(rows[1], "\u{1b}[38;2;1;2;3mlet\u{1b}[0m x = 1;");
     }
 
     #[test]
@@ -1718,7 +1754,11 @@ mod tests {
             assert_eq!(rows, AssistantRows::default().rows(&text, 18));
             previous = rows;
         }
-        assert!(previous.iter().any(|row| row.starts_with("    ↪ ")));
+        assert!(
+            previous
+                .iter()
+                .any(|row| row == "    call(\"alpha  beta\",  gamma);")
+        );
     }
 
     #[test]
@@ -1733,7 +1773,7 @@ mod tests {
                 "{opening}\n```\n~~~\n````suffix\n    abcdefghijkl\n{close}\nwords after the code"
             );
             let rows = AssistantRows::default().rows(&text, 12);
-            assert!(rows.iter().any(|row| row == "    ↪ ijkl"), "{rows:?}");
+            assert!(rows.iter().any(|row| row == "    abcdefghijkl"), "{rows:?}");
             assert_eq!(
                 &rows[rows.len().saturating_sub(2)..],
                 &["words after", "the code"]
@@ -1749,28 +1789,15 @@ mod tests {
     }
 
     #[test]
-    fn code_tabs_and_graphemes_fit_narrow_rows_without_losing_indentation() {
+    fn code_tabs_and_graphemes_stay_whole_at_narrow_widths() {
         let rows = AssistantRows::default().rows("~~~\n\t書e\u{301}👩‍💻書\n~~~", 12);
-        assert_eq!(
-            rows,
-            [
-                "~~~",
-                "        書e\u{301}",
-                "        ↪ 👩‍💻",
-                "        ↪ 書",
-                "~~~"
-            ]
-        );
-        assert!(rows.iter().all(|row| str_width(row) <= 12));
+        assert_eq!(rows, ["~~~", "        書e\u{301}👩‍💻書", "~~~"]);
         for width in 1..=12 {
             let rows = AssistantRows::default().rows("```\n                abcdef\n```", width);
-            assert!(rows.iter().all(|row| str_width(row) <= width), "{rows:?}");
-            let recovered: String = rows
-                .iter()
-                .flat_map(|row| row.chars())
-                .filter(char::is_ascii_alphabetic)
-                .collect();
-            assert_eq!(recovered, "abcdef");
+            assert!(
+                rows.iter().any(|row| row == "                abcdef"),
+                "{rows:?}"
+            );
         }
     }
 
