@@ -507,6 +507,12 @@ impl Recorder {
         Ok(())
     }
 
+    /// Returns the session title, if it has one.
+    #[must_use]
+    pub fn title(&self) -> Option<String> {
+        self.store.title()
+    }
+
     /// Returns true when the session has no title yet.
     #[must_use]
     pub fn title_is_unset(&self) -> bool {

@@ -337,6 +337,16 @@ struct SessionHost {
     workspace: String,
     /// What the terminal reported at startup.
     caps: rune_term::probe::TerminalCaps,
+    /// Whether the spinner is replaced by a static glyph and ticks slowly.
+    reduced_motion: bool,
+    /// Whether the terminal shows a progress indicator for the escape sent to it.
+    progress_supported: bool,
+    /// Whether the window title shows the session and its state.
+    title_enabled: bool,
+    /// The window title last written.
+    window_title: Mutex<String>,
+    /// Escape sequences to send with the next frame, in one write with it.
+    pending_escapes: Mutex<Vec<u8>>,
     /// How many colors the terminal renders.
     depth: ColorDepth,
     /// Terminal width the live region is drawn for.
@@ -878,6 +888,10 @@ impl Host for SessionHost {
                 if matches!(event, Event::TurnStarted { .. })
                     && let Ok(mut started) = self.turn_started.lock()
                 {
+                    if started.is_none() {
+                        self.set_progress(3);
+                        self.set_title_state("working");
+                    }
                     started.get_or_insert_with(std::time::Instant::now);
                 }
                 if self.clear_provider_retry() {
@@ -2091,11 +2105,67 @@ impl SessionHost {
             menu,
             caret,
         };
-        Ok(if paced {
+        let painted = if paced {
             inline.frame_if_changed(&frame)
         } else {
             inline.frame(&frame)
-        })
+        };
+        // Waiting escapes ride inside the next frame, after its begin mark, so
+        // they share its write and its synchronized update.
+        if painted.is_empty() {
+            return Ok(painted);
+        }
+        let pending = std::mem::take(&mut *lock_value(&self.pending_escapes));
+        if pending.is_empty() {
+            return Ok(painted);
+        }
+        let begin = rune_term::inline::BEGIN_SYNC.as_bytes();
+        let at = if painted.starts_with(begin) {
+            begin.len()
+        } else {
+            0
+        };
+        let mut bytes = Vec::with_capacity(painted.len().saturating_add(pending.len()));
+        bytes.extend_from_slice(&painted[..at]);
+        bytes.extend(pending);
+        bytes.extend_from_slice(&painted[at..]);
+        Ok(bytes)
+    }
+
+    /// Sets the terminal's progress indicator, where the terminal has one:
+    /// 3 working, 0 done, 2 failed.
+    fn set_progress(&self, state: u8) {
+        if !self.progress_supported {
+            return;
+        }
+        lock_value(&self.pending_escapes)
+            .extend_from_slice(format!("\u{1b}]9;4;{state};0\u{7}").as_bytes());
+        rune_term::modes::mark(|modes| modes.progress_sent = true);
+    }
+
+    /// Names the session and its state in the window title, when it changed.
+    fn set_title_state(&self, state: &str) {
+        if !self.title_enabled {
+            return;
+        }
+        let session = self
+            .recorder
+            .as_ref()
+            .and_then(|recorder| lock_value(recorder).title())
+            .unwrap_or_else(|| {
+                Utf8Path::new(&self.workspace)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+        let title = window_title(&session, state, self.ascii);
+        let mut last = lock_value(&self.window_title);
+        if *last == title {
+            return;
+        }
+        lock_value(&self.pending_escapes)
+            .extend_from_slice(format!("\u{1b}]2;{title}\u{1b}\\").as_bytes());
+        *last = title;
     }
 
     /// Removes the live region, for a clean exit.
@@ -2555,16 +2625,7 @@ impl SessionHost {
         let reset = rune_term::engine::Style::RESET;
         let row = |label: &str, started: std::time::Instant| {
             let elapsed = started.elapsed();
-            let frames: &[&str] = if self.ascii {
-                &["-", "\\", "|", "/"]
-            } else {
-                &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"]
-            };
-            let step = (elapsed.as_millis() / 150) as usize;
-            let frame = frames
-                .get(step.checked_rem(frames.len()).unwrap_or_default())
-                .copied()
-                .unwrap_or_default();
+            let frame = spinner_frame(elapsed, self.ascii, self.reduced_motion);
             format!("{dim}  {frame} {label} {}{reset}", format_elapsed(elapsed))
         };
         let running = self
@@ -2595,6 +2656,7 @@ impl SessionHost {
     /// redraws is long enough that a reader waiting for a quiet terminal,
     /// such as a PTY harness, still sees one while a turn is held.
     fn tick(&self) {
+        let interval = tick_interval(self.reduced_motion);
         if self.accessible {
             return;
         }
@@ -2608,7 +2670,7 @@ impl SessionHost {
         let Ok(mut last) = self.last_tick.lock() else {
             return;
         };
-        if last.is_some_and(|last| last.elapsed() < TICK_INTERVAL) {
+        if last.is_some_and(|last| last.elapsed() < interval) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -2923,6 +2985,16 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .to_string(),
         ),
         workspace: config.workspace.to_string(),
+        reduced_motion: config.settings.motion == "reduced",
+        progress_supported: keyed
+            && !config.accessible
+            && supports_progress(|key| std::env::var(key).ok()),
+        title_enabled: keyed
+            && !config.accessible
+            && config.settings.terminal_title
+            && probe.caps.env.term.as_deref() != Some("dumb"),
+        window_title: Mutex::new(String::new()),
+        pending_escapes: Mutex::new(Vec::new()),
         caps: probe.caps,
         depth,
         // Seeded from the terminal and refreshed on every frame, so a window
@@ -3043,6 +3115,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 usize::from(host.width()),
             )
         };
+        if host.title_enabled {
+            lock_value(&host.pending_escapes).extend_from_slice(b"\x1b[22;2t");
+            rune_term::modes::mark(|modes| modes.title_pushed = true);
+            host.set_title_state("idle");
+        }
         let painted = host.paint(&opening, None, &prompt_row, &[], caret)?;
         if let Ok(mut sink) = out.lock() {
             sink.write_all(&painted)?;
@@ -3408,6 +3485,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .set_title(&session_log::derive_title(&title))?;
+                        host.set_title_state("idle");
                         note(format!("renamed this session to {title}"));
                     }
                     Handled::Goal(request) => {
@@ -3686,6 +3764,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         if !reader.is_active() && !host.accessible {
                             return Err(err);
                         }
+                        host.set_progress(2);
+                        host.set_title_state("idle");
                         let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
                         host.clear_events();
                         host.clear_streaming();
@@ -3740,6 +3820,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // terminal's own scrollback, so it stays readable with the
                 // terminal's search and copy. Nothing else writes to the
                 // terminal: the region below is redrawn in place.
+                host.set_progress(0);
+                host.set_title_state("idle");
                 let mut lines = report_turn(&outcome, &host, &reasoning)?;
                 if !host.accessible
                     && let Some(summary) =
@@ -4303,12 +4385,24 @@ fn run_steerable<T: Send>(
     }
 }
 
+/// Asks for a decision, with the window title saying the user is needed.
+fn collect_approval(
+    request: &ApprovalRequest,
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> ApprovalOutcome {
+    host.set_title_state("waiting for you");
+    let outcome = collect_approval_inner(request, host, reader);
+    host.set_title_state("working");
+    outcome
+}
+
 /// Shows the complete scope in scrollback, then waits on a picker.
 ///
 /// Deny is selected initially, with running once directly above it, so one
 /// step up runs the action and remembering it takes a second, deliberate one.
 /// Escape, Control-C, and Control-D cancel the turn.
-fn collect_approval(
+fn collect_approval_inner(
     request: &ApprovalRequest,
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
@@ -4373,8 +4467,20 @@ fn rememberable(tool: &str, target: &str) -> bool {
     true
 }
 
-/// Collects every answer without editing or submitting the current draft.
+/// Asks the model's questions, with the window title saying the user is needed.
 fn collect_questions(
+    questions: &[Question],
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+) -> Result<Answer> {
+    host.set_title_state("waiting for you");
+    let answer = collect_questions_inner(questions, host, reader);
+    host.set_title_state("working");
+    answer
+}
+
+/// Collects every answer without editing or submitting the current draft.
+fn collect_questions_inner(
     questions: &[Question],
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
@@ -8016,7 +8122,71 @@ enum RowGlyphs {
 
 /// Summarizes what a call produced in a few words.
 /// Shortest pause between redraws of a running turn's live region.
-const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(125);
+
+/// How often the live region redraws with reduced motion.
+const REDUCED_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The spinner, one frame per [`TICK_INTERVAL`].
+const SPINNER: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+
+/// The spinner in ASCII.
+const ASCII_SPINNER: [&str; 4] = ["-", "\\", "|", "/"];
+
+/// Returns how often the live region redraws while a turn is quiet.
+const fn tick_interval(reduced: bool) -> std::time::Duration {
+    if reduced {
+        REDUCED_TICK_INTERVAL
+    } else {
+        TICK_INTERVAL
+    }
+}
+
+/// Returns the spinner glyph for a row that has run for `elapsed`.
+fn spinner_frame(elapsed: std::time::Duration, ascii: bool, reduced: bool) -> &'static str {
+    if reduced {
+        return if ascii { "..." } else { "\u{2026}" };
+    }
+    let frames: &[&str] = if ascii { &ASCII_SPINNER } else { &SPINNER };
+    let step = elapsed
+        .as_millis()
+        .checked_div(TICK_INTERVAL.as_millis())
+        .unwrap_or(0);
+    let index = usize::try_from(step)
+        .unwrap_or(0)
+        .checked_rem(frames.len())
+        .unwrap_or(0);
+    frames.get(index).copied().unwrap_or_default()
+}
+
+/// Returns true for a terminal known to show the progress escape, and never
+/// inside tmux, which would pass it to whatever terminal is attached.
+fn supports_progress(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    if lookup("TMUX").is_some() {
+        return false;
+    }
+    let program = lookup("TERM_PROGRAM").unwrap_or_default();
+    lookup("WT_SESSION").is_some()
+        || program == "ghostty"
+        || program == "vscode"
+        || lookup("ConEmuANSI").as_deref() == Some("ON")
+        || (program == "iTerm.app"
+            && lookup("TERM_FEATURES").is_some_and(|features| features.contains('P')))
+}
+
+/// Returns the window title for a session in a state, without control
+/// characters and at most 80 characters long.
+fn window_title(session: &str, state: &str, ascii: bool) -> String {
+    let dot = if ascii { "-" } else { "\u{b7}" };
+    format!("rune {dot} {session} {dot} {state}")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect()
+}
 
 /// Shortest time between two stream frames, about sixty a second.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -8698,6 +8868,108 @@ mod tests {
         assert!(sizes.base >= prompt::SYSTEM_PROMPT.len(), "{sizes:?}");
         assert!(sizes.project > "A project rule.".len(), "{sizes:?}");
         assert_eq!(sizes.map, 0, "{sizes:?}");
+    }
+
+    #[test]
+    fn the_spinner_has_ten_frames_at_eight_per_second() {
+        use std::time::Duration;
+        assert_eq!(TICK_INTERVAL, Duration::from_millis(125));
+        let frames: Vec<&str> = (0..10)
+            .map(|step| spinner_frame(Duration::from_millis(step * 125), false, false))
+            .collect();
+        assert_eq!(frames, SPINNER.to_vec());
+        assert_eq!(
+            spinner_frame(Duration::from_millis(1250), false, false),
+            SPINNER[0]
+        );
+        assert_eq!(spinner_frame(Duration::from_millis(250), true, false), "|");
+    }
+
+    #[test]
+    fn reduced_motion_draws_a_static_glyph_and_ticks_once_a_second() {
+        use std::time::Duration;
+        for ms in [0, 125, 900, 5_000] {
+            assert_eq!(
+                spinner_frame(Duration::from_millis(ms), false, true),
+                "\u{2026}"
+            );
+            assert_eq!(spinner_frame(Duration::from_millis(ms), true, true), "...");
+        }
+        assert_eq!(tick_interval(true), Duration::from_secs(1));
+        assert_eq!(tick_interval(false), Duration::from_millis(125));
+    }
+
+    #[test]
+    fn progress_is_sent_only_to_supporting_terminals() {
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        assert!(supports_progress(with(&[("WT_SESSION", "1")])));
+        assert!(supports_progress(with(&[("TERM_PROGRAM", "ghostty")])));
+        assert!(supports_progress(with(&[("TERM_PROGRAM", "vscode")])));
+        assert!(supports_progress(with(&[("ConEmuANSI", "ON")])));
+        assert!(supports_progress(with(&[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_FEATURES", "T3LrMSc7UUw9Ts3BFGsSyHNoSxF:P"),
+        ])));
+        assert!(!supports_progress(with(&[("TERM_PROGRAM", "iTerm.app")])));
+        assert!(!supports_progress(with(&[
+            ("WT_SESSION", "1"),
+            ("TMUX", "/tmp/t")
+        ])));
+        assert!(!supports_progress(with(&[])));
+    }
+
+    #[test]
+    fn a_failed_turn_sets_the_error_state() {
+        let mut host = test_host();
+        host.progress_supported = true;
+        host.set_progress(3);
+        host.set_progress(2);
+        let sent = String::from_utf8(std::mem::take(&mut *lock_value(&host.pending_escapes)))
+            .expect("utf8");
+        assert_eq!(sent, "\u{1b}]9;4;3;0\u{7}\u{1b}]9;4;2;0\u{7}");
+        host.progress_supported = false;
+        host.set_progress(3);
+        assert!(lock_value(&host.pending_escapes).is_empty());
+    }
+
+    #[test]
+    fn the_title_names_the_session_and_its_state() {
+        let mut host = test_host();
+        host.title_enabled = true;
+        host.workspace = "/w/project".to_owned();
+        host.set_title_state("working");
+        let sent = String::from_utf8(std::mem::take(&mut *lock_value(&host.pending_escapes)))
+            .expect("utf8");
+        assert_eq!(sent, "\u{1b}]2;rune \u{b7} project \u{b7} working\u{1b}\\");
+        let long = format!("a\u{7}b{}", "x".repeat(200));
+        let title = window_title(&long, "idle", false);
+        assert_eq!(window_title("s", "idle", true), "rune - s - idle");
+        assert_eq!(title.chars().count(), 80);
+        assert!(!title.contains('\u{7}'), "{title:?}");
+        assert!(title.starts_with("rune \u{b7} ab"), "{title}");
+    }
+
+    #[test]
+    fn the_title_is_written_only_when_it_changes() {
+        let mut host = test_host();
+        host.title_enabled = true;
+        host.set_title_state("idle");
+        host.set_title_state("idle");
+        host.set_title_state("working");
+        host.set_title_state("working");
+        let sent = String::from_utf8(std::mem::take(&mut *lock_value(&host.pending_escapes)))
+            .expect("utf8");
+        assert_eq!(sent.matches("\u{1b}]2;").count(), 2, "{sent:?}");
+        host.title_enabled = false;
+        host.set_title_state("idle");
+        assert!(lock_value(&host.pending_escapes).is_empty());
     }
 
     #[test]
@@ -15228,6 +15500,11 @@ mod tests {
             session_id: Mutex::new("sessiontest1".to_owned()),
             workspace: "/tmp".to_owned(),
             caps: rune_term::probe::TerminalCaps::default(),
+            reduced_motion: false,
+            progress_supported: false,
+            title_enabled: false,
+            window_title: Mutex::new(String::new()),
+            pending_escapes: Mutex::new(Vec::new()),
             depth: ColorDepth::Ansi256,
             width: std::sync::atomic::AtomicU16::new(80),
             height: std::sync::atomic::AtomicU16::new(24),

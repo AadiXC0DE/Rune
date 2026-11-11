@@ -552,6 +552,14 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
 
+    /// Spinner motion: `full` or `reduced`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<String>,
+
+    /// Whether the window title shows the session and its state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_title: Option<bool>,
+
     /// Whether terminal decorations use only ASCII.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ascii: Option<bool>,
@@ -772,6 +780,10 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Color depth, `auto` to detect it from the terminal.
     pub color: String,
+    /// Spinner motion, `full` or `reduced`.
+    pub motion: String,
+    /// Whether the window title shows the session and its state.
+    pub terminal_title: bool,
     /// Whether terminal decorations use only ASCII.
     pub ascii: bool,
     /// Whether automatic update checks run.
@@ -842,6 +854,8 @@ impl Default for Settings {
             fast_mode: false,
             theme: None,
             color: COLOR_VALUES[0].to_owned(),
+            motion: MOTION_VALUES[0].to_owned(),
+            terminal_title: true,
             ascii: false,
             auto_upgrade: true,
             offline: false,
@@ -1006,6 +1020,8 @@ impl Settings {
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
             ("color", self.color.clone()),
+            ("motion", self.motion.clone()),
+            ("terminal_title", self.terminal_title.to_string()),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
             ("edit_tool", self.edit_tool.to_string()),
@@ -1298,6 +1314,9 @@ pub const PROJECT_KEYS: &[&str] = &[
 /// Values the `color` setting accepts, the default first.
 pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
 
+/// The accepted `motion` values, the default first.
+pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
+
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
@@ -1317,6 +1336,8 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "fast_mode",
     "theme",
     "color",
+    "motion",
+    "terminal_title",
     "ascii",
     "auto_upgrade",
     "offline",
@@ -1353,6 +1374,8 @@ pub const USER_KEYS: &[&str] = &[
     "fast_mode",
     "theme",
     "color",
+    "motion",
+    "terminal_title",
     "ascii",
     "auto_upgrade",
     "collapse_tool_calls",
@@ -1389,6 +1412,8 @@ pub const SCALAR_KEYS: &[&str] = &[
     "fast_mode",
     "theme",
     "color",
+    "motion",
+    "terminal_title",
     "ascii",
     "auto_upgrade",
     "collapse_tool_calls",
@@ -1431,6 +1456,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         | "ascii"
         | "auto_upgrade"
         | "collapse_tool_calls"
+        | "terminal_title"
         | "session_titles"
         | "context"
         | "cache_warming"
@@ -1443,6 +1469,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
             "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
         ]),
         "color" => ScalarKind::Choice(&COLOR_VALUES),
+        "motion" => ScalarKind::Choice(&MOTION_VALUES),
         _ => ScalarKind::Text,
     })
 }
@@ -1555,6 +1582,14 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
     ),
     ("theme", "Terminal theme name, or a light or dark pin."),
     ("color", "Color depth: auto, truecolor, 256, 16 or none."),
+    (
+        "motion",
+        "Spinner motion: full, or reduced for a static glyph.",
+    ),
+    (
+        "terminal_title",
+        "Show the session and whether it is idle, working or waiting in the window title.",
+    ),
     ("ascii", "Draw terminal decorations with ASCII only."),
     (
         "web_tools",
@@ -2126,6 +2161,23 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
                     .with_hint("accepted values are auto, truecolor, 256, 16, and none"),
             );
         }
+    }
+    if let Some(raw) = &user.motion {
+        let value = raw.trim().to_ascii_lowercase();
+        if MOTION_VALUES.contains(&value.as_str()) {
+            settings.motion = value;
+            settings.sources.record("motion", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, ErrorCode::InvalidField, format!("motion is `{raw}`"))
+                    .with_key("motion")
+                    .with_hint("accepted values are full and reduced"),
+            );
+        }
+    }
+    if let Some(title) = user.terminal_title {
+        settings.terminal_title = title;
+        settings.sources.record("terminal_title", layer);
     }
     if let Some(ascii) = user.ascii {
         settings.ascii = ascii;
@@ -2797,6 +2849,8 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
         "color": settings.color,
+        "motion": settings.motion,
+        "terminal_title": settings.terminal_title,
         "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
