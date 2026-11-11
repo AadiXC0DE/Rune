@@ -101,7 +101,29 @@ pub struct CheckSummary {
     pub changed_files: Vec<String>,
     /// The latest check after the last change.
     pub last_check: Option<CheckRecord>,
+    /// Notes the harness added because a check kept failing, 0 or 1.
+    pub stall_notes: u32,
 }
+
+/// Work that has stopped making progress, read from the turn's calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stall {
+    /// A check failed the same way again after at least one change.
+    SameFailure {
+        /// Changes made since the earliest failure of the run.
+        changes: usize,
+    },
+    /// One file was changed over and over while the latest check failed.
+    SameFile {
+        /// The path changed most.
+        path: String,
+        /// Changes to that path in the turn.
+        changes: usize,
+    },
+}
+
+/// Changes to one path, at this count or more, while the latest check fails.
+const SAME_FILE_CHANGES: usize = 4;
 
 /// Returns true for a call that changed a file.
 #[must_use]
@@ -192,6 +214,55 @@ pub fn check_record(index: usize, call: &CallResult) -> Option<CheckRecord> {
     }
 }
 
+/// Looks for a stall completed by `calls[index]`, given every call of the turn so far.
+#[must_use]
+pub fn stall_at(calls: &[CallResult], index: usize) -> Option<Stall> {
+    let call = calls.get(index)?;
+    let earlier = calls.get(..index)?;
+    if let Some(record) = check_record(index, call) {
+        if record.passed {
+            return None;
+        }
+        let mut earliest = None;
+        for (position, previous) in earlier.iter().enumerate().rev() {
+            let Some(previous) = check_record(position, previous) else {
+                continue;
+            };
+            if previous.command != record.command {
+                continue;
+            }
+            if previous.passed || previous.signature != record.signature {
+                break;
+            }
+            earliest = Some(position);
+        }
+        let start = earliest?.saturating_add(1);
+        let changes = earlier
+            .iter()
+            .skip(start)
+            .filter(|call| is_change(call))
+            .count();
+        return (changes > 0).then_some(Stall::SameFailure { changes });
+    }
+    let latest_failed = earlier
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, previous)| check_record(position, previous))
+        .is_some_and(|record| !record.passed);
+    if !latest_failed {
+        return None;
+    }
+    changed_paths(call).into_iter().find_map(|path| {
+        let changes = calls
+            .iter()
+            .take(index.saturating_add(1))
+            .filter(|call| changed_paths(call).contains(&path))
+            .count();
+        (changes >= SAME_FILE_CHANGES).then_some(Stall::SameFile { path, changes })
+    })
+}
+
 /// Returns true for a path that looks like a test file.
 #[must_use]
 pub fn is_test_path(path: &str) -> bool {
@@ -211,7 +282,7 @@ pub fn is_test_path(path: &str) -> bool {
 
 /// Summarizes a turn's changes and its latest check after the last change.
 #[must_use]
-pub fn summarize(calls: &[CallResult]) -> CheckSummary {
+pub fn summarize(calls: &[CallResult], stall_noted: bool) -> CheckSummary {
     let mut changed_files: Vec<String> = Vec::new();
     for path in calls.iter().flat_map(changed_paths) {
         if !changed_files.contains(&path) {
@@ -232,6 +303,7 @@ pub fn summarize(calls: &[CallResult]) -> CheckSummary {
         tests_modified: changed_files.iter().any(|path| is_test_path(path)),
         changed_files,
         last_check,
+        stall_notes: u32::from(stall_noted),
     }
 }
 
@@ -305,11 +377,113 @@ mod tests {
         )
     }
 
+    fn failing(command: &str, signature: &str) -> CallResult {
+        let mut result = run(command, 101, Some(1));
+        if let Some(check) = result.output.check.as_mut() {
+            check.signature = signature.to_owned();
+        }
+        result
+    }
+
+    /// Whether a stall ends at any call of the sequence.
+    fn stalls(calls: &[CallResult]) -> Vec<Stall> {
+        (0..calls.len())
+            .filter_map(|index| stall_at(calls, index))
+            .collect()
+    }
+
+    #[test]
+    fn the_same_failure_after_a_change_is_a_stall() {
+        let calls = [
+            failing("cargo test", "a"),
+            edit("src/a.rs"),
+            failing("cargo test", "a"),
+        ];
+        assert_eq!(stall_at(&calls, 2), Some(Stall::SameFailure { changes: 1 }));
+        assert_eq!(stall_at(&calls, 0), None);
+        // An identical rerun with nothing changed is not a stall.
+        let rerun = [failing("cargo test", "a"), failing("cargo test", "a")];
+        assert_eq!(stalls(&rerun), Vec::new());
+        // Checks of another command do not break the run.
+        let mixed = [
+            failing("cargo test", "a"),
+            edit("src/a.rs"),
+            run("cargo build", 0, None),
+            edit("src/a.rs"),
+            failing("cargo test", "a"),
+        ];
+        assert_eq!(stall_at(&mixed, 4), Some(Stall::SameFailure { changes: 2 }));
+    }
+
+    #[test]
+    fn a_different_signature_is_not_a_stall() {
+        let calls = [
+            failing("cargo test", "a"),
+            edit("src/a.rs"),
+            failing("cargo test", "b"),
+        ];
+        assert_eq!(stalls(&calls), Vec::new());
+        let other_command = [
+            failing("cargo test", "a"),
+            edit("src/a.rs"),
+            failing("cargo test -p a", "a"),
+        ];
+        assert_eq!(stalls(&other_command), Vec::new());
+    }
+
+    #[test]
+    fn a_pass_between_failures_resets_the_run() {
+        let calls = [
+            failing("cargo test", "a"),
+            edit("src/a.rs"),
+            run("cargo test", 0, Some(0)),
+            edit("src/a.rs"),
+            failing("cargo test", "a"),
+        ];
+        assert_eq!(stalls(&calls), Vec::new());
+    }
+
+    #[test]
+    fn four_changes_to_one_file_while_failing_is_a_stall() {
+        let calls = [
+            failing("sh check.sh", "a"),
+            edit("a.txt"),
+            edit("a.txt"),
+            edit("b.txt"),
+            edit("a.txt"),
+            edit("a.txt"),
+        ];
+        assert_eq!(stall_at(&calls, 4), None);
+        assert_eq!(
+            stall_at(&calls, 5),
+            Some(Stall::SameFile {
+                path: "a.txt".to_owned(),
+                changes: 4
+            })
+        );
+        assert_eq!(stalls(&calls).len(), 1);
+    }
+
+    #[test]
+    fn four_changes_without_a_failing_check_is_not_a_stall() {
+        let unchecked = [edit("a.txt"), edit("a.txt"), edit("a.txt"), edit("a.txt")];
+        assert_eq!(stalls(&unchecked), Vec::new());
+        let passing = [
+            failing("sh check.sh", "a"),
+            edit("a.txt"),
+            run("sh check.sh", 0, None),
+            edit("a.txt"),
+            edit("a.txt"),
+            edit("a.txt"),
+        ];
+        assert_eq!(stalls(&passing), Vec::new());
+    }
+
     #[test]
     fn an_unlisted_command_that_exits_zero_is_checked() {
         let calls = [edit("src/a.rs"), run("python3 script.py", 0, None)];
         assert_eq!(Verification::of(&calls), Verification::Checked);
-        assert_eq!(summarize(&calls).last_check, None);
+        assert_eq!(summarize(&calls, false).last_check, None);
     }
 
     #[test]
@@ -342,7 +516,7 @@ mod tests {
             run("cargo test", 0, Some(0)),
         ];
         assert_eq!(Verification::of(&fixed), Verification::Verified);
-        let record = summarize(&fixed)
+        let record = summarize(&fixed, false)
             .last_check
             .expect("a check after the change");
         assert_eq!(record.index, 2);
@@ -358,7 +532,9 @@ mod tests {
         let reported = [edit("src/a.rs"), diagnostics.clone()];
         assert_eq!(Verification::of(&reported), Verification::Failed);
         assert_eq!(
-            summarize(&reported).last_check.map(|record| record.command),
+            summarize(&reported, false)
+                .last_check
+                .map(|record| record.command),
             Some("syntax_diagnostics src/a.rs".to_owned())
         );
         diagnostics.output.is_error = false;
@@ -382,7 +558,7 @@ mod tests {
             edit("src/b.rs"),
         ];
         assert_eq!(Verification::of(&calls), Verification::Unverified);
-        let summary = summarize(&calls);
+        let summary = summarize(&calls, false);
         assert_eq!(summary.last_check, None);
         assert_eq!(summary.changed_files, vec!["src/a.rs", "src/b.rs"]);
 
@@ -423,8 +599,8 @@ mod tests {
             assert_eq!(is_test_path(path), test, "{path}");
         }
         let calls = [edit("tests/test_parse.py")];
-        assert!(summarize(&calls).tests_modified);
-        assert!(!summarize(&[edit("src/latest.rs")]).tests_modified);
+        assert!(summarize(&calls, false).tests_modified);
+        assert!(!summarize(&[edit("src/latest.rs")], false).tests_modified);
     }
 
     #[test]

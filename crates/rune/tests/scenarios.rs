@@ -41,6 +41,8 @@ const SCENARIOS: &[&str] = &[
     "question_nudge",
     "question_nudge_off",
     "deepseek_thinking_tools",
+    "stall_same_failure",
+    "stall_same_file",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -139,6 +141,23 @@ fn failed_check_note() {
     assert_eq!(result["verification"], "failed", "{result}");
     assert_eq!(result["tests_modified"], false, "{result}");
     assert_eq!(result["changed_files"], 1, "{result}");
+}
+
+#[test]
+fn stall_same_failure() {
+    // The same failure after a change asks once for competing explanations.
+    let report = run_scenario("stall_same_failure");
+    let result = report.result.expect("a result");
+    assert_eq!(result["stall_notes"], 1, "{result}");
+    assert_eq!(result["verification"], "failed", "{result}");
+}
+
+#[test]
+fn stall_same_file() {
+    // A fourth change to one file while the check fails asks once.
+    let report = run_scenario("stall_same_file");
+    let result = report.result.expect("a result");
+    assert_eq!(result["stall_notes"], 1, "{result}");
 }
 
 #[test]

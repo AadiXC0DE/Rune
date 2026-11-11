@@ -713,6 +713,41 @@ exercises the change and report what it shows, or say why it cannot be run.</har
 const CHECK_FAILED_NOTE: &str = "<harness_check>The last check after your changes failed: \
 `{command}` ({detail}). Fix it, or say why it cannot pass, before finishing.</harness_check>";
 
+/// Asks for competing explanations when the work has stopped making progress.
+const STALL_NOTE: &str = "<harness_check>The same check is still failing after {n} {changes}. \
+Before changing more code: state two different explanations for the failure, then run one \
+command that tells them apart.</harness_check>";
+
+/// Fills the stall note for a number of changes.
+fn stall_note(changes: usize) -> String {
+    let noun = if changes == 1 { "change" } else { "changes" };
+    STALL_NOTE
+        .replace("{n}", &changes.to_string())
+        .replace("{changes}", noun)
+}
+
+/// Appends the stall note to the first result of the batch that completes a
+/// stall. Returns the bytes appended, or `None` when no result does.
+fn note_stall(calls: &mut Vec<CallResult>, results: &mut Vec<CallResult>) -> Option<usize> {
+    let base = calls.len();
+    calls.append(results);
+    let found = (base..calls.len())
+        .find_map(|index| verify::stall_at(calls, index).map(|stall| (index, stall)));
+    let appended = found.and_then(|(index, stall)| {
+        let changes = match stall {
+            verify::Stall::SameFailure { changes } | verify::Stall::SameFile { changes, .. } => {
+                changes
+            }
+        };
+        let note = format!("\n\n{}", stall_note(changes));
+        let result = calls.get_mut(index)?;
+        result.output.text.push_str(&note);
+        Some(note.len())
+    });
+    *results = calls.split_off(base);
+    appended
+}
+
 /// Longest command, in bytes, the failed-check note repeats.
 const NOTE_COMMAND_BYTES: usize = 200;
 
@@ -825,6 +860,8 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         .unwrap_or(0);
     // A failing last check is pointed out once; the harness does not insist.
     let mut failure_noted = false;
+    // A stall is pointed out once per turn.
+    let mut stall_noted = false;
     // A headless question is answered with the nudge once per turn.
     let mut question_nudged = false;
     let max_attempts = limits.get_usize(LimitName::ProviderMaxAttempts).max(1);
@@ -881,7 +918,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
-                checks: verify::summarize(&calls),
+                checks: verify::summarize(&calls, stall_noted),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -927,7 +964,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
-                checks: verify::summarize(&calls),
+                checks: verify::summarize(&calls, stall_noted),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -1156,7 +1193,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 let verdict = Verification::of(&calls);
                 if verdict == Verification::Failed
                     && !failure_noted
-                    && let Some(record) = verify::summarize(&calls).last_check
+                    && let Some(record) = verify::summarize(&calls, stall_noted).last_check
                 {
                     failure_noted = true;
                     history.push_harness_note(&check_failed_note(&record));
@@ -1202,7 +1239,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
-                checks: verify::summarize(&calls),
+                checks: verify::summarize(&calls, stall_noted),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,
@@ -1227,7 +1264,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
         } else {
             Vec::new()
         };
-        let (results, stalled) = if last_step {
+        let (mut results, stalled) = if last_step {
             let refused = pending_calls
                 .iter()
                 .map(|call| {
@@ -1277,6 +1314,11 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
             if !resolved.intercepted {
                 repairs.push(CallRepair::new(id, resolved));
             }
+        }
+
+        if !stall_noted && let Some(appended) = note_stall(&mut calls, &mut results) {
+            result_bytes = result_bytes.saturating_add(appended);
+            stall_noted = true;
         }
 
         let mut result_parts = Vec::new();
@@ -1352,7 +1394,7 @@ pub fn run_turn(history: &mut History, host: &dyn Host) -> Result<TurnOutcome> {
                 last_request,
                 steps,
                 verification: Verification::of(&calls),
-                checks: verify::summarize(&calls),
+                checks: verify::summarize(&calls, stall_noted),
                 calls,
                 repaired_calls: u32::try_from(repairs.len()).unwrap_or(u32::MAX),
                 repairs,

@@ -478,6 +478,11 @@ pub enum NarrationReport {
     },
 }
 
+/// Serde skip test for a count that is left out when zero.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 /// The JSON result object.
 ///
 /// Field order here is the field order on the wire, because the struct is
@@ -530,6 +535,9 @@ pub struct JsonResult {
     /// Files changed during the run, by the edit tools or by commands. Absent when `verification` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed_files: Option<u32>,
+    /// Notes the harness added because a check kept failing. Absent when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stall_notes: u32,
     /// Failure detail, present only when the run failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -583,6 +591,7 @@ impl JsonResult {
             verification: None,
             tests_modified: None,
             changed_files: None,
+            stall_notes: 0,
             error: Some(error.message().to_owned()),
             error_code: Some(error.code()),
             error_detail: (!error.detail().is_empty()).then(|| error.detail().clone()),
@@ -1567,6 +1576,7 @@ pub fn run(
             changed.extend(command_changes.iter().cloned());
             u32::try_from(changed.len()).unwrap_or(u32::MAX)
         }),
+        stall_notes: outcome.checks.stall_notes,
         error: error.as_ref().map(|error| error.message().to_owned()),
         error_code: error.as_ref().map(RuneError::code),
         error_detail: error
@@ -2236,6 +2246,7 @@ mod tests {
             verification: Some("not_applicable"),
             tests_modified: Some(false),
             changed_files: Some(0),
+            stall_notes: 0,
             error: None,
             error_code: None,
             error_detail: None,

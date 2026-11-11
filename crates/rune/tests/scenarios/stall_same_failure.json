@@ -1,0 +1,71 @@
+{
+  "prompt": "Make check.sh pass.",
+  "workspace": "workspaces/stall_same_failure.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "edit_file",
+          "arguments": {
+            "path": "a.txt",
+            "old_string": "v0",
+            "new_string": "v1"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Two explanations: the check ignores a.txt, or it always fails."
+    },
+    {
+      "text": "It cannot pass."
+    }
+  ],
+  "expect": {
+    "files": {
+      "a.txt": "v1\n"
+    },
+    "exit_code": 0,
+    "error_code": null,
+    "final_output": "It cannot pass.",
+    "requests": 5,
+    "request_contains": [
+      {
+        "request": 4,
+        "text": "The same check is still failing after 1 change."
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 3,
+        "text": "still failing"
+      }
+    ],
+    "stop_reason": "end_turn"
+  }
+}
