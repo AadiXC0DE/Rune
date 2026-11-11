@@ -423,6 +423,12 @@ struct SessionHost {
     /// allowed that. Decided once, at the start.
     unsandboxed: bool,
     questions: Arc<TerminalQuestions>,
+    /// The last request as it was sent, which a cache warming ping repeats.
+    last_plan: Mutex<Option<rune_net::provider::RequestPlan>>,
+    /// Ends cache warming when the session is no longer idle.
+    warming: Arc<crate::cache_warming::WarmState>,
+    /// Time between cache warming pings.
+    warm_interval: std::time::Duration,
 }
 
 /// Locks the model, recovering from a poisoned lock.
@@ -671,6 +677,7 @@ impl Host for SessionHost {
         plan: &mut rune_net::provider::RequestPlan,
         client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
+        self.warming.stop();
         // The terminal shows reasoning as it streams.
         plan.show_reasoning = true;
         self.tool_images.hydrate(plan);
@@ -694,6 +701,7 @@ impl Host for SessionHost {
         {
             self.record_context_estimate(done.after_tokens);
         }
+        self.remember_plan(plan);
         Ok(())
     }
 
@@ -1181,6 +1189,55 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// Whether the prompt cache is kept warm while idle: the setting is on,
+    /// the dialect is Anthropic and the session is online.
+    fn warming_allowed(&self) -> bool {
+        self.permission_settings.cache_warming
+            && self.dialect.name() == rune_net::anthropic::NAME
+            && !self.endpoint.offline
+    }
+
+    /// Keeps the request about to be sent, for a cache warming ping to repeat.
+    fn remember_plan(&self, plan: &rune_net::provider::RequestPlan) {
+        if self.warming_allowed() {
+            *self
+                .last_plan
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(plan.clone());
+        }
+    }
+
+    /// Starts keeping the prompt cache warm after a completed turn.
+    fn start_warming(&self) -> Option<std::thread::JoinHandle<u32>> {
+        if !self.warming_allowed() {
+            return None;
+        }
+        let plan = self
+            .last_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        Some(crate::cache_warming::start(
+            &self.warming,
+            crate::cache_warming::Warmer {
+                plan,
+                endpoint: self.endpoint.clone(),
+                dialect: Box::new(rune_net::anthropic::Anthropic),
+                timeouts: rune_net::transport::RequestTimeouts::from_settings(
+                    &self.limits,
+                    self.provider_head_timeout_ms(),
+                ),
+                usage: self.helper_usage.clone(),
+                interval: self.warm_interval,
+            },
+        ))
+    }
+
+    /// Ends cache warming; the session is no longer idle on the same prefix.
+    fn stop_warming(&self) {
+        self.warming.stop();
+    }
+
     /// Queues a line telling the model about a change.
     fn queue_update(&self, line: String) {
         queue(&self.pending_updates, PendingUpdate::other(line));
@@ -2597,6 +2654,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         approval_requests: Mutex::new(None),
         approval_preview: Mutex::new(Vec::new()),
         grants: Mutex::new(Grants::new()),
+        last_plan: Mutex::new(None),
+        warming: Arc::default(),
+        warm_interval: crate::cache_warming::WARM_INTERVAL,
         planning: std::sync::atomic::AtomicBool::new(false),
         unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
         questions: config.questions,
@@ -2741,6 +2801,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             Input::Command { name, arguments } => {
                 // Built here rather than captured, so the status a command
                 // reports is the state at the moment it runs.
+                host.absorb_helper_usage();
                 let info = host.info(&provider_name, &endpoint_url);
                 // Command output is buffered rather than written straight out,
                 // because it has to be committed through the renderer: text
@@ -2764,6 +2825,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     );
                 }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
+                if ends_warming(&handled) {
+                    host.stop_warming();
+                }
                 match handled {
                     Handled::Exit => return Ok(Step::Exit),
                     Handled::PickModel => return Ok(Step::PickModel),
@@ -3195,6 +3259,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 } else {
                     SessionHost::activity_line(&outcome)
                 };
+                if outcome.stop_reason != StopReason::Cancelled {
+                    host.start_warming();
+                }
                 close_turn(
                     &host,
                     sink,
@@ -3309,6 +3376,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         })?
     };
 
+    host.stop_warming();
+    host.absorb_helper_usage();
+
     // The region is removed before the session ends, so the shell that started
     // it continues on a screen that is not half a frame.
     let cleared = host.clear_region()?;
@@ -3320,6 +3390,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
 
     Ok(reason.exit_code())
+}
+
+/// Returns whether a command changes what the next request starts with, or
+/// ends the session, so warming the last request's cache is no longer useful.
+fn ends_warming(handled: &Handled) -> bool {
+    matches!(
+        handled,
+        Handled::Exit
+            | Handled::NewSession
+            | Handled::SetModel(_)
+            | Handled::PickModel
+            | Handled::Compact
+            | Handled::Reload
+    )
 }
 
 /// Runs with canonical line input, reading only explicit approval and question
@@ -9846,6 +9930,186 @@ mod tests {
         assert!(rendered.contains("500 out"), "{rendered}");
     }
 
+    /// Answers every POST with a short Anthropic stream and keeps each body.
+    fn warming_listener() -> (
+        u16,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (kept, stop) = (Arc::clone(&bodies), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let reply = crate::helper_usage::fixture::anthropic_reply("", "max_tokens");
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut length = 0_usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().expect("length");
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("body");
+                kept.lock()
+                    .expect("bodies")
+                    .push(serde_json::from_slice(&body).expect("json body"));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (port, bodies, done)
+    }
+
+    /// A Claude session with warming on, whose last request is already sent.
+    fn warming_host(port: u16) -> (SessionHost, History) {
+        let mut host = test_host();
+        host.permission_settings.cache_warming = true;
+        host.dialect = Box::new(rune_net::anthropic::Anthropic);
+        host.endpoint = Endpoint::new(format!("http://127.0.0.1:{port}"), "k");
+        let mut history = History::new();
+        history.push_user("first question");
+        prepare_next(&host, &mut history);
+        (host, history)
+    }
+
+    /// Prepares the next request as the loop does before sending it.
+    fn prepare_next(host: &SessionHost, history: &mut History) {
+        let mut plan = rune_net::provider::RequestPlan::new(host.model());
+        plan.instructions = "Be brief.".to_owned();
+        plan.messages = history.to_messages();
+        host.prepare_request(history, &mut plan, &SummaryFixture::new("unused"))
+            .expect("prepared");
+    }
+
+    #[test]
+    fn warming_pings_at_most_six_times() {
+        let (port, bodies, done) = warming_listener();
+        let (host, _history) = warming_host(port);
+        let sent = host.start_warming().expect("warming starts").join();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(sent.expect("thread"), 6);
+        let bodies = bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 6);
+        let plan = host.last_plan.lock().expect("plan").clone().expect("kept");
+        let mut sent_body = rune_net::anthropic::Anthropic
+            .build_request(&plan)
+            .expect("body");
+        sent_body["max_tokens"] = serde_json::json!(1);
+        for body in bodies.iter() {
+            assert_eq!(body["max_tokens"], 1);
+            assert_eq!(body, &sent_body, "only the output ceiling changes");
+        }
+        let recorded = host.helper_usage.drain();
+        assert_eq!(recorded.len(), 6);
+        assert!(
+            recorded
+                .iter()
+                .all(|(kind, model, _)| *kind == HelperKind::CacheWarming && model == "test")
+        );
+    }
+
+    #[test]
+    fn a_real_request_stops_warming() {
+        let (port, bodies, done) = warming_listener();
+        let (mut host, mut history) = warming_host(port);
+        host.warm_interval = std::time::Duration::from_millis(300);
+        let warming = host.start_warming().expect("warming starts");
+        let started = std::time::Instant::now();
+        while bodies.lock().expect("bodies").is_empty() {
+            assert!(started.elapsed().as_secs() < 10, "no ping arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        history.push_user("second question");
+        prepare_next(&host, &mut history);
+        assert_eq!(warming.join().expect("thread"), 1);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(bodies.lock().expect("bodies").len(), 1);
+
+        // Each ending command and quitting stop it too.
+        let warming = host.start_warming().expect("warming starts");
+        host.stop_warming();
+        assert_eq!(warming.join().expect("thread"), 0);
+        for handled in [
+            Handled::Exit,
+            Handled::NewSession,
+            Handled::SetModel("other".to_owned()),
+            Handled::PickModel,
+            Handled::Compact,
+            Handled::Reload,
+        ] {
+            assert!(ends_warming(&handled));
+        }
+        assert!(!ends_warming(&Handled::Continue));
+    }
+
+    #[test]
+    fn warming_is_off_by_default_and_for_other_dialects() {
+        let (port, bodies, done) = warming_listener();
+        let (mut host, mut history) = warming_host(port);
+        host.permission_settings.cache_warming = Settings::default().cache_warming;
+        *host.last_plan.lock().expect("plan") = None;
+        prepare_next(&host, &mut history);
+        assert!(host.last_plan.lock().expect("plan").is_none());
+        assert!(host.start_warming().is_none());
+
+        host.permission_settings.cache_warming = true;
+        host.dialect = Box::new(rune_net::chat_completions::ChatCompletions);
+        prepare_next(&host, &mut history);
+        assert!(host.last_plan.lock().expect("plan").is_none());
+        assert!(host.start_warming().is_none());
+
+        host.dialect = Box::new(rune_net::anthropic::Anthropic);
+        host.endpoint.offline = true;
+        prepare_next(&host, &mut history);
+        assert!(host.start_warming().is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(bodies.lock().expect("bodies").is_empty());
+        assert!(host.helper_usage.drain().is_empty());
+    }
+
+    #[test]
+    fn warming_cost_has_its_own_line() {
+        let (port, _bodies, done) = warming_listener();
+        let (host, _history) = warming_host(port);
+        assert_eq!(
+            render_cost(&host.info("p", "e")),
+            "no requests have been made in this session yet"
+        );
+        let sent = host.start_warming().expect("warming starts").join();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(sent.expect("thread"), 6);
+        host.absorb_helper_usage();
+        assert_eq!(
+            render_cost(&host.info("p", "e")),
+            "Requests: 6\n\
+             Tokens:   66 in, 42 out\n  \
+             of which cache warming: 6 requests, 66 in, 42 out"
+        );
+    }
+
     #[test]
     fn helper_usage_appears_under_its_label_in_cost() {
         let host = test_host();
@@ -12905,6 +13169,9 @@ mod tests {
             planning: std::sync::atomic::AtomicBool::new(false),
             unsandboxed: false,
             questions,
+            last_plan: Mutex::new(None),
+            warming: Arc::default(),
+            warm_interval: std::time::Duration::from_millis(50),
         }
     }
 }

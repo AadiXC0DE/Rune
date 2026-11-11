@@ -598,6 +598,10 @@ pub struct UserConfig {
     /// Model that summarizes a conversation too large for its own model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model: Option<String>,
+    /// Keep Claude's prompt cache warm while idle (up to 27 minutes; costs a
+    /// cache read each 4.5 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_warming: Option<bool>,
 
     /// Preferred upstream providers, in order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -800,6 +804,8 @@ pub struct Settings {
     pub review_model: Option<String>,
     /// Model that summarizes a conversation too large for its own model.
     pub compaction_model: Option<String>,
+    /// Whether an idle Claude session keeps its prompt cache warm.
+    pub cache_warming: bool,
     /// Directory provider requests and responses are traced to, when set.
     pub trace_dir: Option<Utf8PathBuf>,
     /// Where each value came from.
@@ -851,6 +857,7 @@ impl Default for Settings {
             vision_model: None,
             review_model: None,
             compaction_model: None,
+            cache_warming: false,
             trace_dir: None,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
@@ -1016,6 +1023,7 @@ impl Settings {
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
+            ("cache_warming", self.cache_warming.to_string()),
             ("context", self.context.to_string()),
             ("provider_strict", self.provider_strict.to_string()),
             (
@@ -1262,6 +1270,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "additional_directories",
     "review_model",
     "compaction_model",
+    "cache_warming",
     "vision_model",
 ];
 
@@ -1635,6 +1644,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(compaction) = &user.compaction_model {
         settings.compaction_model = Some(compaction.clone());
         settings.sources.record("compaction_model", layer);
+    }
+    if let Some(warming) = user.cache_warming {
+        settings.cache_warming = warming;
+        settings.sources.record("cache_warming", layer);
     }
     apply_limit_table(
         &mut settings.limits,
@@ -2250,6 +2263,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "shell_env": settings.shell_env,
         "review_model": settings.review_model,
         "compaction_model": settings.compaction_model,
+        "cache_warming": settings.cache_warming,
         "vision_model": settings.vision_model,
         "pre_tool_hook": settings.pre_tool_hook,
         "post_tool_hook": settings.post_tool_hook,
@@ -2573,6 +2587,17 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message == "RUNE_EDIT_TOOL is `diff`")
         );
+    }
+
+    #[test]
+    fn cache_warming_is_off_unless_the_user_file_turns_it_on() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(!load(None, None, &empty_env()).cache_warming);
+        let user = write(&dir, "config.toml", "cache_warming = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert!(settings.cache_warming);
+        assert_eq!(settings.source_of("cache_warming"), Layer::User);
     }
 
     #[test]
