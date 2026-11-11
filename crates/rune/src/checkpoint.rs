@@ -27,6 +27,10 @@ const LARGE_FILE_BYTES: u64 = 2_097_152;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 /// Most output kept from one git command.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest a workspace's checkpoint store may grow before old sessions are removed.
+pub const STORE_CAP: u64 = 1_073_741_824;
+/// Deadline of the garbage collection that follows a removed session.
+const GC_DEADLINE: Duration = Duration::from_secs(120);
 
 /// A private git directory that snapshots one workspace.
 pub struct Shadow {
@@ -34,6 +38,8 @@ pub struct Shadow {
     workspace: Utf8PathBuf,
     index: Utf8PathBuf,
     exclude: Utf8PathBuf,
+    /// Directory holding one folder per session, to tell which sessions still exist.
+    sessions: Utf8PathBuf,
 }
 
 /// What one snapshot recorded.
@@ -53,13 +59,7 @@ impl Shadow {
         if git_root(&workspace).is_none() || !git_available(&workspace) {
             return Ok(None);
         }
-        let git_dir = shadow_dir(paths, &workspace);
-        let shadow = Self {
-            index: git_dir.join("rune-index"),
-            exclude: git_dir.join("info").join("rune-exclude"),
-            git_dir,
-            workspace,
-        };
+        let shadow = Self::at(paths, workspace);
         let marker = shadow.git_dir.join(WORKSPACE_FILE);
         match std::fs::read_to_string(&marker) {
             Ok(recorded) => {
@@ -79,6 +79,18 @@ impl Shadow {
             Err(error) => return Err(error.into()),
         }
         Ok(Some(shadow))
+    }
+
+    /// The shadow of a canonical workspace path, whether or not it exists yet.
+    fn at(paths: &Paths, workspace: Utf8PathBuf) -> Self {
+        let git_dir = shadow_dir(paths, &workspace);
+        Self {
+            index: git_dir.join("rune-index"),
+            exclude: git_dir.join("info").join("rune-exclude"),
+            sessions: paths.sessions_dir(),
+            git_dir,
+            workspace,
+        }
     }
 
     /// Initialises a new shadow directory and its configuration.
@@ -179,9 +191,51 @@ impl Shadow {
     }
 
     /// Size in bytes of the shadow directory.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn size(&self) -> u64 {
         directory_size(self.git_dir.as_std_path())
+    }
+
+    /// Removes the checkpoints of other sessions until the store is no larger than `cap`.
+    ///
+    /// Sessions whose folder is gone go first, then the oldest by their latest
+    /// checkpoint. The ref of `current` is never removed.
+    pub fn enforce_cap(&self, current: &str, cap: u64) -> Result<()> {
+        if self.size() <= cap {
+            return Ok(());
+        }
+        let listed = self.git(
+            &[
+                "for-each-ref",
+                "--sort=committerdate",
+                "--format=%(refname)",
+                "refs/rune/",
+            ],
+            DEFAULT_DEADLINE,
+        )?;
+        let own = format!("refs/rune/{current}");
+        let mut candidates: Vec<(bool, String)> = String::from_utf8_lossy(&listed)
+            .lines()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty() && *reference != own)
+            .map(|reference| {
+                let session = reference.trim_start_matches("refs/rune/");
+                (self.sessions.join(session).is_dir(), reference.to_owned())
+            })
+            .collect();
+        // A stable sort keeps the age order within each group.
+        candidates.sort_by_key(|(exists, _)| *exists);
+        for (_, reference) in candidates {
+            self.git(&["update-ref", "-d", &reference], DEFAULT_DEADLINE)?;
+            self.git(
+                &["reflog", "expire", "--expire=now", "--all"],
+                DEFAULT_DEADLINE,
+            )?;
+            self.git(&["gc", "--prune=now", "--quiet"], GC_DEADLINE)?;
+            if self.size() <= cap {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The commit a session ref names, or None when the ref does not exist.
@@ -364,11 +418,16 @@ impl Checkpoints {
             .name("rune-checkpoints".to_owned())
             .spawn(move || {
                 let mut reported = false;
+                let mut capped = false;
                 for job in receiver {
                     if !delay.is_zero() {
                         std::thread::sleep(delay);
                     }
-                    let outcome = take(&shadow, &session, &record, &worker_shared, &job);
+                    let mut outcome = take(&shadow, &session, &record, &worker_shared, &job);
+                    if outcome.is_ok() && job.boundary == Boundary::End && !capped {
+                        capped = true;
+                        outcome = shadow.enforce_cap(&session, STORE_CAP);
+                    }
                     if let Err(error) = outcome
                         && !reported
                     {
@@ -509,6 +568,31 @@ impl From<RuneError> for GitFailure {
     }
 }
 
+/// Removes a session's checkpoints from its workspace's store.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn remove_session(paths: &Paths, workspace: &Utf8Path, session: &str) -> Result<()> {
+    let shadow = Shadow::at(paths, rune_policy::trust::canonical_workspace(workspace));
+    if !shadow.git_dir.join(WORKSPACE_FILE).is_file() {
+        return Ok(());
+    }
+    shadow.git(
+        &["update-ref", "-d", &format!("refs/rune/{session}")],
+        DEFAULT_DEADLINE,
+    )?;
+    Ok(())
+}
+
+/// Size in bytes of a workspace's checkpoint store, or None when it has none.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn store_size(paths: &Paths, workspace: &Utf8Path) -> Option<u64> {
+    let shadow = Shadow::at(paths, rune_policy::trust::canonical_workspace(workspace));
+    shadow
+        .git_dir
+        .join(WORKSPACE_FILE)
+        .is_file()
+        .then(|| shadow.size())
+}
+
 /// The shadow directory of a canonical workspace path.
 fn shadow_dir(paths: &Paths, workspace: &Utf8Path) -> Utf8PathBuf {
     let digest = Sha256::digest(workspace.as_str().as_bytes());
@@ -638,7 +722,6 @@ fn trimmed(output: &[u8]) -> String {
 }
 
 /// Sums the sizes of the files under a directory, without following symlinks.
-#[cfg_attr(not(test), allow(dead_code))]
 fn directory_size(directory: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
@@ -896,6 +979,108 @@ mod tests {
             "{listing}"
         );
         assert!(!listing.contains("vendor/lib/"), "{listing}");
+    }
+
+    /// Bytes that do not compress, so each file grows the store by about its size.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// Snapshots the workspace for `session` holding only its own large file.
+    /// Waits first so each session's checkpoint has a later commit time.
+    fn snapshot_alone(fixture: &Fixture, shadow: &Shadow, session: &str, seed: u64) {
+        std::thread::sleep(Duration::from_millis(1100));
+        for entry in std::fs::read_dir(&fixture.workspace).expect("workspace") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|extension| extension == "bin") {
+                std::fs::remove_file(path).expect("remove");
+            }
+        }
+        std::fs::write(
+            fixture.workspace.join(format!("{session}.bin")),
+            noise(seed, 512 * 1024),
+        )
+        .expect("file");
+        shadow.snapshot(session, "turn 1 end").expect("snapshot");
+    }
+
+    fn references(shadow: &Shadow) -> Vec<String> {
+        let listed = shadow
+            .git(
+                &["for-each-ref", "--format=%(refname)", "refs/rune/"],
+                DEFAULT_DEADLINE,
+            )
+            .expect("refs");
+        String::from_utf8_lossy(&listed)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_cap_removes_the_oldest_sessions_first() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        for session in ["oldest", "middle", "current"] {
+            std::fs::create_dir_all(fixture.paths.sessions_dir().join(session)).expect("dir");
+        }
+        snapshot_alone(&fixture, &shadow, "oldest", 1);
+        snapshot_alone(&fixture, &shadow, "middle", 2);
+        let cap = shadow.size() + 256 * 1024;
+        snapshot_alone(&fixture, &shadow, "current", 3);
+        assert!(shadow.size() > cap);
+
+        shadow.enforce_cap("current", cap).expect("cap");
+        assert!(shadow.size() <= cap, "{} > {cap}", shadow.size());
+        assert_eq!(
+            references(&shadow),
+            vec![
+                "refs/rune/current".to_owned(),
+                "refs/rune/middle".to_owned()
+            ]
+        );
+        // Only the current session is never removed, however small the cap.
+        shadow.enforce_cap("current", 0).expect("cap");
+        assert_eq!(references(&shadow), vec!["refs/rune/current".to_owned()]);
+        assert_eq!(
+            store_size(&fixture.paths, &fixture.workspace),
+            Some(shadow.size())
+        );
+    }
+
+    #[test]
+    fn refs_of_removed_sessions_are_deleted_first() {
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        for session in ["kept", "current"] {
+            std::fs::create_dir_all(fixture.paths.sessions_dir().join(session)).expect("dir");
+        }
+        snapshot_alone(&fixture, &shadow, "kept", 1);
+        snapshot_alone(&fixture, &shadow, "gone", 2);
+        let cap = shadow.size() + 256 * 1024;
+        snapshot_alone(&fixture, &shadow, "current", 3);
+
+        shadow.enforce_cap("current", cap).expect("cap");
+        assert_eq!(
+            references(&shadow),
+            vec!["refs/rune/current".to_owned(), "refs/rune/kept".to_owned()]
+        );
+        remove_session(&fixture.paths, &fixture.workspace, "kept").expect("remove");
+        assert_eq!(references(&shadow), vec!["refs/rune/current".to_owned()]);
     }
 
     /// The workspace checkpoints a session log holds, in order.
