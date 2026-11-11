@@ -704,6 +704,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<String>,
 
+    /// Whether file targets are written as terminal hyperlinks: `auto`, `on`, or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlinks: Option<String>,
+
     /// Whether the window title shows the session and its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<bool>,
@@ -937,6 +941,8 @@ pub struct Settings {
     pub color: String,
     /// Spinner motion, `full` or `reduced`.
     pub motion: String,
+    /// Terminal hyperlinks, `auto`, `on`, or `off`.
+    pub hyperlinks: String,
     /// Whether the window title shows the session and its state.
     pub terminal_title: bool,
     /// Whether terminal decorations use only ASCII.
@@ -1013,11 +1019,12 @@ impl Default for Settings {
             theme: None,
             color: COLOR_VALUES[0].to_owned(),
             motion: MOTION_VALUES[0].to_owned(),
+            hyperlinks: HYPERLINK_VALUES[0].to_owned(),
             terminal_title: true,
             ascii: false,
             auto_upgrade: true,
             offline: false,
-            collapse_tool_calls: false,
+            collapse_tool_calls: true,
             ambiguous_width: 1,
             session_titles: true,
             checkpoints: true,
@@ -1180,6 +1187,7 @@ impl Settings {
             ),
             ("color", self.color.clone()),
             ("motion", self.motion.clone()),
+            ("hyperlinks", self.hyperlinks.clone()),
             ("terminal_title", self.terminal_title.to_string()),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
@@ -1485,6 +1493,9 @@ pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
 /// The accepted `motion` values, the default first.
 pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 
+/// The accepted `hyperlinks` values, the default first.
+pub const HYPERLINK_VALUES: [&str; 3] = ["auto", "on", "off"];
+
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
@@ -1506,6 +1517,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "hyperlinks",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1546,6 +1558,7 @@ pub const USER_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "hyperlinks",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1585,6 +1598,7 @@ pub const SCALAR_KEYS: &[&str] = &[
     "theme",
     "color",
     "motion",
+    "hyperlinks",
     "terminal_title",
     "ascii",
     "auto_upgrade",
@@ -1644,6 +1658,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         ]),
         "color" => ScalarKind::Choice(&COLOR_VALUES),
         "motion" => ScalarKind::Choice(&MOTION_VALUES),
+        "hyperlinks" => ScalarKind::Choice(&HYPERLINK_VALUES),
         _ => ScalarKind::Text,
     })
 }
@@ -1759,6 +1774,10 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
     (
         "motion",
         "Spinner motion: full, or reduced for a static glyph.",
+    ),
+    (
+        "hyperlinks",
+        "Link file targets in tool rows: auto, on or off.",
     ),
     (
         "terminal_title",
@@ -2381,6 +2400,23 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
                 Diagnostic::new(layer, ErrorCode::InvalidField, format!("motion is `{raw}`"))
                     .with_key("motion")
                     .with_hint("accepted values are full and reduced"),
+            );
+        }
+    }
+    if let Some(raw) = &user.hyperlinks {
+        let value = raw.trim().to_ascii_lowercase();
+        if HYPERLINK_VALUES.contains(&value.as_str()) {
+            settings.hyperlinks = value;
+            settings.sources.record("hyperlinks", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("hyperlinks is `{raw}`"),
+                )
+                .with_key("hyperlinks")
+                .with_hint("accepted values are auto, on, and off"),
             );
         }
     }
@@ -3063,6 +3099,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "theme": settings.theme,
         "color": settings.color,
         "motion": settings.motion,
+        "hyperlinks": settings.hyperlinks,
         "terminal_title": settings.terminal_title,
         "ascii": settings.ascii,
         "auto_upgrade": settings.auto_upgrade,
@@ -5029,6 +5066,30 @@ max_agent_steps = 50
     fn unconfigured_provider_renders_as_text() {
         assert_eq!(Provider::Unconfigured.to_string(), "unconfigured");
         assert_eq!(provider_key(&Provider::Unconfigured), "default");
+    }
+
+    #[test]
+    fn hyperlinks_setting_accepts_auto_on_and_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().hyperlinks, "auto");
+        for (raw, expected) in [("auto", "auto"), ("On", "on"), (" off ", "off")] {
+            let user = write(&dir, "config.toml", &format!("hyperlinks = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty(), "{raw}");
+            assert_eq!(settings.hyperlinks, expected);
+            assert_eq!(settings.source_of("hyperlinks"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["hyperlinks"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "hyperlinks = \"always\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.hyperlinks, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("hyperlinks")
+                && diagnostic.code == ErrorCode::InvalidField
+        }));
     }
 
     #[test]
