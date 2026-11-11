@@ -51,6 +51,15 @@ impl Registry {
         Ok(())
     }
 
+    /// Adds a tool, or replaces the one registered under its name.
+    ///
+    /// A host uses it to swap a built-in for one built with what it knows only
+    /// after the registry exists, keeping any advertisement override.
+    pub fn replace(&mut self, tool: Box<dyn Tool>) {
+        let _ = model_spec(tool.as_ref());
+        self.tools.insert(tool.name().to_owned(), tool);
+    }
+
     /// Returns a tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -285,6 +294,36 @@ mod tests {
             assert!(!self.fail_validation, "invalid calls must not execute");
             Err(self.error.clone())
         }
+    }
+
+    #[test]
+    fn a_replaced_tool_keeps_its_name_and_advertisement_override() {
+        let mut registry = Registry::new();
+        let failing = |error: RuneError| FailingTool {
+            error,
+            fail_validation: false,
+        };
+        registry
+            .insert(Box::new(failing(RuneError::new(
+                ErrorCode::NotFound,
+                "first",
+            ))))
+            .expect("register");
+        registry.set_advertised("fixture", false);
+        registry.replace(Box::new(failing(RuneError::new(
+            ErrorCode::NotFound,
+            "second",
+        ))));
+        assert_eq!(registry.names(), ["fixture"]);
+        assert!(!registry.is_advertised("fixture"));
+        let output = registry
+            .call(
+                "fixture",
+                &serde_json::json!({}),
+                &ExecutionContext::new("/fixture".into()),
+            )
+            .expect("a tool result");
+        assert!(output.text.contains("second"), "{}", output.text);
     }
 
     #[test]
