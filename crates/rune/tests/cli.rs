@@ -2745,3 +2745,132 @@ fn config_path_honours_rune_config() {
         "{value}"
     );
 }
+
+/// Runs `rune projects` in `workspace`, with state under it.
+fn projects(workspace: &std::path::Path, args: &[&str]) -> Output {
+    let output = Command::new(binary())
+        .isolated_env()
+        .arg("projects")
+        .args(args)
+        .env("HOME", workspace)
+        .env("RUNE_HOME", workspace.join("state"))
+        .env("XDG_CONFIG_HOME", workspace.join("config"))
+        .env("XDG_DATA_HOME", workspace.join("data"))
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run binary");
+    Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+const PROJECT_HOOKS: &str = "[[hooks]]\nevent = 'pre_tool'\nname = 'guard'\n\
+    argv = ['/bin/sh', '-c', 'echo checked']\n\
+    [[hooks]]\nevent = 'turn_end'\nname = 'lint'\nargv = ['/bin/sh', 'lint.sh']\n";
+
+fn write_project_hooks(workspace: &std::path::Path, body: &str) {
+    std::fs::create_dir_all(workspace.join(".rune")).expect("project directory");
+    std::fs::write(workspace.join(".rune/hooks.toml"), body).expect("hooks file");
+}
+
+#[test]
+fn projects_status_lists_project_hook_commands() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let none = projects(dir.path(), &["status"]);
+    assert_eq!(none.status, Some(0), "{}", none.stderr);
+    assert!(
+        none.stdout.contains("project hooks: none\n"),
+        "{}",
+        none.stdout
+    );
+
+    write_project_hooks(dir.path(), PROJECT_HOOKS);
+    let out = projects(dir.path(), &["status"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.contains(
+            "project hooks: not approved (2 hooks)\n  pre_tool guard: /bin/sh -c \"echo checked\"\n  turn_end lint: /bin/sh lint.sh\n"
+        ),
+        "{}",
+        out.stdout
+    );
+
+    write_project_hooks(dir.path(), "model = 'other'\n");
+    let malformed = projects(dir.path(), &["status"]);
+    assert_eq!(malformed.status, Some(0), "{}", malformed.stderr);
+    assert!(
+        malformed
+            .stdout
+            .contains("project hooks: none\n  .rune/hooks.toml was ignored: "),
+        "{}",
+        malformed.stdout
+    );
+}
+
+#[test]
+fn projects_approve_without_a_terminal_needs_yes() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    write_project_hooks(dir.path(), PROJECT_HOOKS);
+
+    let refused = projects(dir.path(), &["approve"]);
+    assert_eq!(refused.status, Some(0), "{}", refused.stderr);
+    assert!(refused.stdout.contains("approved "), "{}", refused.stdout);
+    assert!(
+        refused
+            .stdout
+            .contains("  pre_tool guard: /bin/sh -c \"echo checked\"\n"),
+        "{}",
+        refused.stdout
+    );
+    assert!(
+        refused
+            .stdout
+            .contains("project hooks not approved: pass --yes to approve them without a prompt"),
+        "{}",
+        refused.stdout
+    );
+    let status = projects(dir.path(), &["status"]);
+    assert!(status.stdout.contains(": approved\n"), "{}", status.stdout);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+
+    let approved = projects(dir.path(), &["approve", "--yes"]);
+    assert_eq!(approved.status, Some(0), "{}", approved.stderr);
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status.stdout.contains("project hooks: approved\n"),
+        "{}",
+        status.stdout
+    );
+
+    // One changed argument needs approval again.
+    write_project_hooks(dir.path(), &PROJECT_HOOKS.replace("lint.sh", "lint2.sh"));
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+
+    assert_eq!(projects(dir.path(), &["approve", "--yes"]).status, Some(0));
+    let reset = projects(dir.path(), &["reset"]);
+    assert_eq!(reset.status, Some(0), "{}", reset.stderr);
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+}
