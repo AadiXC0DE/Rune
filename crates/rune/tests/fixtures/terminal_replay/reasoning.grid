@@ -5,7 +5,7 @@ reasoning-finished: 80x24, caret 2,8
 03||
 04|  thought for <t>|
 05|REASONED|
-06|ctrl-c cancel  /help commands  esc clear|
+06|/ commands   ctrl-j newline|
 07|replay-fixture | auto | ctx ~###k (request bytes)|
 08|>|
 09||

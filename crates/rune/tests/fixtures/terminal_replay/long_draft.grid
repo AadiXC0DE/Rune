@@ -1,6 +1,6 @@
 end: 80x24, caret 14,5
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|draft-fixture | auto | ctx ~###k (request bytes)|
 03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
 04|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
@@ -25,7 +25,7 @@ end: 80x24, caret 14,5
 23||
 left: 80x24, caret 13,5
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|draft-fixture | auto | ctx ~###k (request bytes)|
 03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
 04|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
@@ -50,7 +50,7 @@ left: 80x24, caret 13,5
 23||
 edited: 80x24, caret 14,5
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|draft-fixture | auto | ctx ~###k (request bytes)|
 03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
 04|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
@@ -75,7 +75,7 @@ edited: 80x24, caret 14,5
 23||
 home: 80x24, caret 2,3
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|draft-fixture | auto | ctx ~###k (request bytes)|
 03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
 04|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
@@ -100,7 +100,7 @@ home: 80x24, caret 2,3
 23||
 end-again: 80x24, caret 14,5
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|draft-fixture | auto | ctx ~###k (request bytes)|
 03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
 04|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|

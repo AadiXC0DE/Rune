@@ -2396,7 +2396,8 @@ impl SessionHost {
             } else {
                 UiState::Idle
             }),
-            idle_hints: Vec::new(),
+            // The lowest-priority idle hint, shown only when it fits whole.
+            idle_hints: vec![self.caps.newline_hint()],
             fields: Some(lock_value(&self.statusline).clone()),
             branch: lock_value(&self.branch).clone(),
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
@@ -11308,7 +11309,7 @@ mod tests {
                 .filter(|row| {
                     [UiState::Idle, UiState::Running]
                         .iter()
-                        .any(|&ui| row.trim_end() == footer::hints(ui))
+                        .any(|&ui| row.trim_end().starts_with(footer::hints(ui)))
                 })
                 .count();
             assert_eq!(hint_rows, 1, "{screen}");
@@ -11394,6 +11395,19 @@ mod tests {
 
     fn written(sink: &Arc<Mutex<Vec<u8>>>) -> String {
         String::from_utf8_lossy(&sink.lock().expect("lock")).into_owned()
+    }
+
+    #[test]
+    fn the_idle_hint_row_names_the_newline_key_when_it_fits() {
+        // The test host's terminal answered no probe, so Shift+Enter cannot be
+        // told apart and Ctrl+J is the key to name.
+        let host = test_host();
+        let wide = host.status_line_in(120, Some(UiState::Idle));
+        assert!(wide.contains("/ commands   ctrl-j newline"), "{wide:?}");
+        let narrow = host.status_line_in(20, Some(UiState::Idle));
+        assert!(!narrow.contains("newline"), "{narrow:?}");
+        let running = host.status_line_in(120, Some(UiState::Running));
+        assert!(!running.contains("newline"), "{running:?}");
     }
 
     #[test]

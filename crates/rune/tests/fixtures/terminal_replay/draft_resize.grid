@@ -1,6 +1,6 @@
 narrow-draft: 32x24, caret 3,5
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|replay-fixture | auto|
 03|> 012345678901234567890123456789|
 04|  01234567890123456789VISIBLE-EN|
@@ -25,7 +25,7 @@ narrow-draft: 32x24, caret 3,5
 23||
 grown-draft: 80x24, caret 63,3
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|replay-fixture | auto | ctx ~###k (request bytes)|
 03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
 04||
@@ -75,7 +75,7 @@ shrunk-draft: 20x24, caret 9,6
 23||
 grown-again: 80x24, caret 63,3
 00|session ************|
-01|/ commands|
+01|/ commands   ctrl-j newline|
 02|replay-fixture | auto | ctx ~###k (request bytes)|
 03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
 04||
