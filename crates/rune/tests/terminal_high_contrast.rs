@@ -30,7 +30,11 @@ fn high_contrast_draws_explicit_pairs_and_no_color_suppresses_them() {
         assert!(grid.text().contains("ctrl-c cancel"), "{stage}");
         assert!(grid.text().contains("/model"), "{stage}");
         let colorless = stage.starts_with("no-color");
-        let truecolor = stage == "truecolor";
+        let depth = if stage == "truecolor" {
+            rune_term::theme::ColorDepth::TrueColor
+        } else {
+            rune_term::theme::ColorDepth::Ansi256
+        };
         let theme = if colorless {
             rune_term::theme::Theme::no_color()
         } else {
@@ -48,7 +52,7 @@ fn high_contrast_draws_explicit_pairs_and_no_color_suppresses_them() {
                     assert!(!style.has_flag(rune_term::flag::DIM), "{stage}");
                     assert!(
                         rune_term::theme::SLOTS.iter().any(|slot| {
-                            let pair = theme.style(*slot, truecolor);
+                            let pair = theme.style(*slot, depth);
                             pair.fg == style.fg && pair.bg == style.bg
                         }),
                         "unexpected pair in {stage}: {style:?}"
