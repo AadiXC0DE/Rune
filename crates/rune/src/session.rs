@@ -336,6 +336,9 @@ struct SessionHost {
     fast_mode: bool,
     limits: BudgetSet,
     context: ExecutionContext,
+    /// The context every tool of the current turn forks, so one interrupt
+    /// reaches all of them; replaced with a fresh flag when a turn starts.
+    turn_context: Mutex<ExecutionContext>,
     registry: Registry,
     /// MCP connections live until the session host is dropped.
     mcp: Option<McpClient>,
@@ -1137,21 +1140,16 @@ impl Host for SessionHost {
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        let context = self.turn_context();
         if let Some(client) = &self.mcp
             && client.tools().iter().any(|tool| tool.name == name)
         {
-            return crate::mcp::call_tool(
-                client,
-                name,
-                arguments,
-                &self.cancellation,
-                &self.context,
-            );
+            return crate::mcp::call_tool(client, name, arguments, &self.cancellation, &context);
         }
         if name == "subagent"
             && let Some(subagent) = &self.subagent
         {
-            return subagent.call(self, &self.registry, arguments, &self.context);
+            return subagent.call(self, &self.registry, arguments, &context);
         }
         self.wait_for_checkpoint(name);
         if name == "shell" {
@@ -1180,13 +1178,13 @@ impl Host for SessionHost {
         {
             // Keep the source preimage, but record only successful renames so
             // a refused directory or destination cannot pollute `/undo`.
-            let source = rune_tools::resolve(&self.context, source)?.path;
-            let destination = rune_tools::resolve(&self.context, destination)?.path;
+            let source = rune_tools::resolve(&context, source)?.path;
+            let destination = rune_tools::resolve(&context, destination)?.path;
             let before = match rename_snapshot(&source) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => return Ok(ToolOutput::from_error(&error)),
             };
-            let output = self.registry.call(name, arguments, &self.context)?;
+            let output = self.registry.call(name, arguments, &context)?;
             if !output.is_error {
                 let mut undo = self
                     .undo
@@ -1197,7 +1195,7 @@ impl Host for SessionHost {
             }
             return Ok(output);
         }
-        self.registry.call(name, arguments, &self.context)
+        self.registry.call(name, arguments, &context)
     }
 
     fn execute_with_context(
@@ -1347,8 +1345,7 @@ impl Host for SessionHost {
     fn context(&self) -> ExecutionContext {
         // Sharing the cancellation flag is what lets a cancel reach every tool
         // in the turn rather than only the one running when it arrived.
-        self.context
-            .fork()
+        self.turn_context()
             .with_network(self.network.load(std::sync::atomic::Ordering::Relaxed))
     }
 
@@ -1374,6 +1371,28 @@ impl Host for SessionHost {
 }
 
 impl SessionHost {
+    /// A context for one tool call of the current turn.
+    fn turn_context(&self) -> ExecutionContext {
+        lock_value(&self.turn_context).fork()
+    }
+
+    /// Gives the next turn's tools a flag of their own, so an interrupt of
+    /// the last turn does not cancel them.
+    fn fresh_turn_context(&self) {
+        *lock_value(&self.turn_context) = self.context.with_fresh_cancellation();
+    }
+
+    /// Cancels the tools of the current turn.
+    fn turn_context_cancel(&self) {
+        lock_value(&self.turn_context).cancellation().cancel();
+    }
+
+    /// Stops the current turn and the tool it is running.
+    fn interrupt(&self) {
+        self.cancellation.cancel();
+        self.turn_context_cancel();
+    }
+
     /// Whether the prompt cache is kept warm while idle: the setting is on,
     /// the dialect is Anthropic and the session is online.
     fn warming_allowed(&self) -> bool {
@@ -2828,7 +2847,7 @@ impl SessionHost {
         };
         if let Err(error) = result {
             recorder.journal_failed(error);
-            self.cancellation.cancel();
+            self.interrupt();
             return false;
         }
         true
@@ -3636,6 +3655,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         effort_noticed: Mutex::new(std::collections::BTreeSet::new()),
         fast_mode: config.settings.fast_mode,
         limits: limits.clone(),
+        turn_context: Mutex::new(context.fork()),
         context,
         registry: config.registry,
         mcp,
@@ -4869,6 +4889,7 @@ fn run_accessible<T: Send>(
     work: impl FnOnce(&mut History) -> Result<T> + Send,
 ) -> Steered<T> {
     host.cancellation.reset();
+    host.fresh_turn_context();
     let (requests, pending) = mpsc::channel();
     *host
         .approval_requests
@@ -4950,11 +4971,11 @@ fn collect_accessible_questions(
         host.show(&transcript::append_lines(&lines));
         loop {
             let Some(line) = input.next_line()? else {
-                host.cancellation.cancel();
+                host.interrupt();
                 return Ok(Answer::Cancelled);
             };
             if line.trim() == "/cancel" {
-                host.cancellation.cancel();
+                host.interrupt();
                 return Ok(Answer::Cancelled);
             }
             if let Some(choice) = line
@@ -5018,6 +5039,7 @@ fn run_steerable<T: Send>(
     // Cleared before the turn rather than after, so a cancel that arrived as
     // the previous turn ended cannot stop this one before it starts.
     host.cancellation.reset();
+    host.fresh_turn_context();
     // The host's copy of the typed line is what every streamed frame draws, so
     // it starts from the reader's line rather than whatever the last turn left.
     if let Ok(mut typed) = host.typed.lock() {
@@ -5035,6 +5057,11 @@ fn run_steerable<T: Send>(
     }
 
     let (result, diagnostic) = run_on_worker(history, work, || {
+        // A cancellation raised elsewhere, such as by a signal, reaches the
+        // running tool within one poll.
+        if host.cancellation.is_cancelled() {
+            host.turn_context_cancel();
+        }
         if let Ok(request) = pending.try_recv() {
             gesture.disarm();
             let answer = collect_approval(&request, host, reader);
@@ -5093,7 +5120,7 @@ fn run_steerable<T: Send>(
             // is what the key does everywhere else.
             KeyAction::Escape => {
                 if gesture.record() {
-                    host.cancellation.cancel();
+                    host.interrupt();
                     host.draw_notice("cancelling the turn");
                 } else if reader.line().is_empty() {
                     host.draw_notice("press Escape again to cancel");
@@ -5108,7 +5135,7 @@ fn run_steerable<T: Send>(
             KeyAction::Cancel => {
                 gesture.disarm();
                 if reader.line().is_empty() {
-                    host.cancellation.cancel();
+                    host.interrupt();
                     host.draw_notice("cancelling the turn");
                 } else {
                     reader.clear();
@@ -5215,7 +5242,7 @@ fn collect_approval_inner(
         let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
         let idle = key.is_none();
         if let Some(key) = key
-            && let Some(answer) = approval_key(key, &mut picker, &host.cancellation)
+            && let Some(answer) = approval_key(key, &mut picker, host)
         {
             return answer;
         }
@@ -5290,7 +5317,7 @@ fn collect_questions_inner(
             let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
             let idle = key.is_none();
             if let Some(key) = key {
-                let chosen = question_key(key, &mut picker, &host.cancellation);
+                let chosen = question_key(key, &mut picker, host);
                 host.cancellation.check()?;
                 if let Some(chosen) = chosen {
                     answers.push(chosen);
@@ -5319,7 +5346,7 @@ fn question_lines(question: &Question, width: usize) -> Vec<String> {
 fn question_key(
     key: KeyAction,
     picker: &mut rune_term::picker::Picker,
-    cancellation: &Cancellation,
+    host: &SessionHost,
 ) -> Option<usize> {
     match key {
         KeyAction::Suspend => {
@@ -5336,7 +5363,7 @@ fn question_key(
             None
         }
         KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
-            cancellation.cancel();
+            host.interrupt();
             None
         }
         KeyAction::Complete
@@ -5364,7 +5391,7 @@ fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
 fn approval_key(
     key: KeyAction,
     picker: &mut rune_term::picker::Picker,
-    cancellation: &Cancellation,
+    host: &SessionHost,
 ) -> Option<ApprovalOutcome> {
     match key {
         KeyAction::Suspend => {
@@ -5386,7 +5413,7 @@ fn approval_key(
             None
         }
         KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
-            cancellation.cancel();
+            host.interrupt();
             Some(ApprovalOutcome::Deny)
         }
         KeyAction::Complete
@@ -12253,6 +12280,26 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_reaches_the_tool_context() {
+        let host = test_host();
+        let context = Host::context(&host);
+        assert!(!context.is_cancelled());
+        host.interrupt();
+        assert!(host.cancellation.is_cancelled());
+        assert!(
+            context.is_cancelled(),
+            "the running tool sees the interrupt"
+        );
+        host.cancellation.reset();
+        host.fresh_turn_context();
+        assert!(
+            !Host::context(&host).is_cancelled(),
+            "the next turn starts with a flag of its own"
+        );
+        assert!(context.is_cancelled());
+    }
+
+    #[test]
     fn cancellation_wakes_a_worker_waiting_for_approval() {
         let mut host = test_host();
         host.rules
@@ -12495,20 +12542,11 @@ mod tests {
                 .collect(),
             2,
         );
-        let cancellation = Cancellation::new();
-        assert_eq!(
-            question_key(KeyAction::Down, &mut picker, &cancellation),
-            None
-        );
-        assert_eq!(
-            question_key(KeyAction::Ignored, &mut picker, &cancellation),
-            None
-        );
-        assert_eq!(
-            question_key(KeyAction::Submit, &mut picker, &cancellation),
-            Some(1)
-        );
-        assert!(!cancellation.is_cancelled());
+        let host = test_host();
+        assert_eq!(question_key(KeyAction::Down, &mut picker, &host), None);
+        assert_eq!(question_key(KeyAction::Ignored, &mut picker, &host), None);
+        assert_eq!(question_key(KeyAction::Submit, &mut picker, &host), Some(1));
+        assert!(!host.cancellation.is_cancelled());
     }
 
     #[test]
@@ -13874,6 +13912,7 @@ mod tests {
             host.accessible = accessible;
             host.endpoint.offline = true;
             host.context = ExecutionContext::new(root.to_owned());
+            host.fresh_turn_context();
             host.recorder = Some(Arc::new(Mutex::new(
                 Recorder::create(&paths, &id).expect("recorder"),
             )));
@@ -13954,6 +13993,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let mut host = test_host();
         host.context = ExecutionContext::new(root.to_owned());
+        host.fresh_turn_context();
         host.registry
             .insert(Box::new(rune_tools::RenameFile))
             .expect("registered");
@@ -14229,6 +14269,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let mut host = test_host();
         host.context = ExecutionContext::new(root.to_owned());
+        host.fresh_turn_context();
         host.registry
             .insert(Box::new(rune_tools::RenameFile))
             .expect("tool");
@@ -14284,6 +14325,7 @@ mod tests {
         }
         let mut host = test_host();
         host.context = ExecutionContext::new(root.to_owned());
+        host.fresh_turn_context();
         host.registry
             .insert(Box::new(rune_tools::RenameFile))
             .expect("tool");
@@ -14308,6 +14350,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let mut host = test_host();
         host.context = ExecutionContext::new(root.to_owned());
+        host.fresh_turn_context();
         host.registry
             .insert(Box::new(rune_tools::RenameFile))
             .expect("registered");
@@ -14335,6 +14378,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
         let mut host = test_host();
         host.context = ExecutionContext::new(root.to_owned());
+        host.fresh_turn_context();
         host.registry
             .insert(Box::new(rune_tools::RenameFile))
             .expect("registered");
@@ -17829,6 +17873,7 @@ mod tests {
             fast_mode: false,
             limits: BudgetSet::new(),
             context: ExecutionContext::new(Utf8PathBuf::from("/tmp")),
+            turn_context: Mutex::new(ExecutionContext::new(Utf8PathBuf::from("/tmp"))),
             registry,
             mcp: None,
             subagent: None,
