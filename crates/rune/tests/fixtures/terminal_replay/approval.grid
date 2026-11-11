@@ -34,7 +34,7 @@ approval-cancelled: 80x24, caret 2,13
 07|Scope: "echo GRID-APPROVAL"|
 08|[refused shell: ask: no rule matched `echo GRID-APPROVAL`, so the mode's]|
 09|[default applies; approval was cancelled]|
-10|[cancelled]|
+10|[interrupted]|
 11|/ commands   shift-tab mode   ctrl-j newline|
 12|replay-fixture | ask | ctx ~###k (request bytes)|
 13|>|

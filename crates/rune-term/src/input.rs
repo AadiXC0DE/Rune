@@ -87,12 +87,11 @@ Permission and question menus:
   Enter         confirm the selected option
   Esc / Ctrl-C / Ctrl-D  cancel the turn, preserving the draft and caret
 
-Cancellation (outside menus and the transcript):
-  Ctrl-C        clear a nonempty draft first; with an empty draft,
-                cancel a running turn or leave an idle session
-  Esc           while running, clear the draft and arm cancellation;
-                press again within {} ms to cancel; other keys disarm
-  Ctrl-D        with an empty draft during a turn, keep the turn running
+Interrupting:
+  Esc           with an empty draft, stop the running turn now;
+                with text, press twice within {} ms
+  Ctrl-C        clear the draft (Up brings it back); with an empty
+                draft, stop the turn, or press twice to leave when idle
 
 Transcript:
 {}

@@ -190,7 +190,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         for cancel in [b"\x1b", b"\x03", b"\x04"]:
             start = permission()
             send(cancel)
-            settled_reply("[cancelled]", start)
+            settled_reply("[interrupted]", start)
             assert side_effect.read_bytes() == b"x", "cancelled shell ran"
             start = len(transcript)
             send(b"after-cancel\r")

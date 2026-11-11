@@ -104,9 +104,14 @@ pub const ACTIONS: &[ActionInfo] = &[
         "interrupt",
         Context::Turn,
         &["esc"],
-        "stop the running turn (press twice)",
+        "stop the running turn; with text, press twice",
     ),
-    action("clear", Context::Editor, &["esc"], "clear the draft"),
+    action(
+        "clear",
+        Context::Editor,
+        &["esc"],
+        "clear the draft; up brings it back",
+    ),
     action(
         "history_search",
         Context::Editor,
