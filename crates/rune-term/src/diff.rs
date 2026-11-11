@@ -6,6 +6,8 @@
 //! lines so a large edit cannot flood the scrollback. Colours come from the
 //! theme, so a theme without them draws the marks alone.
 
+use std::ops::Range;
+
 use crate::transcript::sanitize;
 use crate::width::{expand_tabs, str_width, truncate_to_width};
 
@@ -179,6 +181,134 @@ fn group<'a>(lines: &[DiffLine<'a>]) -> Vec<Hunk<'a>> {
     }
     hunks.push(hunk(start, end));
     hunks
+}
+
+/// Byte ranges into one line.
+type Ranges = Vec<Range<usize>>;
+
+/// Returns the byte ranges of the words that differ between a removed and an
+/// added line, or `None` when the lines are too unlike for that to help.
+///
+/// Lines are split into runs of letters, digits and `_`, runs of whitespace,
+/// and single other characters. Lines are alike when the tokens they share,
+/// whitespace aside, are at least two fifths of all their tokens.
+#[must_use]
+pub fn word_ranges(removed: &str, added: &str) -> Option<(Ranges, Ranges)> {
+    let old = tokens(removed);
+    let new = tokens(added);
+    if old.len() > MAX_LINES || new.len() > MAX_LINES {
+        return None;
+    }
+    let old_text: Vec<&str> = old.iter().map(|range| &removed[range.clone()]).collect();
+    let new_text: Vec<&str> = new.iter().map(|range| &added[range.clone()]).collect();
+    let script = edit_script(&old_text, &new_text)?;
+    let words = |texts: &[&str]| texts.iter().filter(|text| !is_space(text)).count();
+    let total = words(&old_text).saturating_add(words(&new_text));
+    let (mut at_old, mut at_new, mut common) = (0_usize, 0_usize, 0_usize);
+    let (mut old_ranges, mut new_ranges) = (Vec::new(), Vec::new());
+    for op in script {
+        match op {
+            Op::Context => {
+                if old_text.get(at_old).is_some_and(|text| !is_space(text)) {
+                    common = common.saturating_add(1);
+                }
+                at_old = at_old.saturating_add(1);
+                at_new = at_new.saturating_add(1);
+            }
+            Op::Removed => {
+                push_merged(&mut old_ranges, old.get(at_old));
+                at_old = at_old.saturating_add(1);
+            }
+            Op::Added => {
+                push_merged(&mut new_ranges, new.get(at_new));
+                at_new = at_new.saturating_add(1);
+            }
+        }
+    }
+    // 2 * common / total >= 0.4, in integers.
+    (total > 0 && common.saturating_mul(5) >= total).then_some((old_ranges, new_ranges))
+}
+
+/// Returns the changed words of each line, empty for a shared line, a line
+/// with no partner and a pair too unlike to compare.
+///
+/// In each run of changes the first removed line is paired with the first
+/// added line, the second with the second, and so on.
+#[must_use]
+pub fn word_highlights(lines: &[DiffLine<'_>]) -> Vec<Vec<Range<usize>>> {
+    let mut out = vec![Vec::new(); lines.len()];
+    let mut start = 0;
+    while start < lines.len() {
+        let run = lines[start..]
+            .iter()
+            .take_while(|line| line.op != Op::Context)
+            .count();
+        if run == 0 {
+            start = start.saturating_add(1);
+            continue;
+        }
+        let removed = lines[start..start.saturating_add(run)]
+            .iter()
+            .take_while(|line| line.op == Op::Removed)
+            .count();
+        let added = run.saturating_sub(removed);
+        for pair in 0..removed.min(added) {
+            let old = start.saturating_add(pair);
+            let new = start.saturating_add(removed).saturating_add(pair);
+            if let Some((old_ranges, new_ranges)) = word_ranges(lines[old].text, lines[new].text) {
+                out[old] = old_ranges;
+                out[new] = new_ranges;
+            }
+        }
+        start = start.saturating_add(run);
+    }
+    out
+}
+
+/// Splits a line into word, whitespace and single-character tokens.
+fn tokens(line: &str) -> Vec<Range<usize>> {
+    #[derive(PartialEq)]
+    enum Kind {
+        Word,
+        Space,
+        Other,
+    }
+    let kind = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            Kind::Word
+        } else if c.is_whitespace() {
+            Kind::Space
+        } else {
+            Kind::Other
+        }
+    };
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let mut last = None;
+    for (at, c) in line.char_indices() {
+        let this = kind(c);
+        let end = at.saturating_add(c.len_utf8());
+        match out.last_mut() {
+            Some(range) if this != Kind::Other && last.as_ref() == Some(&this) => range.end = end,
+            _ => out.push(at..end),
+        }
+        last = Some(this);
+    }
+    out
+}
+
+fn is_space(text: &str) -> bool {
+    text.chars().all(char::is_whitespace)
+}
+
+/// Adds a token's range, joining it to the previous one when they touch.
+fn push_merged(ranges: &mut Vec<Range<usize>>, range: Option<&Range<usize>>) {
+    let Some(range) = range else {
+        return;
+    };
+    match ranges.last_mut() {
+        Some(last) if last.end == range.start => last.end = range.end,
+        _ => ranges.push(range.clone()),
+    }
 }
 
 /// Returns a shortest edit script from `old` to `new`, removals first in
@@ -679,5 +809,76 @@ mod tests {
         let out = render(&lines, &style, 2, 40, true);
         assert_eq!(out[0], "    <g>+         x</>");
         assert_eq!(out[1], "    <r>- abc     y</>");
+    }
+
+    #[test]
+    fn a_renamed_variable_highlights_only_the_name() {
+        let removed = "let count = items.len();";
+        let added = "let total_items = items.len();";
+        let (old, new) = word_ranges(removed, added).expect("alike lines");
+        assert_eq!(old, [Range { start: 4, end: 9 }]);
+        assert_eq!(new, [Range { start: 4, end: 15 }]);
+        assert_eq!(&removed[old[0].clone()], "count");
+        assert_eq!(&added[new[0].clone()], "total_items");
+    }
+
+    #[test]
+    fn adjacent_changed_tokens_merge_into_one_range() {
+        let (old, new) = word_ranges("call(a, b);", "call(x.y, b);").expect("alike lines");
+        assert_eq!(old, [Range { start: 5, end: 6 }]);
+        assert_eq!(new, [Range { start: 5, end: 8 }]);
+    }
+
+    #[test]
+    fn unrelated_lines_get_no_word_highlight() {
+        assert_eq!(word_ranges("fn main() {", "return value;"), None);
+        assert_eq!(word_ranges("", ""), None);
+        assert_eq!(word_ranges("   ", " "), None);
+    }
+
+    #[test]
+    fn the_forty_percent_threshold_is_inclusive() {
+        // Two shared words of ten: exactly 0.4.
+        let (old, new) = word_ranges("a b c d e", "a b x y z").expect("at the threshold");
+        // The shared spaces between the changed words stay plain.
+        assert_eq!(old, [4..5, 6..7, 8..9]);
+        assert_eq!(new, [4..5, 6..7, 8..9]);
+        // Two shared words of eleven: under 0.4.
+        assert_eq!(word_ranges("a b c d e", "a b x y z w"), None);
+        // Shared whitespace does not count.
+        assert_eq!(word_ranges("a    b", "c    d"), None);
+    }
+
+    #[test]
+    fn unpaired_lines_are_left_plain() {
+        let old = "keep\nlet a = 1;\nlet b = 2;\nkeep\nx = 1\n";
+        let new = "keep\nlet a = 10;\nkeep\nx = 1\ny = 1\n";
+        let found = hunks(old, new, 1);
+        assert_eq!(found.len(), 1);
+        let lines = &found[0].lines;
+        let words = word_highlights(lines);
+        let shown: Vec<(Op, &str, Vec<&str>)> = lines
+            .iter()
+            .zip(&words)
+            .map(|(line, ranges)| {
+                let texts = ranges
+                    .iter()
+                    .map(|range| &line.text[range.clone()])
+                    .collect();
+                (line.op, line.text, texts)
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Context, "keep", vec![]),
+                (Removed, "let a = 1;", vec!["1"]),
+                (Removed, "let b = 2;", vec![]),
+                (Added, "let a = 10;", vec!["10"]),
+                (Context, "keep", vec![]),
+                (Context, "x = 1", vec![]),
+                (Added, "y = 1", vec![]),
+            ]
+        );
     }
 }
