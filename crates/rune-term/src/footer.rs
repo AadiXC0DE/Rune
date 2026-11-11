@@ -167,6 +167,9 @@ pub struct FooterState {
     /// Hints after the idle set, lowest priority last; each is shown only when
     /// it fits whole.
     pub idle_hints: Vec<&'static str>,
+    /// Hints after the running set, lowest priority last; each is shown only
+    /// when it fits whole.
+    pub running_hints: Vec<&'static str>,
     /// Fields shown, highest priority first; `None` shows every field in the
     /// default order.
     pub fields: Option<Vec<StatusField>>,
@@ -174,7 +177,7 @@ pub struct FooterState {
     pub branch: Option<String>,
     /// Reasoning effort level, absent when it is automatic.
     pub effort: Option<String>,
-    /// Messages queued for the running turn.
+    /// Messages queued to run as turns after the running one.
     pub queued: usize,
     /// Whether commands may use the network.
     pub net: bool,
@@ -344,17 +347,20 @@ fn too_small_row(state: &FooterState, layout: &Layout, theme: &Theme, depth: Col
 /// Returns the hint row.
 fn hint_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize) -> String {
     let mut text = hints(state.ui).to_owned();
-    if state.ui == UiState::Idle {
-        for hint in &state.idle_hints {
-            let wider = str_width(&text)
-                .saturating_add(HINT_GAP.len())
-                .saturating_add(str_width(hint));
-            if wider > width {
-                break;
-            }
-            text.push_str(HINT_GAP);
-            text.push_str(hint);
+    let extra: &[&str] = match state.ui {
+        UiState::Idle => &state.idle_hints,
+        UiState::Running => &state.running_hints,
+        UiState::Menu | UiState::Approval => &[],
+    };
+    for hint in extra {
+        let wider = str_width(&text)
+            .saturating_add(HINT_GAP.len())
+            .saturating_add(str_width(hint));
+        if wider > width {
+            break;
         }
+        text.push_str(HINT_GAP);
+        text.push_str(hint);
     }
     let mut row = paint(theme, Slot::Dim, depth, flag::DIM);
     row.push_str(&text);
@@ -1032,6 +1038,25 @@ mod tests {
         assert_eq!(hint_of(&state, 100), "ctrl-c interrupt   enter steer");
         state.ui = UiState::Idle;
         assert_eq!(hint_of(&state, 12), "/ commands");
+    }
+
+    #[test]
+    fn running_hints_drop_whole_from_the_lowest_priority() {
+        let mut state = state();
+        state.ui = UiState::Running;
+        state.idle_hints = vec!["ctrl-j newline"];
+        state.running_hints = vec!["tab queue", "alt-up edit queued"];
+        assert_eq!(
+            hint_of(&state, 100),
+            "ctrl-c interrupt   enter steer   tab queue   alt-up edit queued"
+        );
+        assert_eq!(
+            hint_of(&state, 50),
+            "ctrl-c interrupt   enter steer   tab queue"
+        );
+        assert_eq!(hint_of(&state, 35), "ctrl-c interrupt   enter steer");
+        state.ui = UiState::Idle;
+        assert_eq!(hint_of(&state, 100), "/ commands   ctrl-j newline");
     }
 
     #[test]

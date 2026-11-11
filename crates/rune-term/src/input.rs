@@ -142,6 +142,8 @@ pub enum KeyAction {
     CycleReasoning,
     /// Move to the next permission mode: ask, auto, then plan.
     ModeCycle,
+    /// Take the newest message waiting for a turn back into the draft.
+    PullQueued,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -608,6 +610,7 @@ impl KeyReader {
                 self.composer.move_right();
                 KeyAction::Ignored
             }
+            (KeyCode::Up, _, true) => KeyAction::PullQueued,
             // An open menu takes the vertical arrows. Otherwise they move
             // between drawn rows and are reported only from the first or last
             // row, where the session recalls an earlier prompt.
@@ -1111,6 +1114,19 @@ mod tests {
         reader.apply(alt('y'));
         assert_eq!(reader.line(), "beta beta");
         assert_eq!(reader.column(), 4);
+    }
+
+    #[test]
+    fn alt_up_pulls_a_queued_message_without_moving_the_caret() {
+        let mut reader = reader();
+        typed(&mut reader, "one");
+        reader.apply(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut reader, "two");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(reader.apply(alt_up), KeyAction::PullQueued);
+        assert_eq!(reader.column(), 7);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 3);
     }
 
     #[test]

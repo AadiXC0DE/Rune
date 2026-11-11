@@ -13,7 +13,7 @@ markdown-streaming: 80x24, caret 2,16
 11|    println!("hi");|
 12|}|
 13|```|
-14|ctrl-c interrupt   enter steer|
+14|ctrl-c interrupt   enter steer   tab queue|
 15|replay-fixture | full access | ctx ~###k (request bytes)|
 16|>|
 17||

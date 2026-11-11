@@ -436,6 +436,10 @@ struct SessionHost {
     subagent: Option<Arc<crate::subagent::Bridge>>,
     cancellation: Cancellation,
     steering: SteeringQueue,
+    /// Messages to run as turns after the running one, oldest first.
+    queued: Mutex<std::collections::VecDeque<String>>,
+    /// Steering submitted and not yet taken in by the turn, oldest first.
+    pending_steer: Mutex<Vec<String>>,
     events: Arc<Mutex<Vec<Event>>>,
     /// The pending or active retry, drawn only through the live footer.
     provider_retry: Mutex<Option<ProviderRetry>>,
@@ -1237,7 +1241,12 @@ impl Host for SessionHost {
                 if *settled { " at a settled point" } else { "" }
             )),
             // A queued message is reported once the turn ends, from the events.
-            Event::SteeringApplied { .. } => {}
+            // The drain takes every pending message, oldest first.
+            Event::SteeringApplied { count, .. } => {
+                let mut pending = lock_value(&self.pending_steer);
+                let taken = (*count).min(pending.len());
+                pending.drain(..taken);
+            }
             // The result ends with a note saying what ran.
             Event::CallRepaired { .. } | Event::ToolRewritten { .. } => {}
             // Said in scrollback, so the reader knows why the turn went on.
@@ -2667,10 +2676,15 @@ impl SessionHost {
             } else {
                 vec!["shift-tab mode", self.caps.newline_hint()]
             },
+            running_hints: if self.lanes_pending() {
+                vec!["tab queue", "alt-up edit queued"]
+            } else {
+                vec!["tab queue"]
+            },
             fields: Some(lock_value(&self.statusline).clone()),
             branch: lock_value(&self.branch).clone(),
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
-            queued: self.steering.len(),
+            queued: lock_value(&self.queued).len(),
             net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !self.endpoint.offline,
             mcp: self.mcp.as_ref().map(McpClient::server_count),
         };
@@ -2883,11 +2897,66 @@ impl SessionHost {
         Ok(inline.clear())
     }
 
-    /// Returns the footer rows for the current state.
+    /// Returns the footer rows for the current state, then the messages
+    /// waiting for a turn, so those sit directly above the prompt.
     fn status_rows(&self, ui: Option<UiState>) -> Vec<String> {
-        self.status_line_in(usize::from(self.width()), ui)
+        let width = usize::from(self.width());
+        let mut rows: Vec<String> = self
+            .status_line_in(width, ui)
             .lines()
             .map(str::to_owned)
+            .collect();
+        rows.extend(self.lane_rows(width));
+        rows
+    }
+
+    /// Returns true when a steering or queued message can be taken back.
+    fn lanes_pending(&self) -> bool {
+        !lock_value(&self.pending_steer).is_empty() || !lock_value(&self.queued).is_empty()
+    }
+
+    /// Returns one dim row per pending steering message, then one per queued
+    /// message, at most three in all, then how many more remain.
+    fn lane_rows(&self, width: usize) -> Vec<String> {
+        const SHOWN: usize = 3;
+        const CUT: usize = 60;
+        let steering = lock_value(&self.pending_steer).clone();
+        let queued: Vec<String> = lock_value(&self.queued).iter().cloned().collect();
+        let ellipsis = if self.ascii { "..." } else { "\u{2026}" };
+        let preview = |text: &str| {
+            let flat: String = transcript::sanitize(text)
+                .chars()
+                .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                .collect();
+            if flat.chars().count() > CUT {
+                let mut cut: String = flat.chars().take(CUT).collect();
+                cut.push_str(ellipsis);
+                cut
+            } else {
+                flat
+            }
+        };
+        let mut texts: Vec<String> = steering
+            .iter()
+            .map(|text| format!("steering: {}", preview(text)))
+            .chain(queued.iter().enumerate().map(|(index, text)| {
+                format!("queued {}: {}", index.saturating_add(1), preview(text))
+            }))
+            .collect();
+        if texts.len() > SHOWN {
+            let more = texts.len().saturating_sub(SHOWN);
+            texts.truncate(SHOWN);
+            texts.push(format!("and {more} more"));
+        }
+        let theme = self.theme();
+        let dim = theme.sgr(Slot::Dim, self.depth);
+        let reset = rune_term::engine::Style::RESET;
+        texts
+            .iter()
+            .map(|text| {
+                let (fitted, _) = rune_term::width::truncate_to_width(text, width);
+                format!("{dim}{fitted}{reset}")
+            })
             .collect()
     }
 
@@ -4176,6 +4245,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         subagent: config.subagent,
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
+        queued: Mutex::new(std::collections::VecDeque::new()),
+        pending_steer: Mutex::new(Vec::new()),
         events: Arc::new(Mutex::new(Vec::new())),
         goal_judge: std::sync::atomic::AtomicBool::new(false),
         provider_retry: Mutex::new(None),
@@ -5097,7 +5168,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         host.clear_events();
                         host.clear_streaming();
                         host.clear_provider_retry();
-                        close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
+                        close_turn(
+                            &host,
+                            sink,
+                            reader,
+                            &lines,
+                            None,
+                            &steered.unsent,
+                            steered.interrupted || steered.failed,
+                        )?;
                         return Ok(Step::Continue);
                     }
                 };
@@ -5197,6 +5276,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     &lines,
                     activity.as_deref(),
                     &steered.unsent,
+                    steered.interrupted || steered.failed,
                 )?;
                 Ok(Step::Continue)
             }
@@ -5229,7 +5309,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 if let Err(err) = &steered.outcome {
                     lines.push(err.message().to_owned());
                 }
-                close_turn(&host, sink, reader, &lines, None, &steered.unsent)?;
+                close_turn(
+                    &host,
+                    sink,
+                    reader,
+                    &lines,
+                    None,
+                    &steered.unsent,
+                    steered.interrupted || steered.failed,
+                )?;
                 Ok(Step::Continue)
             }
             Input::Memory(note) => {
@@ -5276,18 +5364,30 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         // what was typed rather than waiting for the terminal to decide the
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
-        while let Some(input) = await_submission(
-            &completions,
-            &mut reader,
-            &host,
-            &out,
-            RecordedPrompts {
-                here: &recall,
-                all: &everywhere,
-            },
-            &completion_context,
-            &completion_limits,
-        )? {
+        loop {
+            // A message queued during the last turn starts the next one by
+            // itself. A turn that failed or was interrupted has already put
+            // the queue back in the draft, so nothing is left here then.
+            let next = lock_value(&host.queued).pop_front();
+            let input = if let Some(text) = next {
+                Input::parse(&text)
+            } else {
+                match await_submission(
+                    &completions,
+                    &mut reader,
+                    &host,
+                    &out,
+                    RecordedPrompts {
+                        here: &recall,
+                        all: &everywhere,
+                    },
+                    &completion_context,
+                    &completion_limits,
+                )? {
+                    Some(input) => input,
+                    None => break,
+                }
+            };
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
@@ -5493,12 +5593,7 @@ fn run_accessible<T: Send>(
         .requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    Steered {
-        outcome,
-        diagnostic,
-        applied: Vec::new(),
-        unsent: Vec::new(),
-    }
+    Steered::alone(outcome, diagnostic)
 }
 
 fn collect_accessible_questions(
@@ -5580,12 +5675,7 @@ fn run_steerable<T: Send>(
     if !reader.is_active() {
         // Without a terminal there are no keys to read, so the work runs here
         // and the steering path is simply unused.
-        return Steered {
-            outcome: work(history),
-            diagnostic: None,
-            applied: Vec::new(),
-            unsent: Vec::new(),
-        };
+        return Steered::alone(work(history), None);
     }
 
     // Cleared before the turn rather than after, so a cancel that arrived as
@@ -5598,6 +5688,7 @@ fn run_steerable<T: Send>(
         *typed = (reader.line().to_owned(), reader.column());
     }
     let mut submitted: Vec<String> = Vec::new();
+    let mut lanes: Vec<Lane> = Vec::new();
 
     let (requests, pending) = mpsc::channel();
     if let Ok(mut slot) = host.approval_requests.lock() {
@@ -5649,7 +5740,7 @@ fn run_steerable<T: Send>(
             // a new turn, so a correction reaches the running turn instead
             // of queueing behind it.
             KeyAction::Submit => {
-                let text = reader.line().trim().to_owned();
+                let text = lane_text(reader);
                 reader.clear();
                 gesture.disarm();
                 if text.is_empty() {
@@ -5658,6 +5749,8 @@ fn run_steerable<T: Send>(
                 }
                 let notice = match host.steering.submit(text.clone()) {
                     Ok(()) => {
+                        lock_value(&host.pending_steer).push(text.clone());
+                        lanes.push(Lane::Steer);
                         submitted.push(text);
                         String::from("steering queued for the next boundary")
                     }
@@ -5702,6 +5795,47 @@ fn run_steerable<T: Send>(
                 gesture.disarm();
                 host.cycle_reasoning();
             }
+            // Tab holds the draft as a new turn that starts once this one
+            // ends.
+            KeyAction::Complete => {
+                gesture.disarm();
+                let text = lane_text(reader);
+                if text.is_empty() {
+                    return;
+                }
+                lock_value(&host.queued).push_back(text);
+                lanes.push(Lane::Queue);
+                reader.clear();
+                host.draw_stream_with("", 0);
+            }
+            // The newest message still waiting comes back for editing; a
+            // steering message the turn already took in is skipped.
+            KeyAction::PullQueued => {
+                gesture.disarm();
+                let mut recovered = None;
+                while recovered.is_none() {
+                    let Some(lane) = lanes.pop() else {
+                        break;
+                    };
+                    recovered = match lane {
+                        Lane::Queue => lock_value(&host.queued).pop_back(),
+                        Lane::Steer => host.steering.take_newest().inspect(|_| {
+                            lock_value(&host.pending_steer).pop();
+                            submitted.pop();
+                        }),
+                    };
+                }
+                let Some(text) = recovered else {
+                    return;
+                };
+                let typed = reader.line().to_owned();
+                if typed.trim().is_empty() {
+                    reader.replace(&text);
+                } else {
+                    reader.replace(&format!("{typed}\n\n{text}"));
+                }
+                host.draw_stream_with(reader.line(), reader.column());
+            }
             // The mode is changed only at the idle prompt.
             KeyAction::ModeCycle => {}
             // Anything else is an edit, so a half-finished cancel gesture
@@ -5731,14 +5865,15 @@ fn run_steerable<T: Send>(
         .into_iter()
         .map(|message| message.text)
         .collect();
+    lock_value(&host.pending_steer).clear();
     let applied_count = submitted.len().saturating_sub(unsent.len());
     submitted.truncate(applied_count);
-    Steered {
-        outcome: result,
-        diagnostic,
-        applied: submitted,
-        unsent,
-    }
+    let mut steered = Steered::alone(result, diagnostic);
+    steered.interrupted |= host.cancellation.is_cancelled();
+    steered.failed &= !steered.interrupted;
+    steered.applied = submitted;
+    steered.unsent = unsent;
+    steered
 }
 
 /// Asks for a decision, with the window title saying the user is needed.
@@ -5954,6 +6089,7 @@ fn question_key(
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
+        | KeyAction::PullQueued
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -6028,6 +6164,7 @@ fn approval_key(
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
+        | KeyAction::PullQueued
         | KeyAction::Transcript
         | KeyAction::HistorySearch
         | KeyAction::ExternalEditor => None,
@@ -6142,6 +6279,40 @@ struct Steered<T> {
     applied: Vec<String>,
     /// Corrections typed after the turn's last boundary, which it never saw.
     unsent: Vec<String>,
+    /// Whether the user interrupted the work.
+    interrupted: bool,
+    /// Whether the work ended on an error other than an interrupt.
+    failed: bool,
+}
+
+impl<T> Steered<T> {
+    /// Builds the report of work that took no input while it ran.
+    fn alone(outcome: Result<T>, diagnostic: Option<String>) -> Self {
+        let interrupted = matches!(&outcome, Err(err) if err.code() == ErrorCode::Cancelled);
+        let failed = outcome.is_err() && !interrupted;
+        Self {
+            outcome,
+            diagnostic,
+            applied: Vec::new(),
+            unsent: Vec::new(),
+            interrupted,
+            failed,
+        }
+    }
+}
+
+/// Which lane a message typed during a turn went to, newest last.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    /// Steering for the running turn.
+    Steer,
+    /// A new turn after this one.
+    Queue,
+}
+
+/// Returns the text a draft sends to either lane.
+fn lane_text(reader: &rune_term::input::KeyReader) -> String {
+    reader.line().trim().to_owned()
 }
 
 /// Draws the frame that closes a turn: its settled lines, then the input row.
@@ -6149,6 +6320,8 @@ struct Steered<T> {
 /// The input row shows whatever the reader holds, because a user who typed
 /// during the turn is still typing. A correction the turn ended before taking
 /// is put back on the line rather than dropped, where one more Enter sends it.
+/// Work that was interrupted or failed also returns every queued message, so
+/// nothing starts by itself after a turn the user stopped.
 fn close_turn(
     host: &SessionHost,
     sink: &mut LockedSink,
@@ -6156,19 +6329,25 @@ fn close_turn(
     lines: &[String],
     activity: Option<&str>,
     unsent: &[String],
+    ended_early: bool,
 ) -> Result<()> {
     host.refresh_branch();
     let mut notice = activity.map(str::to_owned);
-    if !unsent.is_empty() {
-        let mut restored = unsent.join(" ");
+    let mut returned: Vec<String> = unsent.to_vec();
+    if ended_early {
+        returned.extend(lock_value(&host.queued).drain(..));
+    }
+    if !returned.is_empty() {
+        let count = returned.len();
         if !reader.line().trim().is_empty() {
-            restored.push(' ');
-            restored.push_str(reader.line());
+            returned.push(reader.line().to_owned());
         }
-        reader.replace(&restored);
-        notice = Some(String::from(
-            "the turn ended before this was sent; press Enter to send it",
-        ));
+        reader.replace(&returned.join("\n\n"));
+        notice = Some(if ended_early {
+            format!("{count} unsent message(s) returned to the draft")
+        } else {
+            String::from("the turn ended before this was sent; press Enter to send it")
+        });
     }
     let marker = &prompt_marker(host);
     sync_layout(reader, host, marker);
@@ -6719,7 +6898,10 @@ fn idle_key(
     recall: &[String],
 ) -> Idle {
     match key {
-        KeyAction::Suspend | KeyAction::CycleReasoning | KeyAction::ModeCycle => Idle::Stay,
+        KeyAction::Suspend
+        | KeyAction::CycleReasoning
+        | KeyAction::ModeCycle
+        | KeyAction::PullQueued => Idle::Stay,
         KeyAction::Submit => {
             // Enter takes the highlighted completion when the list is open
             // and the command is not yet complete, so a half-typed name is
@@ -6905,7 +7087,10 @@ fn confirm_choice(
             }
             match answer.read_key() {
                 KeyAction::Suspend => suspend_session(host, out)?,
-                KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
+                KeyAction::Ignored
+                | KeyAction::CycleReasoning
+                | KeyAction::ModeCycle
+                | KeyAction::PullQueued => {
                     let typed = answer.line().to_owned();
                     answer.clear();
                     match typed.as_str() {
@@ -6989,7 +7174,10 @@ fn run_picker(
                 view_transcript(reader, host)?;
             }
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
+            KeyAction::Ignored
+            | KeyAction::CycleReasoning
+            | KeyAction::ModeCycle
+            | KeyAction::PullQueued => {
                 picker.set_query(reader.line());
             }
         }
@@ -7052,7 +7240,10 @@ fn search_prompt_history(
                 KeyAction::Down => {
                     picker.down();
                 }
-                KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
+                KeyAction::Ignored
+                | KeyAction::CycleReasoning
+                | KeyAction::ModeCycle
+                | KeyAction::PullQueued => {
                     picker.set_query(query.line());
                 }
                 KeyAction::HistorySearch => {
@@ -8872,7 +9063,10 @@ fn choose_theme(
             }
             KeyAction::Transcript => view_transcript(reader, host)?,
             KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
-            KeyAction::Ignored | KeyAction::CycleReasoning | KeyAction::ModeCycle => {
+            KeyAction::Ignored
+            | KeyAction::CycleReasoning
+            | KeyAction::ModeCycle
+            | KeyAction::PullQueued => {
                 picker.set_query(reader.line());
                 preview(&picker);
             }
@@ -11922,7 +12116,7 @@ mod tests {
             stream: Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))),
         };
         let mut reader = rune_term::input::KeyReader::line_mode();
-        close_turn(&host, &mut locked, &mut reader, &[], None, &[]).expect("close turn");
+        close_turn(&host, &mut locked, &mut reader, &[], None, &[], false).expect("close turn");
         let output = String::from_utf8(sink.lock().expect("lock").clone()).expect("utf8");
         let output = transcript::sanitize(&output)
             .replace(['\r', '\n'], " ")
@@ -12204,6 +12398,7 @@ mod tests {
             &["answer".to_owned()],
             None,
             &[],
+            false,
         )
         .expect("closed");
         check(&mut grid);
@@ -12247,6 +12442,7 @@ mod tests {
             &["answer".to_owned()],
             None,
             &[],
+            false,
         )
         .expect("closed");
         check(&mut grid, 2);
@@ -13120,7 +13316,7 @@ mod tests {
         host.clear_events();
         host.clear_streaming();
         let mut sink = LockedSink { stream: out };
-        close_turn(&host, &mut sink, &mut reader, &lines, None, &[]).expect("closed");
+        close_turn(&host, &mut sink, &mut reader, &lines, None, &[], false).expect("closed");
         // A subsequent worker and frame must still be usable, and redraws must
         // not settle the diagnostic a second time.
         let (_, diagnostic) = run_on_worker::<turn::TurnOutcome, _, _>(
@@ -13137,6 +13333,7 @@ mod tests {
             &["next turn answer".to_owned()],
             None,
             &[],
+            false,
         )
         .expect("next turn closed");
         println!(
@@ -13313,6 +13510,104 @@ mod tests {
             status < input,
             "the status line was drawn below the input: {text:?}"
         );
+    }
+
+    fn plain_rows(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|row| transcript::sanitize(row)).collect()
+    }
+
+    #[test]
+    fn lane_rows_cap_at_three_with_a_remainder() {
+        let host = test_host();
+        assert!(host.lane_rows(100).is_empty());
+        lock_value(&host.pending_steer).push("a".to_owned());
+        lock_value(&host.queued).extend(["b".to_owned(), "c".to_owned(), "d".to_owned()]);
+        assert_eq!(
+            plain_rows(&host.lane_rows(100)),
+            ["steering: a", "queued 1: b", "queued 2: c", "and 1 more"]
+        );
+    }
+
+    #[test]
+    fn lane_rows_cut_at_sixty_characters() {
+        let mut host = test_host();
+        lock_value(&host.queued).extend(["x".repeat(70), "one\ntwo".to_owned()]);
+        let long = format!("queued 1: {}\u{2026}", "x".repeat(60));
+        assert_eq!(
+            plain_rows(&host.lane_rows(100)),
+            [long, "queued 2: one two".to_owned()]
+        );
+        host.ascii = true;
+        let rows = plain_rows(&host.lane_rows(100));
+        assert_eq!(rows[0], format!("queued 1: {}...", "x".repeat(60)));
+        assert_eq!(
+            plain_rows(&host.lane_rows(12)),
+            ["queued 1: xx", "queued 2: on"]
+        );
+    }
+
+    #[test]
+    fn the_running_hints_offer_alt_up_only_while_something_waits() {
+        let host = test_host();
+        let hints = transcript::sanitize(&host.status_line_in(200, Some(UiState::Running)));
+        assert!(hints.contains("enter steer   tab queue"), "{hints}");
+        assert!(!hints.contains("alt-up edit queued"), "{hints}");
+        lock_value(&host.queued).push_back("later".to_owned());
+        let hints = transcript::sanitize(&host.status_line_in(200, Some(UiState::Running)));
+        assert!(hints.contains("tab queue   alt-up edit queued"), "{hints}");
+        assert!(hints.contains("queued 1"), "{hints}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_returns_steering_and_the_queue_to_the_draft() {
+        let host = test_host();
+        lock_value(&host.queued).extend(["x".to_owned(), "y".to_owned()]);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LockedSink {
+            stream: Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))),
+        };
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        reader.replace("typing");
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &[],
+            None,
+            &["steer".to_owned()],
+            true,
+        )
+        .expect("closed");
+        assert_eq!(reader.line(), "steer\n\nx\n\ny\n\ntyping");
+        assert!(lock_value(&host.queued).is_empty());
+        let shown = String::from_utf8_lossy(&bytes.lock().expect("bytes")).into_owned();
+        assert!(
+            shown.contains("3 unsent message(s) returned to the draft"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_keeps_the_queue_and_restores_steering_with_blank_lines() {
+        let host = test_host();
+        lock_value(&host.queued).push_back("next".to_owned());
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LockedSink {
+            stream: Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes)))),
+        };
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        close_turn(
+            &host,
+            &mut sink,
+            &mut reader,
+            &[],
+            None,
+            &["one".to_owned(), "two".to_owned()],
+            false,
+        )
+        .expect("closed");
+        assert_eq!(reader.line(), "one\n\ntwo");
+        assert_eq!(lock_value(&host.queued).len(), 1);
     }
 
     #[test]
@@ -20095,6 +20390,8 @@ mod tests {
             subagent: None,
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
+            queued: Mutex::new(std::collections::VecDeque::new()),
+            pending_steer: Mutex::new(Vec::new()),
             events: Arc::new(Mutex::new(Vec::new())),
             goal_judge: std::sync::atomic::AtomicBool::new(false),
             provider_retry: Mutex::new(None),
