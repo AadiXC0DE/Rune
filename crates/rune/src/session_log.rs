@@ -64,8 +64,20 @@ pub struct Summary {
     pub workspace: Option<String>,
     /// Parent session, when this session is a child of another.
     pub parent: Option<String>,
+    /// Model most recently selected in the log, when one was recorded.
+    pub model: Option<String>,
+    /// Text of the first user message, when there is one.
+    pub first_prompt: Option<String>,
     /// Directory holding the log.
     pub dir: Utf8PathBuf,
+}
+
+impl Summary {
+    /// Returns the last activity in milliseconds since the epoch.
+    #[must_use]
+    pub const fn updated_at_ms(&self) -> u64 {
+        self.updated_at_ms
+    }
 }
 
 /// An open session log.
@@ -550,7 +562,7 @@ pub fn page(
     paginate(list_scoped(paths, scope), limit, cursor)
 }
 
-/// Searches titles and recorded user messages by a case-insensitive literal fragment.
+/// Searches titles and recorded messages by a case-insensitive literal fragment.
 ///
 /// Workspace and child-session exclusions are the same as for an ordinary
 /// listing. Matching precedes the listing cap and pagination.
@@ -635,8 +647,8 @@ fn list_matching(paths: &Paths, scope: Option<&Utf8Path>, query: Option<&str>) -
                 .as_deref()
                 .is_some_and(|title| title.to_lowercase().contains(query))
             && !state.events.iter().any(|frame| {
-                matches!(&frame.event, SessionEvent::UserMessage { text }
-                    if text.to_lowercase().contains(query))
+                message_text(&frame.event)
+                    .is_some_and(|(_, text)| text.to_lowercase().contains(query))
             })
         {
             continue;
@@ -1311,6 +1323,18 @@ fn flush(
 
 /// Projects a stored session into a listing row.
 fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
+    let model = state
+        .events
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.event {
+            SessionEvent::ModelSet { model, .. } => Some(model.clone()),
+            _ => None,
+        });
+    let first_prompt = state.events.iter().find_map(|frame| match &frame.event {
+        SessionEvent::UserMessage { text } => Some(text.clone()),
+        _ => None,
+    });
     Summary {
         id: state.id.to_string(),
         turns: state.turns,
@@ -1323,8 +1347,137 @@ fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
         title: state.title.clone(),
         workspace: state.workspace.clone(),
         parent: state.parent.clone(),
+        model,
+        first_prompt,
         dir,
     }
+}
+
+/// Returns the role and text of a user or assistant message.
+fn message_text(event: &SessionEvent) -> Option<(&'static str, &str)> {
+    match event {
+        SessionEvent::UserMessage { text } => Some(("user", text)),
+        SessionEvent::AssistantMessage { text, .. } => Some(("assistant", text)),
+        _ => None,
+    }
+}
+
+/// Most search hits printed in one command.
+pub const HIT_LIMIT: usize = 50;
+
+/// Longest line a search hit shows, in characters.
+pub const HIT_CHARS: usize = 100;
+
+/// One line of a stored session that matched a search.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Hit {
+    /// Session identifier.
+    pub id: String,
+    /// Day of the session's last activity, as `YYYY-MM-DD`.
+    pub date: String,
+    /// `user`, `assistant`, or `title` when only the title matched.
+    pub role: &'static str,
+    /// The matching line, cut to [`HIT_CHARS`].
+    pub line: String,
+}
+
+/// Finds the matching message lines of the listed sessions, newest session
+/// first and in log order within a session.
+///
+/// Returns at most [`HIT_LIMIT`] hits and whether more were found.
+#[must_use]
+pub fn search_hits(rows: &[Summary], query: &str) -> (Vec<Hit>, bool) {
+    let query = query.to_lowercase();
+    let mut hits = Vec::new();
+    for row in rows {
+        let Ok(state) = load_read_only(&row.dir) else {
+            continue;
+        };
+        let date = date_of(row.updated_at_ms).unwrap_or_else(|| "unknown".to_owned());
+        let before = hits.len();
+        for frame in &state.events {
+            let Some((role, text)) = message_text(&frame.event) else {
+                continue;
+            };
+            for line in matching_lines(text, &query) {
+                hits.push(Hit {
+                    id: row.id.clone(),
+                    date: date.clone(),
+                    role,
+                    line: cut(line.trim(), HIT_CHARS),
+                });
+            }
+        }
+        if hits.len() == before
+            && let Some(title) = &state.title
+            && title.to_lowercase().contains(&query)
+        {
+            hits.push(Hit {
+                id: row.id.clone(),
+                date: date.clone(),
+                role: "title",
+                line: cut(title, HIT_CHARS),
+            });
+        }
+        if hits.len() > HIT_LIMIT {
+            break;
+        }
+    }
+    let more = hits.len() > HIT_LIMIT;
+    hits.truncate(HIT_LIMIT);
+    (hits, more)
+}
+
+/// Returns the lines of `text` containing `query`, already lowercased.
+///
+/// A query that spans a line break matches no single line, so the line where
+/// the match starts stands for it.
+fn matching_lines<'a>(text: &'a str, query: &str) -> Vec<&'a str> {
+    let lowered = text.to_lowercase();
+    let lines: Vec<&str> = text.lines().collect();
+    let hits: Vec<&str> = lowered
+        .lines()
+        .zip(&lines)
+        .filter(|(folded, _)| folded.contains(query))
+        .map(|(_, line)| *line)
+        .collect();
+    if !hits.is_empty() {
+        return hits;
+    }
+    lowered
+        .find(query)
+        .and_then(|at| lines.get(lowered[..at].matches('\n').count()).copied())
+        .into_iter()
+        .collect()
+}
+
+/// Cuts `text` to at most `limit` characters.
+fn cut(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+/// Formats milliseconds since the epoch as a `YYYY-MM-DD` date.
+fn date_of(millis: u64) -> Option<String> {
+    let millis = i64::try_from(millis).ok()?;
+    jiff::Timestamp::from_millisecond(millis)
+        .ok()
+        .map(|at| at.strftime("%Y-%m-%d").to_string())
+}
+
+/// Renders search hits for a terminal, one line each.
+#[must_use]
+pub fn render_hits(hits: &[Hit], more: bool) -> String {
+    if hits.is_empty() {
+        return "no sessions stored".to_owned();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        let _ = writeln!(out, "{}  {}  {}", hit.id, hit.date, hit.line);
+    }
+    if more {
+        out.push_str("more matches: narrow the search");
+    }
+    out.trim_end().to_owned()
 }
 
 /// Renders a listing for a terminal.
@@ -2378,6 +2531,8 @@ mod tests {
                 title: Some("parser work".to_owned()),
                 workspace: Some("/tmp/work".to_owned()),
                 parent: None,
+                model: None,
+                first_prompt: None,
                 dir: Utf8PathBuf::from("/tmp/a"),
             },
             Summary {
@@ -2389,6 +2544,8 @@ mod tests {
                 title: None,
                 workspace: None,
                 parent: None,
+                model: None,
+                first_prompt: None,
                 dir: Utf8PathBuf::from("/tmp/b"),
             },
         ];
@@ -2768,6 +2925,48 @@ mod tests {
     fn an_empty_prompt_has_no_title_to_derive() {
         assert_eq!(derive_title(""), "untitled");
         assert_eq!(derive_title("\n\n"), "untitled");
+    }
+
+    #[test]
+    fn summaries_carry_model_and_first_prompt() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+
+        let mut recorder = Recorder::create(&paths, &id("sessionmmmmm")).expect("created");
+        for model in ["first-model", "second-model"] {
+            recorder
+                .store
+                .append(SessionEvent::ModelSet {
+                    model: model.to_owned(),
+                    effort: rune_core::config::Effort::Max,
+                })
+                .expect("model");
+        }
+        recorder
+            .user_message("opening prompt\nsecond line")
+            .expect("wrote");
+        recorder.turn(&outcome("answer")).expect("wrote");
+        recorder.user_message("later prompt").expect("wrote");
+        drop(recorder);
+        drop(Recorder::create(&paths, &id("sessionnnnnn")).expect("created"));
+
+        let rows = list_scoped(&paths, None);
+        let full = rows
+            .iter()
+            .find(|row| row.id == "sessionmmmmm")
+            .expect("row");
+        assert_eq!(full.model.as_deref(), Some("second-model"));
+        assert_eq!(
+            full.first_prompt.as_deref(),
+            Some("opening prompt\nsecond line")
+        );
+        let empty = rows
+            .iter()
+            .find(|row| row.id == "sessionnnnnn")
+            .expect("row");
+        assert_eq!(empty.model, None);
+        assert_eq!(empty.first_prompt, None);
     }
 
     #[test]

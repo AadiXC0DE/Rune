@@ -123,6 +123,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "name this session",
     },
     Builtin {
+        name: "resume",
+        arguments: "[id]",
+        summary: "switch to a saved session",
+    },
+    Builtin {
         name: "goal",
         arguments: "[--budget <tokens>] [objective]",
         summary: "set or show the active objective and optional token budget",

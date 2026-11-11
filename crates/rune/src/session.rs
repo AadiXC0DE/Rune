@@ -3227,6 +3227,118 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             ));
                         }
                     }
+                    Handled::Resume(requested) => {
+                        let chosen = match requested {
+                            Some(id) => Some(id),
+                            None if !reader.is_active() => {
+                                note(RESUME_USAGE.to_owned());
+                                None
+                            }
+                            None => {
+                                let stream = Arc::clone(&sink.stream);
+                                let mut draw = |rows: &[String], caret: (u16, u16)| -> Result<()> {
+                                    let painted = host.paint_with_menu(
+                                        &[],
+                                        None,
+                                        rows,
+                                        &[],
+                                        &[],
+                                        caret,
+                                        false,
+                                    )?;
+                                    if !painted.is_empty() {
+                                        let mut out = stream.lock().map_err(|_| {
+                                            RuneError::new(
+                                                ErrorCode::Internal,
+                                                "the output lock was poisoned",
+                                            )
+                                        })?;
+                                        out.write_all(&painted)?;
+                                        out.flush()?;
+                                    }
+                                    Ok(())
+                                };
+                                match crate::resume_picker::pick_styled(
+                                    reader,
+                                    &mut draw,
+                                    &config.paths,
+                                    &config.workspace,
+                                    &host.theme(),
+                                    host.depth,
+                                ) {
+                                    Ok(chosen) => chosen,
+                                    Err(err) => {
+                                        note(error_note(&err));
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        let previous = host.session_id_name();
+                        match chosen {
+                            None => {}
+                            Some(id) if id == previous => note(format!("already in session {id}")),
+                            Some(id) => match open_saved(&config.paths, &id) {
+                                Err(err) => note(err),
+                                Ok((key, loaded, mut resumed, state)) => {
+                                    *recorder
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        loaded;
+                                    resumed.freeze_pins();
+                                    let results = attach_results(&mut resumed, &config.paths, &key);
+                                    history = resumed;
+                                    let entries = resumed_entries(&history, &state);
+                                    host.transcript_history_len
+                                        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
+                                    host.transcript
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .clone_from(&entries);
+                                    *host
+                                        .totals
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Totals::from_saved(&state);
+                                    host.set_session_id(key.as_str());
+                                    // A resumed session keeps the title it was given.
+                                    is_first_prompt = false;
+                                    // Approvals were given for the conversation left behind.
+                                    if let Ok(mut grants) = host.grants.lock() {
+                                        grants.clear();
+                                    }
+                                    let (used, source) = recorder
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .resumed_context();
+                                    host.forget_context();
+                                    if source.is_some() {
+                                        host.context_used
+                                            .store(used, std::sync::atomic::Ordering::Relaxed);
+                                        *host
+                                            .context_source
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            source;
+                                    } else {
+                                        host.estimate_context(&history)?;
+                                    }
+                                    // Replayed only where the opening of a resumed
+                                    // session would replay it.
+                                    if reader.is_active() || host.accessible {
+                                        flush_lines(&host, sink, &render_entries(&entries, &host))?;
+                                    }
+                                    if let Some(notice) = results {
+                                        note(format!("{notice}\n"));
+                                    }
+                                    note(format!(
+                                        "resumed session {key} ({}); /resume {previous} returns",
+                                        state.title.as_deref().unwrap_or("untitled")
+                                    ));
+                                }
+                            },
+                        }
+                    }
                     Handled::Rename(title) => {
                         // The input loop and stream observer share one recorder;
                         // its lock serializes every write to the session log.
@@ -3729,6 +3841,7 @@ fn ends_warming(handled: &Handled) -> bool {
         handled,
         Handled::Exit
             | Handled::NewSession
+            | Handled::Resume(_)
             | Handled::SetModel(_)
             | Handled::PickModel
             | Handled::Compact
@@ -6882,6 +6995,8 @@ enum Handled {
     NewSession,
     /// Give the session a new title.
     Rename(String),
+    /// Switch to a saved session, chosen in a picker when no id is given.
+    Resume(Option<String>),
     /// Set an explicit objective, or inspect the current one without changes.
     Goal(Option<GoalRequest>),
 }
@@ -7222,6 +7337,43 @@ struct SessionInfo<'a> {
     spend_limit: Option<u64>,
 }
 
+/// Shown when `/resume` has no terminal to draw a picker on.
+const RESUME_USAGE: &str =
+    "a session picker needs a terminal; use /resume <id> and run `rune sessions` to list ids";
+
+/// Formats an error as a note: its message, then its hint.
+fn error_note(err: &RuneError) -> String {
+    match err.hint() {
+        Some(hint) => format!("{}\n{hint}", err.message()),
+        None => err.message().to_owned(),
+    }
+}
+
+/// Reads a saved session for `/resume`, naming an unknown id plainly.
+fn open_saved(
+    paths: &Paths,
+    raw: &str,
+) -> std::result::Result<
+    (
+        SessionId,
+        Recorder,
+        History,
+        rune_session::store::SessionState,
+    ),
+    String,
+> {
+    let unknown = || format!("no session `{raw}`");
+    let id: SessionId = raw.parse().map_err(|_| unknown())?;
+    if !paths.session_dir(&id).exists() {
+        return Err(unknown());
+    }
+    let (recorder, history) = session_log::load(paths, &id)
+        .map_err(|err| format!("could not resume: {}", error_note(&err)))?;
+    let state = session_log::inspect(paths, &id)
+        .map_err(|err| format!("could not resume: {}", error_note(&err)))?;
+    Ok((id, recorder, history, state))
+}
+
 /// What the input loop does after handling one line.
 enum Step {
     /// Carry on reading input.
@@ -7302,6 +7454,10 @@ fn handle_command<W: std::io::Write>(
         "new" => Ok(Handled::NewSession),
         "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
         "undo" => Ok(Handled::Undo),
+        "resume" => {
+            let id = arguments.trim();
+            Ok(Handled::Resume((!id.is_empty()).then(|| id.to_owned())))
+        }
         "rename" => {
             let title = arguments.trim();
             if title.is_empty() {
@@ -11240,6 +11396,7 @@ mod tests {
         for handled in [
             Handled::Exit,
             Handled::NewSession,
+            Handled::Resume(None),
             Handled::SetModel("other".to_owned()),
             Handled::PickModel,
             Handled::Compact,
@@ -11892,6 +12049,49 @@ mod tests {
         assert_eq!(action, Handled::Continue);
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/rename <title>"), "{text}");
+    }
+
+    #[test]
+    fn resuming_takes_an_optional_session_id() {
+        for (arguments, expected) in [
+            ("", Handled::Resume(None)),
+            ("  ", Handled::Resume(None)),
+            (
+                " AbCdEf123456 ",
+                Handled::Resume(Some("AbCdEf123456".to_owned())),
+            ),
+        ] {
+            let mut output = Vec::new();
+            let action = handle_command(
+                "resume",
+                arguments,
+                &empty_commands(),
+                None,
+                Utf8Path::new("/w"),
+                &test_info(),
+                &mut output,
+            )
+            .expect("handled");
+            assert_eq!(action, expected, "{arguments:?}");
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_unknown_session_is_named_and_not_opened() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = Paths {
+            state_root: root.join("state"),
+            config_root: root.join("config"),
+            data_root: root.join("data"),
+        };
+        for raw in ["AbCdEf123456", "not an id"] {
+            let Err(message) = open_saved(&paths, raw) else {
+                panic!("{raw} opened");
+            };
+            assert_eq!(message, format!("no session `{raw}`"));
+        }
     }
 
     #[test]

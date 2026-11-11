@@ -35,6 +35,7 @@ mod pre_tool_hook;
 mod prompt_history;
 mod provider_setup;
 mod reference;
+mod resume_picker;
 mod sandbox;
 mod session;
 mod session_log;
@@ -673,6 +674,12 @@ fn run_interactive(
     }
 
     let resume = match &launch.resume {
+        Some(ResumeTarget::Picker) if picker_terminal() && !launch.accessible => {
+            match pick_session(paths, workspace)? {
+                Some(id) => Some(id.parse()?),
+                None => return Ok(ExitCode::from(EXIT_OK)),
+            }
+        }
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
@@ -682,6 +689,49 @@ fn run_interactive(
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, rune_term::inline::TerminalOutput)?;
     Ok(ExitCode::from(code))
+}
+
+/// Returns whether both ends of the session are a terminal, so a picker can
+/// read keys and draw.
+fn picker_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Lets the user choose a saved session before the session starts.
+///
+/// The key reader and the renderer are dropped before returning, so the
+/// session that follows starts on a restored terminal.
+fn pick_session(paths: &Paths, workspace: &Utf8Path) -> Result<Option<String>> {
+    use std::io::Write as _;
+
+    let mut reader = rune_term::input::KeyReader::new();
+    let (cols, rows) = rune_term::shell::terminal_size().unwrap_or((80, 24));
+    let mut inline = rune_term::inline::Inline::new(cols);
+    inline.set_max_rows(rows);
+    let mut out = rune_term::inline::TerminalOutput;
+    let chosen = {
+        let mut draw = |lines: &[String], caret: (u16, u16)| -> Result<()> {
+            if let Some((cols, rows)) = rune_term::shell::terminal_size() {
+                inline.set_width(cols);
+                inline.set_max_rows(rows);
+            }
+            let bytes = inline.frame(&rune_term::inline::Frame {
+                prompt: lines,
+                caret,
+                ..rune_term::inline::Frame::default()
+            });
+            out.write_all(&bytes)?;
+            out.flush()?;
+            Ok(())
+        };
+        resume_picker::pick(&mut reader, &mut draw, paths, workspace)
+    };
+    let cleared = inline.clear();
+    let _ = out.write_all(&cleared);
+    let _ = out.flush();
+    drop(reader);
+    chosen
 }
 
 /// Returns whether a person is waiting at the terminal.
@@ -1594,10 +1644,12 @@ fn run_sessions(
     // Without `--all` the listing is scoped to this workspace, so `last` means
     // the latest session here rather than the latest anywhere.
     let scope = (!launch.has_flag("--all")).then_some(workspace);
-    let page = match launch.flag("--search") {
+    let query = launch.flag("--search");
+    let page = match query {
         Some(query) => session_log::search_page(paths, scope, query, limit, cursor)?,
         None => session_log::page(paths, scope, limit, cursor)?,
     };
+    let hits = query.map(|query| session_log::search_hits(&page.rows, query));
     let rows = &page.rows;
     let entries: Vec<serde_json::Value> = rows
         .iter()
@@ -1612,9 +1664,27 @@ fn run_sessions(
         })
         .collect();
     if output.json {
-        let value = serde_json::json!({ "sessions": entries, "next": page.next });
+        let mut value = serde_json::json!({ "sessions": entries, "next": page.next });
+        if let Some((hits, _)) = &hits {
+            value["hits"] = hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "id": hit.id,
+                        "date": hit.date,
+                        "role": hit.role,
+                        "line": hit.line,
+                    })
+                })
+                .collect();
+        }
         let rendered = serde_json::to_string_pretty(&value)?;
         println!("{rendered}");
+    } else if let Some((hits, more)) = &hits {
+        println!("{}", session_log::render_hits(hits, *more));
+        if let Some(next) = &page.next {
+            println!("\nmore sessions: run again with --cursor {next}");
+        }
     } else {
         println!("{}", session_log::render_listing(rows));
         if let Some(next) = &page.next {
