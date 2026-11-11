@@ -706,7 +706,7 @@ mod tests {
         // only it, on the next row.
         let lines = wrap("hello\u{1b}[31m world foo", 11);
         assert_eq!(lines[0], "hello\u{1b}[31m\u{1b}[0m");
-        assert_eq!(lines[1], "\u{1b}[38;5;1mworld foo\u{1b}[0m");
+        assert_eq!(lines[1], "\u{1b}[31mworld foo\u{1b}[0m");
 
         // A style that spans the break reopens unchanged.
         let lines = wrap("\u{1b}[1mhello world foo\u{1b}[0m", 11);
