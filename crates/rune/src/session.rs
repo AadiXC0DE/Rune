@@ -124,6 +124,9 @@ struct StreamingText {
     /// Blank rows at the end of what was printed, held back until more of
     /// the answer follows them, as a finished answer drops its trailing ones.
     held_blanks: usize,
+    /// Whether the open table outgrew the screen and is printed row by row,
+    /// unaligned.
+    raw_table: bool,
 }
 
 impl StreamingText {
@@ -134,7 +137,49 @@ impl StreamingText {
         self.sealer.reset();
         self.committed = 0;
         self.held_blanks = 0;
+        self.raw_table = false;
     }
+}
+
+/// Rows of an open table held back so it can still be aligned.
+const TABLE_HOLD_ROWS: usize = 40;
+
+/// Returns the byte offset of the space to split an over-tall unfinished line
+/// at: the last one whose text before it fits `rows - 1` rows of `width` and
+/// leaves no code span, emphasis or link open.
+fn split_point(line: &str, rows: usize, width: usize) -> Option<usize> {
+    let limit = rows.saturating_sub(1).saturating_mul(width);
+    let (mut ticks, mut stars, mut unders) = (0_usize, 0_usize, 0_usize);
+    let mut link = false;
+    let mut used = 0_usize;
+    let mut from = 0;
+    let mut best = None;
+    for (at, ch) in line.char_indices() {
+        if ch != ' ' {
+            continue;
+        }
+        let piece = &line[from..at];
+        used = used.saturating_add(rune_term::width::str_width(piece));
+        ticks = ticks.saturating_add(piece.matches('`').count());
+        stars = stars.saturating_add(piece.matches("**").count());
+        unders = unders.saturating_add(piece.matches("__").count());
+        for ch in piece.chars() {
+            match ch {
+                '[' => link = true,
+                ')' => link = false,
+                _ => {}
+            }
+        }
+        if used > limit {
+            break;
+        }
+        if at > 0 && ticks % 2 == 0 && stars % 2 == 0 && unders % 2 == 0 && !link {
+            best = Some(at);
+        }
+        used = used.saturating_add(1);
+        from = at.saturating_add(1);
+    }
+    best
 }
 
 /// Trims committed answer rows as a finished answer's rows are trimmed.
@@ -2570,10 +2615,11 @@ impl SessionHost {
             .store(rows, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut inline) = self.inline.lock() {
             inline.set_width(cols);
-            // One row of slack, so a region that fills the screen still has
+            // Two rows of slack: a region that fills the screen still has
             // somewhere to move the caret and never writes into the terminal's
-            // last row, which is what makes it scroll.
-            inline.set_max_rows(rows.saturating_sub(1));
+            // last row, which is what makes it scroll, and the rows above it
+            // keep showing what reached scrollback last.
+            inline.set_max_rows(rows.saturating_sub(2));
         }
     }
 
@@ -2641,6 +2687,7 @@ impl SessionHost {
         }
         self.refresh_size();
         let footer_rows = self.status_rows(ui);
+        let overflow_style = self.theme().sgr(Slot::Dim, self.depth);
         let mut inline = self
             .inline
             .lock()
@@ -2653,6 +2700,7 @@ impl SessionHost {
             prompt,
             menu,
             caret,
+            overflow_style: &overflow_style,
         };
         let painted = if paced {
             inline.frame_if_changed(&frame)
@@ -2746,7 +2794,7 @@ impl SessionHost {
     fn menu_room(&self) -> usize {
         self.refresh_size();
         usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed))
-            .saturating_sub(1)
+            .saturating_sub(2)
             .saturating_sub(self.status_rows(None).len())
             .saturating_sub(1)
     }
@@ -3075,11 +3123,17 @@ impl SessionHost {
 
     /// Takes the answer rows that can no longer change, once a delta was
     /// appended. Empty in accessible mode, which prints an answer whole.
+    ///
+    /// An open block taller than half the screen is printed through its last
+    /// complete line, so the live region never has to hold it whole.
     fn sealed_answer_rows(&self, streaming: &mut StreamingText) -> Vec<String> {
+        use transcript::Block;
         if self.accessible {
             return Vec::new();
         }
         let width = usize::from(self.width()).saturating_sub(2).max(1);
+        let ascii = self.ascii;
+        let half = usize::from(self.height.load(std::sync::atomic::Ordering::Relaxed)) / 2;
         let markdown = self.markdown_style();
         let StreamingText {
             answer,
@@ -3087,25 +3141,69 @@ impl SessionHost {
             sealer,
             committed,
             held_blanks,
+            raw_table,
             ..
         } = streaming;
         let sealed = sealer.advance(answer);
-        if sealed <= *committed {
-            return Vec::new();
-        }
         answer_rows.set_markdown(&markdown);
-        let _ = answer_rows.rows_with_ascii(answer, width, self.ascii);
-        let in_code = answer_rows.base_in_code();
-        let mut rows = answer_rows.take_through(answer, sealed);
-        // A table is aligned once all its rows exist, as in a finished answer.
-        let range = &answer[*committed..sealed];
-        let aligned = rune_term::markdown::align_tables(range, self.ascii);
-        if !in_code && aligned != range {
-            let aligned = aligned.strip_suffix('\n').unwrap_or(&aligned);
-            rows = transcript::AssistantRows::with_markdown(markdown)
-                .rows_with_ascii(aligned, width, self.ascii);
+        let open_rows = |rows: &mut transcript::AssistantRows, answer: &str| {
+            rows.rows_with_ascii(answer, width, ascii).len()
+        };
+        let mut rows = Vec::new();
+        if sealed > *committed {
+            let _ = open_rows(answer_rows, answer);
+            let in_code = answer_rows.base_in_code();
+            rows = answer_rows.take_through(answer, sealed);
+            // A table is aligned once all its rows exist, as in a finished answer.
+            let range = &answer[*committed..sealed];
+            let aligned = rune_term::markdown::align_tables(range, ascii);
+            if !in_code && !*raw_table && aligned != range {
+                let aligned = aligned.strip_suffix('\n').unwrap_or(&aligned);
+                rows = transcript::AssistantRows::with_markdown(markdown)
+                    .rows_with_ascii(aligned, width, ascii);
+            }
+            *committed = sealed;
         }
-        *committed = sealed;
+        let line_start = sealer.line_start();
+        // An unfinished line after a finished block starts a paragraph, unless
+        // it may still become a fence or a table row.
+        let opening = answer[line_start..].trim_start_matches(' ');
+        let block = match sealer.block() {
+            Block::None if !opening.is_empty() && !opening.starts_with(['|', '`', '~']) => {
+                Block::Paragraph
+            }
+            block => block,
+        };
+        if block != Block::Table {
+            *raw_table = false;
+        }
+        let through_line = match block {
+            Block::None => false,
+            Block::Table => {
+                *raw_table
+                    || (sealer.open_table_rows() > TABLE_HOLD_ROWS
+                        && open_rows(answer_rows, answer) > half)
+            }
+            Block::Code | Block::Paragraph | Block::List | Block::Quote => {
+                open_rows(answer_rows, answer) > half
+            }
+        };
+        if through_line && line_start > *committed {
+            rows.extend(answer_rows.take_through(answer, line_start));
+            *committed = line_start;
+            *raw_table = block == Block::Table;
+        }
+        if through_line && matches!(block, Block::Paragraph | Block::List | Block::Quote) {
+            let line_rows = open_rows(answer_rows, answer);
+            if line_rows > half
+                && let Some(at) = split_point(&answer[*committed..], line_rows, width)
+            {
+                // The space at the split is dropped, as a wrap drops it.
+                let end = committed.saturating_add(at).saturating_add(1);
+                rows.extend(answer_rows.take_through(answer, end));
+                *committed = end;
+            }
+        }
         answer_chunk(rows, held_blanks)
     }
 
@@ -3123,9 +3221,10 @@ impl SessionHost {
             answer_rows,
             committed,
             held_blanks,
+            raw_table,
             ..
         } = &mut *streaming;
-        let rows = if answer_rows.base_in_code() {
+        let rows = if answer_rows.base_in_code() || *raw_table {
             answer_rows.set_markdown(&markdown);
             answer_rows.rows_with_ascii(answer, width, self.ascii)
         } else {
@@ -12098,6 +12197,115 @@ mod tests {
         stream(&host, "unsealed");
         host.emit(Event::StepRestarted { step: 1 });
         assert!(!written(&sink).contains("restarted"));
+    }
+
+    /// Everything written, replayed into a screen tall enough never to scroll.
+    fn tall_screen(sink: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+        let mut grid = rune_term::Grid::new(80, 400).expect("grid");
+        grid.feed(&sink.lock().expect("lock")).expect("feed");
+        (0..400).map(|row| grid.row_text(row)).collect()
+    }
+
+    #[test]
+    fn an_over_tall_code_block_commits_completed_lines() {
+        let (host, sink) = streaming_host();
+        hold_frames(&host);
+        stream(&host, "```\n");
+        for index in 1..=30 {
+            stream(&host, &format!("CODE-{index:02}\n"));
+            assert!(host.streaming_rows().len() <= 13, "line {index}");
+        }
+        stream(&host, "CODE-31");
+        let live = host.streaming_rows().join("\n");
+        assert!(!live.contains("CODE-01"), "{live:?}");
+        assert!(live.contains("CODE-31"), "{live:?}");
+        let screen = tall_screen(&sink);
+        for index in 1..=18 {
+            let code = format!("CODE-{index:02}");
+            assert_eq!(
+                screen.iter().filter(|row| **row == code).count(),
+                1,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_tall_paragraph_commits_all_but_its_last_row() {
+        let (host, sink) = streaming_host();
+        hold_frames(&host);
+        let words: Vec<String> = (1..=400).map(|index| format!("w{index:04}")).collect();
+        let mut splits = 0;
+        for word in &words {
+            let before = host.streaming.lock().expect("streaming").committed;
+            stream(&host, &format!("{word} "));
+            let rows = host.streaming_rows();
+            assert!(rows.len() <= 13, "{word}: {rows:?}");
+            if host.streaming.lock().expect("streaming").committed != before {
+                assert_eq!(rows.len(), 1, "{word}: {rows:?}");
+                splits += 1;
+            }
+        }
+        assert!(splits >= 2, "{splits}");
+        // What was committed and what is still live hold the source once.
+        host.draw_stream();
+        let screen = tall_screen(&sink);
+        let shown: Vec<&str> = screen
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .filter(|word| word.len() == 5 && word.starts_with('w'))
+            .collect();
+        assert_eq!(shown, words);
+        assert!(screen[0].starts_with("w0001 w0002"), "{screen:?}");
+    }
+
+    #[test]
+    fn a_split_avoids_inline_code() {
+        let (host, _sink) = streaming_host();
+        hold_frames(&host);
+        let lead: Vec<String> = (1..=60).map(|index| format!("w{index:04}")).collect();
+        stream(&host, &format!("{} `", lead.join(" ")));
+        for index in 1..=400 {
+            stream(&host, &format!("c{index:04} "));
+        }
+        let streaming = host.streaming.lock().expect("streaming");
+        assert!(streaming.committed > 0, "nothing was split off");
+        let committed = &streaming.answer[..streaming.committed];
+        assert_eq!(committed.matches('`').count(), 0, "{committed:?}");
+        assert!(streaming.answer[streaming.committed..].starts_with('`'));
+    }
+
+    #[test]
+    fn a_long_table_falls_back_to_raw_rows_after_forty() {
+        let (host, sink) = streaming_host();
+        hold_frames(&host);
+        stream(&host, "| key | value |\n| --- | --- |\n");
+        for index in 1..=38 {
+            stream(&host, &format!("| r{index:02} | x |\n"));
+        }
+        // Forty rows with the header are still held for alignment.
+        assert_eq!(host.streaming.lock().expect("streaming").committed, 0);
+        stream(&host, "| r39 | x |\n");
+        let at_41 = host.streaming.lock().expect("streaming").committed;
+        assert_eq!(at_41, host.partial_answer().len());
+        for index in 40..=43 {
+            stream(&host, &format!("| r{index:02} | x |\n"));
+            let streaming = host.streaming.lock().expect("streaming");
+            assert_eq!(streaming.committed, streaming.answer.len(), "row {index}");
+        }
+        stream(&host, "\nafter");
+        let rows = host.take_answer_rows().expect("rows");
+        assert_eq!(rows, ["", "after"]);
+        let screen = tall_screen(&sink);
+        assert!(
+            screen.iter().any(|row| row == "| key | value |"),
+            "{screen:?}"
+        );
+        assert!(screen.iter().any(|row| row == "| r43 | x |"), "{screen:?}");
+        assert!(
+            !screen.iter().any(|row| row.contains('\u{2502}')),
+            "{screen:?}"
+        );
     }
 
     /// A host showing reasoning in `mode`, a turn under way, and what it writes.

@@ -187,15 +187,22 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if scenario == "progressive":
+            if scenario in {"progressive", "tall-code"}:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                for index in range(1, 301):
+                if scenario == "progressive":
+                    chunks = [f"PARA-{index:03}\n\n" for index in range(1, 301)]
+                    pause = 150
+                else:
+                    chunks = ["```\n"] + [f"CODE-{index:03}\n" for index in range(1, 121)]
+                    chunks.append("```\nTALL-END")
+                    pause = 81
+                for index, chunk in enumerate(chunks, 1):
                     self.wfile.write(event({"index": 0, "delta": {
-                        "content": f"PARA-{index:03}\n\n"}, "finish_reason": None}))
+                        "content": chunk}, "finish_reason": None}))
                     self.wfile.flush()
-                    if index == 150:
+                    if index == pause:
                         assert stream_pause.wait(10), "the paused frame was not captured"
                 self.wfile.write(event({"index": 0, "delta": {}, "finish_reason": "stop"})
                                  + b"data: [DONE]\n\n")
@@ -248,7 +255,7 @@ def controlling_terminal():
 
 
 scenario = sys.argv[2]
-assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "shell-tail", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full", "progressive"}, scenario
+assert scenario in {"resize", "narrow", "menu-resize", "completion-resize", "code", "transcript", "compact", "help-40", "help-80", "tools", "shell-tail", "edit", "failure", "approval", "markdown", "reasoning", "reasoning-full", "progressive", "tall-code"}, scenario
 with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     root = pathlib.Path(directory)
     config = root / "config" / "rune"
@@ -312,7 +319,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                   "edit": (80, 24), "failure": (80, 24),
                   "approval": (80, 24), "markdown": (80, 24),
                   "reasoning": (80, 24), "reasoning-full": (80, 24),
-                  "progressive": (80, 24)}[scenario]
+                  "progressive": (80, 24), "tall-code": (80, 24)}[scenario]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
@@ -392,7 +399,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert prompts == ["narrow height"], prompts
         elif scenario == "menu-resize":
             capture("model-open", b"/model\r", "type to narrow")
-            capture("model-shrunk", expected="type to narrow", size=(32, 8))
+            capture("model-shrunk", expected="> replay-model-01 (current)", size=(32, 8))
             capture("model-down", b"\x1b[B", "> replay-model-02")
             capture("model-closed", b"\x1b")
             capture("closed-grown", size=(80, 24))
@@ -536,6 +543,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             stream_pause.set()
             capture("progressive-finished", expected="PARA-300\r\n")
             assert prompts == ["stream"], prompts
+        elif scenario == "tall-code":
+            capture("tall-code-paused", b"code\r", "CODE-080")
+            stream_pause.set()
+            capture("tall-code-finished", expected="TALL-END\r\n")
+            assert prompts == ["code"], prompts
         elif scenario == "markdown":
             capture("markdown-streaming", b"markdown\r", "fn main")
             markdown_step.set()

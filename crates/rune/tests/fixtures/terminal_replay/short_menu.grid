@@ -3,10 +3,10 @@ completion-last: 32x8, caret 3,3
 01|up/down select   tab complete|
 02|menu-model-01 | auto|
 03|> /|
-04|  /help|
-05|  /terminal-setup|
-06|> /quit|
-07|  26-28 of 28|
+04|  /terminal-setup|
+05|> /quit|
+06|  27-28 of 28|
+07||
 completion-closed: 32x8, caret 2,3
 00|session ************|
 01|/ commands   shift-tab mode|
@@ -21,10 +21,10 @@ model-last: 32x8, caret 2,3
 01|up/down select   tab complete|
 02|menu-model-01 | auto|
 03|>|
-04|models from chat_completions|
+04|  menu-model-14|
 05|> menu-model-15|
-06|  15-15 of 15|
-07|type to narrow, up/down choose,|
+06|  14-15 of 15|
+07||
 model-closed: 32x8, caret 2,3
 00|session ************|
 01|/ commands   shift-tab mode|
