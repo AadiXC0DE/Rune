@@ -77,6 +77,10 @@ def deferred_step(request, step, requests):
     assert "mcp_call" in tools and "capability_search" in tools, list(tools)
     assert not [name for name in tools if name.startswith("mcp_") and name != "mcp_call"], list(tools)
     assert request["tools"] == requests[0]["tools"], "the tool list changed during the run"
+    # The prompt cache holds when every request opens with the one before it.
+    if step > 1:
+        earlier = requests[step - 2]["messages"]
+        assert request["messages"][:len(earlier)] == earlier, "a request rewrote the prefix"
     if step == 1:
         return {"name": "capability_search", "arguments": '{"query":"echo"}'}
     result = request["messages"][-1]
