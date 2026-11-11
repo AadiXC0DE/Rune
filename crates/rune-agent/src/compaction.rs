@@ -237,7 +237,15 @@ fn summarize_and_apply(
             })?;
     }
     host.before_compaction(history);
+    let at = u64::try_from(history.len()).unwrap_or(u64::MAX);
     let removed_turns = apply(history, plan, &summary);
+    if let Some(checkpoint) = history.turns().first() {
+        host.journal(&turn::JournalEntry::Checkpoint {
+            at,
+            through: u64::try_from(removed_turns).unwrap_or(u64::MAX),
+            message: checkpoint.text(),
+        });
+    }
     Ok(CompactionReport {
         kind: CompactionKind::Checkpoint,
         pruned_results: 0,
@@ -563,7 +571,7 @@ pub fn compact_now(
     let mut pruned = false;
     if !history.is_signed(host.dialect()) {
         let before = request_tokens(history, host)?;
-        let report = crate::prune::prune(history, host.dialect());
+        let report = crate::prune::prune(history, host);
         if report.results > 0 {
             pruned = true;
             let after = request_tokens(history, host)?;
@@ -684,7 +692,7 @@ pub fn auto_compact_encoded(
     }
     let mut pruned = None;
     if required && !history.is_signed(host.dialect()) {
-        let report = crate::prune::prune(history, host.dialect());
+        let report = crate::prune::prune(history, host);
         if report.results > 0 {
             request.messages = history.to_messages();
             let (pruned_encoded, after) =

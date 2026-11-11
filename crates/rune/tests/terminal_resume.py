@@ -180,9 +180,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         os.write(master, b"continue saved prompt\r")
         wait_for("CONTINUED-REPLY", start)
         drain()
+        # The resumed conversation opens with the message the saved run sent,
+        # its run note included.
+        sent = [message for message in requests[0]["messages"] if message["role"] == "user"]
+        assert sent[0]["content"].startswith("saved prompt\n\n<run_context>"), sent
         assert [message for message in requests[-1]["messages"]
                 if message["role"] != "system"] == [
-            {"role": "user", "content": "saved prompt"},
+            sent[0],
             {"role": "assistant", "content": reply},
             {"role": "user", "content": "continue saved prompt"},
         ], requests[-1]

@@ -6,11 +6,11 @@
 //! that produced it.
 
 use rune_net::message::{ContentPart, Role};
-use rune_net::provider::Provider;
 use rune_tools::result_store::{Handle, Store};
 
 use crate::history::{History, Turn};
 use crate::tokens::estimate_tokens;
+use crate::turn::{Host, JournalEntry};
 
 /// Newest history kept whole by the prune stage, in estimated tokens.
 pub const PROTECTED_TOKENS: u64 = 30_000;
@@ -57,16 +57,17 @@ struct Candidate {
     is_error: bool,
 }
 
-/// Replaces old tool results with receipts. Does nothing on a signed history.
-pub fn prune(history: &mut History, dialect: &dyn Provider) -> PruneReport {
+/// Replaces old tool results with receipts, journaling each through the host.
+/// Does nothing on a signed history.
+pub fn prune(history: &mut History, host: &dyn Host) -> PruneReport {
     let mut report = PruneReport::default();
-    if history.is_signed(dialect) {
+    if history.is_signed(host.dialect()) {
         return report;
     }
     for candidate in candidates(history) {
         let receipt = receipt(history, &candidate);
         let bytes_after = receipt.len();
-        if history.replace_result(&candidate.id, receipt) {
+        if replace(history, host, &candidate.id, receipt) {
             report.results = report.results.saturating_add(1);
             report.bytes_before = report.bytes_before.saturating_add(candidate.content.len());
             report.bytes_after = report.bytes_after.saturating_add(bytes_after);
@@ -358,8 +359,8 @@ pub const MAX_KEPT_SKILL_BYTES: usize = 2048;
 /// Replaces every large `skill` result from before the newest user turn with
 /// a receipt, and returns how many it replaced. A signed history is left as
 /// it is; its next checkpoint drops the bodies.
-pub fn unload_skills(history: &mut History, dialect: &dyn Provider) -> usize {
-    if history.is_signed(dialect) {
+pub fn unload_skills(history: &mut History, host: &dyn Host) -> usize {
+    if history.is_signed(host.dialect()) {
         return 0;
     }
     let turns = history.turns();
@@ -395,8 +396,22 @@ pub fn unload_skills(history: &mut History, dialect: &dyn Provider) -> usize {
     }
     replacements
         .into_iter()
-        .filter(|(id, receipt)| history.replace_result(id, receipt.clone()))
+        .filter(|(id, receipt)| replace(history, host, id, receipt.clone()))
         .count()
+}
+
+/// Replaces one result's content and journals the replacement.
+fn replace(history: &mut History, host: &dyn Host, id: &str, content: String) -> bool {
+    let at = u64::try_from(history.len()).unwrap_or(u64::MAX);
+    if !history.replace_result(id, content.clone()) {
+        return false;
+    }
+    host.journal(&JournalEntry::ResultReplaced {
+        at,
+        call_id: id.to_owned(),
+        content,
+    });
+    true
 }
 
 /// The skill a result loaded: the `name` of a leading `<skill_content>`, else
@@ -425,6 +440,7 @@ mod tests {
     use super::*;
     use rune_core::id::ToolCallId;
     use rune_net::chat_completions::ChatCompletions;
+    use rune_net::provider::Provider;
     use rune_net::provider::RequestPlan;
     use rune_net::stream::StreamReducer;
 
@@ -453,6 +469,87 @@ mod tests {
 
         fn replay_is_signed(&self, _replay: &str) -> bool {
             true
+        }
+    }
+
+    /// A host that only answers with its dialect and keeps what it journals.
+    struct Journaling<'a> {
+        dialect: &'a dyn Provider,
+        endpoint: rune_net::transport::Endpoint,
+        cancellation: crate::steering::Cancellation,
+        steering: crate::steering::SteeringQueue,
+        journal: std::sync::Mutex<Vec<JournalEntry>>,
+    }
+
+    impl<'a> Journaling<'a> {
+        fn host(dialect: &'a dyn Provider) -> Self {
+            Self {
+                dialect,
+                endpoint: rune_net::transport::Endpoint::new("https://api.example.com", "k"),
+                cancellation: crate::steering::Cancellation::new(),
+                steering: crate::steering::SteeringQueue::new(1),
+                journal: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Host for Journaling<'_> {
+        fn dialect(&self) -> &dyn Provider {
+            self.dialect
+        }
+
+        fn endpoint(&self) -> &rune_net::transport::Endpoint {
+            &self.endpoint
+        }
+
+        fn model(&self) -> String {
+            "test/model".to_owned()
+        }
+
+        fn instructions(&self) -> String {
+            String::new()
+        }
+
+        fn tools(&self) -> Vec<rune_net::message::ToolSpec> {
+            Vec::new()
+        }
+
+        fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
+            Box::new(rune_net::transport::UreqFetch::new())
+        }
+
+        fn emit(&self, _event: crate::turn::Event) {}
+
+        fn execute(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> rune_core::error::Result<rune_tools::contract::ToolOutput> {
+            Ok(rune_tools::contract::ToolOutput::success("ok"))
+        }
+
+        fn decide(
+            &self,
+            _name: &str,
+            _target: Option<&str>,
+        ) -> (rune_policy::decision::Outcome, String) {
+            (rune_policy::decision::Outcome::Allow, "allowed".to_owned())
+        }
+
+        fn context(&self) -> rune_tools::contract::ExecutionContext {
+            rune_tools::contract::ExecutionContext::new(camino::Utf8PathBuf::from("/tmp/rune-test"))
+        }
+
+        fn cancellation(&self) -> crate::steering::Cancellation {
+            self.cancellation.clone()
+        }
+
+        fn steering(&self) -> &crate::steering::SteeringQueue {
+            &self.steering
+        }
+
+        fn journal(&self, entry: &JournalEntry) {
+            self.journal.lock().expect("journal").push(entry.clone());
         }
     }
 
@@ -545,7 +642,7 @@ mod tests {
             .fold(0_u64, u64::saturating_add);
         assert!(protected_tokens >= PROTECTED_TOKENS);
 
-        let report = prune(&mut history, &ChatCompletions);
+        let report = prune(&mut history, &Journaling::host(&ChatCompletions));
         assert!(report.results > 0);
         assert!(report.results < 10);
         assert_eq!(
@@ -581,7 +678,7 @@ mod tests {
             &numbered(120),
         );
         filler(&mut history);
-        let report = prune(&mut history, &ChatCompletions);
+        let report = prune(&mut history, &Journaling::host(&ChatCompletions));
         assert_eq!(report.results, 1);
         assert_eq!(
             content_of(&history, "read"),
@@ -622,7 +719,7 @@ mod tests {
             &content,
         );
         filler(&mut history);
-        prune(&mut history, &ChatCompletions);
+        prune(&mut history, &Journaling::host(&ChatCompletions));
         let receipt = content_of(&history, "test");
         let handle = handle_in(&receipt);
         assert_eq!(
@@ -667,7 +764,7 @@ mod tests {
             &original,
         );
         filler(&mut history);
-        prune(&mut history, &ChatCompletions);
+        prune(&mut history, &Journaling::host(&ChatCompletions));
         let receipt = content_of(&history, "grep");
         assert_eq!(
             receipt,
@@ -702,7 +799,7 @@ mod tests {
             &shown,
         );
         filler(&mut history);
-        prune(&mut history, &ChatCompletions);
+        prune(&mut history, &Journaling::host(&ChatCompletions));
         assert_eq!(history.result_store().len(), 1);
         assert_eq!(handle_in(&content_of(&history, "big")), preview.handle);
     }
@@ -721,7 +818,10 @@ mod tests {
         let before = history.turns().to_vec();
         assert!(history.is_signed(&Signed));
         assert!(!history.is_signed(&ChatCompletions));
-        assert_eq!(prune(&mut history, &Signed), PruneReport::default());
+        assert_eq!(
+            prune(&mut history, &Journaling::host(&Signed)),
+            PruneReport::default()
+        );
         assert_eq!(history.turns(), before.as_slice());
         assert!(!history.is_pruned("old"));
     }
@@ -740,7 +840,7 @@ mod tests {
         exchange(&mut history, "skill", "skill", r#"{"name":"x"}"#, &large);
         exchange(&mut history, "other", "grep_files", "{}", &large);
         filler(&mut history);
-        let report = prune(&mut history, &ChatCompletions);
+        let report = prune(&mut history, &Journaling::host(&ChatCompletions));
         assert_eq!(report.results, 2);
         assert!(history.is_pruned("old-plan"));
         assert!(history.is_pruned("other"));
@@ -755,7 +855,7 @@ mod tests {
         exchange(&mut history, "small", "grep_files", "{}", &"s".repeat(1023));
         exchange(&mut history, "large", "grep_files", "{}", &"l".repeat(1024));
         filler(&mut history);
-        let report = prune(&mut history, &ChatCompletions);
+        let report = prune(&mut history, &Journaling::host(&ChatCompletions));
         assert_eq!(report.results, 1);
         assert!(!history.is_pruned("small"));
         assert!(history.is_pruned("large"));
@@ -767,10 +867,13 @@ mod tests {
         history.push_user("look");
         exchange(&mut history, "one", "grep_files", "{}", &"o".repeat(4096));
         filler(&mut history);
-        assert_eq!(prune(&mut history, &ChatCompletions).results, 1);
+        assert_eq!(
+            prune(&mut history, &Journaling::host(&ChatCompletions)).results,
+            1
+        );
         let receipt = content_of(&history, "one");
         assert_eq!(
-            prune(&mut history, &ChatCompletions),
+            prune(&mut history, &Journaling::host(&ChatCompletions)),
             PruneReport::default()
         );
         assert_eq!(content_of(&history, "one"), receipt);
@@ -783,8 +886,36 @@ mod tests {
         history.push_user("look");
         exchange(&mut history, "one", "grep_files", "{}", &"o".repeat(4096));
         assert_eq!(
-            prune(&mut history, &ChatCompletions),
+            prune(&mut history, &Journaling::host(&ChatCompletions)),
             PruneReport::default()
+        );
+    }
+
+    #[test]
+    fn each_replaced_result_is_journaled_at_the_history_length() {
+        let mut history = History::new();
+        history.push_user("use the alpha skill");
+        let body = format!(
+            "<skill_content name=\"alpha\">\n{}\n</skill_content>\n",
+            "a".repeat(4096)
+        );
+        exchange(
+            &mut history,
+            "load",
+            "skill",
+            r#"{"location":"skills/alpha/SKILL.md"}"#,
+            &body,
+        );
+        history.push_user("next task");
+        let host = Journaling::host(&ChatCompletions);
+        assert_eq!(unload_skills(&mut history, &host), 1);
+        assert_eq!(
+            *host.journal.lock().expect("journal"),
+            vec![JournalEntry::ResultReplaced {
+                at: 4,
+                call_id: "load".to_owned(),
+                content: content_of(&history, "load"),
+            }]
         );
     }
 
@@ -807,13 +938,19 @@ mod tests {
             text: "done".to_owned(),
         }]);
         history.push_user("next task");
-        assert_eq!(unload_skills(&mut history, &ChatCompletions), 1);
+        assert_eq!(
+            unload_skills(&mut history, &Journaling::host(&ChatCompletions)),
+            1
+        );
         assert_eq!(
             content_of(&history, "load"),
             "[skill alpha was loaded here and removed to save context; call the skill tool again if it is needed]"
         );
         assert!(history.is_pruned("load"));
-        assert_eq!(unload_skills(&mut history, &ChatCompletions), 0);
+        assert_eq!(
+            unload_skills(&mut history, &Journaling::host(&ChatCompletions)),
+            0
+        );
         assert_eq!(
             skill_name("plain body", Some(r#"{"location":"skills/beta/SKILL.md"}"#)),
             "beta"
@@ -827,10 +964,16 @@ mod tests {
         let body = "b".repeat(4096);
         exchange(&mut history, "load", "skill", "{}", &body);
         exchange(&mut history, "small", "skill", "{}", &"s".repeat(1500));
-        assert_eq!(unload_skills(&mut history, &ChatCompletions), 0);
+        assert_eq!(
+            unload_skills(&mut history, &Journaling::host(&ChatCompletions)),
+            0
+        );
         assert_eq!(content_of(&history, "load"), body);
         history.push_user("next task");
-        assert_eq!(unload_skills(&mut history, &ChatCompletions), 1);
+        assert_eq!(
+            unload_skills(&mut history, &Journaling::host(&ChatCompletions)),
+            1
+        );
         assert_eq!(content_of(&history, "small"), "s".repeat(1500));
     }
 
@@ -846,7 +989,7 @@ mod tests {
         let body = "c".repeat(4096);
         history.push_tool_results(vec![result("load", "skill", &body, false)]);
         history.push_user("next task");
-        assert_eq!(unload_skills(&mut history, &Signed), 0);
+        assert_eq!(unload_skills(&mut history, &Journaling::host(&Signed)), 0);
         assert_eq!(content_of(&history, "load"), body);
     }
 }
