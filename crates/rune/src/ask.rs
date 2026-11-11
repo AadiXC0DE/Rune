@@ -816,6 +816,15 @@ impl Host for AskHost<'_> {
         self.settings.provider_strict
     }
 
+    fn compaction_model(&self) -> Option<String> {
+        self.settings.compaction_model.clone()
+    }
+
+    fn compaction_window(&self) -> Option<u64> {
+        let model = self.compaction_model()?;
+        crate::model_limits::resolve(self.settings, self.paths, &model, None).context_window
+    }
+
     fn prepare_request(
         &self,
         history: &mut History,

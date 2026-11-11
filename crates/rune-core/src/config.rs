@@ -568,6 +568,9 @@ pub struct UserConfig {
     /// Model used for automatic permission review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_model: Option<String>,
+    /// Model that summarizes a conversation too large for its own model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<String>,
 
     /// Preferred upstream providers, in order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -762,6 +765,8 @@ pub struct Settings {
     pub vision_model: Option<String>,
     /// Model used for automatic permission review.
     pub review_model: Option<String>,
+    /// Model that summarizes a conversation too large for its own model.
+    pub compaction_model: Option<String>,
     /// Directory provider requests and responses are traced to, when set.
     pub trace_dir: Option<Utf8PathBuf>,
     /// Where each value came from.
@@ -809,6 +814,7 @@ impl Default for Settings {
             shell_env: Vec::new(),
             vision_model: None,
             review_model: None,
+            compaction_model: None,
             trace_dir: None,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
@@ -1053,6 +1059,8 @@ pub struct EnvironmentOverrides {
     pub shell_env: Option<String>,
     /// Review model.
     pub review_model: Option<String>,
+    /// `RUNE_COMPACTION_MODEL`: model for a standalone summary.
+    pub compaction_model: Option<String>,
     /// Offline mode.
     pub offline: Option<bool>,
     /// Whether the web tools may reach the network.
@@ -1124,6 +1132,7 @@ impl EnvironmentOverrides {
             provider_strict: boolean(&mut lookup, "RUNE_PROVIDER_STRICT"),
             shell_env: lookup("RUNE_SHELL_ENV"),
             review_model: lookup("RUNE_REVIEW_MODEL"),
+            compaction_model: lookup("RUNE_COMPACTION_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
             network: boolean(&mut lookup, "RUNE_NETWORK"),
@@ -1208,6 +1217,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "session_titles",
     "additional_directories",
     "review_model",
+    "compaction_model",
     "vision_model",
 ];
 
@@ -1544,6 +1554,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(review) = &user.review_model {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
+    }
+    if let Some(compaction) = &user.compaction_model {
+        settings.compaction_model = Some(compaction.clone());
+        settings.sources.record("compaction_model", layer);
     }
     apply_limit_table(
         &mut settings.limits,
@@ -1951,6 +1965,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
     }
+    if let Some(compaction) = &env.compaction_model {
+        settings.compaction_model = Some(compaction.clone());
+        settings.sources.record("compaction_model", layer);
+    }
     for (variable, raw) in &env.invalid_booleans {
         settings.diagnostics.push(
             Diagnostic::new(
@@ -2152,6 +2170,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "provider_strict": settings.provider_strict,
         "shell_env": settings.shell_env,
         "review_model": settings.review_model,
+        "compaction_model": settings.compaction_model,
         "vision_model": settings.vision_model,
         "pre_tool_hook": settings.pre_tool_hook,
         "post_tool_hook": settings.post_tool_hook,
@@ -2450,6 +2469,24 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message == "RUNE_EDIT_TOOL is `diff`")
         );
+    }
+
+    #[test]
+    fn compaction_model_is_read_from_the_user_file_and_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(load(None, None, &empty_env()).compaction_model.is_none());
+        let user = write(&dir, "config.toml", "compaction_model = \"small\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.compaction_model.as_deref(), Some("small"));
+        assert_eq!(settings.source_of("compaction_model"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_COMPACTION_MODEL").then(|| String::from("smaller"))
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.compaction_model.as_deref(), Some("smaller"));
+        assert_eq!(settings.source_of("compaction_model"), Layer::Environment);
     }
 
     #[test]

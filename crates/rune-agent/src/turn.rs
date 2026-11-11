@@ -336,6 +336,17 @@ pub trait Host {
         None
     }
 
+    /// Returns the model that summarizes a conversation too large for its
+    /// own model, when one is configured.
+    fn compaction_model(&self) -> Option<String> {
+        None
+    }
+
+    /// Returns the context window of the compaction model, if known.
+    fn compaction_window(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the client this turn sends through.
     ///
     /// A native build defaults to the workspace transport, one per turn, which

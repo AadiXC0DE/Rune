@@ -573,6 +573,16 @@ impl Host for SessionHost {
         self.fast_mode
     }
 
+    fn compaction_model(&self) -> Option<String> {
+        self.permission_settings.compaction_model.clone()
+    }
+
+    fn compaction_window(&self) -> Option<u64> {
+        let model = self.compaction_model()?;
+        let paths = self.usage_paths.as_ref()?;
+        crate::model_limits::resolve(&self.permission_settings, paths, &model, None).context_window
+    }
+
     fn prepare_request(
         &self,
         history: &mut History,
@@ -9989,7 +9999,7 @@ mod tests {
         assert!(
             fetch.requests.lock().expect("requests")[0]
                 .to_string()
-                .contains("<conversation>")
+                .contains("<transcript>")
         );
         assert_eq!(plan.messages, history.to_messages());
         assert!(

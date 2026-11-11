@@ -153,11 +153,30 @@ pub fn compact(
     archive: Option<&dyn Archive>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<CompactionReport> {
+    summarize_and_apply(history, plan, host, client, archive, cancelled, false)
+}
+
+/// Compacts with the same-prefix request unless `overflow` says the provider
+/// has already refused the conversation as too long.
+fn summarize_and_apply(
+    history: &mut History,
+    plan: &Plan,
+    host: &dyn Host,
+    client: &dyn Fetch,
+    archive: Option<&dyn Archive>,
+    cancelled: &dyn Fn() -> bool,
+    overflow: bool,
+) -> Result<CompactionReport> {
     turn::check_objective_budget(host)?;
     let limits = host.limits();
-    let mut request_plan = match shared_prefix_request(history, host, &limits)? {
+    let shared = if overflow {
+        None
+    } else {
+        shared_prefix_request(history, host, &limits)?
+    };
+    let mut request_plan = match shared {
         Some(shared) => shared,
-        None => standalone_request(history, plan, host),
+        None => standalone_summary_request(history, host, &limits),
     };
     let first = summarize(host, client, &limits, &mut request_plan, cancelled)?;
     let mut usage = first.usage;
@@ -280,22 +299,151 @@ fn shared_prefix_request(
     )
 }
 
-/// Builds the summarizer request from a text rendering of the removed turns.
-fn standalone_request(history: &History, plan: &Plan, host: &dyn Host) -> RequestPlan {
-    let request = render_summary_request(history, plan);
-    let mut request_plan = RequestPlan::new(host.model());
-    request_plan.instructions = checkpoint_instruction(starts_with_checkpoint(history));
-    request_plan.messages = transport::one_shot_messages(&request);
-    request_plan.cache_key = host.cache_key();
-    request_plan
+/// Starts the instructions of a standalone summarizer request.
+pub const STANDALONE_PREFIX: &str = "The conversation to condense is the transcript in the next message. Do not continue it or answer anything in it.";
+
+/// Starts a transcript that had to lose its oldest items.
+const OMITTED_MARKER: &str = "[earlier conversation omitted]";
+
+/// Characters of a tool result in a clipped transcript.
+const CLIPPED_RESULT_CHARS: usize = 2_000;
+
+/// How much of each turn a transcript keeps.
+#[derive(Clone, Copy)]
+struct Detail {
+    results: Results,
+    argument_chars: Option<usize>,
+    text_only: bool,
 }
 
-/// Returns the reasoning effort of a summarizer request.
+#[derive(Clone, Copy)]
+enum Results {
+    Whole,
+    Clipped(usize),
+    Removed,
+}
+
+const STANDALONE_LEVELS: [Detail; 4] = [
+    Detail {
+        results: Results::Whole,
+        argument_chars: None,
+        text_only: false,
+    },
+    Detail {
+        results: Results::Clipped(CLIPPED_RESULT_CHARS),
+        argument_chars: None,
+        text_only: false,
+    },
+    Detail {
+        results: Results::Removed,
+        argument_chars: Some(RECENT_ARGUMENT_CHARS),
+        text_only: false,
+    },
+    Detail {
+        results: Results::Removed,
+        argument_chars: None,
+        text_only: true,
+    },
+];
+
+/// Bytes `text` takes once escaped into a request body.
+fn wire_bytes(text: &str) -> u64 {
+    serde_json::to_string(text).map_or(text.len(), |encoded| encoded.len()) as u64
+}
+
+/// Builds a summarizer request that shares nothing with the conversation: the
+/// whole conversation as a transcript, in the most detail that fits `window`.
 ///
-/// On the Anthropic dialect the session effort is kept, because changing the
-/// thinking settings invalidates the cached messages. Elsewhere it is the
-/// lowest effort the model accepts, or `Auto` when none is listed.
-fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::config::Effort {
+/// A `window` of zero means unknown, and the transcript is left whole. When
+/// text alone is too large the oldest items go. The newest item is never
+/// dropped: it is clipped instead, so the summarizer always has something to
+/// summarize.
+#[must_use]
+pub fn standalone_request(
+    history: &History,
+    update: bool,
+    model: &str,
+    window: u64,
+) -> RequestPlan {
+    let mut request = RequestPlan::new(model.to_owned());
+    request.instructions = format!("{STANDALONE_PREFIX}\n\n{}", checkpoint_instruction(update));
+    request.tool_choice = rune_net::provider::ToolChoice::None;
+    request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
+    request.cache_markers = rune_net::provider::MarkerPolicy::None;
+
+    let room = window.saturating_sub(SUMMARY_OUTPUT_TOKENS);
+    let pinned = pinned_block(history);
+    let fixed = [
+        request.instructions.len() as u64,
+        "<transcript>\n\n</transcript>".len() as u64,
+        wire_bytes(&pinned),
+        wire_bytes(OMITTED_MARKER),
+    ]
+    .into_iter()
+    .fold(0_u64, u64::saturating_add);
+    let fits = |bytes: u64| {
+        window == 0 || crate::tokens::estimate_tokens(fixed.saturating_add(bytes)) <= room
+    };
+
+    let mut text = None;
+    for detail in STANDALONE_LEVELS {
+        let items = transcript_items(history.turns(), detail);
+        let bytes: u64 = items.iter().map(|item| wire_bytes(item)).sum();
+        if fits(bytes) {
+            text = Some(items.concat());
+            break;
+        }
+    }
+    let text = text.unwrap_or_else(|| {
+        let items = transcript_items(history.turns(), STANDALONE_LEVELS[3]);
+        let mut bytes: u64 = items.iter().map(|item| wire_bytes(item)).sum();
+        let mut start = 0_usize;
+        while start.saturating_add(1) < items.len() && !fits(bytes) {
+            bytes = bytes.saturating_sub(wire_bytes(&items[start]));
+            start = start.saturating_add(1);
+        }
+        let mut kept = items[start..].concat();
+        let mut keep = usize::try_from(room.saturating_mul(4)).unwrap_or(usize::MAX);
+        while !fits(wire_bytes(&kept)) && keep > 0 {
+            kept = clip_middle(&items[start], keep);
+            keep /= 2;
+        }
+        format!("{OMITTED_MARKER}\n{kept}")
+    });
+    request.messages = vec![Message::user(format!(
+        "<transcript>\n{pinned}{}\n</transcript>",
+        text.trim_end()
+    ))];
+    request
+}
+
+/// Builds the standalone request for this host's compaction model, on the
+/// window that model is known to have, or else the session's.
+fn standalone_summary_request(
+    history: &History,
+    host: &dyn Host,
+    limits: &BudgetSet,
+) -> RequestPlan {
+    let configured = host.compaction_model();
+    let model = configured.clone().unwrap_or_else(|| host.model());
+    let known = configured.and_then(|_| host.compaction_window());
+    let window = bounded_window(
+        Window(known.or_else(|| host.context_window()).unwrap_or(0)),
+        history,
+        &model,
+    );
+    let window = crate::tokens::effective_window(window.0, limits);
+    let mut request = standalone_request(history, starts_with_checkpoint(history), &model, window);
+    (request.compat, request.traits) = host.compat(&model);
+    request.effort = lowest_accepted(request.traits.efforts);
+    request.provider_order = host.provider_order();
+    request.provider_strict = host.provider_strict();
+    request.cache_key = host.cache_key();
+    request
+}
+
+/// Returns the lowest effort in `efforts`, or `Auto` when none is listed.
+fn lowest_accepted(efforts: &[rune_core::config::Effort]) -> rune_core::config::Effort {
     use rune_core::config::Effort;
     const ORDER: [Effort; 7] = [
         Effort::None,
@@ -306,13 +454,22 @@ fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::
         Effort::Xhigh,
         Effort::Max,
     ];
+    ORDER
+        .into_iter()
+        .find(|effort| efforts.contains(effort))
+        .unwrap_or(Effort::Auto)
+}
+
+/// Returns the reasoning effort of a same-prefix summarizer request.
+///
+/// On the Anthropic dialect the session effort is kept, because changing the
+/// thinking settings invalidates the cached messages. Elsewhere it is the
+/// lowest effort the model accepts, or `Auto` when none is listed.
+fn summariser_effort(host: &dyn Host, request_plan: &RequestPlan) -> rune_core::config::Effort {
     if host.dialect().name() == rune_net::anthropic::NAME {
         return request_plan.effort;
     }
-    ORDER
-        .into_iter()
-        .find(|effort| request_plan.traits.efforts.contains(effort))
-        .unwrap_or(Effort::Auto)
+    lowest_accepted(request_plan.traits.efforts)
 }
 
 /// Sends one summarizer request, charging it to the objective.
@@ -338,10 +495,15 @@ fn summarize(
     );
     accounting.finish(host, response.as_ref().ok().map(|outcome| outcome.usage))?;
     response.map_err(|err| {
-        RuneError::new(
-            err.kind().code(),
-            format!("compaction failed, nothing was changed: {err}"),
-        )
+        let message = if request_plan.model == host.model() {
+            format!("compaction failed, nothing was changed: {err}")
+        } else {
+            format!(
+                "compaction with model {} failed, nothing was changed: {err}",
+                request_plan.model
+            )
+        };
+        RuneError::new(err.kind().code(), message)
     })
 }
 
@@ -410,9 +572,15 @@ pub fn compact_now(
     };
     let before_tokens = size(history)?;
     let cancellation = host.cancellation();
-    let report = compact(history, &compaction_plan, host, client, None, &|| {
-        cancellation.is_cancelled()
-    })?;
+    let report = summarize_and_apply(
+        history,
+        &compaction_plan,
+        host,
+        client,
+        None,
+        &|| cancellation.is_cancelled(),
+        true,
+    )?;
     host.context_replaced(&report);
     let after_tokens = size(history)?;
     host.emit(Event::ContextCompacted {
@@ -753,12 +921,8 @@ fn plan_keeping(history: &History, keep: u64, dialect: &dyn Provider) -> Option<
     Some(plan)
 }
 
-/// Renders the request sent to the summarizer.
-///
-/// Contains the turns being removed and the separately pinned user constraints.
-/// Retained turns are excluded; pins remain independent of the returned summary.
-#[must_use]
-pub fn render_summary_request(history: &History, plan: &Plan) -> String {
+/// Renders the separately pinned user constraints, or nothing without any.
+fn pinned_block(history: &History) -> String {
     let mut out = String::new();
     if !history.pinned_constraints().is_empty() {
         out.push_str("<pinned_user_constraints>\nThese user constraints remain active and will be carried forward verbatim, independently of your summary.\n");
@@ -768,6 +932,16 @@ pub fn render_summary_request(history: &History, plan: &Plan) -> String {
         }
         out.push_str("</pinned_user_constraints>\n\n");
     }
+    out
+}
+
+/// Renders the request sent to the summarizer.
+///
+/// Contains the turns being removed and the separately pinned user constraints.
+/// Retained turns are excluded; pins remain independent of the returned summary.
+#[must_use]
+pub fn render_summary_request(history: &History, plan: &Plan) -> String {
+    let mut out = pinned_block(history);
     out.push_str("<conversation>\n");
     for turn in history.turns() {
         if turn.seq >= plan.cut_at {
@@ -1020,22 +1194,43 @@ pub fn clip_middle(text: &str, keep: usize) -> String {
 /// thousand characters and call arguments to 300 characters.
 #[must_use]
 pub fn render_recent_context(turns: &[Turn]) -> String {
-    let mut out = String::new();
+    transcript_items(
+        turns,
+        Detail {
+            results: Results::Clipped(RECENT_RESULT_CHARS),
+            argument_chars: Some(RECENT_ARGUMENT_CHARS),
+            text_only: false,
+        },
+    )
+    .concat()
+}
+
+/// Renders each part of `turns` as one newline-ended item at `detail`.
+fn transcript_items(turns: &[Turn], detail: Detail) -> Vec<String> {
+    let mut items = Vec::new();
     for turn in turns {
         let mut tool = "";
         for part in &turn.parts {
-            match part {
-                ContentPart::Text { text } => {
-                    let _ = writeln!(out, "{}: {text}", turn.role.as_str());
+            let item = match part {
+                ContentPart::Text { text } => Some(format!("{}: {text}\n", turn.role.as_str())),
+                ContentPart::ToolCall { .. }
+                | ContentPart::ToolResult { .. }
+                | ContentPart::Image { .. }
+                    if detail.text_only =>
+                {
+                    None
                 }
                 ContentPart::ToolCall {
                     name, arguments, ..
                 } => {
-                    let arguments = match arguments.char_indices().nth(RECENT_ARGUMENT_CHARS) {
+                    let arguments = match detail
+                        .argument_chars
+                        .and_then(|limit| arguments.char_indices().nth(limit))
+                    {
                         Some((end, _)) => format!("{}...", &arguments[..end]),
                         None => arguments.clone(),
                     };
-                    let _ = writeln!(out, "call {name} {arguments}");
+                    Some(format!("call {name} {arguments}\n"))
                 }
                 ContentPart::ToolResult {
                     name,
@@ -1044,28 +1239,35 @@ pub fn render_recent_context(turns: &[Turn]) -> String {
                     ..
                 } => {
                     tool = name;
-                    let label = if *is_error { "error" } else { "result" };
-                    if name == "skill" && content.len() > crate::prune::MAX_KEPT_SKILL_BYTES {
-                        let receipt = crate::prune::SKILL_RECEIPT
-                            .replace("{name}", &crate::prune::skill_name(content, None));
-                        let _ = writeln!(out, "{label} skill: {receipt}");
-                        continue;
-                    }
-                    let content = clip_middle(content, RECENT_RESULT_CHARS);
-                    let _ = writeln!(out, "{label} {name}: {content}");
+                    Some(result_item(name, content, *is_error, detail.results))
                 }
-                ContentPart::Image { .. } => {
-                    if turn.role == Role::Tool {
-                        let _ = writeln!(out, "result {tool}: [image]");
-                    } else {
-                        let _ = writeln!(out, "{}: [image]", turn.role.as_str());
-                    }
-                }
-                ContentPart::Reasoning { .. } => {}
-            }
+                ContentPart::Image { .. } => Some(if turn.role == Role::Tool {
+                    format!("result {tool}: [image]\n")
+                } else {
+                    format!("{}: [image]\n", turn.role.as_str())
+                }),
+                ContentPart::Reasoning { .. } => None,
+            };
+            items.extend(item);
         }
     }
-    out
+    items
+}
+
+/// Renders one tool result as a transcript item.
+fn result_item(name: &str, content: &str, is_error: bool, results: Results) -> String {
+    let label = if is_error { "error" } else { "result" };
+    let keep = match results {
+        Results::Removed => return format!("result {name}: [removed]\n"),
+        Results::Whole => usize::MAX,
+        Results::Clipped(keep) => keep,
+    };
+    if name == "skill" && content.len() > crate::prune::MAX_KEPT_SKILL_BYTES {
+        let receipt =
+            crate::prune::SKILL_RECEIPT.replace("{name}", &crate::prune::skill_name(content, None));
+        return format!("{label} skill: {receipt}\n");
+    }
+    format!("{label} {name}: {}\n", clip_middle(content, keep))
 }
 
 /// Rejects a summary that is unusable.
@@ -1666,16 +1868,176 @@ mod tests {
     }
 
     /// Returns the text of the last user message of a summarizer request body.
-    fn last_user_text(body: &serde_json::Value) -> String {
-        body["messages"]
-            .as_array()
-            .expect("messages")
-            .iter()
-            .rev()
-            .find(|message| message["role"] == "user")
-            .and_then(|message| message["content"].as_str())
-            .expect("a user message")
-            .to_owned()
+    /// A history with one large tool result per exchange, and a long argument.
+    fn wide_history() -> History {
+        let payload = "payload ".repeat(1_000);
+        let mut history = History::new();
+        for index in 0..5 {
+            let id = ToolCallId::new(format!("c{index}")).expect("id");
+            history.push_user(format!("question {index}"));
+            history.push_assistant(vec![ContentPart::ToolCall {
+                id: id.clone(),
+                name: "lookup".to_owned(),
+                arguments: "a".repeat(400),
+            }]);
+            history.push_tool_results(vec![ContentPart::ToolResult {
+                id,
+                name: "lookup".to_owned(),
+                content: payload.clone(),
+                is_error: false,
+            }]);
+            history.push_assistant(vec![ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        history
+    }
+
+    fn transcript_at(history: &History, window: u64) -> String {
+        standalone_request(history, false, "m", window).messages[0].text()
+    }
+
+    #[test]
+    fn standalone_levels_shrink_in_order() {
+        let history = wide_history();
+        let whole = transcript_at(&history, 0);
+        assert!(whole.starts_with("<transcript>\nuser: question 0\ncall lookup "));
+        assert!(whole.ends_with("assistant: answer 4\n</transcript>"));
+        assert!(whole.contains(&"payload ".repeat(1_000)));
+        assert!(whole.contains(&"a".repeat(400)));
+
+        let clipped = transcript_at(&history, SUMMARY_OUTPUT_TOKENS + 4_000);
+        assert!(clipped.contains("characters left out"));
+        assert!(clipped.contains(&"a".repeat(400)));
+
+        let removed = transcript_at(&history, SUMMARY_OUTPUT_TOKENS + 1_000);
+        assert!(removed.contains("result lookup: [removed]"));
+        assert!(!removed.contains("payload"));
+        assert!(!removed.contains(&"a".repeat(301)));
+        assert!(removed.contains(&format!("{}...", "a".repeat(300))));
+
+        let text = transcript_at(&history, SUMMARY_OUTPUT_TOKENS + 360);
+        assert!(text.contains("assistant: answer 4"));
+        assert!(!text.contains("call lookup"));
+        assert!(!text.contains("[removed]"));
+        assert!(!text.contains("[earlier conversation omitted]"));
+    }
+
+    #[test]
+    fn the_oldest_items_go_when_text_alone_is_too_large() {
+        let mut history = History::new();
+        for index in 0..200 {
+            history.push_user(format!("question {index} {}", "x".repeat(200)));
+            history.push_assistant(vec![ContentPart::Text {
+                text: format!("answer {index}"),
+            }]);
+        }
+        let window = SUMMARY_OUTPUT_TOKENS + 1_000;
+        let request = standalone_request(&history, false, "m", window);
+        let text = request.messages[0].text();
+        assert!(text.starts_with("<transcript>\n[earlier conversation omitted]\n"));
+        assert!(text.contains("answer 199"));
+        assert!(!text.contains("question 0 "));
+        let bytes = request.instructions.len() + wire_bytes(&text) as usize;
+        assert!(crate::tokens::estimate_tokens(bytes as u64) <= 1_000);
+    }
+
+    #[test]
+    fn a_single_huge_message_is_clipped_rather_than_dropped() {
+        let mut history = History::new();
+        history.push_user(format!("start {} end", "x".repeat(100_000)));
+        let window = SUMMARY_OUTPUT_TOKENS + 2_000;
+        let request = standalone_request(&history, false, "m", window);
+        let text = request.messages[0].text();
+        assert!(text.contains("user: start"));
+        assert!(text.contains("characters left out"));
+        assert!(text.ends_with("end\n</transcript>"));
+        let bytes = request.instructions.len() + wire_bytes(&text) as usize;
+        assert!(crate::tokens::estimate_tokens(bytes as u64) <= 2_000);
+    }
+
+    #[test]
+    fn the_standalone_summary_carries_no_markers() {
+        let request = standalone_request(&wide_history(), false, "claude-sonnet-4-6", 0);
+        let body = rune_net::anthropic::Anthropic
+            .build_request(&request)
+            .expect("body")
+            .to_string();
+        assert!(!body.contains("cache_control"));
+        assert!(body.contains("<transcript>"));
+        assert_eq!(request.max_output_tokens, Some(SUMMARY_OUTPUT_TOKENS));
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn an_overflow_always_summarizes_a_transcript() {
+        let mut host = SummaryHost::new();
+        host.window = Some(1_000_000);
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        assert!(compact_now(&mut history, &host, &fetch, 100).expect("compacts"));
+        let bodies = fetch.bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0]["messages"][0]["content"]
+                .as_str()
+                .expect("instructions")
+                .starts_with(STANDALONE_PREFIX)
+        );
+        assert!(
+            bodies[0]["messages"][1]["content"]
+                .as_str()
+                .expect("transcript")
+                .starts_with("<transcript>\n")
+        );
+        assert!(body_has_no_tools(&bodies[0]));
+    }
+
+    fn body_has_no_tools(body: &serde_json::Value) -> bool {
+        body.get("tools").is_none()
+    }
+
+    #[test]
+    fn the_compaction_model_is_used_for_a_standalone_summary() {
+        let mut host = SummaryHost::new();
+        host.compaction_model = Some("small/model".to_owned());
+        let fetch = ReplyFetch::new(&[(CHECKPOINT_REPLY, "stop")]);
+        let mut history = short_history();
+        let cut = plan(&history, &host.limits()).expect("a plan");
+        compact(&mut history, &cut, &host, &fetch, None, &|| false).expect("compacts");
+        assert_eq!(fetch.bodies()[0]["model"], "small/model");
+    }
+
+    #[test]
+    fn a_failed_compaction_model_is_named_and_changes_nothing() {
+        struct Refusing;
+        impl Fetch for Refusing {
+            fn send(
+                &self,
+                _request: rune_net::fetch::FetchRequest,
+            ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+                Ok(rune_net::fetch::FetchResponse {
+                    status: 404,
+                    content_type: "application/json".to_owned(),
+                    retry_after: None,
+                    retry_after_ms: None,
+                    should_retry: None,
+                    location: None,
+                    body: Box::new(std::io::Cursor::new(
+                        br#"{"error":{"message":"model not found"}}"#.to_vec(),
+                    )),
+                })
+            }
+        }
+        let mut host = SummaryHost::new();
+        host.compaction_model = Some("small/model".to_owned());
+        let mut history = short_history();
+        let before = history.clone();
+        let cut = plan(&history, &host.limits()).expect("a plan");
+        let err = compact(&mut history, &cut, &host, &Refusing, None, &|| false)
+            .expect_err("the model is refused");
+        assert!(err.to_string().contains("small/model"), "{err}");
+        assert_eq!(history.turns(), before.turns());
     }
 
     #[test]
@@ -1698,21 +2060,16 @@ mod tests {
         let bodies = fetch.bodies();
         assert_eq!(bodies.len(), 2);
         let opening = |body: &serde_json::Value| {
-            let request = last_user_text(body);
-            let (_, instruction) = request
-                .split_once("</conversation>\n\n")
-                .expect("an instruction after the conversation");
+            assert_eq!(body["messages"][0]["role"], "system");
+            let system = body["messages"][0]["content"]
+                .as_str()
+                .expect("system text");
+            let (prefix, instruction) = system.split_once("\n\n").expect("two paragraphs");
+            assert_eq!(prefix, STANDALONE_PREFIX);
             instruction.to_owned()
         };
         assert!(opening(&bodies[0]).starts_with(CHECKPOINT_OPENING));
         assert!(opening(&bodies[1]).starts_with(CHECKPOINT_UPDATE_OPENING));
-        assert_eq!(bodies[1]["messages"][0]["role"], "system");
-        assert!(
-            bodies[1]["messages"][0]["content"]
-                .as_str()
-                .expect("system text")
-                .starts_with(CHECKPOINT_UPDATE_OPENING)
-        );
 
         let mut quoted = History::new();
         quoted.push_user("what does <conversation-checkpoint> mean");
@@ -1879,6 +2236,8 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
         events: std::sync::Mutex<Vec<Event>>,
         cancellation: crate::steering::Cancellation,
         steering: crate::steering::SteeringQueue,
+        window: Option<u64>,
+        compaction_model: Option<String>,
     }
 
     impl SummaryHost {
@@ -1888,6 +2247,8 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
                 events: std::sync::Mutex::new(Vec::new()),
                 cancellation: crate::steering::Cancellation::new(),
                 steering: crate::steering::SteeringQueue::new(8),
+                window: None,
+                compaction_model: None,
             }
         }
 
@@ -1928,6 +2289,14 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
 
         fn model(&self) -> String {
             "test/model".to_owned()
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            self.window
+        }
+
+        fn compaction_model(&self) -> Option<String> {
+            self.compaction_model.clone()
         }
 
         fn instructions(&self) -> String {

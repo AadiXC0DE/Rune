@@ -154,7 +154,11 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                 assert!(
                     request["messages"][0]["content"]
                         .as_str()
+                        .and_then(
+                            |text| text.strip_prefix(rune_agent::compaction::STANDALONE_PREFIX)
+                        )
                         .is_some_and(|text| {
+                            let text = text.trim_start();
                             text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
                                 || text
                                     .starts_with(rune_agent::compaction::CHECKPOINT_UPDATE_OPENING)
