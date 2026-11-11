@@ -508,7 +508,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert prompts == ["think"], prompts
         elif scenario == "reasoning-full":
             # Alt+T twice: collapsed, then tail, then full.
-            wait_for("ctrl-c cancel")
+            wait_for("/ commands")
             os.write(master, b"\x1bt")
             wait_for("reasoning display: tail")
             os.write(master, b"\x1bt")

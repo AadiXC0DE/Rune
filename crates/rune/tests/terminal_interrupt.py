@@ -149,7 +149,7 @@ with tempfile.TemporaryDirectory(prefix="rune-interrupt-") as directory:
         assert not errors, errors
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"command\r")
         pid_file = root / "pid.txt"
