@@ -37,6 +37,7 @@ mod reference;
 mod sandbox;
 mod session;
 mod session_log;
+mod session_prefix;
 mod shutdown;
 mod spec;
 mod spend;

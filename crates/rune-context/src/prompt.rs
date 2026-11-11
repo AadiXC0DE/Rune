@@ -542,6 +542,15 @@ pub struct MappedInstructions {
 }
 
 impl MappedInstructions {
+    /// Returns instructions whose map is already built, as an earlier run of
+    /// the same session sent them.
+    #[must_use]
+    pub fn built(text: String) -> Self {
+        Self {
+            built: std::sync::Mutex::new(Some(text)),
+        }
+    }
+
     /// Returns the instructions, building the map on first use.
     pub fn get(&self, base: &str, workspace: &Utf8Path, limits: &BudgetSet) -> String {
         let mut built = self

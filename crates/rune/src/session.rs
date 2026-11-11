@@ -1361,6 +1361,41 @@ impl SessionHost {
         *lock_value(&self.nested_rules) = base.nested;
         *lock_value(&self.watched) = context_watch::Watched::of(&workspace, &paths.config_root);
         lock_value(&self.pending_updates).retain(|update| update.kind == UpdateKind::Other);
+        self.save_prefix();
+    }
+
+    /// Saves the prefix this session's requests open with, so a resume with
+    /// the same model sends the same bytes. A failure only costs the cache.
+    fn save_prefix(&self) {
+        let (Some(paths), Some(recorder)) = (&self.usage_paths, &self.recorder) else {
+            return;
+        };
+        let id = lock_value(recorder).id();
+        let base = lock_value(&self.instructions).clone();
+        let mapped = self.mapped.get(
+            &base,
+            self.context.workspace(),
+            &crate::ask::map_limits(&self.limits, self.permission_settings.experiments),
+        );
+        let map = mapped.get(base.len()..).unwrap_or_default().to_owned();
+        let prefix = {
+            let watched = lock_value(&self.watched);
+            crate::session_prefix::SavedPrefix::new(
+                self.permission_settings.provider.as_str(),
+                &self.model(),
+                base,
+                self.stable_instructions_len
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                map,
+                self.tools.clone(),
+                watched.file_records(),
+                watched.skill_names(),
+                watched.test_command(),
+            )
+        };
+        if let Err(err) = crate::session_prefix::save(paths, &id, &prefix) {
+            self.draw_notice(&format!("the session prefix was not saved: {err}"));
+        }
     }
 
     /// Waits for a terminal answer while allowing cancellation to wake us.
@@ -2696,6 +2731,45 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     context
         .additional_roots
         .clone_from(&config.settings.additional_directories);
+    // A resumed session with the same provider and model opens with the
+    // instructions and tools it was started with, so the provider's cached
+    // prefix still applies; changes on disk since reach it as updates.
+    let saved_prefix = config.resume.as_ref().and_then(|id| {
+        crate::session_prefix::load(&config.paths, id).filter(|saved| {
+            saved.fits(
+                config.settings.provider.as_str(),
+                &config.settings.model,
+                |name| {
+                    tools.iter().any(|tool| tool.name == name)
+                        || config.registry.get(name).is_some()
+                },
+            )
+        })
+    });
+    let reuse_prefix = saved_prefix.is_some();
+    let opening = match saved_prefix {
+        Some(saved) => Opening {
+            mapped: prompt::MappedInstructions::built(format!(
+                "{}{}",
+                saved.instructions, saved.map
+            )),
+            watched: context_watch::Watched::seeded(
+                &saved.instruction_files,
+                saved.skills,
+                saved.test_command,
+            ),
+            instructions: saved.instructions,
+            stable_len: saved.stable_len,
+            tools: saved.tools,
+        },
+        None => Opening {
+            instructions: prompt.instructions,
+            stable_len: prompt.stable_len,
+            tools,
+            mapped: prompt::MappedInstructions::default(),
+            watched: context_watch::Watched::of(&config.workspace, &config.paths.config_root),
+        },
+    };
     let host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
@@ -2708,18 +2782,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         compat: crate::provider_setup::CompatSource::from_settings(&config.settings),
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
-        instructions: Mutex::new(prompt.instructions),
-        stable_instructions_len: std::sync::atomic::AtomicUsize::new(prompt.stable_len),
+        instructions: Mutex::new(opening.instructions),
+        stable_instructions_len: std::sync::atomic::AtomicUsize::new(opening.stable_len),
         frozen_objective: Mutex::new(FrozenObjective::Unread),
         pending_updates: Mutex::new(Vec::new()),
-        watched: Mutex::new(context_watch::Watched::of(
-            &config.workspace,
-            &config.paths.config_root,
-        )),
+        watched: Mutex::new(opening.watched),
         nested_rules: Mutex::new(nested_rules),
         instruction_sizes: Mutex::new(instruction_sizes),
-        mapped: prompt::MappedInstructions::default(),
-        tools,
+        mapped: opening.mapped,
+        tools: opening.tools,
         rules: Mutex::new(config.rules),
         mode: Mutex::new(config.settings.permission_mode),
         permission_settings: config.settings.clone(),
@@ -2819,6 +2890,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         unsandboxed: config.settings.allow_unsandboxed && !rune_exec::detect().support().is_full(),
         questions: config.questions,
     };
+    if !reuse_prefix {
+        host.save_prefix();
+    }
     if let Ok(mut inline) = host.inline.lock() {
         inline.set_synchronized(host.caps.env.term.as_deref() != Some("dumb"));
     }
@@ -6594,6 +6668,15 @@ enum FrozenObjective {
     Unread,
     /// Read, and fixed until the next rebuild.
     Fixed(Option<String>),
+}
+
+/// What a session's requests open with, saved or newly built.
+struct Opening {
+    instructions: String,
+    stable_len: usize,
+    tools: Vec<ToolSpec>,
+    mapped: prompt::MappedInstructions,
+    watched: context_watch::Watched,
 }
 
 /// What a queued update is about, so a rebuild can drop the ones it covers.

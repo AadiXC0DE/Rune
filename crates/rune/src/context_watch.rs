@@ -22,8 +22,8 @@ struct WatchedFile {
 #[derive(Debug, Default)]
 pub struct Watched {
     files: Vec<WatchedFile>,
-    /// Name and location of each skill; `None` until first looked at.
-    skills: Option<Vec<(String, Utf8PathBuf)>>,
+    /// Name of each skill; `None` until first looked at.
+    skills: Option<Vec<String>>,
     /// The detected test command, once first looked at.
     test_command: Option<String>,
     /// Whether the test command was looked at.
@@ -124,16 +124,13 @@ impl Watched {
         let home = rune_core::paths::home_directory();
         let found = rune_context::skills::discover(workspace, home.as_deref(), config_root)
             .unwrap_or_default();
-        let now: Vec<(String, Utf8PathBuf)> = found
-            .iter()
-            .map(|skill| (skill.name.clone(), skill.location.clone()))
-            .collect();
+        let now: Vec<String> = found.iter().map(|skill| skill.name.clone()).collect();
         let Some(before) = self.skills.replace(now.clone()) else {
             return Vec::new();
         };
         let mut lines: Vec<String> = found
             .iter()
-            .filter(|skill| !before.contains(&(skill.name.clone(), skill.location.clone())))
+            .filter(|skill| !before.contains(&skill.name))
             .map(|skill| {
                 format!(
                     "Skill installed: {}",
@@ -145,7 +142,7 @@ impl Watched {
             before
                 .iter()
                 .filter(|known| !now.contains(known))
-                .map(|(name, _)| format!("Skill removed: {name}.")),
+                .map(|name| format!("Skill removed: {name}.")),
         );
         lines
     }
@@ -164,16 +161,94 @@ impl Watched {
     }
 }
 
-fn skills(
-    workspace: &Utf8Path,
-    home: Option<&Utf8Path>,
-    config_root: &Utf8Path,
-) -> Vec<(String, Utf8PathBuf)> {
+fn skills(workspace: &Utf8Path, home: Option<&Utf8Path>, config_root: &Utf8Path) -> Vec<String> {
     rune_context::skills::discover(workspace, home, config_root)
         .unwrap_or_default()
         .into_iter()
-        .map(|skill| (skill.name, skill.location))
+        .map(|skill| skill.name)
         .collect()
+}
+
+/// One watched instruction file as saved with a session's prefix.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileRecord {
+    /// The file.
+    pub path: Utf8PathBuf,
+    /// The directory its rules apply to.
+    pub scope: Utf8PathBuf,
+    /// Its size when last seen.
+    pub bytes: u64,
+    /// Its SHA-256 when last seen, in hex; empty once seen deleted.
+    pub sha256: String,
+}
+
+impl Watched {
+    /// Returns the watched instruction files, for saving.
+    #[must_use]
+    pub fn file_records(&self) -> Vec<FileRecord> {
+        self.files
+            .iter()
+            .map(|file| FileRecord {
+                path: file.path.clone(),
+                scope: file.scope.clone(),
+                bytes: file.len,
+                sha256: file.digest.map(hex).unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// Returns the skill names last seen.
+    #[must_use]
+    pub fn skill_names(&self) -> Vec<String> {
+        self.skills.clone().unwrap_or_default()
+    }
+
+    /// Returns the test command last seen.
+    #[must_use]
+    pub fn test_command(&self) -> Option<String> {
+        self.test_command.clone()
+    }
+
+    /// Rebuilds what was watched from a saved prefix, so whatever changed on
+    /// disk since is found as a change.
+    #[must_use]
+    pub fn seeded(files: &[FileRecord], skills: Vec<String>, test_command: Option<String>) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|file| WatchedFile {
+                    path: file.path.clone(),
+                    scope: file.scope.clone(),
+                    len: file.bytes,
+                    modified: None,
+                    digest: unhex(&file.sha256),
+                })
+                .collect(),
+            skills: Some(skills),
+            test_command,
+            test_command_seen: true,
+        }
+    }
+}
+
+fn hex(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    digest.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+fn unhex(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let pair = text.get(index.saturating_mul(2)..index.saturating_mul(2).saturating_add(2))?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(digest)
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
