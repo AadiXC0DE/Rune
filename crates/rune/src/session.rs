@@ -15909,11 +15909,17 @@ mod tests {
     #[test]
     fn the_idle_hint_row_names_the_newline_key_when_it_fits() {
         // The test host's terminal answered no probe, so Shift+Enter cannot be
-        // told apart and Ctrl+J is the key to name.
+        // told apart and Ctrl+J is the key to name; the Windows console reports
+        // Shift+Enter itself.
         let host = test_host();
         let wide = host.status_line_in(120, Some(UiState::Idle));
+        let newline = if cfg!(windows) {
+            "shift-enter newline"
+        } else {
+            "ctrl-j newline"
+        };
         assert!(
-            wide.contains("/ commands   shift-tab mode   ctrl-j newline"),
+            wide.contains(&format!("/ commands   shift-tab mode   {newline}")),
             "{wide:?}"
         );
         let narrow = host.status_line_in(20, Some(UiState::Idle));
@@ -22968,7 +22974,10 @@ mod tests {
         let host = panel_host(settings);
         assert_eq!(
             set_permissions(&host, Some("delete 1")),
-            "rule 1 comes from /work/app/.rune.toml in the repository; edit that file"
+            format!(
+                "rule 1 comes from {} in the repository; edit that file",
+                Utf8Path::new("/work/app").join(".rune.toml")
+            )
         );
         assert_eq!(host.decide("shell", Some("rm -rf x")).0, Outcome::Deny);
     }
@@ -24608,13 +24617,17 @@ mod tests {
         }
         host.touch("../outside.rs");
         host.touch("src/");
-        assert_eq!(
-            *lock_value(&host.touched),
-            ["docs/guide.md", "notes.txt", "src/", "src/main.rs"]
+        // `/tmp/src/main.rs` is inside the `/tmp` workspace only where a path
+        // starting with `/` is absolute.
+        let mut expected: std::collections::BTreeSet<String> =
+            ["docs/guide.md", "notes.txt", "src/"]
                 .map(str::to_owned)
                 .into_iter()
-                .collect()
-        );
+                .collect();
+        if cfg!(unix) {
+            expected.insert("src/main.rs".to_owned());
+        }
+        assert_eq!(*lock_value(&host.touched), expected);
     }
 
     fn test_host() -> SessionHost {

@@ -374,11 +374,15 @@ mod tests {
             Paths::collect(line, line.len(), &context, &limits, Some(&index)).matches,
             ["fresh.txt"]
         );
-        let line = format!("read {}/fr", context.workspace());
-        assert_eq!(
-            Paths::collect(&line, line.len(), &context, &limits, Some(&index)).matches,
-            [format!("{}/fresh.txt", context.workspace())]
-        );
+        // An absolute token skips the index. Completion reads a backslash as
+        // an escape, so this half needs a path written with slashes.
+        if cfg!(unix) {
+            let line = format!("read {}/fr", context.workspace());
+            assert_eq!(
+                Paths::collect(&line, line.len(), &context, &limits, Some(&index)).matches,
+                [format!("{}/fresh.txt", context.workspace())]
+            );
+        }
     }
 
     #[test]

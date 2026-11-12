@@ -666,8 +666,9 @@ mod tests {
         let rules = validated(&settings).expect("rules");
         let text = explain(&rules, &settings, mode, "shell", target);
         assert!(text.contains(": allowed"), "{text}");
+        let file = Utf8Path::new("/work/app").join(".rune.toml");
         assert!(
-            text.ends_with("; source: project file /work/app/.rune.toml"),
+            text.ends_with(&format!("; source: project file {file}")),
             "{text}"
         );
         assert_eq!(

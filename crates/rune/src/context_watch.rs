@@ -452,7 +452,12 @@ mod tests {
             appendix.text
         );
         assert!(!appendix.text.contains("Use spaces in b."));
-        assert_eq!(appendix.keys, vec!["rules:a/AGENTS.md".to_owned()]);
+        // Keys show the path as the rendered `from` does, with this
+        // platform's separator.
+        assert_eq!(
+            appendix.keys,
+            vec![format!("rules:{}", Utf8Path::new("a").join("AGENTS.md"))]
+        );
 
         // A deep path gets every file on the way, the widest first.
         let deep = deliver(&[call(
@@ -468,7 +473,10 @@ mod tests {
         let other = deliver(&[call("read_file", &serde_json::json!({"path": "b/z.txt"}))])
             .expect("rules for b");
         assert!(
-            other.text.contains("from=\"b/CLAUDE.md\""),
+            other.text.contains(&format!(
+                "from=\"{}\"",
+                Utf8Path::new("b").join("CLAUDE.md")
+            )),
             "{}",
             other.text
         );
