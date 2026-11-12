@@ -8429,12 +8429,15 @@ fn path_key(
     {
         return false;
     }
-    let choices = crate::path_completion::Paths::collect(
+    let snapshot = files.snapshot_since();
+    let choices = crate::path_completion::Paths::collect_since(
         reader.line(),
         reader.cursor_byte(),
         context,
         limits,
-        files.snapshot().as_deref().map(Vec::as_slice),
+        snapshot
+            .as_ref()
+            .map(|(paths, started)| (paths.as_slice(), Some(*started))),
     );
     *selected = 0;
     if choices.matches.len() == 1 {

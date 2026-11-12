@@ -22,16 +22,20 @@ const MAX_GAP_PENALTY: i64 = 15;
 pub struct FileIndex {
     paths: Arc<Vec<String>>,
     built: Instant,
+    /// The wall-clock start of the walk, to tell files made after it.
+    started: std::time::SystemTime,
     truncated: bool,
 }
 
 impl FileIndex {
     fn build(root: &Utf8Path) -> Self {
         let built = Instant::now();
+        let started = std::time::SystemTime::now();
         let Ok(walker) = Walker::new(root, INDEX_CAP) else {
             return Self {
                 paths: Arc::new(Vec::new()),
                 built,
+                started,
                 truncated: false,
             };
         };
@@ -58,6 +62,7 @@ impl FileIndex {
         Self {
             paths: Arc::new(paths),
             built,
+            started,
             truncated,
         }
     }
@@ -95,6 +100,16 @@ impl SharedIndex {
         if stale {
             self.spawn(root.to_owned());
         }
+    }
+
+    /// The paths of the last finished build and the wall-clock time its walk
+    /// started, if any.
+    pub fn snapshot_since(&self) -> Option<(Arc<Vec<String>>, std::time::SystemTime)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|index| (Arc::clone(&index.paths), index.started))
     }
 
     /// The paths of the last finished build, if any.
@@ -140,6 +155,7 @@ impl SharedIndex {
         *index.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(FileIndex {
             paths: Arc::new(paths),
             built: Instant::now(),
+            started: std::time::SystemTime::now(),
             truncated: false,
         });
         index

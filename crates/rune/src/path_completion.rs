@@ -21,6 +21,7 @@ impl Paths {
     /// the token is relative; otherwise, or when the index has no match,
     /// reads directory names only after the shared resolver checks
     /// containment.
+    #[cfg(test)]
     pub fn collect(
         line: &str,
         caret: usize,
@@ -28,13 +29,45 @@ impl Paths {
         limits: &FileLimits,
         index: Option<&[String]>,
     ) -> Self {
-        if let Some(index) = index {
+        Self::collect_since(
+            line,
+            caret,
+            context,
+            limits,
+            index.map(|paths| (paths, None)),
+        )
+    }
+
+    /// [`Self::collect`], where `index` also says when the walk that built it
+    /// started: a file in the token's directory changed since then is not in
+    /// the index yet, so it is offered beside the index's matches. An older
+    /// file the index lacks was left out on purpose (ignored) and stays out.
+    pub fn collect_since(
+        line: &str,
+        caret: usize,
+        context: &ExecutionContext,
+        limits: &FileLimits,
+        index: Option<(&[String], Option<std::time::SystemTime>)>,
+    ) -> Self {
+        let read_dir = |path: &Utf8Path| std::fs::read_dir(path);
+        if let Some((paths, started)) = index {
             let (range, prefix) = token_at(line, caret);
-            if let Some(matches) = from_index(index, &prefix, limits) {
+            if let Some(mut matches) = from_index(paths, &prefix, limits) {
+                if let Some(started) = started {
+                    let fresh =
+                        Self::collect_listed(line, caret, context, limits, read_dir, Some(started));
+                    for candidate in fresh.matches {
+                        if !matches.contains(&candidate)
+                            && matches.len() < limits.list_entries.min(MAX_MATCHES)
+                        {
+                            matches.push(candidate);
+                        }
+                    }
+                }
                 return Self { range, matches };
             }
         }
-        Self::collect_with(line, caret, context, limits, |path| std::fs::read_dir(path))
+        Self::collect_with(line, caret, context, limits, read_dir)
     }
 
     fn collect_with(
@@ -42,7 +75,20 @@ impl Paths {
         caret: usize,
         context: &ExecutionContext,
         limits: &FileLimits,
+        read_dir: impl FnMut(&Utf8Path) -> std::io::Result<std::fs::ReadDir>,
+    ) -> Self {
+        Self::collect_listed(line, caret, context, limits, read_dir, None)
+    }
+
+    /// Lists the token's directory; with `since`, only entries modified at or
+    /// after it.
+    fn collect_listed(
+        line: &str,
+        caret: usize,
+        context: &ExecutionContext,
+        limits: &FileLimits,
         mut read_dir: impl FnMut(&Utf8Path) -> std::io::Result<std::fs::ReadDir>,
+        since: Option<std::time::SystemTime>,
     ) -> Self {
         let (range, prefix) = token_at(line, caret);
         let mut result = Self {
@@ -73,6 +119,14 @@ impl Paths {
                 continue;
             };
             if !filename.starts_with(name) || filename.chars().any(char::is_control) {
+                continue;
+            }
+            if let Some(since) = since
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|modified| modified < since)
+            {
                 continue;
             }
             // An offered link must also lead inside a permitted root. No file
@@ -242,6 +296,34 @@ mod tests {
                 "./fixture.txt",
             ]
         );
+    }
+
+    #[test]
+    fn files_made_after_the_index_are_offered_beside_it() {
+        let (_temp, context) = fixture();
+        let root = context.workspace();
+        std::fs::write(root.join("fixture old.txt"), "old").expect("old");
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("fixture new.txt"), "new").expect("new");
+        let index = vec!["fixture listed.txt".to_owned()];
+        let limits = FileLimits::default();
+        let line = "read fixture";
+        let choices = Paths::collect_since(
+            line,
+            line.len(),
+            &context,
+            &limits,
+            Some((&index, Some(started))),
+        );
+        // The new file joins the index's match; the older unindexed one is
+        // what an ignore rule left out, so it stays out.
+        assert_eq!(
+            choices.matches,
+            ["'fixture listed.txt'", "'fixture new.txt'"]
+        );
+        let without = Paths::collect(line, line.len(), &context, &limits, Some(&index));
+        assert_eq!(without.matches, ["'fixture listed.txt'"]);
     }
 
     #[test]
