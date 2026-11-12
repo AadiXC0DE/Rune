@@ -8,14 +8,14 @@ approval-open: 80x24, caret 0,11
 06|  in <dir>|
 07|  why: ask: no rule matched `echo GRID-APPROVAL`, so the mode's default applies|
 08|permission required|
-09|y once   a session   n deny|
+09|y once   a session   n deny   tab comment|
 10|replay-fixture | ask | ctx ~###k (request bytes)|
 11||
 12|  y  run once|
 13|  a  allow for this session|
 14|  p  always allow in this project|
 15|  n  deny|
-16||
+16|  tab  deny and say what to do instead|
 17||
 18||
 19||

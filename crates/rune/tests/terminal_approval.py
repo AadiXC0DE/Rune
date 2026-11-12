@@ -197,14 +197,30 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         send(b"n")
         settled_reply("FIXTURE_REPLY_2", start)
         assert "refused by policy" in results[1], results
-        assert "approval was denied" in results[1], results
+        assert "the user denied this command" in results[1], results
+        assert side_effect.read_bytes() == b"x", "denied shell ran"
+
+        # Tab denies with a message; Escape in the field goes back to the menu.
+        start = permission()
+        send(b"\t")
+        wait_for("tell the model what to do instead (enter sends, esc goes back)", start)
+        send(b"\x1b")
+        back = len(transcript)
+        wait_for("y  run once", back)
+        send(b"\t")
+        send(b"use make test instead\r")
+        settled_reply("FIXTURE_REPLY_3", start)
+        assert (
+            "the user denied this command and said: use make test instead" in results[2]
+        ), results
+        wait_for("denied: use make test instead", start)
         assert side_effect.read_bytes() == b"x", "denied shell ran"
 
         # Escape denies and the turn goes on.
         start = permission()
         send(b"\x1b")
-        settled_reply("FIXTURE_REPLY_3", start)
-        assert "approval was denied" in results[2], results
+        settled_reply("FIXTURE_REPLY_4", start)
+        assert "the user denied this command" in results[3], results
         assert side_effect.read_bytes() == b"x", "denied shell ran"
 
         # Control-C and Control-D deny, interrupt, and leave the session usable.
@@ -230,7 +246,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         release_draft.set()
         menu(start)
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15y")
-        settled_reply("FIXTURE_REPLY_4", start)
+        settled_reply("FIXTURE_REPLY_5", start)
         assert side_effect.read_bytes() == b"xx"
         start = len(transcript)
         send(b"X\r")
@@ -247,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         time.sleep(0.5)
         assert side_effect.read_bytes() == b"xx", "type-ahead approved the command"
         send(b"y")
-        settled_reply("FIXTURE_REPLY_5", start)
+        settled_reply("FIXTURE_REPLY_6", start)
         assert side_effect.read_bytes() == b"xxx"
 
         send(b"/quit\r")
