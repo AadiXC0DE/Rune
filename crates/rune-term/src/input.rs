@@ -223,6 +223,8 @@ pub enum KeyAction {
     Queue,
     /// Show or hide the plan pinned above the prompt.
     TogglePlan,
+    /// Show the key overlay.
+    Help,
     /// Replace the paste chip at the caret with its text.
     ExpandChip,
 }
@@ -913,6 +915,12 @@ impl KeyReader {
     /// meaning or is typed.
     pub fn apply(&mut self, key: KeyEvent) -> KeyAction {
         match self.keymap.action(self.context, &key) {
+            // The overlay opens only on an empty draft at the idle prompt;
+            // anywhere else the key is typed.
+            Some("help") if self.context != Context::Editor || !self.composer.text().is_empty() => {
+                self.apply_unbound(key)
+            }
+            Some("help") => KeyAction::Help,
             Some(id) => self.run_action(id),
             None => self.apply_unbound(key),
         }
@@ -2357,6 +2365,22 @@ mod tests {
             reader.choice_event(key(KeyCode::Char('y'))),
             Some(ChoiceKey::Char('y'))
         );
+    }
+
+    #[test]
+    fn question_mark_opens_help_only_on_an_empty_idle_draft() {
+        let mut reader = reader();
+        reader.set_context(Context::Editor);
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(reader.apply(question), KeyAction::Help);
+        assert_eq!(reader.line(), "");
+        reader.replace("why");
+        assert_eq!(reader.apply(question), KeyAction::Ignored);
+        assert_eq!(reader.line(), "why?");
+        reader.clear();
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(question), KeyAction::Ignored);
+        assert_eq!(reader.line(), "?");
     }
 
     #[test]

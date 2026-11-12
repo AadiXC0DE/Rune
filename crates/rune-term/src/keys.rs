@@ -59,6 +59,95 @@ pub struct ActionInfo {
     pub summary: &'static str,
 }
 
+/// The overlay's groups, in order, with the contexts each lists.
+const HELP_GROUPS: [(&str, &[Context]); 4] = [
+    ("editing", &[Context::Editor]),
+    ("during a turn", &[Context::Turn]),
+    ("menus", &[Context::Menu, Context::Approval]),
+    ("viewer", &[Context::Viewer]),
+];
+
+/// Returns the key overlay: each group's heading in `accent`, then
+/// `{keys}  {summary}` for every action with a key, keys joined by `/`.
+/// Entries flow top to bottom in three columns from 120 columns, two from 80,
+/// else one; no row is wider than `width`.
+#[must_use]
+pub fn help_rows(keymap: &Keymap, width: usize, accent: &str, reset: &str) -> Vec<String> {
+    let mut cells: Vec<(String, bool)> = Vec::new();
+    for (heading, contexts) in HELP_GROUPS {
+        cells.push((heading.to_owned(), true));
+        for info in ACTIONS
+            .iter()
+            .filter(|info| contexts.contains(&info.context))
+        {
+            let keys = keymap.keys(info.id);
+            if !keys.is_empty() {
+                cells.push((format!("{}  {}", keys.join("/"), info.summary), false));
+            }
+        }
+    }
+    let columns = if width >= 120 {
+        3
+    } else if width >= 80 {
+        2
+    } else {
+        1
+    };
+    let per_column = cells.len().div_ceil(columns).max(1);
+    let widths: Vec<usize> = cells
+        .chunks(per_column)
+        .map(|column| {
+            column
+                .iter()
+                .map(|(text, _)| crate::width::str_width(text))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(2)
+        })
+        .collect();
+    (0..per_column)
+        .map(|row| {
+            let mut line = String::new();
+            let mut used = 0_usize;
+            for (column, cell_width) in widths.iter().enumerate() {
+                let Some((text, heading)) =
+                    cells.get(column.saturating_mul(per_column).saturating_add(row))
+                else {
+                    continue;
+                };
+                let room = width.saturating_sub(used);
+                if room == 0 {
+                    break;
+                }
+                let shown = if crate::width::str_width(text) > room {
+                    let (kept, _) = crate::width::truncate_to_width(text, room.saturating_sub(1));
+                    format!("{kept}\u{2026}")
+                } else {
+                    text.clone()
+                };
+                let shown_width = crate::width::str_width(&shown);
+                if *heading && !accent.is_empty() {
+                    line.push_str(accent);
+                    line.push_str(&shown);
+                    line.push_str(reset);
+                } else {
+                    line.push_str(&shown);
+                }
+                used = used.saturating_add(shown_width);
+                let last = column.saturating_add(1) == widths.len();
+                if !last {
+                    let pad = cell_width
+                        .saturating_sub(shown_width)
+                        .min(width.saturating_sub(used));
+                    line.push_str(&" ".repeat(pad));
+                    used = used.saturating_add(pad);
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
 const fn action(
     id: &'static str,
     context: Context,
@@ -135,6 +224,12 @@ pub const ACTIONS: &[ActionInfo] = &[
         Context::Editor,
         &["shift+tab"],
         "cycle ask, auto and plan",
+    ),
+    action(
+        "help",
+        Context::Editor,
+        &["?"],
+        "show every key, on an empty draft",
     ),
     action(
         "toggle_plan",
@@ -596,6 +691,46 @@ impl Default for Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_rows_use_three_two_or_one_column() {
+        let keymap = Keymap::defaults();
+        let one = help_rows(&keymap, 40, "", "");
+        let two = help_rows(&keymap, 100, "", "");
+        let three = help_rows(&keymap, 160, "", "");
+        assert_eq!(two.len(), one.len().div_ceil(2));
+        assert_eq!(three.len(), one.len().div_ceil(3));
+        assert_eq!(one[0], "editing");
+        assert!(one.iter().any(|row| row == "during a turn"), "{one:?}");
+        assert!(one.iter().any(|row| row == "menus"), "{one:?}");
+        assert!(one.iter().any(|row| row == "viewer"), "{one:?}");
+        assert!(
+            one.iter()
+                .any(|row| row == "?  show every key, on an empty draft"),
+            "{one:?}"
+        );
+        // Rebound keys are what the overlay names.
+        let mut file = BTreeMap::new();
+        file.insert("queue".to_owned(), vec!["ctrl+q".to_owned()]);
+        let rebound = Keymap::with_overrides(&file).expect("valid");
+        let rows = help_rows(&rebound, 40, "", "");
+        assert!(
+            rows.iter().any(|row| row.starts_with("ctrl+q  ")),
+            "{rows:?}"
+        );
+        let styled = help_rows(&keymap, 40, "<", ">");
+        assert_eq!(styled[0], "<editing>");
+    }
+
+    #[test]
+    fn help_rows_never_exceed_the_width() {
+        let keymap = Keymap::defaults();
+        for width in [10, 20, 40, 79, 80, 119, 120, 160, 300] {
+            for row in help_rows(&keymap, width, "", "") {
+                assert!(crate::width::str_width(&row) <= width, "{width}: {row}");
+            }
+        }
+    }
 
     fn overrides(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         pairs

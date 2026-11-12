@@ -300,6 +300,7 @@ pub fn pick_styled(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::Help
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {}

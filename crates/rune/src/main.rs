@@ -27,6 +27,7 @@ mod diagnostics;
 mod file_index;
 mod help;
 mod helper_usage;
+mod hints;
 mod hooks;
 mod install;
 mod keys_file;

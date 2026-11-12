@@ -104,6 +104,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         "RUNE_DRAFT_TEST_KEY": "fixture-key",
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
+        # The help is read in the viewer; its pager prints the whole text.
+        "PAGER": "cat",
     })
     stub = root / "editor.py"
     stub.write_text("import pathlib, sys\np = pathlib.Path(sys.argv[1])\n"
@@ -178,10 +180,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
             sys.exit(0)
 
         wait_for("/ commands")
+        start = len(transcript)
         keys(b"/help\r")
-        wait_for("Terminals without bracketed paste send ordinary keys.")
-        # Verify the complete help through the output emitted by /help itself.
-        help_output = transcript.decode(errors="replace")
+        # The help opens in the viewer, on the alternate screen.
+        wait_for("\x1b[?1049h", start)
+        wait_for("/model", start)
+        keys(b"v")
+        wait_for("Terminals without bracketed paste send ordinary keys.", start)
+        # Verify the complete help through the pager's copy of it.
+        help_output = transcript[start:].decode(errors="replace")
         for binding in ["Enter", "Alt-Enter", "Left / Right", "Home / Ctrl-A",
                         "End / Ctrl-E", "Ctrl-B / Alt-Left", "Ctrl-F / Alt-Right",
                         "Backspace", "Delete", "Ctrl-D", "Ctrl-W", "Ctrl-U",
@@ -193,6 +200,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         assert "within 1000 ms" in help_output
         assert "clear the draft (Up brings it back)" in help_output
         assert "Interrupting:" in help_output
+        keys(b"q")
+        wait_for("\x1b[?1049l", start)
 
         # Each alternative spelling gets its own caret assertion.
         draft("typed", "one 界e\u0301 two".encode(), "one 界e\u0301 two", 13)

@@ -589,6 +589,10 @@ struct SessionHost {
     /// Rows committed while the transcript or editor held the screen, put in
     /// scrollback once it is given back.
     withheld: Mutex<Vec<String>>,
+    /// The one-time hints used and shown.
+    hints: Mutex<crate::hints::Hints>,
+    /// Whether this turn has shown a hint already.
+    hint_shown: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
     ///
     /// Held on the host because the streaming thread redraws the whole frame
@@ -3914,6 +3918,25 @@ impl SessionHost {
         }
     }
 
+    /// Shows a one-time hint as a dim committed row, at most one per turn.
+    fn offer_hint(&self, hint: crate::hints::Hint) {
+        use std::sync::atomic::Ordering;
+        if self.hint_shown.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(text) = lock_value(&self.hints).offer(hint) else {
+            return;
+        };
+        self.hint_shown.store(true, Ordering::Relaxed);
+        let dim = self.theme().sgr(Slot::Dim, self.depth);
+        self.commit_lines(&[styled(&dim, &format!("hint: {text}"))]);
+    }
+
+    /// Records that a hinted feature was used, so its hint stops.
+    fn hint_used(&self, hint: crate::hints::Hint) {
+        lock_value(&self.hints).used(hint);
+    }
+
     /// Commits the rows held while the screen was handed over.
     fn release_withheld(&self) {
         let rows = std::mem::take(&mut *lock_value(&self.withheld));
@@ -4740,6 +4763,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
         withheld: Mutex::new(Vec::new()),
+        hints: Mutex::new(crate::hints::Hints::load(&config.paths.state_root)),
+        hint_shown: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -4999,6 +5024,16 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         "\n{}",
                         rune_term::input::render_bindings_help(reader.is_active(), reader.keymap())
                     );
+                    // A terminal reads it in the viewer instead of scrollback.
+                    if reader.is_active() && !host.accessible {
+                        let text = String::from_utf8_lossy(&captured).trim_end().to_owned();
+                        view_text(
+                            reader,
+                            &host,
+                            vec![Entry::notice("commands and keys"), Entry::notice(&text)],
+                        )?;
+                        return Ok(Step::Continue);
+                    }
                 }
                 let mut note = |text: String| captured.extend_from_slice(text.as_bytes());
                 // A model chosen by a command belongs to the prompt right after
@@ -5454,6 +5489,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 let painted = host.paint(&echo, None, &prompt_row, &[], caret)?;
                 sink.write_all(&painted)?;
                 sink.flush()?;
+                host.hint_shown
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if names_a_file_without_a_mention(&text) {
+                    host.offer_hint(crate::hints::Hint::Mention);
+                }
 
                 // Recorded before the turn runs, so a prompt that is interrupted
                 // or blocked is still recallable.
@@ -5700,6 +5740,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     .ok()
                     .and_then(|started| *started)
                     .map(|started| started.elapsed());
+                let tool_calls = lock_value(&host.events)
+                    .iter()
+                    .filter(|event| matches!(event, Event::ToolStarted { .. }))
+                    .count();
                 host.clear_events();
                 // The streamed text has been superseded by the finished turn,
                 // so it is taken before the render that replaces it; only the
@@ -5762,6 +5806,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     &steered.unsent,
                     steered.interrupted || steered.failed,
                 )?;
+                if tool_calls >= TRANSCRIPT_HINT_CALLS {
+                    host.offer_hint(crate::hints::Hint::Transcript);
+                }
                 Ok(Step::Continue)
             }
             Input::Shell(command) => {
@@ -6216,6 +6263,31 @@ fn run_turn_steerable(
     })
 }
 
+/// Tool calls in one turn after which the transcript hint appears.
+const TRANSCRIPT_HINT_CALLS: usize = 3;
+
+/// Returns true when a prompt names a path or a file, such as `src/x` or
+/// `notes.md`, without an `@` mention.
+fn names_a_file_without_a_mention(text: &str) -> bool {
+    if text.contains('@') {
+        return false;
+    }
+    text.split_whitespace().any(|token| {
+        let token = token
+            .trim_matches(|ch: char| matches!(ch, ',' | ';' | ':' | '(' | ')' | '"' | '\'' | '`'));
+        token.contains('/')
+            || token.rsplit_once('.').is_some_and(|(stem, extension)| {
+                !stem.is_empty()
+                    && (1..=6).contains(&extension.len())
+                    && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+                    && extension.chars().any(|ch| ch.is_ascii_alphabetic())
+            })
+    })
+}
+
+/// How long a turn runs before the queue hint appears.
+const QUEUE_HINT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Slash commands that run while a turn is in flight. They read or change
 /// session settings and never touch the conversation the turn is using.
 const TURN_SAFE_COMMANDS: &[&str] = &[
@@ -6432,6 +6504,9 @@ fn run_steerable<T: Send>(
         let Some(key) = polled else {
             host.flush_frame();
             host.tick();
+            if host.turn_elapsed() >= QUEUE_HINT_AFTER {
+                host.offer_hint(crate::hints::Hint::Queue);
+            }
             return;
         };
         match key {
@@ -6547,6 +6622,7 @@ fn run_steerable<T: Send>(
             // ends.
             KeyAction::Queue => {
                 gesture.disarm();
+                host.hint_used(crate::hints::Hint::Queue);
                 let text = lane_text(reader);
                 if text.is_empty() {
                     return;
@@ -7213,6 +7289,7 @@ fn question_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
+        | KeyAction::Help
         | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue
@@ -7804,6 +7881,26 @@ fn pager_text(
 /// a turn streams. The reader's composer is never replaced, so its caret,
 /// recall state and kill buffer survive intact.
 fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
+    host.hint_used(crate::hints::Hint::Transcript);
+    view_with(reader, host, None)
+}
+
+/// Opens fixed text in the viewer, from its top, such as `/help`.
+fn view_text(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    entries: Vec<Entry>,
+) -> Result<()> {
+    view_with(reader, host, Some(entries))
+}
+
+/// The viewer over the live session, or over `fixed` entries that never
+/// change.
+fn view_with(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    fixed: Option<Vec<Entry>>,
+) -> Result<()> {
     use rune_term::input::TranscriptAction;
 
     host.refresh_size();
@@ -7812,7 +7909,8 @@ fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost)
         host.height.load(std::sync::atomic::Ordering::Relaxed),
     );
     let mut signature = viewer_signature(host);
-    let mut details = transcript::ToolDetails::new(viewer_entries(host));
+    let live = fixed.is_none();
+    let mut details = transcript::ToolDetails::new(fixed.unwrap_or_else(|| viewer_entries(host)));
     let style = host.diff_style();
     let display = |width: u16| Display {
         width: usize::from(width),
@@ -7831,10 +7929,12 @@ fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost)
     };
     let mut built = details.rows(display(size.0));
     let mut view = rune_term::screen::Transcript::new(std::mem::take(&mut built.rows));
-    view.jump(usize::MAX, view.body(size.1.saturating_sub(1)));
+    if live {
+        view.jump(usize::MAX, view.body(size.1.saturating_sub(1)));
+    }
     let mut starts = built.starts;
     let mut mode = ViewerMode::Browse;
-    let mut following = true;
+    let mut following = live;
     let mut new_rows = 0_usize;
     let mut notice: Option<String> = None;
     let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
@@ -7870,7 +7970,11 @@ fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost)
             host.height.load(std::sync::atomic::Ordering::Relaxed),
         );
         let resized = next_size != size;
-        let next_signature = viewer_signature(host);
+        let next_signature = if live {
+            viewer_signature(host)
+        } else {
+            signature
+        };
         let grown = next_signature != signature;
         if resized || grown {
             size = next_size;
@@ -8270,6 +8374,10 @@ fn await_submission(
             host.toggle_plan();
             continue;
         }
+        if key == KeyAction::Help {
+            show_key_overlay(reader, host, out)?;
+            continue;
+        }
         if key == KeyAction::ModeCycle {
             let line = cycle_mode(host);
             flash = std::time::Instant::now()
@@ -8393,12 +8501,46 @@ fn await_submission(
                 if let Input::Prompt(text) = &input {
                     for path in mentions(text) {
                         host.touch(&path);
+                        host.hint_used(crate::hints::Hint::Mention);
                     }
                 }
                 return Ok(Some(input));
             }
         }
     }
+}
+
+/// Draws the key overlay under the prompt until any key, which is ignored.
+fn show_key_overlay(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+) -> Result<()> {
+    reader.with_temporary_line(|overlay| {
+        loop {
+            let theme = host.theme();
+            let accent = theme.sgr(Slot::Accent, host.depth);
+            let dim = theme.sgr(Slot::Dim, host.depth);
+            let reset = if accent.is_empty() { "" } else { RESET };
+            let mut rows = rune_term::keys::help_rows(
+                overlay.keymap(),
+                usize::from(host.width()),
+                &accent,
+                reset,
+            );
+            let room = host.menu_room().max(1);
+            if rows.len() >= room {
+                rows.truncate(room.saturating_sub(1));
+                rows.push(styled(&dim, "... resize or press any key"));
+            } else {
+                rows.push(styled(&dim, "type ? after other text to insert it"));
+            }
+            draw_prompt(overlay, host, out, &rows, &prompt_marker(host), None)?;
+            if next_key(overlay, host).is_some() {
+                return Ok(());
+            }
+        }
+    })
 }
 
 /// A filesystem menu is opened only by Tab and discarded when the draft changes.
@@ -8736,6 +8878,7 @@ fn idle_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
+        | KeyAction::Help
         | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue => Idle::Stay,
@@ -8948,6 +9091,7 @@ fn confirm_choice(
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
+                | KeyAction::Help
                 | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
@@ -9041,6 +9185,7 @@ fn run_picker(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::Help
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -9110,6 +9255,7 @@ fn search_prompt_history(
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
+                | KeyAction::Help
                 | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
@@ -11246,6 +11392,7 @@ fn choose_theme(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::Help
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -11450,6 +11597,7 @@ fn pick_index(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::Help
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -15128,6 +15276,24 @@ mod tests {
         assert!(keyed.contains("first second third"), "{keyed:?}");
         assert!(keyed.contains("> Z"), "{keyed:?}");
         assert!(!host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_prompt_naming_a_file_offers_the_mention_hint() {
+        assert!(names_a_file_without_a_mention("look at src/main.rs please"));
+        assert!(names_a_file_without_a_mention("fix notes.md"));
+        assert!(names_a_file_without_a_mention("edit (Cargo.toml)"));
+        assert!(!names_a_file_without_a_mention("look at @src/main.rs"));
+        assert!(!names_a_file_without_a_mention("version 1.2 is out."));
+        assert!(!names_a_file_without_a_mention("hello there."));
+        let host = test_host();
+        let bytes = capture_output(&host);
+        host.offer_hint(crate::hints::Hint::Mention);
+        host.offer_hint(crate::hints::Hint::Transcript);
+        let written = String::from_utf8_lossy(&bytes.lock().expect("bytes")).into_owned();
+        // One hint per turn.
+        assert!(written.contains("hint: @ mentions a file"), "{written}");
+        assert!(!written.contains("ctrl-o opens"), "{written}");
     }
 
     #[test]
@@ -24544,6 +24710,10 @@ mod tests {
             transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
             transcript_open: std::sync::atomic::AtomicBool::new(false),
             withheld: Mutex::new(Vec::new()),
+            hints: Mutex::new(crate::hints::Hints::load(Utf8Path::new(
+                "/nonexistent/rune-test-state",
+            ))),
+            hint_shown: std::sync::atomic::AtomicBool::new(false),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,

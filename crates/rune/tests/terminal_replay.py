@@ -392,7 +392,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             # At 12 columns the hint is deliberately clipped to this prefix.
             wait_for("/ commands")
         if scenario.startswith("help-"):
-            capture("help-settled", b"/help\r")
+            capture("help-viewer", b"/help\r", "/model")
+            capture("help-closed", b"q", "\x1b[?1049l")
             assert not prompts, prompts
         elif scenario == "resize":
             draft = "0123456789" * 5 + "VISIBLE-END"
