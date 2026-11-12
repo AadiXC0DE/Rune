@@ -182,6 +182,9 @@ with tempfile.TemporaryDirectory(prefix="rune-paste-") as directory:
     finally:
         if child.poll() is None:
             child.kill()
+            # The session may be writing the long echo; reading lets the
+            # write, and so the kill, finish.
+            drain_wait(child, master, 10, transcript)
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()
