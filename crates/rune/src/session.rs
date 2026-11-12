@@ -6450,6 +6450,7 @@ fn collect_approval(
         &format!("waiting for approval: {}", request.tool),
     );
     let answer = collect_approval_inner(request, host, reader);
+    reader.set_context(rune_term::keys::Context::Menu);
     lock_value(&host.approval_hint).take();
     host.set_title_state("working");
     answer
@@ -6463,7 +6464,7 @@ const APPROVAL_QUARANTINE: std::time::Duration = std::time::Duration::from_milli
 /// shown only once an arrow was pressed.
 #[derive(Clone, Debug)]
 struct ApprovalMenu {
-    /// Key, text and outcome of each row, top first.
+    /// Action id, text and outcome of each row, top first.
     rows: Vec<(&'static str, &'static str, ApprovalOutcome)>,
     /// The highlighted row, once an arrow was pressed.
     highlight: Option<usize>,
@@ -6472,24 +6473,24 @@ struct ApprovalMenu {
 impl ApprovalMenu {
     /// The rows a request offers.
     fn for_request(request: &ApprovalRequest) -> Self {
-        let mut rows = vec![("y", "run once", ApprovalOutcome::RunOnce)];
+        let mut rows = vec![("approve_once", "run once", ApprovalOutcome::RunOnce)];
         if request.rememberable {
             rows.push((
-                "a",
+                "approve_session",
                 "allow for this session",
                 ApprovalOutcome::RememberForSession,
             ));
         }
         if request.project_pattern.is_some() {
             rows.push((
-                "p",
+                "approve_always",
                 "always allow in this project",
                 ApprovalOutcome::AlwaysForProject,
             ));
         }
-        rows.push(("n", "deny", ApprovalOutcome::Deny));
+        rows.push(("deny", "deny", ApprovalOutcome::Deny));
         rows.push((
-            "tab",
+            "deny_with_message",
             "deny and say what to do instead",
             ApprovalOutcome::Deny,
         ));
@@ -6503,34 +6504,41 @@ impl ApprovalMenu {
     fn deny_row(&self) -> usize {
         self.rows
             .iter()
-            .position(|(_, _, outcome)| *outcome == ApprovalOutcome::Deny)
+            .position(|(id, _, _)| *id == "deny")
             .unwrap_or_default()
     }
 
-    /// The outcome of a row's key, when the row is offered.
-    fn by_key(&self, key: &str) -> Option<ApprovalOutcome> {
+    /// The outcome of an action, when its row is offered.
+    fn by_id(&self, id: &str) -> Option<ApprovalOutcome> {
         self.rows
             .iter()
-            .find(|(shown, _, _)| *shown == key)
+            .find(|(shown, _, _)| *shown == id)
             .map(|(_, _, outcome)| *outcome)
     }
 
     /// The hint row's text.
     fn hint(&self) -> &'static str {
-        if self.by_key("a").is_some() {
+        if self.by_id("approve_session").is_some() {
             "y once   a session   n deny   tab comment"
         } else {
             "y once   n deny   tab comment"
         }
     }
 
-    /// The menu rows, the highlighted one marked.
-    fn lines(&self, theme: &Theme, depth: ColorDepth) -> Vec<String> {
+    /// The menu rows, each led by the first key bound to it, the highlighted
+    /// one marked.
+    fn lines(
+        &self,
+        theme: &Theme,
+        depth: ColorDepth,
+        keymap: &rune_term::keys::Keymap,
+    ) -> Vec<String> {
         let accent = theme.sgr(Slot::Accent, depth);
         self.rows
             .iter()
             .enumerate()
-            .map(|(index, (key, text, _))| {
+            .map(|(index, (id, text, _))| {
+                let key = keymap.keys(id).into_iter().next().unwrap_or_default();
                 if self.highlight == Some(index) {
                     styled(&accent, &format!("> {key}  {text}"))
                 } else {
@@ -6556,17 +6564,18 @@ enum ApprovalStep {
     Suspend,
 }
 
-/// Maps one key to its effect: `y`, `a`, `p` and `n` answer, Escape denies,
-/// Control-C and Control-D deny and interrupt, the arrows move a highlight
-/// that Enter confirms, and every other key does nothing.
+/// Maps one key to its effect: the approval actions (`y`, `a`, `p`, `n` or
+/// Escape, and Tab by default) answer, Control-C and Control-D deny and
+/// interrupt, the arrows move a highlight that Enter confirms, and every
+/// other key does nothing.
 fn approval_key(key: rune_term::input::ChoiceKey, menu: &mut ApprovalMenu) -> ApprovalStep {
     use rune_term::input::ChoiceKey;
     match key {
-        ChoiceKey::Char(ch) => menu
-            .by_key(ch.encode_utf8(&mut [0; 4]))
+        ChoiceKey::Bound("deny_with_message") => ApprovalStep::Comment,
+        ChoiceKey::Bound(id) => menu
+            .by_id(id)
             .map_or(ApprovalStep::Stay, ApprovalStep::Answer),
-        ChoiceKey::Action(KeyAction::Escape) => ApprovalStep::Answer(ApprovalOutcome::Deny),
-        ChoiceKey::Action(KeyAction::Complete) => ApprovalStep::Comment,
+        ChoiceKey::Char(_) => ApprovalStep::Stay,
         ChoiceKey::Action(KeyAction::Cancel | KeyAction::Interrupt) => ApprovalStep::Interrupt,
         ChoiceKey::Action(KeyAction::Suspend) => ApprovalStep::Suspend,
         ChoiceKey::Action(arrow @ (KeyAction::Up | KeyAction::Down)) => {
@@ -6581,8 +6590,8 @@ fn approval_key(key: rune_term::input::ChoiceKey, menu: &mut ApprovalMenu) -> Ap
         ChoiceKey::Action(KeyAction::Submit) => menu
             .highlight
             .and_then(|row| menu.rows.get(row))
-            .map_or(ApprovalStep::Stay, |(key, _, outcome)| {
-                if *key == "tab" {
+            .map_or(ApprovalStep::Stay, |(id, _, outcome)| {
+                if *id == "deny_with_message" {
                     ApprovalStep::Comment
                 } else {
                     ApprovalStep::Answer(*outcome)
@@ -6612,7 +6621,9 @@ enum Comment {
 /// Edits a one-line message for a denial in a composer of its own, so the
 /// draft being written for the turn is left as it was.
 fn approval_comment(host: &SessionHost, reader: &mut rune_term::input::KeyReader) -> Comment {
-    reader.with_temporary_line(|field| {
+    // The field is edited like a draft, so the approval keys do not apply.
+    reader.set_context(rune_term::keys::Context::Editor);
+    let comment = reader.with_temporary_line(|field| {
         loop {
             if host.cancellation.is_cancelled() {
                 return Comment::Interrupt;
@@ -6639,7 +6650,9 @@ fn approval_comment(host: &SessionHost, reader: &mut rune_term::input::KeyReader
                 Some(_) | None => {}
             }
         }
-    })
+    });
+    reader.set_context(rune_term::keys::Context::Approval);
+    comment
 }
 
 /// Draws a one-line field under an activity line, like [`draw_choice`].
@@ -6726,25 +6739,29 @@ fn save_rule_rows(rule: &str) -> Vec<String> {
 fn confirm_rule(host: &SessionHost, reader: &mut rune_term::input::KeyReader, rule: &str) -> bool {
     use rune_term::input::ChoiceKey;
     *lock_value(&host.approval_hint) = Some("y yes   n no");
+    // A yes or no question, so the approval keys do not apply.
+    reader.set_context(rune_term::keys::Context::Menu);
     let rows = save_rule_rows(rule);
     let mut paced = false;
-    loop {
+    let saved = loop {
         if host.cancellation.is_cancelled()
             || draw_choice(host, SAVE_RULE_QUESTION, &rows, &[], paced).is_err()
         {
-            return false;
+            break false;
         }
         paced = true;
         match reader.poll_choice_key(rune_term::shell::POLL_INTERVAL) {
-            Some(ChoiceKey::Char('y')) => return true,
-            Some(ChoiceKey::Char('n') | ChoiceKey::Action(KeyAction::Escape)) => return false,
+            Some(ChoiceKey::Char('y')) => break true,
+            Some(ChoiceKey::Char('n') | ChoiceKey::Action(KeyAction::Escape)) => break false,
             Some(ChoiceKey::Action(KeyAction::Cancel | KeyAction::Interrupt)) => {
                 host.interrupt();
-                return false;
+                break false;
             }
             _ => {}
         }
-    }
+    };
+    reader.set_context(rune_term::keys::Context::Approval);
+    saved
 }
 
 /// Shows the complete request in scrollback, then waits for a one-key answer.
@@ -6758,6 +6775,7 @@ fn collect_approval_inner(
 ) -> ApprovalAnswer {
     let mut menu = ApprovalMenu::for_request(request);
     *lock_value(&host.approval_hint) = Some(menu.hint());
+    reader.set_context(rune_term::keys::Context::Approval);
     reader.discard_pending();
     host.refresh_size();
     let mut lines = approval_lines(request, usize::from(host.width()));
@@ -6768,7 +6786,7 @@ fn collect_approval_inner(
         }
     }
     let lines = host.spaced(RowKind::Notice, &lines);
-    let rows = menu.lines(&host.theme(), host.depth);
+    let rows = menu.lines(&host.theme(), host.depth, reader.keymap());
     if draw_choice(host, "permission required", &rows, &lines, false).is_err() {
         return ApprovalOutcome::Deny.into();
     }
@@ -6792,7 +6810,7 @@ fn collect_approval_inner(
                             return ApprovalOutcome::AlwaysForProject.into();
                         }
                         *lock_value(&host.approval_hint) = Some(menu.hint());
-                        let rows = menu.lines(&host.theme(), host.depth);
+                        let rows = menu.lines(&host.theme(), host.depth, reader.keymap());
                         if draw_choice(host, "permission required", &rows, &[], false).is_err() {
                             return ApprovalOutcome::Deny.into();
                         }
@@ -6825,7 +6843,7 @@ fn collect_approval_inner(
                 }
             }
         }
-        let rows = menu.lines(&host.theme(), host.depth);
+        let rows = menu.lines(&host.theme(), host.depth, reader.keymap());
         // Also refreshes dimensions when no input arrives.
         if draw_choice(host, "permission required", &rows, &[], idle).is_err() {
             return ApprovalOutcome::Deny.into();
@@ -16299,17 +16317,40 @@ mod tests {
                 .map(|(key, _, _)| *key)
                 .collect()
         };
-        assert_eq!(keys("docker ps -a"), ["y", "a", "p", "n", "tab"]);
         assert_eq!(
-            ApprovalMenu::for_request(&shell_request("docker ps -a")).by_key("p"),
+            keys("docker ps -a"),
+            [
+                "approve_once",
+                "approve_session",
+                "approve_always",
+                "deny",
+                "deny_with_message"
+            ]
+        );
+        assert_eq!(
+            ApprovalMenu::for_request(&shell_request("docker ps -a")).by_id("approve_always"),
             Some(ApprovalOutcome::AlwaysForProject)
         );
         // A consequential command is approved one run at a time.
-        assert_eq!(keys("git push"), ["y", "n", "tab"]);
+        assert_eq!(
+            keys("git push"),
+            ["approve_once", "deny", "deny_with_message"]
+        );
         // No safe pattern: remembered for the session only.
-        assert_eq!(keys("docker ps; docker images"), ["y", "a", "n", "tab"]);
-        let rows = ApprovalMenu::for_request(&shell_request("git push"))
-            .lines(&Theme::no_color(), ColorDepth::Ansi256);
+        assert_eq!(
+            keys("docker ps; docker images"),
+            [
+                "approve_once",
+                "approve_session",
+                "deny",
+                "deny_with_message"
+            ]
+        );
+        let rows = ApprovalMenu::for_request(&shell_request("git push")).lines(
+            &Theme::no_color(),
+            ColorDepth::Ansi256,
+            &rune_term::keys::Keymap::defaults(),
+        );
         assert_eq!(
             rows,
             [
@@ -16324,27 +16365,25 @@ mod tests {
     fn approval_keys_map_to_outcomes() {
         use rune_term::input::ChoiceKey;
         let mut menu = ApprovalMenu::for_request(&shell_request("docker ps -a"));
-        for (key, expected) in [
-            ('y', ApprovalOutcome::RunOnce),
-            ('a', ApprovalOutcome::RememberForSession),
-            ('p', ApprovalOutcome::AlwaysForProject),
-            ('n', ApprovalOutcome::Deny),
+        for (id, expected) in [
+            ("approve_once", ApprovalOutcome::RunOnce),
+            ("approve_session", ApprovalOutcome::RememberForSession),
+            ("approve_always", ApprovalOutcome::AlwaysForProject),
+            ("deny", ApprovalOutcome::Deny),
         ] {
             assert_eq!(
-                approval_key(ChoiceKey::Char(key), &mut menu),
+                approval_key(ChoiceKey::Bound(id), &mut menu),
                 ApprovalStep::Answer(expected)
             );
         }
-        for ignored in ['Y', 'x', ' ', 'q'] {
+        // An unbound character, such as `y` moved elsewhere by a key file,
+        // does nothing.
+        for ignored in ['y', 'Y', 'x', ' ', 'q'] {
             assert_eq!(
                 approval_key(ChoiceKey::Char(ignored), &mut menu),
                 ApprovalStep::Stay
             );
         }
-        assert_eq!(
-            approval_key(ChoiceKey::Action(KeyAction::Escape), &mut menu),
-            ApprovalStep::Answer(ApprovalOutcome::Deny)
-        );
         for interrupt in [KeyAction::Cancel, KeyAction::Interrupt] {
             assert_eq!(
                 approval_key(ChoiceKey::Action(interrupt), &mut menu),
@@ -16454,7 +16493,7 @@ mod tests {
         assert!(!ApprovalAnswer::from(ApprovalOutcome::RunOnce).always);
         // Chaining has no safe pattern, so `p` is not offered for it.
         let menu = ApprovalMenu::for_request(&shell_request("cargo test && rm -rf x"));
-        assert_eq!(menu.by_key("p"), None);
+        assert_eq!(menu.by_id("approve_always"), None);
     }
 
     #[test]
@@ -16476,7 +16515,7 @@ mod tests {
         assert_eq!(denial_row(None), "denied");
         let mut menu = ApprovalMenu::for_request(&shell_request("ls"));
         assert_eq!(
-            approval_key(ChoiceKey::Action(KeyAction::Complete), &mut menu),
+            approval_key(ChoiceKey::Bound("deny_with_message"), &mut menu),
             ApprovalStep::Comment
         );
         // The tab row can also be reached with the arrows.
@@ -16502,7 +16541,11 @@ mod tests {
             ApprovalStep::Stay
         );
         assert_eq!(menu.highlight, Some(menu.deny_row()));
-        let rows = menu.lines(&Theme::no_color(), ColorDepth::Ansi256);
+        let rows = menu.lines(
+            &Theme::no_color(),
+            ColorDepth::Ansi256,
+            &rune_term::keys::Keymap::defaults(),
+        );
         assert!(rows.iter().any(|row| row == "> n  deny"), "{rows:?}");
         assert_eq!(
             approval_key(enter, &mut menu),

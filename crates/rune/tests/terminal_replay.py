@@ -547,7 +547,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("approval-write", b"write\r", "+ second note",
                     repaint=b"\x1b[?25l\r\x1b[1G\x1b[?25h")
             time.sleep(0.4)
+            interrupted_at = len(transcript)
             os.write(master, b"\x03")
+            wait_for("/ commands", interrupted_at)
             assert prompts == ["approve", "write"], prompts
         elif scenario == "reasoning":
             capture("reasoning-finished", b"think\r", "REASONED\r\n")

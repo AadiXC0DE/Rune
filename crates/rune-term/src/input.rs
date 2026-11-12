@@ -190,6 +190,8 @@ pub enum KeyAction {
 /// A key read while a one-key answer is awaited.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChoiceKey {
+    /// A key bound to an approval action in the approval keys.
+    Bound(&'static str),
     /// A character typed without Control or Alt.
     Char(char),
     /// Any other key, as the action it maps to.
@@ -519,16 +521,28 @@ impl KeyReader {
         self.choice_event(event)
     }
 
-    /// Maps one event the way [`Self::poll_choice_key`] does.
+    /// Maps one event the way [`Self::poll_choice_key`] does. In the
+    /// approval context a key bound to an approval action is reported by
+    /// the action's id, so `keys.toml` can move it.
     pub fn choice_event(&mut self, event: Event) -> Option<ChoiceKey> {
         if let Event::Key(key) = &event
             && key.kind != KeyEventKind::Release
-            && let KeyCode::Char(ch) = key.code
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            return Some(ChoiceKey::Char(ch));
+            if self.context == Context::Approval
+                && let Some(id) = self.keymap.action(Context::Approval, key)
+                && ACTIONS
+                    .iter()
+                    .any(|info| info.id == id && info.context == Context::Approval)
+            {
+                return Some(ChoiceKey::Bound(id));
+            }
+            if let KeyCode::Char(ch) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return Some(ChoiceKey::Char(ch));
+            }
         }
         if matches!(event, Event::Paste(_)) {
             return None;
@@ -1950,6 +1964,34 @@ mod tests {
         );
         assert_eq!(reader.choice_event(Event::Paste("y".to_owned())), None);
         assert_eq!(reader.line(), "draft");
+
+        // In the approval keys a bound key reports its action, and a key file
+        // moves it.
+        reader.set_context(Context::Approval);
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('y'))),
+            Some(ChoiceKey::Bound("approve_once"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Esc)),
+            Some(ChoiceKey::Bound("deny"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Tab)),
+            Some(ChoiceKey::Bound("deny_with_message"))
+        );
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("approve_once".to_owned(), vec!["o".to_owned()]);
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('o'))),
+            Some(ChoiceKey::Bound("approve_once"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('y'))),
+            Some(ChoiceKey::Char('y'))
+        );
     }
 
     #[test]

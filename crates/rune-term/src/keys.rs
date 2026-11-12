@@ -215,6 +215,31 @@ pub const ACTIONS: &[ActionInfo] = &[
         &["esc", "ctrl+o", "ctrl+d"],
         "close the transcript",
     ),
+    action(
+        "approve_once",
+        Context::Approval,
+        &["y"],
+        "run the action once",
+    ),
+    action(
+        "approve_session",
+        Context::Approval,
+        &["a"],
+        "allow the action for this session",
+    ),
+    action(
+        "approve_always",
+        Context::Approval,
+        &["p"],
+        "always allow the action in this project",
+    ),
+    action("deny", Context::Approval, &["n", "esc"], "deny the action"),
+    action(
+        "deny_with_message",
+        Context::Approval,
+        &["tab"],
+        "deny and tell the model what to do instead",
+    ),
 ];
 
 /// Keys that share a context and may still be bound together, one in each:
