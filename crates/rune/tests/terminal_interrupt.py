@@ -17,7 +17,10 @@ import threading
 import time
 
 
-COMMAND = "echo $$ > pid.txt; exec sleep 30"
+# A duration no other process uses, so the command is found by its own
+# command line: inside a sandbox's process namespace `$$` is not its host pid.
+COMMAND = "echo $$ > pid.txt; exec sleep 31.4159"
+COMMAND_LINE = r"^sleep 31\.4159$"
 PARTIAL = "HOLD_PARTIAL_TEXT"
 errors = []
 requests = []
@@ -97,12 +100,10 @@ def controlling_terminal():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def exists(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def running():
+    """Returns the host pids of the command, found by its command line."""
+    found = subprocess.run(["pgrep", "-f", COMMAND_LINE], capture_output=True, text=True)
+    return [int(pid) for pid in found.stdout.split()]
 
 
 scenario = sys.argv[2]
@@ -178,12 +179,15 @@ with tempfile.TemporaryDirectory(prefix="rune-interrupt-") as directory:
                 "the command never started:\n" + transcript.decode(errors="replace")
             )
             read_some(0.05)
-        pid = int(pid_file.read_text().strip())
-        assert exists(pid), pid
+        deadline = time.monotonic() + 5
+        while not running():
+            assert time.monotonic() < deadline, "the command is not running"
+            read_some(0.05)
+        pid = running()[0]
 
         os.write(master, b"\x03")
         deadline = time.monotonic() + 1
-        while exists(pid):
+        while running():
             assert time.monotonic() < deadline, (
                 f"the command {pid} still runs 1 s after the interrupt:\n"
                 + transcript.decode(errors="replace")
@@ -262,8 +266,8 @@ with tempfile.TemporaryDirectory(prefix="rune-interrupt-") as directory:
             os.write(master, b"\x15/quit\r")
             assert drain_wait(child, master, 10, transcript) == 0
     finally:
-        if pid is not None and exists(pid):
-            os.kill(pid, signal.SIGKILL)
+        for leftover in running():
+            os.kill(leftover, signal.SIGKILL)
         if child.poll() is None:
             child.kill()
             child.wait()
