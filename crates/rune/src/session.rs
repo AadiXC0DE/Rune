@@ -281,7 +281,30 @@ struct ApprovalRequest {
     preview: Vec<String>,
     /// A question shown above the request, for one the session asks itself.
     header: Option<String>,
-    answer: mpsc::SyncSender<ApprovalOutcome>,
+    /// Where a command would run, for a shell request.
+    cwd: Option<String>,
+    answer: mpsc::SyncSender<ApprovalAnswer>,
+}
+
+/// What the user answered to an approval.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ApprovalAnswer {
+    /// The decision.
+    outcome: ApprovalOutcome,
+    /// What the user said instead, with a denial.
+    message: Option<String>,
+    /// Whether the user asked for a saved rule.
+    always: bool,
+}
+
+impl From<ApprovalOutcome> for ApprovalAnswer {
+    fn from(outcome: ApprovalOutcome) -> Self {
+        Self {
+            outcome,
+            message: None,
+            always: outcome == ApprovalOutcome::AlwaysForProject,
+        }
+    }
 }
 
 /// A tool worker hands questions to the thread that owns terminal input.
@@ -637,6 +660,10 @@ struct SessionHost {
     approval_requests: Mutex<Option<mpsc::Sender<ApprovalRequest>>>,
     /// The change an edit awaiting a decision would make, for its prompt.
     approval_preview: Mutex<Vec<String>>,
+    /// Where a command awaiting a decision would run, for its prompt.
+    approval_cwd: Mutex<Option<String>>,
+    /// The hint row's text while an approval is open.
+    approval_hint: Mutex<Option<&'static str>>,
     /// Exact actions approved for the rest of this session.
     grants: Mutex<Grants>,
     /// Whether the session is planning: only reads and plan updates may run.
@@ -1521,10 +1548,17 @@ impl Host for SessionHost {
         if let Ok(mut slot) = self.approval_preview.lock() {
             *slot = preview;
         }
+        *lock_value(&self.approval_cwd) = (name == "shell").then(|| {
+            arguments
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| self.workspace.clone(), str::to_owned)
+        });
         let decision = self.decide(name, target);
         if let Ok(mut slot) = self.approval_preview.lock() {
             slot.clear();
         }
+        lock_value(&self.approval_cwd).take();
         decision
     }
 
@@ -1870,6 +1904,7 @@ impl SessionHost {
                 .map(|mut preview| std::mem::take(&mut *preview))
                 .unwrap_or_default(),
             header: header.map(str::to_owned),
+            cwd: lock_value(&self.approval_cwd).clone(),
             answer,
         };
         if requests.send(request).is_err() {
@@ -1882,7 +1917,10 @@ impl SessionHost {
             if self.cancellation.is_cancelled() {
                 return (Outcome::Deny, format!("{reason}; approval was cancelled"));
             }
-            match response.recv_timeout(rune_term::shell::POLL_INTERVAL) {
+            match response
+                .recv_timeout(rune_term::shell::POLL_INTERVAL)
+                .map(|answer| answer.outcome)
+            {
                 Ok(ApprovalOutcome::RunOnce) if !self.cancellation.is_cancelled() => {
                     return (Outcome::Allow, format!("{reason}; approved for this call"));
                 }
@@ -2806,6 +2844,8 @@ impl SessionHost {
             },
             gesture_hint: if running && ui.is_none_or(|ui| ui == UiState::Running) {
                 self.escape_hint()
+            } else if ui == Some(UiState::Approval) {
+                *lock_value(&self.approval_hint)
             } else {
                 None
             },
@@ -4619,6 +4659,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         review_session: Arc::new(Mutex::new(ReviewSession::new(&limits))),
         approval_requests: Mutex::new(None),
         approval_preview: Mutex::new(Vec::new()),
+        approval_cwd: Mutex::new(None),
+        approval_hint: Mutex::new(None),
         grants: Mutex::new(Grants::new()),
         last_plan: Mutex::new(None),
         warming: Arc::default(),
@@ -5865,26 +5907,29 @@ fn run_accessible<T: Send>(
         if let Ok(request) = pending.try_recv() {
             let mut lines = approval_lines(&request, usize::MAX);
             lines.push(if request.rememberable {
-                    "type yes to run once, or always to allow it for this session; any other answer denies"
-                        .to_owned()
-                } else {
-                    "type yes to run once; any other answer denies".to_owned()
-                });
+                "type y to run once, a to allow for this session, or anything else to deny"
+                    .to_owned()
+            } else {
+                "type y to run once, or anything else to deny".to_owned()
+            });
             host.show(&transcript::append_lines(&transcript::accessible_lines(&[
                 Entry::notice(lines.join("\n")),
             ])));
             let answer = match input.next_line() {
-                Ok(Some(line)) if line.trim().eq_ignore_ascii_case("yes") => {
+                Ok(Some(line))
+                    if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") =>
+                {
                     ApprovalOutcome::RunOnce
                 }
                 Ok(Some(line))
-                    if request.rememberable && line.trim().eq_ignore_ascii_case("always") =>
+                    if request.rememberable
+                        && matches!(line.trim().to_ascii_lowercase().as_str(), "a" | "always") =>
                 {
                     ApprovalOutcome::RememberForSession
                 }
                 _ => ApprovalOutcome::Deny,
             };
-            let _ = request.answer.send(answer);
+            let _ = request.answer.send(answer.into());
         } else if let Ok(request) = pending_questions.try_recv() {
             let answer = collect_accessible_questions(&request.questions, host, input);
             let _ = request.answer.send(answer);
@@ -6386,57 +6431,193 @@ fn collect_approval(
     request: &ApprovalRequest,
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
-) -> ApprovalOutcome {
+) -> ApprovalAnswer {
     host.set_title_state("waiting for you");
     host.notify_unfocused(
         reader.focus(),
         host.turn_elapsed(),
         &format!("waiting for approval: {}", request.tool),
     );
-    let outcome = collect_approval_inner(request, host, reader);
+    let answer = collect_approval_inner(request, host, reader);
+    lock_value(&host.approval_hint).take();
     host.set_title_state("working");
-    outcome
+    answer
 }
 
-/// Shows the complete scope in scrollback, then waits on a picker.
+/// How long a new approval or question ignores keys, so keys typed for
+/// something else cannot answer it.
+const APPROVAL_QUARANTINE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The one-key approval menu: the rows offered and the highlight, which is
+/// shown only once an arrow was pressed.
+#[derive(Clone, Debug)]
+struct ApprovalMenu {
+    /// Key, text and outcome of each row, top first.
+    rows: Vec<(&'static str, &'static str, ApprovalOutcome)>,
+    /// The highlighted row, once an arrow was pressed.
+    highlight: Option<usize>,
+}
+
+impl ApprovalMenu {
+    /// The rows a request offers.
+    fn for_request(request: &ApprovalRequest) -> Self {
+        let mut rows = vec![("y", "run once", ApprovalOutcome::RunOnce)];
+        if request.rememberable {
+            rows.push((
+                "a",
+                "allow for this session",
+                ApprovalOutcome::RememberForSession,
+            ));
+        }
+        if request.project_pattern.is_some() {
+            rows.push((
+                "p",
+                "always allow in this project",
+                ApprovalOutcome::AlwaysForProject,
+            ));
+        }
+        rows.push(("n", "deny", ApprovalOutcome::Deny));
+        Self {
+            rows,
+            highlight: None,
+        }
+    }
+
+    /// The row the highlight starts on.
+    fn deny_row(&self) -> usize {
+        self.rows
+            .iter()
+            .position(|(_, _, outcome)| *outcome == ApprovalOutcome::Deny)
+            .unwrap_or_default()
+    }
+
+    /// The outcome of a row's key, when the row is offered.
+    fn by_key(&self, key: &str) -> Option<ApprovalOutcome> {
+        self.rows
+            .iter()
+            .find(|(shown, _, _)| *shown == key)
+            .map(|(_, _, outcome)| *outcome)
+    }
+
+    /// The hint row's text.
+    fn hint(&self) -> &'static str {
+        if self.by_key("a").is_some() {
+            "y once   a session   n deny"
+        } else {
+            "y once   n deny"
+        }
+    }
+
+    /// The menu rows, the highlighted one marked.
+    fn lines(&self, theme: &Theme, depth: ColorDepth) -> Vec<String> {
+        let accent = theme.sgr(Slot::Accent, depth);
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, (key, text, _))| {
+                if self.highlight == Some(index) {
+                    styled(&accent, &format!("> {key}  {text}"))
+                } else {
+                    format!("  {key}  {text}")
+                }
+            })
+            .collect()
+    }
+}
+
+/// What a key does to an approval.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ApprovalStep {
+    /// Nothing yet.
+    Stay,
+    /// The answer.
+    Answer(ApprovalOutcome),
+    /// A denial that also interrupts the turn.
+    Interrupt,
+    /// Suspend the session.
+    Suspend,
+}
+
+/// Maps one key to its effect: `y`, `a`, `p` and `n` answer, Escape denies,
+/// Control-C and Control-D deny and interrupt, the arrows move a highlight
+/// that Enter confirms, and every other key does nothing.
+fn approval_key(key: rune_term::input::ChoiceKey, menu: &mut ApprovalMenu) -> ApprovalStep {
+    use rune_term::input::ChoiceKey;
+    match key {
+        ChoiceKey::Char(ch) => menu
+            .by_key(ch.encode_utf8(&mut [0; 4]))
+            .map_or(ApprovalStep::Stay, ApprovalStep::Answer),
+        ChoiceKey::Action(KeyAction::Escape) => ApprovalStep::Answer(ApprovalOutcome::Deny),
+        ChoiceKey::Action(KeyAction::Cancel | KeyAction::Interrupt) => ApprovalStep::Interrupt,
+        ChoiceKey::Action(KeyAction::Suspend) => ApprovalStep::Suspend,
+        ChoiceKey::Action(arrow @ (KeyAction::Up | KeyAction::Down)) => {
+            let last = menu.rows.len().saturating_sub(1);
+            menu.highlight = Some(match (menu.highlight, arrow) {
+                (None, _) => menu.deny_row(),
+                (Some(row), KeyAction::Up) => row.saturating_sub(1),
+                (Some(row), _) => row.saturating_add(1).min(last),
+            });
+            ApprovalStep::Stay
+        }
+        ChoiceKey::Action(KeyAction::Submit) => menu
+            .highlight
+            .and_then(|row| menu.rows.get(row))
+            .map_or(ApprovalStep::Stay, |(_, _, outcome)| {
+                ApprovalStep::Answer(*outcome)
+            }),
+        ChoiceKey::Action(_) => ApprovalStep::Stay,
+    }
+}
+
+/// Shows the complete request in scrollback, then waits for a one-key answer.
 ///
-/// Deny is selected initially, with running once directly above it, so one
-/// step up runs the action and remembering it takes a second, deliberate one.
-/// Escape, Control-C, and Control-D cancel the turn.
+/// Keys already waiting are dropped and keys in the first moments after the
+/// request appears are ignored, so type-ahead never approves anything.
 fn collect_approval_inner(
     request: &ApprovalRequest,
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
-) -> ApprovalOutcome {
-    let choices = approval_choices(request);
-    let mut picker = rune_term::picker::Picker::new(
-        "permission required",
-        choices.iter().map(|(label, _)| label.clone()).collect(),
-        choices.len(),
-    );
-    picker.to(choices.len().saturating_sub(1));
+) -> ApprovalAnswer {
+    let mut menu = ApprovalMenu::for_request(request);
+    *lock_value(&host.approval_hint) = Some(menu.hint());
+    reader.discard_pending();
     host.refresh_size();
-    let lines = host.spaced(
-        RowKind::Notice,
-        &approval_lines(request, usize::from(host.width())),
-    );
-    if draw_choice(host, &picker, &lines, false).is_err() {
-        return ApprovalOutcome::Deny;
+    let mut lines = approval_lines(request, usize::from(host.width()));
+    if !request.rememberable {
+        let warning = host.theme().sgr(Slot::Warning, host.depth);
+        if let Some(first) = lines.iter_mut().find(|line| line.starts_with("warning: ")) {
+            *first = styled(&warning, first);
+        }
     }
+    let lines = host.spaced(RowKind::Notice, &lines);
+    let rows = menu.lines(&host.theme(), host.depth);
+    if draw_choice(host, "permission required", &rows, &lines, false).is_err() {
+        return ApprovalOutcome::Deny.into();
+    }
+    let opened = std::time::Instant::now();
     loop {
         if host.cancellation.is_cancelled() {
-            return ApprovalOutcome::Deny;
+            return ApprovalOutcome::Deny.into();
         }
-        let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
+        let key = reader.poll_choice_key(rune_term::shell::POLL_INTERVAL);
         let idle = key.is_none();
         if let Some(key) = key
-            && let Some(answer) = approval_key(key, &mut picker, &choices, host)
+            && opened.elapsed() >= APPROVAL_QUARANTINE
         {
-            return answer;
+            match approval_key(key, &mut menu) {
+                ApprovalStep::Stay => {}
+                ApprovalStep::Answer(outcome) => return outcome.into(),
+                ApprovalStep::Interrupt => {
+                    host.interrupt();
+                    return ApprovalOutcome::Deny.into();
+                }
+                ApprovalStep::Suspend => rune_term::modes::suspend(),
+            }
         }
+        let rows = menu.lines(&host.theme(), host.depth);
         // Also refreshes dimensions when no input arrives.
-        if draw_choice(host, &picker, &[], idle).is_err() {
-            return ApprovalOutcome::Deny;
+        if draw_choice(host, "permission required", &rows, &[], idle).is_err() {
+            return ApprovalOutcome::Deny.into();
         }
     }
 }
@@ -6535,12 +6716,22 @@ fn collect_questions_inner(
             RowKind::Notice,
             &question_lines(question, usize::from(host.width())),
         );
-        draw_choice(host, &picker, &lines, false)?;
+        reader.discard_pending();
+        draw_choice(
+            host,
+            picker.title(),
+            &picker.rows(&host.theme(), host.depth),
+            &lines,
+            false,
+        )?;
+        let opened = std::time::Instant::now();
         loop {
             host.cancellation.check()?;
             let key = reader.poll_choice(rune_term::shell::POLL_INTERVAL);
             let idle = key.is_none();
-            if let Some(key) = key {
+            if let Some(key) = key
+                && opened.elapsed() >= APPROVAL_QUARANTINE
+            {
                 let chosen = question_key(key, &mut picker, host);
                 host.cancellation.check()?;
                 if let Some(chosen) = chosen {
@@ -6548,7 +6739,13 @@ fn collect_questions_inner(
                     break;
                 }
             }
-            draw_choice(host, &picker, &[], idle)?;
+            draw_choice(
+                host,
+                picker.title(),
+                &picker.rows(&host.theme(), host.depth),
+                &[],
+                idle,
+            )?;
         }
     }
     Ok(Answer::Chosen(answers))
@@ -6603,84 +6800,98 @@ fn question_key(
     }
 }
 
-/// Quoting makes control characters visible without changing the approved scope.
-fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
-    request
-        .header
-        .iter()
-        .cloned()
-        .chain([
-            format!("Permission request for {:?}", request.tool),
-            format!("Reason: {:?}", request.reason),
-            format!("Scope: {:?}", request.target),
-        ])
-        .flat_map(|line| rune_term::width::wrap(&line, width.max(1)))
-        .chain(request.preview.iter().cloned())
+/// Tools whose target is a path they would change.
+const FILE_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "rename_file",
+    "create_directory",
+];
+
+/// The reason a policy gives when nothing more specific applies; it is not
+/// repeated under a request.
+const PLAIN_APPROVAL_REASON: &str = "requires approval";
+
+/// Returns true for the zero-width and direction-changing characters that
+/// can make text read differently from what it is.
+const fn is_invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+    )
+}
+
+/// Shows control characters, invisible format characters and backslashes
+/// escaped, so a line cannot hide what follows it or pass for another.
+fn escape_controls(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            let hidden = ch == '\\' || ch.is_control() || is_invisible_format(ch);
+            if hidden {
+                ch.escape_debug().to_string()
+            } else {
+                ch.to_string()
+            }
+        })
         .collect()
 }
 
-/// The picker's choices, top first, with the label each shows.
-fn approval_choices(request: &ApprovalRequest) -> Vec<(String, ApprovalOutcome)> {
-    let mut choices = Vec::with_capacity(4);
-    if let Some(pattern) = &request.project_pattern {
-        let outcome = ApprovalOutcome::AlwaysForProject;
-        choices.push((format!("{}: {pattern}", outcome.label()), outcome));
-    }
-    let rest: &[ApprovalOutcome] = if request.rememberable {
-        &[
-            ApprovalOutcome::RememberForSession,
-            ApprovalOutcome::RunOnce,
-            ApprovalOutcome::Deny,
-        ]
+/// The request as committed above the menu. Control characters are shown
+/// escaped, so what is on screen is what would run; the approved scope is the
+/// original text.
+fn approval_lines(request: &ApprovalRequest, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let escape = |text: &str| escape_controls(text);
+    let label = if request.rememberable {
+        ""
     } else {
-        &[ApprovalOutcome::RunOnce, ApprovalOutcome::Deny]
+        "warning: "
     };
-    for outcome in rest {
-        choices.push((outcome.label().to_owned(), *outcome));
+    let mut lines: Vec<String> = request
+        .header
+        .iter()
+        .flat_map(|header| rune_term::width::wrap(header, width))
+        .collect();
+    if request.tool == "shell" {
+        lines.extend(rune_term::width::wrap(
+            &format!("{label}shell wants to run:"),
+            width,
+        ));
+        let rows = rune_term::width::wrap(&escape(&request.target), width.saturating_sub(4).max(1));
+        for (index, row) in rows.into_iter().enumerate() {
+            let indent = if index == 0 { "  " } else { "    " };
+            lines.push(format!("{indent}{row}"));
+        }
+        if let Some(cwd) = &request.cwd {
+            lines.extend(rune_term::width::wrap(
+                &format!("  in {}", escape(cwd)),
+                width,
+            ));
+        }
+    } else {
+        let verb = if FILE_TOOLS.contains(&request.tool.as_str()) {
+            "change"
+        } else {
+            "use"
+        };
+        lines.extend(rune_term::width::wrap(
+            &format!(
+                "{label}{} wants to {verb} {}:",
+                escape(&request.tool),
+                escape(&request.target)
+            ),
+            width,
+        ));
     }
-    choices
-}
-
-fn approval_key(
-    key: KeyAction,
-    picker: &mut rune_term::picker::Picker,
-    choices: &[(String, ApprovalOutcome)],
-    host: &SessionHost,
-) -> Option<ApprovalOutcome> {
-    match key {
-        KeyAction::Suspend => {
-            rune_term::modes::suspend();
-            None
-        }
-        KeyAction::Submit => Some(
-            choices
-                .iter()
-                .find(|(label, _)| picker.selected() == Some(label.as_str()))
-                .map_or(ApprovalOutcome::Deny, |(_, outcome)| *outcome),
-        ),
-        KeyAction::Up => {
-            picker.up();
-            None
-        }
-        KeyAction::Down => {
-            picker.down();
-            None
-        }
-        KeyAction::Escape | KeyAction::Cancel | KeyAction::Interrupt => {
-            host.interrupt();
-            Some(ApprovalOutcome::Deny)
-        }
-        KeyAction::Complete
-        | KeyAction::Ignored
-        | KeyAction::CycleReasoning
-        | KeyAction::ModeCycle
-        | KeyAction::TogglePlan
-        | KeyAction::PullQueued
-        | KeyAction::Queue
-        | KeyAction::Transcript
-        | KeyAction::HistorySearch
-        | KeyAction::ExternalEditor => None,
+    if request.reason.trim() != PLAIN_APPROVAL_REASON {
+        lines.extend(rune_term::width::wrap(
+            &format!("  why: {}", escape(&request.reason)),
+            width,
+        ));
     }
+    lines.extend(request.preview.iter().cloned());
+    lines
 }
 
 /// Uses the session renderer and reports if the choice cannot be displayed.
@@ -6688,7 +6899,8 @@ fn approval_key(
 /// A `paced` redraw that would change nothing on screen writes nothing.
 fn draw_choice(
     host: &SessionHost,
-    picker: &rune_term::picker::Picker,
+    title: &str,
+    menu: &[String],
     settled: &[String],
     paced: bool,
 ) -> Result<()> {
@@ -6702,14 +6914,13 @@ fn draw_choice(
         .ok()
         .and_then(|slot| slot.clone())
         .ok_or_else(|| RuneError::new(ErrorCode::InputRequired, "choice output is unavailable"))?;
-    let menu = picker.rows(&host.theme(), host.depth);
     let painted = host.paint_in(
         Some(UiState::Approval),
         settled,
-        Some(picker.title()),
+        Some(title),
         &[],
         &[],
-        &menu,
+        menu,
         (0, 0),
         paced,
     )?;
@@ -13577,17 +13788,45 @@ mod tests {
             vec!["run once".to_owned(), "deny".to_owned()],
             2,
         );
-        draw_choice(&host, &picker, &["shell ls".to_owned()], false).expect("drawn");
+        draw_choice(
+            &host,
+            picker.title(),
+            &picker.rows(&host.theme(), host.depth),
+            &["shell ls".to_owned()],
+            false,
+        )
+        .expect("drawn");
         assert!(String::from_utf8_lossy(&written()).contains("permission required"));
         // The settled lines scrolled the region, so the first redraw repaints it.
-        draw_choice(&host, &picker, &[], true).expect("drawn");
+        draw_choice(
+            &host,
+            picker.title(),
+            &picker.rows(&host.theme(), host.depth),
+            &[],
+            true,
+        )
+        .expect("drawn");
         assert!(!written().is_empty());
         for _ in 0..3 {
-            draw_choice(&host, &picker, &[], true).expect("drawn");
+            draw_choice(
+                &host,
+                picker.title(),
+                &picker.rows(&host.theme(), host.depth),
+                &[],
+                true,
+            )
+            .expect("drawn");
             assert!(written().is_empty());
         }
         assert!(picker.to(1));
-        draw_choice(&host, &picker, &[], true).expect("drawn");
+        draw_choice(
+            &host,
+            picker.title(),
+            &picker.rows(&host.theme(), host.depth),
+            &[],
+            true,
+        )
+        .expect("drawn");
         assert!(!written().is_empty());
     }
 
@@ -15307,7 +15546,7 @@ mod tests {
             assert_eq!(request.target, "rm -rf /tmp/x");
             request
                 .answer
-                .send(ApprovalOutcome::RunOnce)
+                .send(ApprovalOutcome::RunOnce.into())
                 .expect("answered");
         });
 
@@ -15423,12 +15662,15 @@ mod tests {
                 assert!(request.reason.contains("redirects"));
                 request
                     .answer
-                    .send(ApprovalOutcome::RunOnce)
+                    .send(ApprovalOutcome::RunOnce.into())
                     .expect("approve once");
                 let request = pending
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .expect("approval cannot leak to the next call");
-                request.answer.send(ApprovalOutcome::Deny).expect("deny");
+                request
+                    .answer
+                    .send(ApprovalOutcome::Deny.into())
+                    .expect("deny");
                 let (first, second) = worker.join().expect("worker");
                 assert_eq!(first.0, Outcome::Allow);
                 assert_eq!(second.0, Outcome::Deny);
@@ -15518,12 +15760,15 @@ mod tests {
             );
             first
                 .answer
-                .send(ApprovalOutcome::RunOnce)
+                .send(ApprovalOutcome::RunOnce.into())
                 .expect("approve once");
             let second = pending
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the same command needs another approval");
-            second.answer.send(ApprovalOutcome::Deny).expect("deny");
+            second
+                .answer
+                .send(ApprovalOutcome::Deny.into())
+                .expect("deny");
             let (first, second) = worker.join().expect("worker");
             assert_eq!(first.0, Outcome::Allow, "{}", first.1);
             assert_eq!(second.0, Outcome::Deny, "{}", second.1);
@@ -15699,49 +15944,161 @@ mod tests {
         }
     }
 
+    fn shell_request(target: &str) -> ApprovalRequest {
+        let (answer, _response) = mpsc::sync_channel(1);
+        let rememberable = rememberable("shell", target);
+        ApprovalRequest {
+            tool: "shell".to_owned(),
+            target: target.to_owned(),
+            reason: "requires approval".to_owned(),
+            rememberable,
+            project_pattern: rememberable
+                .then(|| rune_policy::approval::project_pattern("shell", target))
+                .flatten(),
+            preview: Vec::new(),
+            header: None,
+            cwd: Some("/w".to_owned()),
+            answer,
+        }
+    }
+
     #[test]
-    fn the_approval_picker_shows_the_rule_a_project_approval_saves() {
-        let request = |target: &str| {
-            let (answer, _response) = mpsc::sync_channel(1);
-            let rememberable = rememberable("shell", target);
-            ApprovalRequest {
-                tool: "shell".to_owned(),
-                target: target.to_owned(),
-                reason: String::new(),
-                rememberable,
-                project_pattern: rememberable
-                    .then(|| rune_policy::approval::project_pattern("shell", target))
-                    .flatten(),
-                preview: Vec::new(),
-                header: None,
-                answer,
-            }
-        };
-        let labels = |target: &str| -> Vec<String> {
-            approval_choices(&request(target))
-                .into_iter()
-                .map(|(label, _)| label)
+    fn the_approval_menu_offers_a_project_rule_only_where_one_is_safe() {
+        let keys = |target: &str| -> Vec<&str> {
+            ApprovalMenu::for_request(&shell_request(target))
+                .rows
+                .iter()
+                .map(|(key, _, _)| *key)
                 .collect()
         };
+        assert_eq!(keys("docker ps -a"), ["y", "a", "p", "n"]);
         assert_eq!(
-            labels("docker ps -a"),
-            [
-                "Always allow in this project: docker ps*",
-                "Remember for this session",
-                "Run once",
-                "Deny"
-            ]
-        );
-        assert_eq!(
-            approval_choices(&request("docker ps -a"))[0].1,
-            ApprovalOutcome::AlwaysForProject
+            ApprovalMenu::for_request(&shell_request("docker ps -a")).by_key("p"),
+            Some(ApprovalOutcome::AlwaysForProject)
         );
         // A consequential command is approved one run at a time.
-        assert_eq!(labels("git push"), ["Run once", "Deny"]);
+        assert_eq!(keys("git push"), ["y", "n"]);
         // No safe pattern: remembered for the session only.
+        assert_eq!(keys("docker ps; docker images"), ["y", "a", "n"]);
+        let rows = ApprovalMenu::for_request(&shell_request("git push"))
+            .lines(&Theme::no_color(), ColorDepth::Ansi256);
+        assert_eq!(rows, ["  y  run once", "  n  deny"]);
+    }
+
+    #[test]
+    fn approval_keys_map_to_outcomes() {
+        use rune_term::input::ChoiceKey;
+        let mut menu = ApprovalMenu::for_request(&shell_request("docker ps -a"));
+        for (key, expected) in [
+            ('y', ApprovalOutcome::RunOnce),
+            ('a', ApprovalOutcome::RememberForSession),
+            ('p', ApprovalOutcome::AlwaysForProject),
+            ('n', ApprovalOutcome::Deny),
+        ] {
+            assert_eq!(
+                approval_key(ChoiceKey::Char(key), &mut menu),
+                ApprovalStep::Answer(expected)
+            );
+        }
+        for ignored in ['Y', 'x', ' ', 'q'] {
+            assert_eq!(
+                approval_key(ChoiceKey::Char(ignored), &mut menu),
+                ApprovalStep::Stay
+            );
+        }
         assert_eq!(
-            labels("docker ps; docker images"),
-            ["Remember for this session", "Run once", "Deny"]
+            approval_key(ChoiceKey::Action(KeyAction::Escape), &mut menu),
+            ApprovalStep::Answer(ApprovalOutcome::Deny)
+        );
+        for interrupt in [KeyAction::Cancel, KeyAction::Interrupt] {
+            assert_eq!(
+                approval_key(ChoiceKey::Action(interrupt), &mut menu),
+                ApprovalStep::Interrupt
+            );
+        }
+        assert_eq!(
+            approval_key(ChoiceKey::Action(KeyAction::Complete), &mut menu),
+            ApprovalStep::Stay
+        );
+    }
+
+    #[test]
+    fn enter_needs_an_arrow_first() {
+        use rune_term::input::ChoiceKey;
+        let mut menu = ApprovalMenu::for_request(&shell_request("ls"));
+        let enter = ChoiceKey::Action(KeyAction::Submit);
+        assert_eq!(approval_key(enter, &mut menu), ApprovalStep::Stay);
+        assert_eq!(menu.highlight, None);
+        // The first arrow shows the highlight on deny without moving it.
+        assert_eq!(
+            approval_key(ChoiceKey::Action(KeyAction::Down), &mut menu),
+            ApprovalStep::Stay
+        );
+        assert_eq!(menu.highlight, Some(menu.deny_row()));
+        let rows = menu.lines(&Theme::no_color(), ColorDepth::Ansi256);
+        assert_eq!(rows.last().map(String::as_str), Some("> n  deny"));
+        assert_eq!(
+            approval_key(enter, &mut menu),
+            ApprovalStep::Answer(ApprovalOutcome::Deny)
+        );
+        let mut menu = ApprovalMenu::for_request(&shell_request("ls"));
+        for _ in 0..4 {
+            let _ = approval_key(ChoiceKey::Action(KeyAction::Up), &mut menu);
+        }
+        assert_eq!(
+            approval_key(enter, &mut menu),
+            ApprovalStep::Answer(ApprovalOutcome::RunOnce)
+        );
+    }
+
+    #[test]
+    fn a_is_ignored_when_not_rememberable() {
+        use rune_term::input::ChoiceKey;
+        let mut menu = ApprovalMenu::for_request(&shell_request("git push origin main"));
+        assert_eq!(
+            approval_key(ChoiceKey::Char('a'), &mut menu),
+            ApprovalStep::Stay
+        );
+        assert_eq!(
+            approval_key(ChoiceKey::Char('p'), &mut menu),
+            ApprovalStep::Stay
+        );
+        assert_eq!(menu.hint(), "y once   n deny");
+        let offered = ApprovalMenu::for_request(&shell_request("ls"));
+        assert_eq!(offered.hint(), "y once   a session   n deny");
+    }
+
+    #[test]
+    fn destructive_actions_get_the_warning_label() {
+        let lines = approval_lines(&shell_request("git push origin main"), 80);
+        assert_eq!(
+            lines,
+            [
+                "warning: shell wants to run:",
+                "  git push origin main",
+                "  in /w"
+            ]
+        );
+        let lines = approval_lines(&shell_request("ls -la"), 80);
+        assert_eq!(lines, ["shell wants to run:", "  ls -la", "  in /w"]);
+        let (answer, _response) = mpsc::sync_channel(1);
+        let edit = ApprovalRequest {
+            tool: "write_file".to_owned(),
+            target: "src/main.rs".to_owned(),
+            reason: "outside the workspace".to_owned(),
+            rememberable: true,
+            project_pattern: None,
+            preview: Vec::new(),
+            header: None,
+            cwd: None,
+            answer,
+        };
+        assert_eq!(
+            approval_lines(&edit, 80),
+            [
+                "write_file wants to change src/main.rs:",
+                "  why: outside the workspace"
+            ]
         );
     }
 
@@ -15773,7 +16130,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_scope_cannot_hide_terminal_controls_or_clip_long_commands() {
+    fn approval_lines_escape_control_characters() {
         let (answer, _response) = mpsc::sync_channel(1);
         let request = ApprovalRequest {
             tool: "shell".to_owned(),
@@ -15783,6 +16140,7 @@ mod tests {
             project_pattern: None,
             preview: Vec::new(),
             header: None,
+            cwd: None,
             answer,
         };
         let lines = approval_lines(&request, 80).join("\n");
@@ -15792,13 +16150,16 @@ mod tests {
         );
         assert!(lines.contains("a\\\\b"), "{lines}");
         assert!(!lines.contains('\u{1b}'));
+        assert!(!lines.contains('"'), "{lines}");
         let narrow = approval_lines(&request, 12);
         assert!(
             narrow
                 .iter()
                 .all(|line| rune_term::width::str_width(line) <= 12)
         );
-        assert!(narrow.join("").ends_with("TAIL-END\""));
+        // The whole command is shown, never clipped.
+        let joined: String = narrow.iter().map(|line| line.trim_start()).collect();
+        assert!(joined.contains("TAIL-END"), "{narrow:?}");
     }
 
     #[test]
@@ -15813,11 +16174,12 @@ mod tests {
             project_pattern: None,
             preview: Vec::new(),
             header: None,
+            cwd: None,
             answer,
         };
         let mut reader = rune_term::input::KeyReader::new();
         assert_eq!(
-            collect_approval(&request, &host, &mut reader),
+            collect_approval(&request, &host, &mut reader).outcome,
             ApprovalOutcome::Deny
         );
     }
@@ -20346,7 +20708,7 @@ mod tests {
             );
             request
                 .answer
-                .send(ApprovalOutcome::RunOnce)
+                .send(ApprovalOutcome::RunOnce.into())
                 .expect("allow");
             let output = worker.join().expect("worker").expect("output");
             assert_eq!(output.text, "ok");
@@ -20381,7 +20743,10 @@ mod tests {
             let request = pending
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("the network question");
-            request.answer.send(ApprovalOutcome::Deny).expect("deny");
+            request
+                .answer
+                .send(ApprovalOutcome::Deny.into())
+                .expect("deny");
             let output = worker.join().expect("worker").expect("output");
             assert!(output.is_error);
             assert!(output.text.contains(rune_tools::shell::NETWORK_NOTICE));
@@ -20777,7 +21142,10 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("the edit asks");
             let lines = approval_lines(&request, 80).join("\n");
-            request.answer.send(ApprovalOutcome::Deny).expect("answer");
+            request
+                .answer
+                .send(ApprovalOutcome::Deny.into())
+                .expect("answer");
             lines
         });
         let arguments = serde_json::json!({
@@ -20806,7 +21174,7 @@ mod tests {
             assert!(request.rememberable);
             request
                 .answer
-                .send(ApprovalOutcome::RememberForSession)
+                .send(ApprovalOutcome::RememberForSession.into())
                 .expect("answer");
         });
         let (outcome, _) = host.request_approval("shell", "npm run e2e", "asked".to_owned());
@@ -21921,11 +22289,12 @@ mod tests {
             project_pattern: None,
             preview: Vec::new(),
             header: None,
+            cwd: None,
             answer,
         };
         let mut reader = rune_term::input::KeyReader::line_mode();
         assert_eq!(
-            collect_approval(&request, &host, &mut reader),
+            collect_approval(&request, &host, &mut reader).outcome,
             ApprovalOutcome::Deny
         );
         let approval = sent();
@@ -22304,6 +22673,8 @@ mod tests {
             review_session: Arc::new(Mutex::new(ReviewSession::new(&BudgetSet::new()))),
             approval_requests: Mutex::new(None),
             approval_preview: Mutex::new(Vec::new()),
+            approval_cwd: Mutex::new(None),
+            approval_hint: Mutex::new(None),
             grants: Mutex::new(Grants::new()),
             planning: std::sync::atomic::AtomicBool::new(false),
             unsandboxed: false,

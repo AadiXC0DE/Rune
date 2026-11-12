@@ -173,6 +173,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
     def send(data):
         os.write(master, data)
 
+    def settle():
+        # A new question ignores keys for its first 300 ms.
+        time.sleep(0.4)
+
     def question(prompt="question"):
         start = len(transcript)
         send(prompt.encode() + b"\r")
@@ -180,6 +184,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         wait_for("Which choice should Rune use?", start)
         wait_for("Use the second choice", start)
         wait_for("> Alpha", start)
+        settle()
         return start
 
     try:
@@ -202,6 +207,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         send(b"question-multiple\r")
         for index in range(1, 5):
             wait_for(f"answer required ({index}/4)", start)
+            settle()
             send(b"\x1b[B" * 5 + b"\r")
         wait_for_committed("QUESTION_REPLY_3", start)
         assert results[2]["content"] == "\n".join(
@@ -227,6 +233,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         wait_for("correction", start)
         release_draft.set()
         wait_for("answer required (1/1)", start)
+        settle()
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[B\r")
         wait_for_committed("QUESTION_REPLY_4", start)
         assert results[3]["content"].endswith("Answer: Beta"), results

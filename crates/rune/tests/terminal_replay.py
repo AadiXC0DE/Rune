@@ -530,7 +530,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             # The turn's ticker keeps repainting an empty frame under the prompt.
             capture("approval-open", b"approve\r", "permission required",
                     repaint=b"\x1b[?25l\r\x1b[1G\x1b[?25h")
-            capture("approval-cancelled", b"\x1b", "cancelled")
+            time.sleep(0.4)
+            capture("approval-cancelled", b"\x03", "cancelled")
             assert prompts == ["approve"], prompts
         elif scenario == "reasoning":
             capture("reasoning-finished", b"think\r", "REASONED\r\n")

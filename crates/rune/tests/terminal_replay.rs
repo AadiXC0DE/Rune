@@ -187,6 +187,10 @@ fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
         if let Some(id) = line.strip_prefix("session ") {
             line = "session ".to_owned() + &"*".repeat(id.len());
         }
+        // An approval names the fixture's temporary directory.
+        if line.starts_with("  in /") {
+            "  in <dir>".clone_into(&mut line);
+        }
         // The fixture's temporary path and session id vary each launch. Only
         // that suffix is masked; model, prompt and menu stay exact.
         let line = line
@@ -521,8 +525,10 @@ fn approval_prompt_grids() {
     compare_grid("approval.grid", &actual);
     let open = stage_rows(&actual, "approval-open").join("\n");
     assert!(open.contains("permission required"), "{actual}");
-    assert!(open.contains("Scope: \"echo GRID-APPROVAL\""), "{actual}");
-    assert!(open.contains("> Deny"), "{actual}");
+    assert!(open.contains("shell wants to run:"), "{actual}");
+    assert!(open.contains("  echo GRID-APPROVAL"), "{actual}");
+    assert!(open.contains("  y  run once"), "{actual}");
+    assert!(open.contains("  n  deny"), "{actual}");
     let cancelled = stage_rows(&actual, "approval-cancelled").join("\n");
     assert!(cancelled.contains("cancelled"), "{actual}");
 }

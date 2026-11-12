@@ -187,6 +187,15 @@ pub enum KeyAction {
     TogglePlan,
 }
 
+/// A key read while a one-key answer is awaited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChoiceKey {
+    /// A character typed without Control or Alt.
+    Char(char),
+    /// Any other key, as the action it maps to.
+    Action(KeyAction),
+}
+
 /// Navigation while the transcript owns the terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TranscriptAction {
@@ -497,6 +506,51 @@ impl KeyReader {
         let action = self.poll_key(timeout);
         self.composer = draft;
         action
+    }
+
+    /// Polls a one-key answer without changing the draft: a plain character
+    /// is reported as itself, anything else as the action it maps to. Pastes
+    /// are ignored, so pasted text never answers.
+    pub fn poll_choice_key(&mut self, timeout: Duration) -> Option<ChoiceKey> {
+        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+            return None;
+        }
+        let event = crossterm::event::read().ok()?;
+        self.choice_event(event)
+    }
+
+    /// Maps one event the way [`Self::poll_choice_key`] does.
+    pub fn choice_event(&mut self, event: Event) -> Option<ChoiceKey> {
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && let KeyCode::Char(ch) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Some(ChoiceKey::Char(ch));
+        }
+        if matches!(event, Event::Paste(_)) {
+            return None;
+        }
+        let draft = std::mem::take(&mut self.composer);
+        let action = self.handle(event);
+        self.composer = draft;
+        action.map(ChoiceKey::Action)
+    }
+
+    /// Reads and drops every event already waiting, so keys typed before a
+    /// question appeared cannot answer it.
+    pub fn discard_pending(&mut self) {
+        if !self.active {
+            return;
+        }
+        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(event) => self.note_focus(&event),
+                Err(_) => break,
+            }
+        }
     }
 
     /// Polls viewer navigation, leaving the complete composer untouched.
@@ -1874,6 +1928,28 @@ mod tests {
         assert_eq!(reader.apply(back_tab), KeyAction::Ignored);
         reader.set_menu_open(false);
         assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+    }
+
+    #[test]
+    fn poll_choice_key_reports_plain_characters() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(reader.choice_event(plain), Some(ChoiceKey::Char('y')));
+        let shifted = Event::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+        assert_eq!(reader.choice_event(shifted), Some(ChoiceKey::Char('Y')));
+        let control = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            reader.choice_event(control),
+            Some(ChoiceKey::Action(KeyAction::Cancel))
+        );
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            reader.choice_event(enter),
+            Some(ChoiceKey::Action(KeyAction::Submit))
+        );
+        assert_eq!(reader.choice_event(Event::Paste("y".to_owned())), None);
+        assert_eq!(reader.line(), "draft");
     }
 
     #[test]

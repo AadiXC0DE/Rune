@@ -223,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         assert b"THINKING" not in terminal.output
 
         terminal.send("question")
-        terminal.wait_for('Permission request for "ask_user_question"')
+        terminal.wait_for("ask_user_question wants to use")
         terminal.send("yes")
         terminal.wait_for("Answer: enter an option number")
         assert not tool_results, "question selected an option automatically"
@@ -236,7 +236,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         for answer, allowed in [("", False), ("yes", True)]:
             start = len(terminal.output)
             terminal.send("permission")
-            terminal.wait_for("type yes to run once", start)
+            terminal.wait_for("type y to run once", start)
             assert not (root / "approved.txt").exists(), "shell ran before approval"
             terminal.send(answer)
             terminal.wait_for("Assistant: TOOL_REPLY", start)
@@ -246,7 +246,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
 
         start = len(terminal.output)
         terminal.send("question")
-        terminal.wait_for('Permission request for "ask_user_question"', start)
+        terminal.wait_for("ask_user_question wants to use", start)
         terminal.send("yes")
         terminal.wait_for("Answer: enter an option number", start)
         terminal.send("/cancel")

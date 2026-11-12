@@ -3,18 +3,18 @@ approval-open: 80x24, caret 0,11
 01||
 02|▌ approve|
 03||
-04|Permission request for "shell"|
-05|Reason: "ask: no rule matched `echo GRID-APPROVAL`, so the mode's default|
-06|applies"|
-07|Scope: "echo GRID-APPROVAL"|
+04|shell wants to run:|
+05|  echo GRID-APPROVAL|
+06|  in <dir>|
+07|  why: ask: no rule matched `echo GRID-APPROVAL`, so the mode's default applies|
 08|permission required|
-09|up/down select   enter confirm   esc cancel|
+09|y once   a session   n deny|
 10|replay-fixture | ask | ctx ~###k (request bytes)|
 11||
-12|  Always allow in this project: echo*|
-13|  Remember for this session|
-14|  Run once|
-15|> Deny|
+12|  y  run once|
+13|  a  allow for this session|
+14|  p  always allow in this project|
+15|  n  deny|
 16||
 17||
 18||
@@ -28,10 +28,10 @@ approval-cancelled: 80x24, caret 2,13
 01||
 02|▌ approve|
 03||
-04|Permission request for "shell"|
-05|Reason: "ask: no rule matched `echo GRID-APPROVAL`, so the mode's default|
-06|applies"|
-07|Scope: "echo GRID-APPROVAL"|
+04|shell wants to run:|
+05|  echo GRID-APPROVAL|
+06|  in <dir>|
+07|  why: ask: no rule matched `echo GRID-APPROVAL`, so the mode's default applies|
 08|[refused shell: ask: no rule matched `echo GRID-APPROVAL`, so the mode's]|
 09|[default applies; approval was cancelled]|
 10|[interrupted]|

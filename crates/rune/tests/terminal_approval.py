@@ -22,6 +22,7 @@ prompts = []
 errors = []
 draft_request = threading.Event()
 release_draft = threading.Event()
+quarantine_call = threading.Event()
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -53,6 +54,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
                     if text == "permission-draft":
                         draft_request.set()
                         assert release_draft.wait(10), "draft was never released"
+                    if text == "permission-quarantine":
+                        quarantine_call.set()
                     delta = {
                         "tool_calls": [{
                             "index": 0,
@@ -159,13 +162,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # submits steering to the old turn instead of starting the next one.
         wait_for(text + "\r\n", start)
 
+    def menu(start):
+        wait_for("permission required", start)
+        wait_for("shell wants to run:", start)
+        wait_for(f"  {COMMAND}", start)
+        wait_for("y  run once", start)
+        wait_for("n  deny", start)
+        # Keys in the first 300 ms of a request are ignored.
+        time.sleep(0.4)
+
     def permission(prompt="permission"):
         start = len(transcript)
         send(prompt.encode() + b"\r")
-        wait_for("permission required", start)
-        wait_for(f'Scope: "{COMMAND}"', start)
-        wait_for("  Run once", start)
-        wait_for("> Deny", start)
+        menu(start)
         return start
 
     try:
@@ -173,21 +182,33 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         start = permission()
         assert not side_effect.exists(), "shell ran before approval"
         confirmed_at = len(transcript)
-        send(b"\x1b[A\r")
+        send(b"y")
         settled_reply("FIXTURE_REPLY_1", start)
         wait_for("AUDIT_SHELL_OK", confirmed_at)
         assert "AUDIT_SHELL_OK" in results[0], results
         assert side_effect.read_bytes() == b"x"
 
-        # Approving once does not grant the same command on a subsequent turn.
+        # Approving once does not grant the same command on a subsequent turn,
+        # and Enter before an arrow does nothing.
         start = permission()
         send(b"\r")
+        time.sleep(0.3)
+        assert len(results) == 1, results
+        send(b"n")
         settled_reply("FIXTURE_REPLY_2", start)
         assert "refused by policy" in results[1], results
+        assert "approval was denied" in results[1], results
         assert side_effect.read_bytes() == b"x", "denied shell ran"
 
-        # Every cancel key releases the worker and leaves the session usable.
-        for cancel in [b"\x1b", b"\x03", b"\x04"]:
+        # Escape denies and the turn goes on.
+        start = permission()
+        send(b"\x1b")
+        settled_reply("FIXTURE_REPLY_3", start)
+        assert "approval was denied" in results[2], results
+        assert side_effect.read_bytes() == b"x", "denied shell ran"
+
+        # Control-C and Control-D deny, interrupt, and leave the session usable.
+        for cancel in [b"\x03", b"\x04"]:
             start = permission()
             send(cancel)
             settled_reply("[interrupted]", start)
@@ -207,16 +228,27 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         draft_end = transcript.index(b"correction", start) + len(b"correction")
         wait_for("\x1b[10G\x1b[?25h", draft_end)
         release_draft.set()
-        wait_for("permission required", start)
-        wait_for("> Deny", start)
-        send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[A\r")
-        settled_reply("FIXTURE_REPLY_3", start)
+        menu(start)
+        send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15y")
+        settled_reply("FIXTURE_REPLY_4", start)
         assert side_effect.read_bytes() == b"xx"
         start = len(transcript)
         send(b"X\r")
         settled_reply("SESSION_STILL_USABLE", start)
         assert prompts[-1] == "correctXion", prompts
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
+
+        # A key typed as the request arrives cannot answer it.
+        start = len(transcript)
+        send(b"permission-quarantine\r")
+        assert event_wait(quarantine_call, master, 10, transcript), "no quarantine call"
+        send(b"y")
+        wait_for("permission required", start)
+        time.sleep(0.5)
+        assert side_effect.read_bytes() == b"xx", "type-ahead approved the command"
+        send(b"y")
+        settled_reply("FIXTURE_REPLY_5", start)
+        assert side_effect.read_bytes() == b"xxx"
 
         send(b"/quit\r")
         assert drain_wait(child, master, 10, transcript) == 0
@@ -229,10 +261,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         )
         assert piped.returncode == 0, piped.stderr
         assert "no way to ask for approval" in results[-1], results
-        assert side_effect.read_bytes() == b"xx", "piped shell ran"
+        assert side_effect.read_bytes() == b"xxx", "piped shell ran"
         assert not errors, errors
-        print("approved shell returned AUDIT_SHELL_OK; repeat denial, three cancel keys, "
-              "draft/caret preservation, and piped refusal passed")
+        print("approved shell returned AUDIT_SHELL_OK; repeat denial, escape denial, two cancel "
+              "keys, draft/caret preservation, quarantine and piped refusal passed")
     finally:
         release_draft.set()
         if child.poll() is None:
