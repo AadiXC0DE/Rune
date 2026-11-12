@@ -6,7 +6,7 @@
 mod support;
 
 #[test]
-fn two_provider_failures_show_pending_and_active_retries_in_one_status_row() {
+fn two_provider_failures_count_down_then_show_the_active_retry() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
@@ -34,6 +34,18 @@ fn two_provider_failures_show_pending_and_active_retries_in_one_status_row() {
         if status == "completed" {
             assert!(!screen.contains("provider retry"), "{screen}");
             assert!(screen.contains("RETRY-RECOVERED"), "{screen}");
+        } else if status.contains("retrying in") {
+            // A waiting retry is counted down on the activity row, not the
+            // status row.
+            assert!(!screen.contains("provider retry"), "{screen}");
+            // The seconds count down between frames; the attempt does not.
+            let attempt = status.split_once(" (").map_or("", |(_, rest)| rest);
+            let row = screen
+                .lines()
+                .find(|row| row.contains(", retrying in ") && row.contains(attempt))
+                .unwrap_or_else(|| panic!("activity row: {screen}"));
+            assert!(!row.contains("| auto |"), "{screen}");
+            assert!(screen.contains("esc cancels"), "{screen}");
         } else {
             assert_eq!(screen.matches("provider retry").count(), 1, "{screen}");
             assert!(screen.contains(&status), "{screen}");

@@ -1443,8 +1443,8 @@ impl rune_agent::turn::Host for SdkHost<'_> {
         self.provider.as_ref()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.context.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.context.endpoint)
     }
 
     fn model(&self) -> String {

@@ -441,6 +441,18 @@ impl KeyReader {
         self.composer.move_end();
     }
 
+    /// Runs `action` with the terminal in its ordinary line mode, as a child
+    /// program would find it, and puts the session's modes back after.
+    pub fn with_cooked_terminal<T>(&mut self, action: impl FnOnce() -> T) -> std::io::Result<T> {
+        if !self.active {
+            return Ok(action());
+        }
+        let suspension = TerminalSuspension::new()?;
+        let result = action();
+        suspension.resume()?;
+        Ok(result)
+    }
+
     /// Hands the terminal to VISUAL, EDITOR, or vi, then reloads the draft.
     /// Failed edits leave the complete composer untouched.
     pub fn edit_external(&mut self) -> std::io::Result<()> {

@@ -512,7 +512,7 @@ fn summarize(
     let mut accounting = turn::ObjectiveAccounting::begin(host, request_plan)?;
     let response = transport::stream_completion_observed(
         client,
-        host.endpoint(),
+        &host.endpoint(),
         host.dialect(),
         request_plan,
         RequestTimeouts {
@@ -2362,8 +2362,8 @@ Copy file paths, symbols, commands, error messages and identifiers exactly. Leav
             &rune_net::chat_completions::ChatCompletions
         }
 
-        fn endpoint(&self) -> &transport::Endpoint {
-            &self.endpoint
+        fn endpoint(&self) -> std::borrow::Cow<'_, transport::Endpoint> {
+            std::borrow::Cow::Borrowed(&self.endpoint)
         }
 
         fn model(&self) -> String {

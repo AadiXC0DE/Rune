@@ -203,6 +203,12 @@ pub struct ProviderRetry {
     pub max_attempts: usize,
     /// Pending wait, absent once the retry starts.
     pub delay: Option<Duration>,
+    /// When the next attempt is sent.
+    pub retry_at: Option<std::time::SystemTime>,
+    /// What failed, as the failure kind's wire name, such as `rate_limited`.
+    pub kind: &'static str,
+    /// When the endpoint was first found unreachable in this step.
+    pub unreachable_since: Option<std::time::Instant>,
 }
 
 impl FooterState {
@@ -384,8 +390,11 @@ fn hint_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize)
 /// The retry field and the highest-priority field are never dropped; only
 /// when they alone are wider does the row get clipped.
 fn status_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize) -> String {
+    // While a retry waits, the activity row counts it down; the field names
+    // the attempt once it is under way.
     let retry = state
         .provider_retry
+        .filter(|retry| retry.delay.is_none())
         .map(|retry| retry_field(retry, theme, depth));
     let mut shown: Vec<(StatusField, String)> = state
         .fields
@@ -759,16 +768,21 @@ mod tests {
             attempt: 2,
             max_attempts: 3,
             delay: Some(Duration::from_millis(250)),
+            retry_at: None,
+            kind: "rate_limited",
+            unreachable_since: None,
         });
         for height in [4, 24] {
             let layout = solve((80, height), 1, false, DEFAULT_MINIMUM_ROWS);
             for theme in [Theme::no_color(), Theme::high_contrast()] {
                 let rows = strip(&render(&state, &layout, &theme, 80, ColorDepth::TrueColor));
                 assert_eq!(rows.len(), usize::from(layout.footer_rows));
-                assert!(
-                    rows.last()
-                        .expect("status")
-                        .starts_with("provider retry 2/3 in 250ms")
+                // The full layout leaves a waiting retry to the activity row.
+                let status = rows.last().expect("status");
+                assert_eq!(
+                    status.starts_with("provider retry 2/3 in 250ms"),
+                    height == 4,
+                    "{status}"
                 );
                 for width in [12, 32, 80] {
                     for row in render(&state, &layout, &theme, width, ColorDepth::TrueColor) {
@@ -1112,6 +1126,9 @@ mod tests {
             attempt: 2,
             max_attempts: 3,
             delay: None,
+            retry_at: None,
+            kind: "unavailable",
+            unreachable_since: None,
         });
         assert_eq!(
             status_of(&retried, 40),

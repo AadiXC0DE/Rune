@@ -136,11 +136,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
     try:
         wait_for("/ commands")
         os.write(master, b"retry please\r")
-        capture("provider retry 2/3 in 1000ms")
+        capture("rate limited, retrying in 1s (attempt 2 of 3)", "attempt 2 of 3)")
         assert len(requests) == 1, requests
         capture("provider retry 2/3 |")
         release_second.set()
-        capture("provider retry 3/3 in 2000ms")
+        capture("provider error, retrying in 2s (attempt 3 of 3)", "attempt 3 of 3)")
         assert len(requests) == 2, requests
         capture("provider retry 3/3 |")
         release_third.set()

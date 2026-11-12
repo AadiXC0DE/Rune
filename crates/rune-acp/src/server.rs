@@ -1401,8 +1401,8 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         self.server.config.dialect.provider()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.server.config.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.server.config.endpoint)
     }
 
     fn model(&self) -> String {

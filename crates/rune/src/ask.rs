@@ -975,8 +975,8 @@ impl Host for AskHost<'_> {
         self.dialect.as_ref()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.endpoint)
     }
 
     fn model(&self) -> String {

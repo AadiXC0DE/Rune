@@ -527,8 +527,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert (root / "app.txt").read_text() == "alpha\nBETA\nbeta two\ngamma\n"
         elif scenario == "failure":
             os.write(master, b"fail\r")
-            wait_for("error: the turn failed: ", offset)
-            failed = transcript.index(b"error: the turn failed: ", offset)
+            wait_for("error: ", offset)
+            failed = transcript.index(b"error: ", offset)
             # The hint is the indented row under the failure row.
             wait_for("\r\n", failed)
             first_end = transcript.index(b"\r\n", failed) + 2

@@ -504,7 +504,7 @@ fn failed_turn_grids() {
     let rows = stage_rows(&actual, "failure-reported");
     let failed = rows
         .iter()
-        .position(|row| row.starts_with("error: the turn failed: "))
+        .position(|row| row.starts_with("error: "))
         .expect("failure row");
     assert!(rows.contains(&"\u{258c} fail"), "{actual}");
     assert_eq!(

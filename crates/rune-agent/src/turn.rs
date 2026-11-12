@@ -318,8 +318,9 @@ pub trait Host {
     /// Returns a provider dialect for the active model.
     fn dialect(&self) -> &dyn Provider;
 
-    /// Returns the endpoint to reach.
-    fn endpoint(&self) -> &Endpoint;
+    /// Returns the endpoint to reach. A host whose credential can be replaced
+    /// while it runs returns a copy.
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint>;
 
     /// Returns the model identifier.
     ///
@@ -2051,7 +2052,7 @@ fn stream_with_retry(
 
         let response = transport::stream_completion_encoded(
             client,
-            host.endpoint(),
+            &host.endpoint(),
             host.dialect(),
             &plan,
             encoded,

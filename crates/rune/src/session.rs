@@ -408,7 +408,9 @@ struct SessionHost {
     accessible: bool,
     ascii: bool,
     recorder: Option<Arc<Mutex<Recorder>>>,
-    endpoint: Endpoint,
+    /// Where requests go; `/connect` replaces the credential while the
+    /// session runs.
+    endpoint: Mutex<Endpoint>,
     /// How requests to the endpoint are shaped, per model.
     compat: crate::provider_setup::CompatSource,
     dialect: Box<dyn Provider>,
@@ -471,6 +473,9 @@ struct SessionHost {
     /// The model ids of the newest catalog the session saw, for `/model`'s
     /// value menu.
     model_ids: Mutex<Vec<String>>,
+    /// The message of the last failed or interrupted turn and how it can be
+    /// recovered, for `/retry` and Enter on an empty draft.
+    last_failed: Mutex<Option<(String, Recovery)>>,
     /// The newest plan the model reported, pinned above the prompt.
     plan: Mutex<Option<rune_tools::PlanUpdate>>,
     /// Whether the pinned plan is drawn; Ctrl+T flips it.
@@ -736,8 +741,8 @@ impl Host for SessionHost {
         self.dialect.as_ref()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Owned(lock_value(&self.endpoint).clone())
     }
 
     fn compat(
@@ -1107,16 +1112,28 @@ impl Host for SessionHost {
                 next_attempt,
                 max_attempts,
                 delay,
+                retry_at,
+                kind,
                 ..
             } => {
-                *self
+                let mut slot = self
                     .provider_retry
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProviderRetry {
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The offline time counts from the first unreachable retry.
+                let unreachable_since = (*kind == "unreachable").then(|| {
+                    slot.and_then(|retry| retry.unreachable_since)
+                        .unwrap_or_else(std::time::Instant::now)
+                });
+                *slot = Some(ProviderRetry {
                     attempt: *next_attempt,
                     max_attempts: *max_attempts,
                     delay: Some(*delay),
+                    retry_at: Some(*retry_at),
+                    kind,
+                    unreachable_since,
                 });
+                drop(slot);
                 self.request_frame();
             }
             Event::ProviderRetryFinished { .. }
@@ -1646,7 +1663,7 @@ impl SessionHost {
     fn warming_allowed(&self) -> bool {
         self.permission_settings.cache_warming
             && self.dialect.name() == rune_net::anthropic::NAME
-            && !self.endpoint.offline
+            && !lock_value(&self.endpoint).offline
     }
 
     /// Keeps the request about to be sent, for a cache warming ping to repeat.
@@ -1673,7 +1690,7 @@ impl SessionHost {
             &self.warming,
             crate::cache_warming::Warmer {
                 plan,
-                endpoint: self.endpoint.clone(),
+                endpoint: lock_value(&self.endpoint).clone(),
                 dialect: Box::new(rune_net::anthropic::Anthropic),
                 timeouts: rune_net::transport::RequestTimeouts::from_settings(
                     &self.limits,
@@ -1981,7 +1998,7 @@ impl SessionHost {
             .is_ok_and(|slot| slot.is_some());
         if !output.text.contains(rune_tools::shell::NETWORK_NOTICE)
             || self.network.load(Ordering::Relaxed)
-            || self.endpoint.offline
+            || lock_value(&self.endpoint).offline
             || !attached
             || self.network_asked.swap(true, Ordering::Relaxed)
         {
@@ -2075,6 +2092,11 @@ impl SessionHost {
             "saved: allow {tool} \"{pattern}\" in this project ({path})"
         ));
         Ok(project_rule_text(tool, &pattern, &workspace))
+    }
+
+    /// The endpoint's credential, for hooks that may present it.
+    fn credential(&self) -> String {
+        lock_value(&self.endpoint).credential.clone()
     }
 
     /// The workspace a saved rule is limited to.
@@ -2646,7 +2668,7 @@ impl SessionHost {
             cancellation: &self.cancellation,
             check: &check,
             warn: &warn,
-            credential: &self.endpoint.credential,
+            credential: &self.credential(),
             max_result_bytes: usize::try_from(
                 limits.get_bytes(rune_core::LimitName::MaxToolResultBytes),
             )
@@ -2671,7 +2693,7 @@ impl SessionHost {
             },
             cancellation,
             warn: &warn,
-            credential: &self.endpoint.credential,
+            credential: &self.credential(),
         })
     }
 
@@ -2725,7 +2747,7 @@ impl SessionHost {
             session_id: self.session_id_name(),
             cwd: self.context.workspace().to_owned(),
             turn: self.turn_number(),
-            credential: self.endpoint.credential.clone(),
+            credential: self.credential(),
         }
         .notify(kind, message, move |message| {
             notices
@@ -2766,7 +2788,7 @@ impl SessionHost {
             },
             cancellation: &cancellation,
             warn: &warn,
-            credential: &self.endpoint.credential,
+            credential: &self.credential(),
         }
         .observe(
             rune_core::config::HookEvent::SessionEnd,
@@ -2804,11 +2826,14 @@ impl SessionHost {
             .lock()
             .is_ok_and(|started| started.is_some());
         let (_, effort) = self.effective_effort();
+        // Read once: a guard taken inside the literal below would last the
+        // whole statement.
+        let provider_retry = *lock_value(&self.provider_retry);
+        let retry_waiting = provider_retry.is_some_and(|retry| retry.delay.is_some());
+        let approval_hint = *lock_value(&self.approval_hint);
+        let offline = lock_value(&self.endpoint).offline;
         let state = FooterState {
-            provider_retry: *self
-                .provider_retry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            provider_retry,
             model: lock_model(&self.model).clone(),
             permission_mode: self.mode(),
             planning: self.planning.load(std::sync::atomic::Ordering::Relaxed),
@@ -2844,15 +2869,21 @@ impl SessionHost {
             } else {
                 vec!["shift-tab mode", self.caps.newline_hint()]
             },
-            running_hints: if self.lanes_pending() {
-                vec!["tab queue", "alt-up edit queued"]
-            } else {
-                vec!["tab queue"]
+            running_hints: {
+                let mut hints = Vec::new();
+                if retry_waiting {
+                    hints.push("esc cancels");
+                }
+                hints.push("tab queue");
+                if self.lanes_pending() {
+                    hints.push("alt-up edit queued");
+                }
+                hints
             },
             gesture_hint: if running && ui.is_none_or(|ui| ui == UiState::Running) {
                 self.escape_hint()
             } else if ui == Some(UiState::Approval) {
-                *lock_value(&self.approval_hint)
+                approval_hint
             } else {
                 None
             },
@@ -2860,7 +2891,7 @@ impl SessionHost {
             branch: lock_value(&self.branch).clone(),
             effort: (effort != Effort::Auto).then(|| effort.to_string()),
             queued: lock_value(&self.queued).len(),
-            net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !self.endpoint.offline,
+            net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !offline,
             mcp: self.mcp.as_ref().map(|client| client.server_count()),
             tasks: self.background_tasks().len(),
         };
@@ -4068,7 +4099,20 @@ impl SessionHost {
                 }
             }
         }
-        if rows.is_empty() {
+        let waiting = (*lock_value(&self.provider_retry)).filter(|retry| retry.delay.is_some());
+        if rows.is_empty()
+            && let Some(retry) = waiting
+        {
+            let since = self
+                .turn_started
+                .lock()
+                .ok()
+                .and_then(|started| *started)
+                .unwrap_or_else(std::time::Instant::now);
+            let frame = spinner_frame(since.elapsed(), self.ascii, self.reduced_motion);
+            let text = retry_row(&retry, std::time::SystemTime::now());
+            rows.push(format!("{dim}  {frame} {text}{reset}"));
+        } else if rows.is_empty() {
             rows.extend(self.thinking_rows(&row, width, &dim));
         }
         let style = RowStyle {
@@ -4525,7 +4569,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         accessible: config.accessible,
         ascii: config.settings.ascii,
         recorder: Some(Arc::clone(&recorder)),
-        endpoint: config.endpoint,
+        endpoint: Mutex::new(config.endpoint),
         compat,
         dialect: config.dialect,
         model: Mutex::new(config.settings.model.clone()),
@@ -4560,6 +4604,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         steering: SteeringQueue::from_limits(&limits),
         queued: Mutex::new(std::collections::VecDeque::new()),
         model_ids: Mutex::new(Vec::new()),
+        last_failed: Mutex::new(None),
         plan: Mutex::new(None),
         plan_visible: std::sync::atomic::AtomicBool::new(terminal_height() >= PLAN_PIN_MIN_HEIGHT),
         cleared: Mutex::new(std::collections::VecDeque::new()),
@@ -4803,6 +4848,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
 
     // The Escape gesture spans presses, so it outlives a single read.
     let mut cancellation_gesture = rune_term::shell::EscapeGesture::default();
+    // A message `/retry` or a finished `/connect` sends again next.
+    let mut retry_next: Option<String> = None;
 
     // A session with no model asks for one now, before the first turn, because
     // a turn cannot be sent without an identifier. A terminal drives the picker,
@@ -4916,6 +4963,11 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             None => note("there is no reply to copy yet".to_owned()),
                         }
                     }
+                    Handled::Retry => match lock_value(&host.last_failed).clone() {
+                        Some((text, _)) => return Ok(Step::Retry(text)),
+                        None => note("nothing to retry".to_owned()),
+                    },
+                    Handled::Connect(provider) => return Ok(Step::Connect(provider)),
                     Handled::TerminalSetup if host.accessible => {
                         note("terminal setup needs the interactive terminal".to_owned());
                     }
@@ -5313,6 +5365,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Ok(Step::Continue)
             }
             Input::Prompt(text) => {
+                let retry_text = text.clone();
                 // Held for the whole arm, so every way the turn ends puts the
                 // session model back.
                 let pending = lock_value(&host.pending_model).take();
@@ -5456,7 +5509,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         .user_message(correction)?;
                 }
                 let outcome = match steered.outcome {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        lock_value(&host.last_failed).take();
+                        outcome
+                    }
                     // A cancelled or failed turn ends that exchange, not the
                     // session. Cancelling is something the keyboard offers while
                     // a turn runs, so ending the session for it would make the
@@ -5508,7 +5564,18 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             "failed"
                         };
                         host.notify_turn_end(reader.focus(), host.turn_elapsed(), how);
-                        let lines = report_failed_turn(&err, &host, steered.diagnostic.as_deref());
+                        let lines = report_failed_turn(
+                            &err,
+                            &host,
+                            steered.diagnostic.as_deref(),
+                            &provider_name,
+                        );
+                        let recovery = if err.code() == ErrorCode::Cancelled {
+                            Recovery::None
+                        } else {
+                            recovery(&err, &provider_name)
+                        };
+                        *lock_value(&host.last_failed) = Some((retry_text.clone(), recovery));
                         host.clear_events();
                         host.clear_streaming();
                         host.clear_provider_retry();
@@ -5713,7 +5780,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             // itself. A turn that failed or was interrupted has already put
             // the queue back in the draft, so nothing is left here then.
             let next = lock_value(&host.queued).pop_front();
-            let input = if let Some(text) = next {
+            let input = if let Some(text) = retry_next.take() {
+                Input::Prompt(text)
+            } else if let Some(text) = next {
                 Input::parse(&text)
             } else {
                 match await_submission(
@@ -5750,6 +5819,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Step::PickModel => {
                     choose_model(&mut reader, &host, &out, &settings, &config.paths)?;
                 }
+                Step::Retry(text) => retry_next = Some(text),
+                Step::Connect(provider) => {
+                    let (lines, retry) = connect_in_session(
+                        &mut reader,
+                        &host,
+                        &out,
+                        &settings,
+                        &config.paths,
+                        &config.workspace,
+                        provider.as_deref(),
+                    );
+                    flush_lines(&host, &mut sink, &lines)?;
+                    retry_next = retry;
+                }
                 Step::PickTheme => {
                     let line = choose_theme(&mut reader, &host, &out, &config.paths)?;
                     if let Some(line) = line {
@@ -5774,17 +5857,22 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         reason
     } else if config.accessible {
         loop {
-            host.show(&transcript::append_lines(&[
-                "Input: enter a prompt or slash command".to_owned(),
-            ]));
-            let Some(line) = source.next_line()? else {
-                break ExitReason::EndOfInput;
+            let input = if let Some(text) = retry_next.take() {
+                Input::Prompt(text)
+            } else {
+                host.show(&transcript::append_lines(&[
+                    "Input: enter a prompt or slash command".to_owned(),
+                ]));
+                let Some(line) = source.next_line()? else {
+                    break ExitReason::EndOfInput;
+                };
+                Input::parse(&line)
             };
             let mut sink = LockedSink {
                 stream: Arc::clone(&out),
             };
             match handle_input(
-                Input::parse(&line),
+                input,
                 &mut sink,
                 &mut history_file,
                 &mut reader,
@@ -5793,6 +5881,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             )? {
                 Step::Exit => break ExitReason::Requested,
                 Step::Restore(ask) => report_undo(&host, &mut sink, ask)?,
+                Step::Retry(text) => retry_next = Some(text),
+                Step::Connect(provider) => {
+                    let (lines, retry) = connect_in_session(
+                        &mut reader,
+                        &host,
+                        &out,
+                        &settings,
+                        &config.paths,
+                        &config.workspace,
+                        provider.as_deref(),
+                    );
+                    flush_lines(&host, &mut sink, &lines)?;
+                    retry_next = retry;
+                }
                 Step::PickModel => {
                     flush_lines(
                         &host,
@@ -5839,6 +5941,23 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     for line in task_list(&host) {
                         let _ = writeln!(sink, "{line}");
                     }
+                    Ok(Action::Continue)
+                }
+                Step::Retry(text) => {
+                    match handle_input(
+                        Input::Prompt(text),
+                        &mut sink,
+                        &mut history_file,
+                        &mut reader,
+                        &mut cancellation_gesture,
+                        None,
+                    )? {
+                        Step::Exit => Ok(Action::Exit),
+                        _ => Ok(Action::Continue),
+                    }
+                }
+                Step::Connect(_) => {
+                    let _ = writeln!(sink, "connecting needs a terminal; run `rune connect`");
                     Ok(Action::Continue)
                 }
             }
@@ -7763,6 +7882,23 @@ fn await_submission(
             host.cycle_reasoning();
             continue;
         }
+        // After a retryable failure, Enter on an empty draft sends the message
+        // again and Escape dismisses the offer.
+        let last = lock_value(&host.last_failed).clone();
+        if key == KeyAction::Submit
+            && let Some(text) = retry_on_enter(reader.line(), last.as_ref())
+        {
+            return Ok(Some(Input::Prompt(text)));
+        }
+        if key == KeyAction::Escape
+            && reader.line().is_empty()
+            && last
+                .as_ref()
+                .is_some_and(|(_, recovery)| *recovery == Recovery::Retry)
+        {
+            lock_value(&host.last_failed).take();
+            continue;
+        }
         let had_draft = !reader.line().is_empty();
         let step = idle_key(
             commands,
@@ -8424,7 +8560,7 @@ fn compact_history(
         );
     };
 
-    if host.endpoint.offline {
+    if lock_value(&host.endpoint).offline {
         return report(
             host,
             sink,
@@ -9858,7 +9994,7 @@ fn set_network(host: &SessionHost, requested: Option<&str>) -> String {
     match requested {
         None => {
             let on = host.network.load(Ordering::Relaxed);
-            let offline = if host.endpoint.offline {
+            let offline = if lock_value(&host.endpoint).offline {
                 " (offline mode overrides it)"
             } else {
                 ""
@@ -10460,6 +10596,96 @@ fn choose_theme(
     Ok(None)
 }
 
+/// Runs the connection flow inside the session, then puts the new key to
+/// use when the connection is the one the session already talks to.
+///
+/// Returns the lines to commit and, when the user asked for it, the failed
+/// message to send again. The terminal is handed to the flow in its ordinary
+/// line mode, like an external editor; a credential is never printed.
+fn connect_in_session(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    provider: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let flow = || -> Result<String> {
+        let entry = match provider {
+            Some(name) => crate::connect_flow::resolve_choice(name).ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::InvalidConfiguration,
+                    format!("`{name}` is not a provider this build knows"),
+                )
+            })?,
+            None => crate::connect_flow::choose_provider()?,
+        };
+        crate::connect_flow::run(paths, settings, entry)
+    };
+    let connected = if host.accessible || !reader.is_active() {
+        flow()
+    } else {
+        let screen = {
+            let _frame = host
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            host.transcript_open
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let screen = TranscriptScreen(host);
+            host.show(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+            rune_term::modes::mark(|modes| modes.alternate_screen = true);
+            screen
+        };
+        let result = reader
+            .with_cooked_terminal(flow)
+            .unwrap_or_else(|err| Err(RuneError::from(err)));
+        drop(screen);
+        result
+    };
+    let name = match connected {
+        Ok(name) => name,
+        Err(err) if err.message() == "no provider was chosen" => {
+            return (vec![CONNECTION_UNCHANGED.to_owned()], None);
+        }
+        Err(err) => {
+            return (
+                vec![error_note(&err), CONNECTION_UNCHANGED.to_owned()],
+                None,
+            );
+        }
+    };
+    let reloaded = rune_core::config::load(
+        Some(&workspace.join(".rune.toml")),
+        Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
+        &rune_core::config::EnvironmentOverrides::from_process(),
+    );
+    let same = reloaded.provider == settings.provider && reloaded.base_url == settings.base_url;
+    if !same {
+        return (
+            vec![format!(
+                "connected {name}; restart rune to use it (rune -c continues this conversation)"
+            )],
+            None,
+        );
+    }
+    match crate::provider_setup::configured_endpoint(&reloaded, paths) {
+        Ok(endpoint) => lock_value(&host.endpoint).credential = endpoint.credential,
+        Err(err) => return (vec![error_note(&err)], None),
+    }
+    let lines = vec![format!("connected {name}; the session uses the new key")];
+    let failed = lock_value(&host.last_failed).clone();
+    let Some((text, _)) = failed else {
+        return (lines, None);
+    };
+    let retry = confirm_choice(reader, host, out, "retry the failed message now?").unwrap_or(false);
+    (lines, retry.then_some(text))
+}
+
+/// Said when `/connect` changed nothing.
+const CONNECTION_UNCHANGED: &str = "connection unchanged";
+
 /// What `/tasks` says when the shell holds no running command.
 const NO_TASKS: &str = "no commands are running";
 
@@ -11021,6 +11247,10 @@ enum Handled {
     Goal(Option<GoalRequest>),
     /// Configure this terminal so Shift-Enter inserts a newline.
     TerminalSetup,
+    /// Send the last failed or interrupted message again.
+    Retry,
+    /// Connect a provider or replace its key, inside the session.
+    Connect(Option<String>),
 }
 
 /// What a `/goal` command with arguments asks for.
@@ -11408,6 +11638,10 @@ enum Step {
     PickTheme,
     /// List the commands still running, with a picker where there are keys.
     Tasks,
+    /// Send this message again as a new turn.
+    Retry(String),
+    /// Connect a provider, then maybe send the failed message again.
+    Connect(Option<String>),
     /// Put back files: undo, undo despite outside changes, or redo.
     Restore(RestoreAsk),
 }
@@ -11528,6 +11762,10 @@ fn handle_command<W: std::io::Write>(
         "copy" => Ok(Handled::Copy),
         "tasks" => Ok(Handled::Tasks),
         "terminal-setup" => Ok(Handled::TerminalSetup),
+        "retry" => Ok(Handled::Retry),
+        "connect" | "login" => Ok(Handled::Connect(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
         "new" => Ok(Handled::NewSession),
         "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
         "undo" if arguments.trim() == "confirm" => Ok(Handled::UndoConfirm),
@@ -12955,6 +13193,7 @@ fn report_failed_turn(
     err: &RuneError,
     host: &SessionHost,
     diagnostic: Option<&str>,
+    provider: &str,
 ) -> Vec<String> {
     host.flush_held();
     let answer = host.take_answer_rows();
@@ -12967,20 +13206,122 @@ fn report_failed_turn(
     if let Some(diagnostic) = diagnostic {
         after.push(Entry::notice(diagnostic));
     }
-    if err.code() == ErrorCode::Cancelled {
+    let recovery_text = if err.code() == ErrorCode::Cancelled {
         after.push(Entry::notice("interrupted"));
+        None
     } else {
         after.push(Entry::error(
-            format!("the turn failed: {}", err.message()),
+            err.message().to_owned(),
             err.hint().map(str::to_owned),
         ));
+        let recovery = recovery(err, provider);
+        // A line-mode session has no empty prompt for Enter to retry from.
+        if host.accessible && recovery == Recovery::Retry {
+            Some("/retry sends the message again".to_owned())
+        } else {
+            recovery_row(&recovery, &host.model_name())
+        }
+    };
+    if host.accessible
+        && let Some(text) = &recovery_text
+    {
+        after.push(Entry::notice(text.clone()));
     }
     let mut rows = host.entry_rows(&entries);
     if let Some(answer) = answer {
         rows.extend(host.spaced(RowKind::Assistant, &answer));
     }
     rows.extend(host.entry_rows(&after));
+    if !host.accessible
+        && let Some(text) = recovery_text
+    {
+        rows.push(styled(&host.theme().sgr(Slot::Dim, host.depth), &text));
+    }
     rows
+}
+
+/// The message Enter on `draft` sends again: only an empty draft, and only
+/// after a failure that retrying may fix.
+fn retry_on_enter(draft: &str, last: Option<&(String, Recovery)>) -> Option<String> {
+    match last {
+        Some((text, Recovery::Retry)) if draft.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// What helps after a failed turn.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Recovery {
+    /// Sending the message again may work.
+    Retry,
+    /// The credential was refused; `/connect` replaces it.
+    Connect(String),
+    /// The endpoint does not serve the model.
+    Model,
+    /// The conversation is too long for the model.
+    Compact,
+    /// Nothing in particular.
+    None,
+}
+
+/// Chooses the recovery a failure offers from its error code.
+fn recovery(err: &RuneError, provider: &str) -> Recovery {
+    match err.code() {
+        ErrorCode::AuthenticationRequired => Recovery::Connect(provider.to_owned()),
+        ErrorCode::NotFound if err.message().starts_with("the endpoint returned HTTP 404") => {
+            Recovery::Model
+        }
+        ErrorCode::TooLarge => Recovery::Compact,
+        ErrorCode::RateLimited
+        | ErrorCode::LimitExceeded
+        | ErrorCode::TransportFailure
+        | ErrorCode::Timeout
+        | ErrorCode::IncompleteStream
+        | ErrorCode::RequestRejected => Recovery::Retry,
+        _ => Recovery::None,
+    }
+}
+
+/// The row under a failure that names its recovery.
+fn recovery_row(recovery: &Recovery, model: &str) -> Option<String> {
+    match recovery {
+        Recovery::Retry => Some("enter retries   esc dismisses".to_owned()),
+        Recovery::Connect(provider) => Some(format!(
+            "{provider} refused the credential; /connect stores a new key"
+        )),
+        Recovery::Model => Some(format!(
+            "the endpoint does not serve {model}; /model picks another"
+        )),
+        Recovery::Compact => Some(
+            "the conversation is too long for this model; /compact summarises it, /new starts fresh"
+                .to_owned(),
+        ),
+        Recovery::None => None,
+    }
+}
+
+/// The activity row while a provider retry waits: a countdown in whole
+/// seconds, or how long the endpoint has been unreachable.
+fn retry_row(retry: &ProviderRetry, now: std::time::SystemTime) -> String {
+    let seconds = retry
+        .retry_at
+        .and_then(|at| at.duration_since(now).ok())
+        .map_or(0, |left| left.as_millis().div_ceil(1000));
+    let (attempt, max) = (retry.attempt, retry.max_attempts);
+    match retry.kind {
+        "rate_limited" | "quota_exceeded" => {
+            format!("rate limited, retrying in {seconds}s (attempt {attempt} of {max})")
+        }
+        "unreachable" => format!(
+            "offline, retrying ({})",
+            format_elapsed(
+                retry
+                    .unreachable_since
+                    .map_or_else(Default::default, |since| since.elapsed())
+            )
+        ),
+        _ => format!("provider error, retrying in {seconds}s (attempt {attempt} of {max})"),
+    }
 }
 
 /// Keeps only the answer bytes the turn has not already added to history.
@@ -13713,7 +14054,7 @@ mod tests {
             .set_budgeted_objective("fixture objective", 30)
             .expect("goal");
         let mut host = test_host();
-        host.endpoint = Endpoint::new(format!("http://{address}/v1"), "test-key");
+        *lock_value(&host.endpoint) = Endpoint::new(format!("http://{address}/v1"), "test-key");
         host.recorder = Some(Arc::new(Mutex::new(recorder)));
         let mut history = History::new();
         for index in 1..=2 {
@@ -14399,9 +14740,16 @@ mod tests {
                 kind: "rate_limited",
             });
             let screen = replay(&mut grid);
-            assert_eq!(screen.matches("provider retry").count(), 1, "{screen}");
-            assert!(
-                screen.contains(&format!("provider retry {attempt}/3 in {delay}ms")),
+            // While it waits, the activity row counts the retry down and the
+            // status row leaves it out.
+            assert!(!screen.contains("provider retry"), "{screen}");
+            assert_eq!(
+                screen
+                    .matches(&format!(
+                        "rate limited, retrying in 0s (attempt {attempt} of 3)"
+                    ))
+                    .count(),
+                1,
                 "{screen}"
             );
             end_frame_interval(&host);
@@ -15246,6 +15594,7 @@ mod tests {
             &result.expect_err("caught panic"),
             &host,
             diagnostic.as_deref(),
+            "test",
         );
         host.clear_events();
         host.clear_streaming();
@@ -15294,11 +15643,8 @@ mod tests {
 
         let error = result.expect_err("caught worker panic");
         assert_eq!(error.code(), ErrorCode::Internal);
-        let lines = report_failed_turn(&error, &host, diagnostic.as_deref()).join("\n");
-        assert!(
-            lines.contains("the turn failed: internal worker failure"),
-            "{lines}"
-        );
+        let lines = report_failed_turn(&error, &host, diagnostic.as_deref(), "test").join("\n");
+        assert!(lines.contains("error: internal worker failure"), "{lines}");
         assert!(lines.contains("partial before panic"), "{lines}");
         assert_eq!(
             lines.matches("worker panicked: R060_FIXTURE").count(),
@@ -15381,8 +15727,13 @@ mod tests {
         if let Ok(mut streaming) = host.streaming.lock() {
             streaming.answer.push_str("half an answer");
         }
-        let lines =
-            report_failed_turn(&rune_agent::steering::cancelled_error(), &host, None).join("\n");
+        let lines = report_failed_turn(
+            &rune_agent::steering::cancelled_error(),
+            &host,
+            None,
+            "test",
+        )
+        .join("\n");
         assert!(lines.contains("half an answer"), "{lines}");
         assert!(lines.contains("[interrupted]"), "{lines}");
         assert!(
@@ -15424,7 +15775,7 @@ mod tests {
             "the endpoint closed the stream",
         )
         .with_hint("check the provider status");
-        let lines = report_failed_turn(&err, &host, None).join("\n");
+        let lines = report_failed_turn(&err, &host, None, "test").join("\n");
         assert!(lines.contains("the endpoint closed the stream"), "{lines}");
         assert!(lines.contains("check the provider status"), "{lines}");
     }
@@ -16494,6 +16845,125 @@ mod tests {
         // Chaining has no safe pattern, so `p` is not offered for it.
         let menu = ApprovalMenu::for_request(&shell_request("cargo test && rm -rf x"));
         assert_eq!(menu.by_id("approve_always"), None);
+    }
+
+    #[test]
+    fn recovery_follows_the_error_code() {
+        let error = |code, message: &str| RuneError::new(code, message.to_owned());
+        assert_eq!(
+            recovery(&error(ErrorCode::AuthenticationRequired, "401"), "openai"),
+            Recovery::Connect("openai".to_owned())
+        );
+        assert_eq!(
+            recovery(
+                &error(
+                    ErrorCode::NotFound,
+                    "the endpoint returned HTTP 404: no model"
+                ),
+                "p"
+            ),
+            Recovery::Model
+        );
+        assert_eq!(
+            recovery(&error(ErrorCode::NotFound, "no such session"), "p"),
+            Recovery::None
+        );
+        assert_eq!(
+            recovery(&error(ErrorCode::TooLarge, "too long"), "p"),
+            Recovery::Compact
+        );
+        for code in [
+            ErrorCode::RateLimited,
+            ErrorCode::LimitExceeded,
+            ErrorCode::TransportFailure,
+            ErrorCode::Timeout,
+            ErrorCode::IncompleteStream,
+            ErrorCode::RequestRejected,
+        ] {
+            assert_eq!(
+                recovery(&error(code, "x"), "p"),
+                Recovery::Retry,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            recovery(&error(ErrorCode::Internal, "x"), "p"),
+            Recovery::None
+        );
+        assert_eq!(
+            recovery_row(&Recovery::Retry, "m").as_deref(),
+            Some("enter retries   esc dismisses")
+        );
+        assert_eq!(
+            recovery_row(&Recovery::Connect("openai".to_owned()), "m").as_deref(),
+            Some("openai refused the credential; /connect stores a new key")
+        );
+        assert_eq!(
+            recovery_row(&Recovery::Model, "gpt-x").as_deref(),
+            Some("the endpoint does not serve gpt-x; /model picks another")
+        );
+        assert!(
+            recovery_row(&Recovery::Compact, "m")
+                .is_some_and(|row| row.contains("/compact summarises it, /new starts fresh"))
+        );
+        assert_eq!(recovery_row(&Recovery::None, "m"), None);
+    }
+
+    #[test]
+    fn retry_row_text_counts_down() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let mut retry = ProviderRetry {
+            attempt: 2,
+            max_attempts: 3,
+            delay: Some(std::time::Duration::from_secs(3)),
+            retry_at: Some(now + std::time::Duration::from_millis(2500)),
+            kind: "rate_limited",
+            unreachable_since: None,
+        };
+        assert_eq!(
+            retry_row(&retry, now),
+            "rate limited, retrying in 3s (attempt 2 of 3)"
+        );
+        assert_eq!(
+            retry_row(&retry, now + std::time::Duration::from_millis(1600)),
+            "rate limited, retrying in 1s (attempt 2 of 3)"
+        );
+        assert_eq!(
+            retry_row(&retry, now + std::time::Duration::from_secs(9)),
+            "rate limited, retrying in 0s (attempt 2 of 3)"
+        );
+        retry.kind = "unavailable";
+        assert_eq!(
+            retry_row(&retry, now),
+            "provider error, retrying in 3s (attempt 2 of 3)"
+        );
+        retry.kind = "unreachable";
+        retry.unreachable_since = Some(std::time::Instant::now());
+        assert!(
+            retry_row(&retry, now).starts_with("offline, retrying ("),
+            "{}",
+            retry_row(&retry, now)
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_draft_retries_only_retryable_failures() {
+        let retryable = ("hello".to_owned(), Recovery::Retry);
+        assert_eq!(
+            retry_on_enter("", Some(&retryable)).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            retry_on_enter("  ", Some(&retryable)).as_deref(),
+            Some("hello")
+        );
+        // A draft is sent as itself, not as the retry.
+        assert_eq!(retry_on_enter("queued text", Some(&retryable)), None);
+        let refused = ("hello".to_owned(), Recovery::Connect("p".to_owned()));
+        assert_eq!(retry_on_enter("", Some(&refused)), None);
+        let interrupted = ("hello".to_owned(), Recovery::None);
+        assert_eq!(retry_on_enter("", Some(&interrupted)), None);
+        assert_eq!(retry_on_enter("", None), None);
     }
 
     #[test]
@@ -17568,7 +18038,7 @@ mod tests {
         written.push_str(&render_entries(&[Entry::assistant(answer)], &host).join("\r\n"));
         let err = RuneError::new(ErrorCode::InvalidField, "the provider refused the request")
             .with_hint("check the model name");
-        written.push_str(&report_failed_turn(&err, &host, None).join("\r\n"));
+        written.push_str(&report_failed_turn(&err, &host, None, "test").join("\r\n"));
         written.push_str(&host.status_line(100));
         written
     }
@@ -17719,7 +18189,7 @@ mod tests {
         let mut host = test_host();
         host.permission_settings.cache_warming = true;
         host.dialect = Box::new(rune_net::anthropic::Anthropic);
-        host.endpoint = Endpoint::new(format!("http://127.0.0.1:{port}"), "k");
+        *lock_value(&host.endpoint) = Endpoint::new(format!("http://127.0.0.1:{port}"), "k");
         let mut history = History::new();
         history.push_user("first question");
         prepare_next(&host, &mut history);
@@ -17814,7 +18284,7 @@ mod tests {
         assert!(host.start_warming().is_none());
 
         host.dialect = Box::new(rune_net::anthropic::Anthropic);
-        host.endpoint.offline = true;
+        lock_value(&host.endpoint).offline = true;
         prepare_next(&host, &mut history);
         assert!(host.start_warming().is_none());
 
@@ -18183,7 +18653,7 @@ mod tests {
             let id = SessionId::generate();
             let mut host = test_host();
             host.accessible = accessible;
-            host.endpoint.offline = true;
+            lock_value(&host.endpoint).offline = true;
             host.context = ExecutionContext::new(root.to_owned());
             host.fresh_turn_context();
             host.recorder = Some(Arc::new(Mutex::new(
@@ -19016,8 +19486,8 @@ mod tests {
 
     #[test]
     fn compaction_preview_matches_the_applied_plan_and_preserves_history() {
-        let (mut host, mut history, _) = compaction_fixture();
-        host.endpoint.offline = true;
+        let (host, mut history, _) = compaction_fixture();
+        lock_value(&host.endpoint).offline = true;
         let before = serde_json::to_value(&history).expect("history");
         let plan = rune_agent::compaction::plan(&history, &host.limits).expect("plan");
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -19283,7 +19753,7 @@ mod tests {
             assert_eq!(history.pinned_constraints(), constraints);
             rune_net::transport::stream_completion(
                 &fetch,
-                &host.endpoint,
+                &lock_value(&host.endpoint),
                 host.dialect.as_ref(),
                 &plan,
                 rune_net::transport::RequestTimeouts::from_settings(&host.limits, None),
@@ -19376,7 +19846,7 @@ mod tests {
         history.validate().expect("compacted history is valid");
         rune_net::transport::stream_completion(
             &fetch,
-            &host.endpoint,
+            &lock_value(&host.endpoint),
             host.dialect.as_ref(),
             &plan,
             rune_net::transport::RequestTimeouts::from_settings(&host.limits, None),
@@ -21267,8 +21737,8 @@ mod tests {
         assert!(again.text.contains(rune_tools::shell::NETWORK_NOTICE));
         assert!(pending.try_recv().is_err(), "asked after a no");
 
-        let (mut offline, pending) = network_host();
-        offline.endpoint.offline = true;
+        let (offline, pending) = network_host();
+        lock_value(&offline.endpoint).offline = true;
         let output = offline.execute("shell", &arguments).expect("offline");
         assert!(output.text.contains(rune_tools::shell::NETWORK_NOTICE));
         assert!(pending.try_recv().is_err(), "asked while offline");
@@ -23076,7 +23546,7 @@ mod tests {
             accessible: false,
             ascii: false,
             recorder: None,
-            endpoint: Endpoint::new("https://example.invalid", "k"),
+            endpoint: Mutex::new(Endpoint::new("https://example.invalid", "k")),
             compat: crate::provider_setup::CompatSource::default(),
             dialect: Box::new(rune_net::chat_completions::ChatCompletions),
             model: Mutex::new("test".to_owned()),
@@ -23109,6 +23579,7 @@ mod tests {
             steering: SteeringQueue::new(4),
             queued: Mutex::new(std::collections::VecDeque::new()),
             model_ids: Mutex::new(Vec::new()),
+            last_failed: Mutex::new(None),
             plan: Mutex::new(None),
             plan_visible: std::sync::atomic::AtomicBool::new(true),
             cleared: Mutex::new(std::collections::VecDeque::new()),

@@ -498,8 +498,8 @@ mod tests {
             self.dialect
         }
 
-        fn endpoint(&self) -> &rune_net::transport::Endpoint {
-            &self.endpoint
+        fn endpoint(&self) -> std::borrow::Cow<'_, rune_net::transport::Endpoint> {
+            std::borrow::Cow::Borrowed(&self.endpoint)
         }
 
         fn model(&self) -> String {

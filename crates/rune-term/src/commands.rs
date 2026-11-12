@@ -163,6 +163,16 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "list commands and active keyboard bindings",
     },
     Builtin {
+        name: "retry",
+        arguments: "",
+        summary: "send the last failed or interrupted message again",
+    },
+    Builtin {
+        name: "connect",
+        arguments: "[provider]",
+        summary: "connect a provider or replace its key",
+    },
+    Builtin {
         name: "terminal-setup",
         arguments: "",
         summary: "configure this terminal so Shift-Enter inserts a newline",

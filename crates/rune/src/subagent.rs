@@ -303,7 +303,7 @@ impl Host for ChildHost<'_> {
     fn dialect(&self) -> &dyn Provider {
         self.parent.dialect()
     }
-    fn endpoint(&self) -> &Endpoint {
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
         self.parent.endpoint()
     }
     fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
@@ -453,8 +453,8 @@ mod tests {
         fn dialect(&self) -> &dyn Provider {
             &rune_net::chat_completions::ChatCompletions
         }
-        fn endpoint(&self) -> &Endpoint {
-            &self.endpoint
+        fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+            std::borrow::Cow::Borrowed(&self.endpoint)
         }
         fn model(&self) -> String {
             "fixture".to_owned()

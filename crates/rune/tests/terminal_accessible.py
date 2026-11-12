@@ -254,7 +254,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
 
         start = len(terminal.output)
         terminal.send("fail")
-        terminal.wait_for("Notice: the turn failed:", start)
+        terminal.wait_for("Notice: the endpoint returned HTTP 400", start)
         terminal.send("after-failure")
         terminal.wait_for("Assistant: SESSION_STILL_USABLE", start)
         terminal.send("/status")

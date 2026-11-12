@@ -309,8 +309,8 @@ impl Host for TestHost {
         }
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.endpoint)
     }
 
     fn model(&self) -> String {
@@ -2787,6 +2787,34 @@ fn a_transient_failure_is_retried_and_the_turn_completes() {
     let outcome = run_turn(&mut history, &host).expect("turn");
     assert_eq!(outcome.stop_reason, StopReason::Completed);
     assert_eq!(outcome.text, "recovered");
+}
+
+#[test]
+fn provider_retry_event_carries_the_kind() {
+    let endpoint = MockEndpoint::start(vec![Script::text("recovered")]);
+    endpoint.fail_first(1);
+    let host = TestHost::new(endpoint);
+    let mut history = rune_agent::History::new();
+    history.push_user("hello");
+    let before = std::time::SystemTime::now();
+    run_turn(&mut history, &host).expect("turn");
+    let retries: Vec<_> = host
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::ProviderRetry {
+                kind,
+                retry_at,
+                delay,
+                ..
+            } => Some((kind, retry_at, delay)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    let (kind, retry_at, delay) = retries[0];
+    assert_eq!(kind, "unavailable");
+    assert!(retry_at >= before + delay, "{retry_at:?}");
 }
 
 #[test]
