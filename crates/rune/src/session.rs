@@ -1915,6 +1915,7 @@ impl SessionHost {
                 .as_ref()
                 .ok()
                 .and_then(|answer| answer.message.clone());
+            let always = received.as_ref().is_ok_and(|answer| answer.always);
             match received.map(|answer| answer.outcome) {
                 Ok(ApprovalOutcome::RunOnce) if !self.cancellation.is_cancelled() => {
                     return (Outcome::Allow, format!("{reason}; approved for this call"));
@@ -1928,7 +1929,9 @@ impl SessionHost {
                         format!("{reason}; approved for the rest of this session"),
                     );
                 }
-                Ok(ApprovalOutcome::AlwaysForProject) if !self.cancellation.is_cancelled() => {
+                Ok(ApprovalOutcome::AlwaysForProject)
+                    if always && !self.cancellation.is_cancelled() =>
+                {
                     // A rule that cannot be saved still approves this call.
                     let line = match self.save_project_rule(tool, target) {
                         Ok(_) => None,
@@ -2034,11 +2037,7 @@ impl SessionHost {
                 format!("could not save the rule: no rule may be saved for `{target}`"),
             )
         })?;
-        let workspace = self
-            .permission_settings
-            .workspace
-            .clone()
-            .unwrap_or_else(|| rune_policy::trust::canonical_workspace(self.context.workspace()));
+        let workspace = self.rule_workspace();
         let path = self.user_config_file().ok_or_else(|| {
             RuneError::new(
                 ErrorCode::InvalidConfiguration,
@@ -2075,7 +2074,15 @@ impl SessionHost {
         self.checkpoint_notice(format!(
             "saved: allow {tool} \"{pattern}\" in this project ({path})"
         ));
-        Ok(format!("allow {tool} \"{pattern}\" in {workspace}"))
+        Ok(project_rule_text(tool, &pattern, &workspace))
+    }
+
+    /// The workspace a saved rule is limited to.
+    fn rule_workspace(&self) -> Utf8PathBuf {
+        self.permission_settings
+            .workspace
+            .clone()
+            .unwrap_or_else(|| rune_policy::trust::canonical_workspace(self.context.workspace()))
     }
 
     /// Points the session at another model.
@@ -6696,6 +6703,50 @@ fn denial_row(message: Option<&str>) -> String {
     )
 }
 
+/// A saved rule as the user is shown it: `allow shell "cargo test*" in /w`.
+fn project_rule_text(tool: &str, pattern: &str, workspace: &Utf8Path) -> String {
+    format!("allow {tool} \"{pattern}\" in {workspace}")
+}
+
+/// The question asked before a rule is saved.
+const SAVE_RULE_QUESTION: &str = "save this rule to your user configuration?";
+
+/// The rows under the save question: the rule, then the two answers.
+fn save_rule_rows(rule: &str) -> Vec<String> {
+    vec![
+        format!("  {rule}"),
+        String::new(),
+        "  y  yes".to_owned(),
+        "  n  no".to_owned(),
+    ]
+}
+
+/// Shows the rule an "always allow" answer would save and asks before saving
+/// it. Returns true for yes; no and Escape go back to the approval menu.
+fn confirm_rule(host: &SessionHost, reader: &mut rune_term::input::KeyReader, rule: &str) -> bool {
+    use rune_term::input::ChoiceKey;
+    *lock_value(&host.approval_hint) = Some("y yes   n no");
+    let rows = save_rule_rows(rule);
+    let mut paced = false;
+    loop {
+        if host.cancellation.is_cancelled()
+            || draw_choice(host, SAVE_RULE_QUESTION, &rows, &[], paced).is_err()
+        {
+            return false;
+        }
+        paced = true;
+        match reader.poll_choice_key(rune_term::shell::POLL_INTERVAL) {
+            Some(ChoiceKey::Char('y')) => return true,
+            Some(ChoiceKey::Char('n') | ChoiceKey::Action(KeyAction::Escape)) => return false,
+            Some(ChoiceKey::Action(KeyAction::Cancel | KeyAction::Interrupt)) => {
+                host.interrupt();
+                return false;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Shows the complete request in scrollback, then waits for a one-key answer.
 ///
 /// Keys already waiting are dropped and keys in the first moments after the
@@ -6733,6 +6784,20 @@ fn collect_approval_inner(
         {
             match approval_key(key, &mut menu) {
                 ApprovalStep::Stay => {}
+                ApprovalStep::Answer(ApprovalOutcome::AlwaysForProject) => {
+                    if let Some(pattern) = &request.project_pattern {
+                        let rule =
+                            project_rule_text(&request.tool, pattern, &host.rule_workspace());
+                        if confirm_rule(host, reader, &rule) {
+                            return ApprovalOutcome::AlwaysForProject.into();
+                        }
+                        *lock_value(&host.approval_hint) = Some(menu.hint());
+                        let rows = menu.lines(&host.theme(), host.depth);
+                        if draw_choice(host, "permission required", &rows, &[], false).is_err() {
+                            return ApprovalOutcome::Deny.into();
+                        }
+                    }
+                }
                 ApprovalStep::Answer(outcome) => return outcome.into(),
                 ApprovalStep::Interrupt => {
                     host.interrupt();
@@ -16369,6 +16434,27 @@ mod tests {
             approval_preview("write_file", &arguments, &inner, 80, true),
             ["new file, 1 line", "+ a"]
         );
+    }
+
+    #[test]
+    fn the_save_question_shows_the_exact_rule() {
+        let rule = project_rule_text("shell", "cargo test*", Utf8Path::new("/w"));
+        assert_eq!(rule, "allow shell \"cargo test*\" in /w");
+        assert_eq!(
+            save_rule_rows(&rule),
+            [
+                "  allow shell \"cargo test*\" in /w",
+                "",
+                "  y  yes",
+                "  n  no"
+            ]
+        );
+        let answer = ApprovalAnswer::from(ApprovalOutcome::AlwaysForProject);
+        assert!(answer.always);
+        assert!(!ApprovalAnswer::from(ApprovalOutcome::RunOnce).always);
+        // Chaining has no safe pattern, so `p` is not offered for it.
+        let menu = ApprovalMenu::for_request(&shell_request("cargo test && rm -rf x"));
+        assert_eq!(menu.by_key("p"), None);
     }
 
     #[test]

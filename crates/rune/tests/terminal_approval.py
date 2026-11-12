@@ -17,6 +17,8 @@ import time
 
 
 COMMAND = "printf AUDIT_SHELL_OK; printf x >> shell-ran"
+# One program and its arguments, so an always-allow rule may be saved for it.
+ALWAYS_COMMAND = "git status --short"
 results = []
 prompts = []
 errors = []
@@ -56,6 +58,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
                         assert release_draft.wait(10), "draft was never released"
                     if text == "permission-quarantine":
                         quarantine_call.set()
+                    command = ALWAYS_COMMAND if text == "permission-always" else COMMAND
                     delta = {
                         "tool_calls": [{
                             "index": 0,
@@ -65,7 +68,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
                                 "name": "shell",
                                 "arguments": json.dumps({
                                     "action": "run",
-                                    "command": COMMAND,
+                                    "command": command,
                                 }),
                             },
                         }],
@@ -266,8 +269,40 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         settled_reply("FIXTURE_REPLY_6", start)
         assert side_effect.read_bytes() == b"xxx"
 
+        # `p` shows the exact rule, saves it on yes, and the call runs.
+        start = len(transcript)
+        send(b"permission-always\r")
+        wait_for("p  always allow in this project", start)
+        time.sleep(0.4)
+        send(b"p")
+        wait_for("save this rule to your user configuration?", start)
+        wait_for('allow shell "git status*" in ', start)
+        assert "git status" not in config_file.read_text(), "rule saved before yes"
+        # No goes back to the menu and saves nothing.
+        back = len(transcript)
+        send(b"n")
+        wait_for("y  run once", back)
+        assert "git status" not in config_file.read_text(), "rule saved after no"
+        send(b"p")
+        wait_for("save this rule to your user configuration?", back)
+        send(b"y")
+        settled_reply("FIXTURE_REPLY_7", start)
+        saved = config_file.read_text()
+        assert 'match = "git status*"' in saved, saved
+        assert "refused by policy" not in results[-1], results
+
         send(b"/quit\r")
         assert drain_wait(child, master, 10, transcript) == 0
+
+        # A new session runs the same command without asking.
+        always = subprocess.run(
+            [sys.argv[1], "--permission-mode", "ask", "--allow-unsandboxed"],
+            input=b"permission-always\n/quit\n", stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=root, env=environment, timeout=10,
+        )
+        assert always.returncode == 0, always.stderr
+        assert "no way to ask for approval" not in results[-1], results
+        assert "refused by policy" not in results[-1], results
 
         # Piped sessions have nobody to ask and must keep their refusal behavior.
         piped = subprocess.run(
