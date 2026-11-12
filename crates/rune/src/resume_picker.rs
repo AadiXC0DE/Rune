@@ -102,6 +102,13 @@ pub fn row_text(row: &ResumeRow, now_ms: u64, width: usize) -> String {
     format!("{}{tail}", fit(&title, room))
 }
 
+/// Renders a session as an argument menu row: its title and age.
+#[must_use]
+pub fn value_label(summary: &Summary) -> String {
+    let title = rune_term::transcript::sanitize(&title_of(summary)).replace('\n', " ");
+    format!("{title}  {}", age(now_ms(), summary.updated_at_ms()))
+}
+
 /// Returns the last exchange of a session.
 ///
 /// Row 0 is the first line of the last user message, rows 1 and 2 the first

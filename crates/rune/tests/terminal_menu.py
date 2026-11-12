@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory(prefix="rune-terminal-menu-") as directory:
             capture("custom-tab", b"\t", "> /audit-command")
             capture("custom-menu-enter", b"\x15/audit", "> /audit-command")
             capture("custom-enter", b"\r", "> /audit-command")
-            capture("custom-expanded", b"\r", "/audit-command expanded; edit before sending")
+            capture("custom-expanded", b"\r", "/audit-command expanded into the draft")
             os.write(master, b"\x15")
         else:
             # Walk to the last builtin, /quit, past the first window. The count

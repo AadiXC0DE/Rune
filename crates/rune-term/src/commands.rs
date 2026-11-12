@@ -211,18 +211,44 @@ pub fn render_help() -> String {
     out.trim_end().to_owned()
 }
 
-/// Returns the candidates matching a word being typed after a slash.
+/// Returns the indexes of `names` that match `word`, best first.
 ///
-/// A candidate matches when its name starts with what was typed. An empty word
-/// matches everything, which is what makes a bare `/` show the whole list.
-/// Matching is exact on the prefix rather than fuzzy, because a slash command
-/// is short and a fuzzy match would order a longer name above the one being
-/// typed.
+/// Names that start with the word come first, then names that contain its
+/// characters in order, each group in table order, so the name being typed
+/// stays above a longer one that merely contains it. Both comparisons ignore
+/// case. An empty word matches every name.
+#[must_use]
+pub fn fuzzy_rank(word: &str, names: &[&str]) -> Vec<usize> {
+    let word = word.to_lowercase();
+    let mut ranked = Vec::new();
+    let mut later = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let name = name.to_lowercase();
+        if name.starts_with(&word) {
+            ranked.push(index);
+        } else if is_subsequence(&word, &name) {
+            later.push(index);
+        }
+    }
+    ranked.extend(later);
+    ranked
+}
+
+/// Returns true when every character of `word` appears in `name` in order.
+fn is_subsequence(word: &str, name: &str) -> bool {
+    let mut rest = name.chars();
+    word.chars().all(|wanted| rest.any(|found| found == wanted))
+}
+
+/// Returns the candidates matching a word being typed after a slash, in the
+/// order of [`fuzzy_rank`]. An empty word matches everything, which is what
+/// makes a bare `/` show the whole list.
 #[must_use]
 pub fn matching(word: &str) -> Vec<&'static Builtin> {
-    BUILTINS
-        .iter()
-        .filter(|entry| entry.name.starts_with(word))
+    let names: Vec<&str> = BUILTINS.iter().map(|entry| entry.name).collect();
+    fuzzy_rank(word, &names)
+        .into_iter()
+        .filter_map(|index| BUILTINS.get(index))
         .collect()
 }
 
@@ -276,11 +302,29 @@ mod tests {
     #[test]
     fn a_prefix_narrows_the_list_in_table_order() {
         let got: Vec<&str> = matching("mo").iter().map(|e| e.name).collect();
-        assert_eq!(got, vec!["model", "models"]);
+        assert_eq!(got[..2], ["model", "models"]);
         let got: Vec<&str> = matching("mode").iter().map(|e| e.name).collect();
         assert_eq!(got, vec!["model", "models"]);
         // `/mod` is the case that must offer both, so a user typing it can pick.
         assert_eq!(matching("mod").len(), 2);
+    }
+
+    #[test]
+    fn fuzzy_rank_puts_prefix_matches_first() {
+        let names = ["settings", "status", "stats", "cost"];
+        assert_eq!(fuzzy_rank("st", &names), [1, 2, 0, 3]);
+        assert_eq!(fuzzy_rank("", &names), [0, 1, 2, 3]);
+        assert_eq!(fuzzy_rank("STAT", &names), [1, 2]);
+    }
+
+    #[test]
+    fn fuzzy_rank_matches_subsequences() {
+        let names = ["status", "settings", "copy"];
+        assert_eq!(fuzzy_rank("sts", &names), [0, 1]);
+        assert!(fuzzy_rank("tss", &names).is_empty());
+        assert!(fuzzy_rank("zzz", &names).is_empty());
+        let got: Vec<&str> = matching("sts").iter().map(|e| e.name).collect();
+        assert!(got.contains(&"status"), "{got:?}");
     }
 
     #[test]

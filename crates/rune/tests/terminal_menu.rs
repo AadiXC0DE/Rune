@@ -129,33 +129,32 @@ fn discovered_custom_slash_command_can_be_completed_and_expanded_in_a_terminal()
     for (stage, bytes) in captures {
         let mut grid = rune_term::Grid::new(80, 24).expect("grid");
         grid.feed(&bytes).expect("frame");
-        let expected = match stage.as_str() {
-            "custom-menu-tab" | "custom-menu-enter" => {
-                assert!(
-                    grid.text()
-                        .contains("> /audit-command  Describe audit command files."),
-                    "{stage}: {}",
-                    grid.text()
-                );
-                assert!(
-                    grid.text()
-                        .lines()
-                        .any(|row| row == "up/down select   tab complete   esc close"),
-                    "{stage}: {}",
-                    grid.text()
-                );
-                "> /audit"
-            }
-            "custom-expanded" => {
-                assert!(grid.text().contains("Describe audit command files."));
-                assert!(
-                    grid.text()
-                        .contains("/audit-command expanded; edit before sending")
-                );
-                ">"
-            }
-            _ => "> /audit-command",
-        };
+        let expected =
+            match stage.as_str() {
+                "custom-menu-tab" | "custom-menu-enter" => {
+                    assert!(
+                        grid.text()
+                            .contains("> /audit-command  Describe audit command files."),
+                        "{stage}: {}",
+                        grid.text()
+                    );
+                    assert!(
+                        grid.text()
+                            .lines()
+                            .any(|row| row == "up/down select   tab complete   esc close"),
+                        "{stage}: {}",
+                        grid.text()
+                    );
+                    "> /audit"
+                }
+                "custom-expanded" => {
+                    assert!(grid.text().contains(
+                        "/audit-command expanded into the draft; edit it, then press enter"
+                    ));
+                    "> Describe audit command files."
+                }
+                _ => "> /audit-command",
+            };
         assert_eq!(grid.row_text(grid.cursor().row), expected, "{stage}");
         assert_eq!(
             usize::from(grid.cursor().col),

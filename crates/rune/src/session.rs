@@ -445,6 +445,9 @@ struct SessionHost {
     steering: SteeringQueue,
     /// Messages to run as turns after the running one, oldest first.
     queued: Mutex<std::collections::VecDeque<String>>,
+    /// The model ids of the newest catalog the session saw, for `/model`'s
+    /// value menu.
+    model_ids: Mutex<Vec<String>>,
     /// The newest plan the model reported, pinned above the prompt.
     plan: Mutex<Option<rune_tools::PlanUpdate>>,
     /// Whether the pinned plan is drawn; Ctrl+T flips it.
@@ -4509,6 +4512,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         queued: Mutex::new(std::collections::VecDeque::new()),
+        model_ids: Mutex::new(Vec::new()),
         plan: Mutex::new(None),
         plan_visible: std::sync::atomic::AtomicBool::new(terminal_height() >= PLAN_PIN_MIN_HEIGHT),
         cleared: Mutex::new(std::collections::VecDeque::new()),
@@ -5241,16 +5245,16 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                 .push(Entry::notice(&line));
                             note(format!("{line}\n"));
                         }
-                        match model {
-                            Some(model) => {
-                                note(format!(
-                                    "-- /{name} expanded; edit before sending; the turn uses model {model} --\n{text}"
-                                ));
-                                *lock_value(&host.pending_model) = Some(model);
-                            }
-                            None => note(format!(
-                                "-- /{name} expanded; edit before sending --\n{text}"
-                            )),
+                        let active = reader.is_active();
+                        note(expand_into_draft(
+                            reader,
+                            active,
+                            &name,
+                            &text,
+                            model.as_deref(),
+                        ));
+                        if let Some(model) = model {
+                            *lock_value(&host.pending_model) = Some(model);
                         }
                     }
                     Handled::Continue => {}
@@ -5380,7 +5384,14 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 let steered = if let Some(input) = line_input {
                     run_turn_accessible(&mut history, &host, input)
                 } else {
-                    run_turn_steerable(&mut history, &host, reader, gesture)
+                    let turn_commands = TurnCommands {
+                        commands: &commands,
+                        provider: &provider_name,
+                        endpoint: &endpoint_url,
+                        workspace: &config.workspace,
+                        paths: &config.paths,
+                    };
+                    run_turn_steerable(&mut history, &host, reader, gesture, &turn_commands)
                 };
                 host.absorb_helper_usage();
                 recorder
@@ -5586,7 +5597,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 let steered = if let Some(input) = line_input {
                     run_accessible(&mut history, &host, input, job)
                 } else {
-                    run_steerable(&mut history, &host, reader, gesture, job)
+                    run_steerable(&mut history, &host, reader, gesture, None, job)
                 };
                 host.clear_events();
                 let mut lines: Vec<String> = steered.diagnostic.into_iter().collect();
@@ -5954,10 +5965,153 @@ fn run_turn_steerable(
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
     gesture: &mut rune_term::shell::EscapeGesture,
+    commands: &TurnCommands<'_>,
 ) -> Steered<turn::TurnOutcome> {
-    run_steerable(history, host, reader, gesture, |taken| {
+    run_steerable(history, host, reader, gesture, Some(commands), |taken| {
         turn::run_turn(taken, host).and_then(turn::TurnOutcome::into_strict)
     })
+}
+
+/// Slash commands that run while a turn is in flight. They read or change
+/// session settings and never touch the conversation the turn is using.
+const TURN_SAFE_COMMANDS: &[&str] = &[
+    "status",
+    "cost",
+    "context",
+    "help",
+    "tasks",
+    "diff",
+    "copy",
+    "permissions",
+    "effort",
+    "network",
+    "statusline",
+    "theme",
+];
+
+/// What a slash command typed during a turn does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnCommandKind {
+    /// Runs now.
+    Run,
+    /// Waits for the turn to end; the draft is kept.
+    Later,
+    /// Not a command name, so the text is steering.
+    Steer,
+}
+
+/// Classifies a command name typed during a turn. `custom` says whether a
+/// discovered command has the name.
+fn turn_command_kind(name: &str, custom: bool) -> TurnCommandKind {
+    let builtin = rune_term::commands::find(name).is_some();
+    if builtin && TURN_SAFE_COMMANDS.contains(&name) {
+        TurnCommandKind::Run
+    } else if builtin || custom {
+        TurnCommandKind::Later
+    } else {
+        TurnCommandKind::Steer
+    }
+}
+
+/// What a slash command needs while a turn holds the conversation.
+struct TurnCommands<'a> {
+    /// The discovered custom commands.
+    commands: &'a rune_context::commands::Discovery,
+    /// The provider name as configured.
+    provider: &'a str,
+    /// The endpoint requests go to.
+    endpoint: &'a str,
+    /// The workspace the session runs in.
+    workspace: &'a Utf8Path,
+    /// Where themes and settings are saved.
+    paths: &'a Paths,
+}
+
+/// The notice for a command that has to wait for the turn to end.
+fn turn_command_later(name: &str) -> String {
+    format!("/{name} is available when the turn has finished")
+}
+
+/// Runs a turn-safe command while a turn is in flight and returns the lines to
+/// commit. Commands that need the conversation say they have to wait.
+fn turn_command(
+    host: &SessionHost,
+    context: &TurnCommands<'_>,
+    name: &str,
+    arguments: &str,
+) -> Vec<String> {
+    host.absorb_helper_usage();
+    let info = host.info(context.provider, context.endpoint);
+    let mut captured: Vec<u8> = Vec::new();
+    let handled = match handle_command(
+        name,
+        arguments,
+        context.commands,
+        None,
+        context.workspace,
+        &info,
+        &mut captured,
+    ) {
+        Ok(handled) => handled,
+        Err(err) => return vec![error_note(&err)],
+    };
+    let mut lines = output_lines(&captured);
+    let note = match handled {
+        Handled::Continue => None,
+        Handled::Effort(requested) => {
+            let reply = set_effort(host, requested.as_deref());
+            Some(
+                if requested.is_some() && reply.starts_with("effort set to") {
+                    format!("{reply}; applies from the next request")
+                } else {
+                    reply
+                },
+            )
+        }
+        Handled::Permissions(requested) => Some(set_permissions(host, requested.as_deref())),
+        Handled::Network(requested) => Some(set_network(host, requested.as_deref())),
+        Handled::StatusLine(requested) => Some(set_statusline(host, requested.as_deref())),
+        Handled::Theme(Some(theme)) => Some(set_theme_named(host, context.paths, &theme)),
+        Handled::Theme(None) => Some(format!(
+            "themes: {}; /theme <name> switches",
+            theme_names(context.paths).join(", ")
+        )),
+        Handled::Tasks => {
+            lines.extend(task_list(host));
+            None
+        }
+        Handled::Copy if host.accessible => {
+            Some("accessible mode: copy the reply from terminal scrollback".to_owned())
+        }
+        Handled::Copy => Some(match turn_reply(host) {
+            Some(reply) => match copy_to_clipboard(&reply) {
+                Ok(()) => format!(
+                    "copied {} character(s) to the clipboard",
+                    reply.chars().count()
+                ),
+                Err(err) => format!("could not copy: {err}"),
+            },
+            None => "there is no reply to copy yet".to_owned(),
+        }),
+        _ => Some(turn_command_later(name)),
+    };
+    lines.extend(note);
+    lines
+}
+
+/// Returns the reply `/copy` takes during a turn: the newest committed
+/// answer, or the answer being written when this turn has produced text.
+fn turn_reply(host: &SessionHost) -> Option<String> {
+    let partial = host.partial_answer();
+    if !partial.trim().is_empty() {
+        return Some(partial);
+    }
+    lock_value(&host.transcript)
+        .iter()
+        .rev()
+        .find(|entry| entry.speaker == transcript::Speaker::Assistant)
+        .map(|entry| entry.text.clone())
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// Runs `work` on its own thread while the keyboard stays live, with the
@@ -5967,6 +6121,7 @@ fn run_steerable<T: Send>(
     host: &SessionHost,
     reader: &mut rune_term::input::KeyReader,
     gesture: &mut rune_term::shell::EscapeGesture,
+    commands: Option<&TurnCommands<'_>>,
     work: impl FnOnce(&mut History) -> Result<T> + Send,
 ) -> Steered<T> {
     if !reader.is_active() {
@@ -6047,8 +6202,45 @@ fn run_steerable<T: Send>(
             // of queueing behind it.
             KeyAction::Submit => {
                 let text = lane_text(reader);
-                reader.clear();
                 gesture.disarm();
+                // A command name runs now or waits for the turn; anything
+                // else, such as a path written with a leading slash, steers.
+                if let Some(context) = commands
+                    && let Input::Command { name, arguments } = Input::parse(text.trim())
+                {
+                    let custom = context
+                        .commands
+                        .commands
+                        .iter()
+                        .any(|command| command.name == name);
+                    match turn_command_kind(&name, custom) {
+                        TurnCommandKind::Run => {
+                            reader.clear();
+                            let mut lines = turn_command(host, context, &name, &arguments);
+                            if name == "help" {
+                                lines.push(String::new());
+                                lines.extend(
+                                    rune_term::input::render_bindings_help(true, reader.keymap())
+                                        .lines()
+                                        .map(str::to_owned),
+                                );
+                            }
+                            host.commit_lines(&lines);
+                            host.draw_stream_with("", 0);
+                            return;
+                        }
+                        TurnCommandKind::Later => {
+                            host.draw_notice_with(
+                                &turn_command_later(&name),
+                                reader.line(),
+                                reader.column(),
+                            );
+                            return;
+                        }
+                        TurnCommandKind::Steer => {}
+                    }
+                }
+                reader.clear();
                 if text.is_empty() {
                     host.draw_stream_with("", 0);
                     return;
@@ -6995,18 +7187,45 @@ fn await_submission(
     let mut paths: Option<crate::path_completion::Paths> = None;
     // The line naming a mode just chosen, and when it is taken down.
     let mut flash: Option<(String, std::time::Instant)> = None;
+    // The values of the command whose argument is being typed, read once when
+    // its menu opens.
+    let mut values: Option<(String, CommandValues)> = None;
 
     loop {
-        let rows = paths.as_ref().map_or_else(
-            || {
-                completion_rows(
-                    commands,
-                    reader.line(),
+        let typed = value_query(reader.line())
+            .map(|(name, partial, _)| (name.to_owned(), partial.to_owned()));
+        match &typed {
+            Some((name, _)) if values.as_ref().is_none_or(|(held, _)| held != name) => {
+                values = command_values(host, name).map(|found| (name.clone(), found));
+            }
+            Some(_) => {}
+            None => values = None,
+        }
+        let value_menu = typed
+            .as_ref()
+            .zip(values.as_ref())
+            .map(|((_, partial), (_, found))| {
+                value_rows(
+                    &matching_values(found, partial),
+                    found.1.as_deref(),
                     selected,
                     &host.theme(),
                     host.depth(),
                     host.menu_room(),
                 )
+            });
+        let rows = paths.as_ref().map_or_else(
+            || {
+                value_menu.clone().unwrap_or_else(|| {
+                    completion_rows(
+                        commands,
+                        reader.line(),
+                        selected,
+                        &host.theme(),
+                        host.depth(),
+                        host.menu_room(),
+                    )
+                })
             },
             |paths| {
                 path_completion_rows(
@@ -7077,6 +7296,12 @@ fn await_submission(
             search_prompt_history(reader, host, out, recall, prompts.all)?;
             selected = 0;
             paths = None;
+            continue;
+        }
+        if paths.is_none()
+            && let Some((_, found)) = &values
+            && value_key(key, reader, found, &mut selected)
+        {
             continue;
         }
         if path_key(
@@ -8154,7 +8379,8 @@ fn command_candidates(custom: &[rune_context::commands::Command]) -> Vec<Command
         .collect()
 }
 
-/// Rendering, navigation and acceptance all use the same prefix matches.
+/// Rendering, navigation and acceptance all use the same matches: prefix
+/// matches first, then names holding the typed characters in order.
 fn matching_commands<'a>(
     commands: &[CommandCandidate<'a>],
     line: &str,
@@ -8162,10 +8388,10 @@ fn matching_commands<'a>(
     let Some(word) = slash_word(line) else {
         return Vec::new();
     };
-    commands
-        .iter()
-        .filter(|command| command.name.starts_with(word))
-        .copied()
+    let names: Vec<&str> = commands.iter().map(|command| command.name).collect();
+    rune_term::commands::fuzzy_rank(word, &names)
+        .into_iter()
+        .filter_map(|index| commands.get(index).copied())
         .collect()
 }
 
@@ -8258,6 +8484,225 @@ fn completion_rows(
 #[must_use]
 fn completion_matches(commands: &[CommandCandidate<'_>], line: &str) -> usize {
     matching_commands(commands, line).len()
+}
+
+/// Places a custom command's expansion in the draft for review and returns
+/// the note saying so. Without a terminal there is no draft, so the note
+/// carries the expansion itself.
+fn expand_into_draft(
+    reader: &mut rune_term::input::KeyReader,
+    active: bool,
+    name: &str,
+    text: &str,
+    model: Option<&str>,
+) -> String {
+    let uses = model
+        .map(|model| format!("; the turn uses model {model}"))
+        .unwrap_or_default();
+    if active {
+        reader.replace(text);
+        format!("/{name} expanded into the draft{uses}; edit it, then press enter")
+    } else {
+        format!("/{name} expanded{uses}:\n{text}")
+    }
+}
+
+/// One value a command's argument menu offers: the row it shows and the text
+/// choosing it inserts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct CommandValue {
+    /// What the row shows.
+    label: String,
+    /// What replaces the partial word.
+    value: String,
+}
+
+impl CommandValue {
+    /// A value shown as itself.
+    fn plain(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            label: value.clone(),
+            value,
+        }
+    }
+}
+
+/// The closed set of values a command takes, and the one in force.
+type CommandValues = (Vec<CommandValue>, Option<String>);
+
+/// Returns the values `/{name}` takes and the current one, for the commands
+/// whose argument is one of a known set.
+fn command_values(host: &SessionHost, name: &str) -> Option<CommandValues> {
+    match name {
+        "model" | "models" => Some((
+            lock_value(&host.model_ids)
+                .iter()
+                .map(CommandValue::plain)
+                .collect(),
+            Some(host.model_name()),
+        )),
+        "effort" => Some((
+            accepted_efforts(host)
+                .iter()
+                .map(|effort| CommandValue::plain(effort.as_str()))
+                .collect(),
+            Some(host.effective_effort().1.as_str().to_owned()),
+        )),
+        "permissions" => Some((
+            [
+                PermissionMode::Ask,
+                PermissionMode::Auto,
+                PermissionMode::FullAccess,
+            ]
+            .iter()
+            .map(|mode| CommandValue::plain(mode.as_str()))
+            .collect(),
+            Some(host.mode().as_str().to_owned()),
+        )),
+        "theme" => Some((
+            theme_names(&Paths::from_process())
+                .into_iter()
+                .map(CommandValue::plain)
+                .collect(),
+            Some(lock_value(&host.theme_name).clone()),
+        )),
+        "statusline" => Some((
+            rune_core::config::STATUSLINE_FIELDS
+                .iter()
+                .map(|field| CommandValue::plain(*field))
+                .collect(),
+            None,
+        )),
+        "resume" => {
+            let workspace = Utf8PathBuf::from(host.workspace.as_str());
+            let current = host.session_id_name();
+            Some((
+                session_log::list_scoped(&Paths::from_process(), Some(&workspace))
+                    .iter()
+                    .map(|summary| CommandValue {
+                        label: crate::resume_picker::value_label(summary),
+                        value: summary.id.clone(),
+                    })
+                    .collect(),
+                Some(current),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Splits a line being given a command's argument into the command name, the
+/// partial word and the byte where that word starts. A line with a second
+/// word is past the point a value menu helps.
+fn value_query(line: &str) -> Option<(&str, &str, usize)> {
+    let rest = line.strip_prefix('/')?;
+    let (name, partial) = rest.split_once(' ')?;
+    if name.is_empty() || partial.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((name, partial, line.len().saturating_sub(partial.len())))
+}
+
+/// The values a command's menu offers for one line, best match first.
+fn matching_values<'a>(values: &'a CommandValues, partial: &str) -> Vec<&'a CommandValue> {
+    let labels: Vec<&str> = values.0.iter().map(|value| value.label.as_str()).collect();
+    rune_term::commands::fuzzy_rank(partial, &labels)
+        .into_iter()
+        .filter_map(|index| values.0.get(index))
+        .collect()
+}
+
+/// Draws a command's value menu like the command menu: the selected row in
+/// Accent, the rest Dim, the current value marked.
+fn value_rows(
+    matches: &[&CommandValue],
+    current: Option<&str>,
+    selected: usize,
+    theme: &Theme,
+    depth: ColorDepth,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 || matches.is_empty() {
+        return Vec::new();
+    }
+    let accent = theme.sgr(Slot::Accent, depth);
+    let dim = theme.sgr(Slot::Dim, depth);
+    let window = completion_window(
+        matches.len(),
+        selected,
+        menu_window(matches.len(), COMPLETION_WINDOW, max_rows),
+    );
+    let mut rows: Vec<String> = Vec::with_capacity(window.len().saturating_add(1));
+    for index in window.clone() {
+        let Some(entry) = matches.get(index) else {
+            continue;
+        };
+        let mark = if current == Some(entry.value.as_str()) {
+            " (current)"
+        } else {
+            ""
+        };
+        let body = format!("{}{mark}", transcript::sanitize(&entry.label));
+        if index == selected {
+            rows.push(styled(&accent, &format!("> {body}")));
+        } else {
+            rows.push(styled(&dim, &format!("  {body}")));
+        }
+    }
+    if matches.len() > window.len() && rows.len() < max_rows {
+        rows.push(styled(
+            &dim,
+            &format!(
+                "  {}-{} of {}",
+                window.start.saturating_add(1),
+                window.end,
+                matches.len()
+            ),
+        ));
+    }
+    rows
+}
+
+/// Handles a key while a command's value menu is open. Returns true when the
+/// key was used: the arrows move, Tab inserts the chosen value, and Enter
+/// inserts it unless the word is already a complete value, which runs.
+fn value_key(
+    key: KeyAction,
+    reader: &mut rune_term::input::KeyReader,
+    values: &CommandValues,
+    selected: &mut usize,
+) -> bool {
+    let line = reader.line().to_owned();
+    let Some((_, partial, start)) = value_query(&line) else {
+        return false;
+    };
+    let matches = matching_values(values, partial);
+    if matches.is_empty() {
+        return false;
+    }
+    match key {
+        KeyAction::Up => {
+            *selected = selected.saturating_sub(1);
+            true
+        }
+        KeyAction::Down => {
+            *selected = selected
+                .saturating_add(1)
+                .min(matches.len().saturating_sub(1));
+            true
+        }
+        KeyAction::Submit if values.0.iter().any(|value| value.value == partial) => false,
+        KeyAction::Complete | KeyAction::Submit => {
+            if let Some(chosen) = matches.get(*selected) {
+                let prefix = line.get(..start).unwrap_or_default();
+                reader.replace(&format!("{prefix}{}", chosen.value));
+            }
+            *selected = 0;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Returns the word after a leading slash, when the line is one.
@@ -8372,6 +8817,7 @@ fn choose_model(
         .iter()
         .map(|model| model.id.clone())
         .collect();
+    lock_value(&host.model_ids).clone_from(&items);
     let current = host.model_name();
     let picker = rune_term::picker::Picker::new(
         format!("models from {}", catalog.provider),
@@ -9308,14 +9754,20 @@ fn prompt_marker(host: &SessionHost) -> String {
     }
 }
 
-fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
-    let model = host.model_name();
-    let (_, traits) = host.compat.resolve(&model);
-    let accepted = if traits.efforts.is_empty() {
+/// Returns the efforts the current model accepts: its own list when the
+/// compatibility table names one, else the dialect's.
+fn accepted_efforts(host: &SessionHost) -> &'static [Effort] {
+    let (_, traits) = host.compat.resolve(&host.model_name());
+    if traits.efforts.is_empty() {
         host.dialect.capabilities().efforts
     } else {
         traits.efforts
-    };
+    }
+}
+
+fn set_effort(host: &SessionHost, requested: Option<&str>) -> String {
+    let model = host.model_name();
+    let accepted = accepted_efforts(host);
     let names = accepted
         .iter()
         .map(|effort| effort.as_str())
@@ -9385,6 +9837,11 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
     else {
         return;
     };
+    *lock_value(&host.model_ids) = catalog
+        .models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect();
     let current = host.model_name();
     let model = catalog.models.iter().find(|model| model.id == current);
     let resolved = crate::model_limits::resolve(settings, paths, &current, model);
@@ -19286,6 +19743,144 @@ mod tests {
     }
 
     #[test]
+    fn custom_expansion_fills_the_draft() {
+        let mut discovery = rune_context::commands::Discovery::default();
+        discovery.commands.push(rune_context::commands::Command {
+            name: "greet".to_owned(),
+            description: "Greet".to_owned(),
+            argument_hint: Some("<name>".to_owned()),
+            body: "say hello to $1".to_owned(),
+            model: None,
+            ignored: Vec::new(),
+            origin: rune_context::commands::Origin::Project,
+            source: None,
+        });
+        let handled = handle_command(
+            "greet",
+            "Ana",
+            &discovery,
+            None,
+            Utf8Path::new("/w"),
+            &test_info(),
+            &mut Vec::new(),
+        )
+        .expect("handled");
+        let Handled::Expand { text, model } = handled else {
+            panic!("not an expansion: {handled:?}");
+        };
+        let mut reader = rune_term::input::KeyReader::new();
+        let note = expand_into_draft(&mut reader, true, "greet", &text, model.as_deref());
+        assert_eq!(reader.line(), "say hello to Ana");
+        assert_eq!(
+            note,
+            "/greet expanded into the draft; edit it, then press enter"
+        );
+        assert!(!note.contains("say hello"), "{note}");
+
+        let mut piped = rune_term::input::KeyReader::new();
+        let shown = expand_into_draft(&mut piped, false, "greet", &text, Some("m1"));
+        assert_eq!(
+            shown,
+            "/greet expanded; the turn uses model m1:\nsay hello to Ana"
+        );
+        let candidates = command_candidates(&discovery.commands);
+        let theme = Theme::no_color();
+        let rows = completion_rows(&candidates, "/gree", 0, &theme, ColorDepth::Ansi256, 8);
+        assert!(rows[0].starts_with("> /greet <name>"), "{rows:?}");
+    }
+
+    #[test]
+    fn turn_safe_commands_are_recognised() {
+        assert_eq!(turn_command_kind("status", false), TurnCommandKind::Run);
+        assert_eq!(turn_command_kind("effort", false), TurnCommandKind::Run);
+        assert_eq!(turn_command_kind("tasks", false), TurnCommandKind::Run);
+        assert_eq!(turn_command_kind("model", false), TurnCommandKind::Later);
+        assert_eq!(turn_command_kind("compact", false), TurnCommandKind::Later);
+        assert_eq!(turn_command_kind("greet", true), TurnCommandKind::Later);
+        // A partial name or a path is text for the model.
+        assert_eq!(turn_command_kind("stat", false), TurnCommandKind::Steer);
+        assert_eq!(turn_command_kind("usr/bin", false), TurnCommandKind::Steer);
+        for name in TURN_SAFE_COMMANDS {
+            assert!(
+                rune_term::commands::find(name).is_none()
+                    || turn_command_kind(name, false) == TurnCommandKind::Run,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            Input::parse("/status extra"),
+            Input::Command {
+                name: "status".to_owned(),
+                arguments: "extra".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn values_mark_the_current_permission_mode() {
+        let mut host = test_host();
+        *host.mode.get_mut().expect("mode") = PermissionMode::Auto;
+        let values = command_values(&host, "permissions").expect("permissions values");
+        let names: Vec<&str> = values.0.iter().map(|value| value.value.as_str()).collect();
+        assert_eq!(names, ["ask", "auto", "full_access"]);
+        let theme = Theme::no_color();
+        let rows = value_rows(
+            &matching_values(&values, ""),
+            values.1.as_deref(),
+            0,
+            &theme,
+            ColorDepth::Ansi256,
+            8,
+        );
+        assert_eq!(rows, ["> ask", "  auto (current)", "  full_access"]);
+        let narrowed = matching_values(&values, "fa");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].value, "full_access");
+        assert!(command_values(&host, "compact").is_none());
+
+        assert_eq!(value_query("/permissions "), Some(("permissions", "", 13)));
+        assert_eq!(
+            value_query("/permissions au"),
+            Some(("permissions", "au", 13))
+        );
+        assert_eq!(value_query("/permissions a b"), None);
+        assert_eq!(value_query("/permissions"), None);
+
+        let mut reader = rune_term::input::KeyReader::new();
+        reader.replace("/permissions ");
+        let mut selected = 0;
+        assert!(value_key(
+            KeyAction::Down,
+            &mut reader,
+            &values,
+            &mut selected
+        ));
+        assert_eq!(selected, 1);
+        assert!(value_key(
+            KeyAction::Complete,
+            &mut reader,
+            &values,
+            &mut selected
+        ));
+        assert_eq!(reader.line(), "/permissions auto");
+        // A complete value runs on Enter rather than being replaced.
+        assert!(!value_key(
+            KeyAction::Submit,
+            &mut reader,
+            &values,
+            &mut selected
+        ));
+        reader.replace("/permissions fu");
+        assert!(value_key(
+            KeyAction::Submit,
+            &mut reader,
+            &values,
+            &mut selected
+        ));
+        assert_eq!(reader.line(), "/permissions full_access");
+    }
+
+    #[test]
     fn a_user_command_expands_for_review_instead_of_running() {
         let mut discovery = rune_context::commands::Discovery::default();
         discovery.commands.push(rune_context::commands::Command {
@@ -21634,6 +22229,7 @@ mod tests {
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             queued: Mutex::new(std::collections::VecDeque::new()),
+            model_ids: Mutex::new(Vec::new()),
             plan: Mutex::new(None),
             plan_visible: std::sync::atomic::AtomicBool::new(true),
             cleared: Mutex::new(std::collections::VecDeque::new()),
