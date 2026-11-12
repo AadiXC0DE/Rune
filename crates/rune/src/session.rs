@@ -586,6 +586,9 @@ struct SessionHost {
     transcript_history_len: std::sync::atomic::AtomicUsize,
     /// Prevents streaming frames from painting over the transcript or editor.
     transcript_open: std::sync::atomic::AtomicBool,
+    /// Rows committed while the transcript or editor held the screen, put in
+    /// scrollback once it is given back.
+    withheld: Mutex<Vec<String>>,
     /// The line being typed while a turn runs, with the caret's display column.
     ///
     /// Held on the host because the streaming thread redraws the whole frame
@@ -3898,6 +3901,9 @@ impl SessionHost {
             .transcript_open
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            // Kept, not dropped: these rows belong in scrollback once the
+            // screen is back.
+            lock_value(&self.withheld).extend(lines.iter().cloned());
             return;
         }
         let marker = &prompt_marker(self);
@@ -3905,6 +3911,14 @@ impl SessionHost {
         let (prompt_rows, caret) = transcript::render_draft_at(marker, &line, column, width);
         if let Ok(painted) = self.paint(lines, None, &prompt_rows, &rows, caret) {
             self.show(&painted);
+        }
+    }
+
+    /// Commits the rows held while the screen was handed over.
+    fn release_withheld(&self) {
+        let rows = std::mem::take(&mut *lock_value(&self.withheld));
+        if !rows.is_empty() {
+            self.commit_lines(&rows);
         }
     }
 
@@ -4725,6 +4739,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         results: Mutex::new(Some(history.result_store().clone())),
         transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
+        withheld: Mutex::new(Vec::new()),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -7556,16 +7571,19 @@ fn edit_draft(reader: &mut rune_term::input::KeyReader, host: &SessionHost) {
 
 impl Drop for TranscriptScreen<'_> {
     fn drop(&mut self) {
-        let _frame = self
-            .0
-            .frame
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.0.show(b"\x1b[0m\x1b[?1049l\x1b[?25h");
-        rune_term::modes::mark(|modes| modes.alternate_screen = false);
-        self.0
-            .transcript_open
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        {
+            let _frame = self
+                .0
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.0.show(b"\x1b[0m\x1b[?1049l\x1b[?25h");
+            rune_term::modes::mark(|modes| modes.alternate_screen = false);
+            self.0
+                .transcript_open
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.0.release_withheld();
     }
 }
 
@@ -15110,6 +15128,27 @@ mod tests {
         assert!(keyed.contains("first second third"), "{keyed:?}");
         assert!(keyed.contains("> Z"), "{keyed:?}");
         assert!(!host.frame_dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rows_committed_while_the_viewer_is_open_reach_scrollback_after() {
+        let host = test_host();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: LiveSink = Arc::new(Mutex::new(SharedSink(Arc::clone(&bytes))));
+        *host.live_out.lock().expect("output lock") = Some(out);
+        let written = || {
+            String::from_utf8_lossy(&std::mem::take(&mut *bytes.lock().expect("bytes")))
+                .into_owned()
+        };
+        let screen = TranscriptScreen(&host);
+        host.transcript_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = written();
+        host.commit_lines(&["SEALED-WHILE-VIEWING".to_owned()]);
+        assert!(!written().contains("SEALED-WHILE-VIEWING"));
+        drop(screen);
+        assert!(written().contains("SEALED-WHILE-VIEWING"));
+        assert!(lock_value(&host.withheld).is_empty());
     }
 
     #[test]
@@ -24504,6 +24543,7 @@ mod tests {
             results: Mutex::new(None),
             transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
             transcript_open: std::sync::atomic::AtomicBool::new(false),
+            withheld: Mutex::new(Vec::new()),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,
