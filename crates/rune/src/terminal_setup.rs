@@ -191,17 +191,17 @@ fn editor_keybindings(home: Option<&Utf8Path>, os: Os) -> Setup {
         return no_home("keybindings.json", &entry);
     };
     let config = if os == Os::Mac {
-        home.join("Library/Application Support")
+        under(home, "Library/Application Support")
     } else {
         home.join(".config")
     };
     let Some(folder) = ["Code/User", "Cursor/User", "Code - Insiders/User"]
         .iter()
-        .map(|name| config.join(name))
+        .map(|name| under(&config, name))
         .find(|folder| folder.is_dir())
     else {
         return Setup::Refuse {
-            path: config.join("Code/User/keybindings.json"),
+            path: under(&config, "Code/User/keybindings.json"),
             reason: format!(
                 "no editor settings folder was found in {config}; add this entry to keybindings.json yourself:"
             ),
@@ -214,6 +214,14 @@ fn editor_keybindings(home: Option<&Utf8Path>, os: Os) -> Setup {
     })
 }
 
+/// Joins `relative`, written with `/`, onto `base` one part at a time, so
+/// the path uses this platform's separator throughout.
+fn under(base: &Utf8Path, relative: &str) -> Utf8PathBuf {
+    relative
+        .split('/')
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 /// A keymap binding in a `Terminal` context.
 fn zed_keymap(home: Option<&Utf8Path>) -> Setup {
     let entry = json!({
@@ -223,7 +231,7 @@ fn zed_keymap(home: Option<&Utf8Path>) -> Setup {
     let Some(home) = home else {
         return no_home("~/.config/zed/keymap.json", &entry);
     };
-    json_list(&home.join(".config/zed/keymap.json"), entry, |item| {
+    json_list(&under(home, ".config/zed/keymap.json"), entry, |item| {
         item.get("context").and_then(Value::as_str) == Some("Terminal")
             && item
                 .get("bindings")
@@ -291,7 +299,7 @@ fn alacritty(home: Option<&Utf8Path>) -> Setup {
             snippet: BLOCK.to_owned(),
         };
     };
-    let path = home.join(".config/alacritty/alacritty.toml");
+    let path = under(home, ".config/alacritty/alacritty.toml");
     let before = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -359,7 +367,7 @@ mod tests {
     #[test]
     fn vscode_entry_is_appended_and_detected_next_time() {
         let (_dir, home) = temp_home();
-        let folder = home.join(".config/Code/User");
+        let folder = under(&home, ".config/Code/User");
         std::fs::create_dir_all(&folder).expect("settings folder");
         let path = folder.join("keybindings.json");
         std::fs::write(&path, r#"[{"key":"ctrl+k","command":"other"}]"#).expect("existing");
@@ -405,7 +413,7 @@ mod tests {
     #[test]
     fn json_with_comments_is_refused_with_the_snippet() {
         let (_dir, home) = temp_home();
-        let folder = home.join("Library/Application Support/Cursor/User");
+        let folder = under(&home, "Library/Application Support/Cursor/User");
         std::fs::create_dir_all(&folder).expect("settings folder");
         let path = folder.join("keybindings.json");
         let text = "// Place your key bindings in this file\n[]\n";
@@ -492,7 +500,7 @@ mod tests {
             alacritty_window_id: Some("1".to_owned()),
             ..TerminalEnv::default()
         });
-        let folder = home.join(".config/alacritty");
+        let folder = under(&home, ".config/alacritty");
         std::fs::create_dir_all(&folder).expect("config folder");
         let path = folder.join("alacritty.toml");
         std::fs::write(&path, "[font]\nsize = 12").expect("existing");
@@ -534,7 +542,7 @@ mod tests {
         let (_dir, home) = temp_home();
         let setup = plan(&program("zed"), Some(&home), Os::Mac);
         apply(&setup).expect("written");
-        let path = home.join(".config/zed/keymap.json");
+        let path = under(&home, ".config/zed/keymap.json");
         let written: Vec<Value> =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("keymap")).expect("json");
         assert_eq!(
