@@ -300,6 +300,7 @@ pub fn pick_styled(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {}
             KeyAction::Ignored => picker.set_query(reader.line()),

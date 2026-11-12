@@ -122,7 +122,7 @@ pub const ACTIONS: &[ActionInfo] = &[
         "transcript",
         Context::Editor,
         &["ctrl+o"],
-        "open the transcript",
+        "open the transcript, or expand the paste at the caret",
     ),
     action(
         "external_editor",
