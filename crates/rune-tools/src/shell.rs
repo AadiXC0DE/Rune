@@ -1645,7 +1645,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[test]
     fn a_running_command_stores_its_newest_lines_in_the_live_tail() {
         let tool = Shell::default();
@@ -1680,6 +1679,7 @@ mod tests {
         assert_eq!(*lock(&seen), ["two", "three", "four"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutdown_ends_every_session_gracefully() {
         let tool = shell(4, TEST_CAP);

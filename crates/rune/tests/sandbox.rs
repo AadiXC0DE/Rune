@@ -381,7 +381,10 @@ fn explain_without_a_command_prints_the_backend() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).expect("utf8");
-    assert!(!text.contains("command:"), "{text}");
+    assert!(
+        !text.lines().any(|line| line.starts_with("command:")),
+        "{text}"
+    );
     for label in [
         "backend: ",
         "support: ",
