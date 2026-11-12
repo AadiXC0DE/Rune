@@ -141,10 +141,8 @@ def capture(binary, root, environment, arguments):
         drain()
         start = len(transcript)
         os.write(master, b"\x0f")
-        wait_for(b"Transcript", start)
-        drain()
-        start = len(transcript)
-        os.write(master, b"\x1b[F")
+        # The viewer opens at the newest row.
+        wait_for(b"pager", start)
         wait_for(b"ASCII_REPLY_END", start)
         drain()
         assert transcript.isascii(), transcript.decode(errors="replace")

@@ -390,41 +390,96 @@ pub fn render(entries: &[Entry], display: Display) -> String {
     render_lanes(entries, display, &Lanes::default())
 }
 
-/// Maximum source bytes and wrapped rows in a requested tool expansion.
-pub const TOOL_DETAIL_BYTES: usize = 16 * 1024;
-/// Maximum wrapped content rows in a requested tool expansion.
-pub const TOOL_DETAIL_ROWS: usize = 200;
+/// What an expanded entry shows in place of its recorded text.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Expansion {
+    /// Nothing more than the recorded text.
+    Recorded,
+    /// Text drawn as the entry's body, in full.
+    Text(String),
+    /// Rows drawn as they are, such as a rendered diff.
+    Rows(Vec<String>),
+}
 
-/// Tool selection and disclosure state for a transcript snapshot.
+/// The viewer's rows with where each entry and the selection start.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DetailRows {
+    /// Every row, in order.
+    pub rows: Vec<String>,
+    /// The selected entry's header row.
+    pub selected: Option<usize>,
+    /// The first row of each entry.
+    pub starts: Vec<usize>,
+}
+
+/// Whether an entry can be expanded and collapsed in the viewer.
+fn collapsible(entry: &Entry) -> bool {
+    match entry.speaker {
+        Speaker::Tool => entry.expandable,
+        Speaker::Reasoning => true,
+        _ => false,
+    }
+}
+
+/// Selection and disclosure state for the transcript viewer.
 ///
-/// Untouched entries retain the full transcript view. Toggling a selected tool
-/// collapses it to the normal preview, then expands it within fixed bounds.
-/// Source entries are kept intact so closing and reopening restores the full view.
-#[derive(Debug)]
+/// A tool entry shows its recorded text until it is expanded, when it shows
+/// what the caller supplied for it, uncapped. A reasoning entry shows one
+/// `thought:` row until it is expanded. Source entries are kept intact.
+#[derive(Debug, Default)]
 pub struct ToolDetails {
     entries: Vec<Entry>,
-    expanded: Vec<Option<bool>>,
+    expanded: Vec<bool>,
+    expansions: Vec<Option<Expansion>>,
     selected: Option<usize>,
 }
 
 impl ToolDetails {
-    /// Starts with every recorded entry visible, matching the full viewer.
+    /// Starts with every entry collapsed and nothing selected.
     #[must_use]
     pub fn new(entries: Vec<Entry>) -> Self {
-        Self {
-            expanded: vec![None; entries.len()],
-            entries,
-            selected: None,
+        let mut details = Self::default();
+        details.replace(entries);
+        details
+    }
+
+    /// Replaces the entries, keeping each unchanged entry's state by index.
+    pub fn replace(&mut self, entries: Vec<Entry>) {
+        let kept = self
+            .entries
+            .iter()
+            .zip(&entries)
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.expanded.truncate(kept);
+        self.expansions.truncate(kept);
+        self.expanded.resize(entries.len(), false);
+        self.expansions.resize(entries.len(), None);
+        self.entries = entries;
+        if self.selected.is_some_and(|index| index >= kept) {
+            self.selected = None;
         }
     }
 
-    /// Selects the next or previous expandable tool, wrapping at either end.
+    /// The entries as given.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// The selected entry.
+    #[must_use]
+    pub const fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Selects the next or previous collapsible entry, wrapping at either end.
     pub fn select(&mut self, backwards: bool) {
         let tools: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.speaker == Speaker::Tool && entry.expandable)
+            .filter(|(_, entry)| collapsible(entry))
             .map(|(index, _)| index)
             .collect();
         self.selected = if backwards {
@@ -442,92 +497,151 @@ impl ToolDetails {
         .copied();
     }
 
-    /// Toggles the selected tool; without a selection this is a no-op.
+    /// Selects the first collapsible entry with a row at or after `row`, or
+    /// the last one before it, given the starts [`Self::rows`] reported.
+    pub fn select_from_row(&mut self, row: usize, starts: &[usize]) {
+        let candidates = || {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| collapsible(entry))
+                .map(|(index, _)| index)
+        };
+        let end = |index: usize| {
+            starts
+                .get(index.saturating_add(1))
+                .copied()
+                .unwrap_or(usize::MAX)
+        };
+        self.selected = candidates()
+            .find(|&index| end(index) > row)
+            .or_else(|| candidates().next_back());
+    }
+
+    /// Toggles the selected entry; without a selection this is a no-op.
     pub fn toggle(&mut self) {
         if let Some(index) = self.selected {
-            self.expanded[index] = Some(!self.expanded[index].unwrap_or(true));
+            self.expanded[index] = !self.expanded[index];
         }
     }
 
-    /// Renders rows and the selected tool's header row for viewport navigation.
-    #[must_use]
-    pub fn rows(&self, display: Display) -> (Vec<String>, Option<usize>) {
-        let mut out = String::new();
-        let mut selected_row = None;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if index > 0 {
-                out.push('\n');
-            }
-            let selected = self.selected == Some(index);
-            if selected || self.expanded[index].is_some() {
-                if selected {
-                    selected_row = Some(out.lines().count());
-                }
-                let state = match self.expanded[index] {
-                    None => "full",
-                    Some(false) => "collapsed",
-                    Some(true) => "expanded, up to 16 KiB / 200 rows",
-                };
-                for line in wrap(
-                    &format!(
-                        "{}tool {}: {state}",
-                        if selected { "> " } else { "  " },
-                        index.saturating_add(1)
-                    ),
-                    display.width.max(MIN_WIDTH),
-                ) {
-                    let _ = writeln!(out, "{line}");
-                }
-            }
-            if let Some(expanded) = self.expanded[index] {
-                let end = entry
-                    .text
-                    .floor_char_boundary(TOOL_DETAIL_BYTES.min(entry.text.len()));
-                let bounded = Entry::tool(&entry.text[..end]);
-                let mut preview = String::new();
-                render_entry(
-                    &bounded,
-                    Display {
-                        tool_lines: if expanded {
-                            TOOL_DETAIL_ROWS
-                        } else {
-                            display.tool_lines
-                        },
-                        ..display
-                    },
-                    &Lanes::default(),
-                    &mut preview,
-                );
-                for line in preview
-                    .lines()
-                    .flat_map(|line| wrap(line, display.width.max(MIN_WIDTH)))
-                {
-                    let _ = writeln!(out, "{line}");
-                }
-                if end < entry.text.len() {
-                    for line in wrap(
-                        "  [tool preview byte limit; reopen for full recorded output]",
-                        display.width.max(MIN_WIDTH),
-                    ) {
-                        let _ = writeln!(out, "{line}");
-                    }
-                }
-            } else {
-                render_entry(
-                    entry,
-                    Display {
-                        tool_lines: usize::MAX,
-                        ..display
-                    },
-                    &Lanes::default(),
-                    &mut out,
-                );
+    /// Expands every collapsible entry, or collapses them all when all are
+    /// expanded already.
+    pub fn toggle_all(&mut self) {
+        let all = self
+            .entries
+            .iter()
+            .zip(&self.expanded)
+            .all(|(entry, expanded)| !collapsible(entry) || *expanded);
+        for (entry, expanded) in self.entries.iter().zip(&mut self.expanded) {
+            if collapsible(entry) {
+                *expanded = !all;
             }
         }
-        (
-            out.trim_end().lines().map(str::to_owned).collect(),
-            selected_row,
-        )
+    }
+
+    /// Expanded tool entries whose expansion is not known yet.
+    #[must_use]
+    pub fn pending(&self) -> Vec<usize> {
+        (0..self.entries.len())
+            .filter(|&index| {
+                self.expanded[index]
+                    && self.entries[index].speaker == Speaker::Tool
+                    && self.expansions[index].is_none()
+            })
+            .collect()
+    }
+
+    /// Drops every supplied expansion, so [`Self::pending`] asks again.
+    pub fn forget_expansions(&mut self) {
+        self.expansions.fill(None);
+    }
+
+    /// Supplies what an expanded entry shows.
+    pub fn set_expansion(&mut self, index: usize, expansion: Expansion) {
+        if let Some(slot) = self.expansions.get_mut(index) {
+            *slot = Some(expansion);
+        }
+    }
+
+    /// Renders rows with a header row on the selected and expanded entries.
+    #[must_use]
+    pub fn rows(&self, display: Display) -> DetailRows {
+        self.render(display, false)
+    }
+
+    /// Renders every entry expanded, without header rows.
+    #[must_use]
+    pub fn expanded_rows(&self, display: Display) -> DetailRows {
+        self.render(display, true)
+    }
+
+    fn render(&self, display: Display, everything: bool) -> DetailRows {
+        let width = display.width.max(MIN_WIDTH);
+        let mut out: Vec<String> = Vec::new();
+        let mut selected_row = None;
+        let mut starts = Vec::with_capacity(self.entries.len());
+        let push = |out: &mut Vec<String>, text: &str| {
+            out.extend(text.trim_end().lines().map(str::to_owned));
+        };
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                out.push(String::new());
+            }
+            starts.push(out.len());
+            let expanded = everything || self.expanded[index];
+            let selected = !everything && self.selected == Some(index);
+            if selected || (!everything && expanded) {
+                if selected {
+                    selected_row = Some(out.len());
+                }
+                let kind = if entry.speaker == Speaker::Reasoning {
+                    "thought"
+                } else {
+                    "tool"
+                };
+                let state = if expanded { "expanded" } else { "collapsed" };
+                let header = format!(
+                    "{}{kind} {}: {state}",
+                    if selected { "> " } else { "  " },
+                    index.saturating_add(1)
+                );
+                out.extend(wrap(&header, width));
+            }
+            let mut body = String::new();
+            let full = Display {
+                tool_lines: usize::MAX,
+                ..display
+            };
+            match (entry.speaker, expanded, self.expansions[index].as_ref()) {
+                (Speaker::Reasoning, false, _) => {
+                    let first = first_line(&sanitize(&entry.text));
+                    render_entry(
+                        &Entry::reasoning(format!("thought: {first}")),
+                        full,
+                        &Lanes::default(),
+                        &mut body,
+                    );
+                }
+                (Speaker::Tool, true, Some(Expansion::Text(text))) => {
+                    render_entry(&Entry::tool(text), full, &Lanes::default(), &mut body);
+                }
+                (Speaker::Tool, true, Some(Expansion::Rows(rows))) => {
+                    out.extend(rows.iter().cloned());
+                    continue;
+                }
+                _ => render_entry(entry, full, &Lanes::default(), &mut body),
+            }
+            push(&mut out, &body);
+        }
+        while out.last().is_some_and(String::is_empty) {
+            out.pop();
+        }
+        DetailRows {
+            rows: out,
+            selected: selected_row,
+            starts,
+        }
     }
 }
 
@@ -1448,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_disclosure_bounds_rows_and_preserves_surrounding_entries() {
+    fn tool_disclosure_keeps_surrounding_entries_and_source_text() {
         let content = (0..300)
             .map(|row| format!("TOOL-{row:03}"))
             .collect::<Vec<_>>()
@@ -1460,8 +1574,9 @@ mod tests {
         ];
         let mut details = ToolDetails::new(entries.clone());
         let display = Display::default();
+        let untouched = details.rows(display);
         assert_eq!(
-            details.rows(display).0.join("\n"),
+            untouched.rows.join("\n"),
             render(
                 &entries,
                 Display {
@@ -1470,37 +1585,55 @@ mod tests {
                 }
             )
         );
+        assert_eq!(untouched.starts, [0, 2, 303]);
         details.toggle();
-        assert_eq!(details.rows(display).1, None);
+        assert_eq!(details.rows(display).selected, None);
         details.select(false);
         details.toggle();
-        let collapsed = details.rows(display);
-        assert!(collapsed.0.join("\n").contains("TOOL-011"));
-        assert!(!collapsed.0.join("\n").contains("TOOL-012"));
-        assert!(collapsed.0[collapsed.1.expect("selection")].contains("collapsed"));
+        let expanded = details.rows(display);
+        assert!(expanded.rows[expanded.selected.expect("selection")].contains("expanded"));
+        assert!(expanded.rows.join("\n").contains("TOOL-299"));
+        details.set_expansion(1, Expansion::Text("STORED-BODY".to_owned()));
+        let stored = details.rows(display).rows.join("\n");
+        assert!(stored.contains("STORED-BODY") && !stored.contains("TOOL-000"));
+        assert!(stored.starts_with("\u{258c} before"));
+        assert!(stored.ends_with("after"));
         details.toggle();
-        let expanded = details.rows(display).0.join("\n");
-        assert!(expanded.contains("TOOL-199"));
-        assert!(!expanded.contains("TOOL-200"));
-        assert!(expanded.contains("100 more line(s)"));
-        assert!(expanded.starts_with("\u{258c} before"));
-        assert!(expanded.ends_with("after"));
-        details.toggle();
-        assert_eq!(details.rows(display), collapsed);
+        assert!(details.rows(display).rows.join("\n").contains("TOOL-000"));
         details.select(true);
-        assert_eq!(details.rows(display), collapsed, "one tool wraps to itself");
-        assert_eq!(details.entries, entries, "source content stays intact");
+        assert_eq!(details.selected(), Some(1), "one tool wraps to itself");
+        assert_eq!(details.entries(), entries.as_slice(), "source stays intact");
+
+        details.toggle();
+        let mut grown = entries.clone();
+        grown.push(Entry::assistant("later"));
+        details.replace(grown);
+        assert_eq!(details.selected(), Some(1));
+        assert!(
+            details
+                .rows(display)
+                .rows
+                .join("\n")
+                .contains("STORED-BODY")
+        );
+        let mut changed = entries;
+        changed[1] = Entry::tool("other");
+        details.replace(changed);
+        assert!(details.pending().is_empty());
+        assert_eq!(details.selected(), None);
     }
 
     #[test]
-    fn tool_disclosure_bounds_unicode_bytes_and_rewraps_without_losing_state() {
-        let mut details = ToolDetails::new(vec![
-            Entry::tool(String::from("x") + &"é".repeat(TOOL_DETAIL_BYTES) + "END"),
-            Entry::assistant("after"),
-        ]);
-        details.select(true);
+    fn expanded_tool_details_are_not_capped() {
+        let text = (0..1100)
+            .map(|row| format!("{row:04} {}", "x".repeat(34)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.len() >= 40 * 1024);
+        let mut details = ToolDetails::new(vec![Entry::tool(text), Entry::assistant("after")]);
+        details.select(false);
         details.toggle();
-        details.toggle();
+        assert_eq!(details.pending(), [0]);
         for width in [80, 12] {
             let rows = details
                 .rows(Display {
@@ -1508,18 +1641,41 @@ mod tests {
                     ascii: true,
                     ..Display::default()
                 })
-                .0;
-            let text = rows.join("\n");
-            assert!(text.contains("expanded"));
-            assert!(text.contains("byte"));
-            assert!(!text.contains("END"));
-            assert!(text.ends_with("after"));
+                .rows;
+            let joined = rows.join("\n");
+            assert!(joined.contains("expanded"));
+            assert!(joined.contains("1099"), "the last line is shown");
+            assert!(!joined.contains("more line(s)"));
+            assert!(!joined.contains("byte limit"));
+            assert!(joined.ends_with("after"));
             assert!(rows.iter().all(|row| str_width(row) <= width));
-            assert_eq!(
-                text.chars().filter(|ch| *ch == 'é').count(),
-                ((TOOL_DETAIL_BYTES - 1) / 2).min(TOOL_DETAIL_ROWS * (width - 2) - 1)
-            );
         }
+    }
+
+    #[test]
+    fn reasoning_entries_collapse_by_default() {
+        let mut details = ToolDetails::new(vec![
+            Entry::reasoning("first idea\nsecond idea"),
+            Entry::assistant("answer"),
+        ]);
+        let plain = |rows: &[String]| sanitize(&rows.join("\n"));
+        let display = Display::default();
+        let collapsed = plain(&details.rows(display).rows);
+        assert!(collapsed.contains("thought: first idea"), "{collapsed}");
+        assert!(!collapsed.contains("second idea"));
+        details.select(false);
+        assert_eq!(details.selected(), Some(0));
+        details.toggle();
+        let expanded = plain(&details.rows(display).rows);
+        assert!(expanded.contains("second idea"), "{expanded}");
+        assert!(details.pending().is_empty(), "reasoning needs no expansion");
+        details.toggle();
+        details.toggle_all();
+        assert!(plain(&details.rows(display).rows).contains("second idea"));
+        details.toggle_all();
+        assert!(!plain(&details.rows(display).rows).contains("second idea"));
+        let everything = plain(&details.expanded_rows(display).rows);
+        assert!(everything.contains("second idea") && !everything.contains("thought 1"));
     }
 
     #[test]
@@ -1543,8 +1699,9 @@ mod tests {
         let mut empty = ToolDetails::new(vec![Entry::assistant("answer")]);
         empty.select(false);
         empty.toggle();
+        let rows = empty.rows(Display::default());
         assert_eq!(
-            empty.rows(Display::default()),
+            (rows.rows, rows.selected),
             (vec![String::from("answer")], None)
         );
     }

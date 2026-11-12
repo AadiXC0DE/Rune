@@ -259,12 +259,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         keys(b"\x1b")
         draft("before-viewer", b"draft\x1b[D", "draft", 6)
         viewer("open", b"\x0f")
+        viewer("home", b"\x1b[H")
         viewer("down", b"\x1b[B")
         viewer("up", b"\x1b[A")
         viewer("page-down", b"\x1b[6~")
         viewer("page-up", b"\x1b[5~")
         viewer("end", b"\x1b[F")
-        viewer("home", b"\x1b[H")
         for label, close in [("escape", b"\x1b"), ("ctrl-o", b"\x0f"),
                              ("ctrl-c", b"\x03"), ("ctrl-d", b"\x04")]:
             if label != "escape":
@@ -291,7 +291,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r073-") as directory:
         keys(b"\x04")  # Empty Ctrl-D must not stop or leave a running turn.
         assert b"[interrupted]" not in transcript and child.poll() is None
         keys(b"\x0f")  # Transcript also opens while the turn runs.
-        wait_for("Transcript", len(transcript) - 1000)
+        wait_for("pager", len(transcript) - 1000)
         keys(b"\x03")  # Close takes precedence over cancellation.
         assert b"[interrupted]" not in transcript
         start = len(transcript)
