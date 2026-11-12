@@ -2916,7 +2916,7 @@ impl SessionHost {
                 let mut hints = if self.accessible {
                     vec![self.caps.newline_hint()]
                 } else {
-                    vec!["shift-tab mode", self.caps.newline_hint()]
+                    vec!["@ files", "shift-tab mode", self.caps.newline_hint()]
                 };
                 if self.on_chip.load(std::sync::atomic::Ordering::Relaxed) {
                     hints.insert(0, "ctrl-o expands the paste");
@@ -15919,7 +15919,9 @@ mod tests {
             "ctrl-j newline"
         };
         assert!(
-            wide.contains(&format!("/ commands   shift-tab mode   {newline}")),
+            wide.contains(&format!(
+                "/ commands   @ files   shift-tab mode   {newline}"
+            )),
             "{wide:?}"
         );
         let narrow = host.status_line_in(20, Some(UiState::Idle));
@@ -15937,7 +15939,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let idle = host.status_line_in(120, Some(UiState::Idle));
         assert!(
-            idle.contains("/ commands   ctrl-o expands the paste   shift-tab mode"),
+            idle.contains("/ commands   ctrl-o expands the paste   @ files   shift-tab mode"),
             "{idle:?}"
         );
         let running = host.status_line_in(120, Some(UiState::Running));
@@ -24083,7 +24085,13 @@ mod tests {
             at("read_file five.rs"),
         ];
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rows:#?}");
-        assert!(rows_with(&rows, "files").is_empty(), "no group: {rows:#?}");
+        // The idle hint row names `@ files`; no row groups the reads.
+        assert!(
+            rows_with(&rows, "files")
+                .iter()
+                .all(|row| row.starts_with("/ commands")),
+            "no group: {rows:#?}"
+        );
     }
 
     #[test]

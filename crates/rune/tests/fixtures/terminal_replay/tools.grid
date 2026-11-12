@@ -11,7 +11,7 @@ tools-finished: 80x24, caret 2,14
 09|TOOLS-DONE|
 10|  <t>|
 11|hint: ctrl-o opens the full transcript|
-12|/ commands   shift-tab mode   ctrl-j newline|
+12|/ commands   @ files   shift-tab mode   ctrl-j newline|
 13|replay-fixture | full access | ctx ~###k (request bytes)|
 14|>|
 15||

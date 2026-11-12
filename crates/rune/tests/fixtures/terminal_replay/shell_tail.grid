@@ -9,7 +9,7 @@ shell-finished: 80x24, caret 2,12
 07||
 08|SHELL-DONE|
 09|  <t>|
-10|/ commands   shift-tab mode   ctrl-j newline|
+10|/ commands   @ files   shift-tab mode   ctrl-j newline|
 11|replay-fixture | full access | ctx ~###k (request bytes)|
 12|>|
 13||

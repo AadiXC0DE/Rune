@@ -95,6 +95,6 @@ finished: 100x24, caret 2,23
 18|STREAM-29|
 19||
 20|STREAM-30|
-21|/ commands   shift-tab mode   ctrl-j newline|
+21|/ commands   @ files   shift-tab mode   ctrl-j newline|
 22|replay-fixture | auto | ctx ~###k (request bytes)|
 23|>|

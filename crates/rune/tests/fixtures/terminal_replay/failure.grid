@@ -6,7 +6,7 @@ failure-reported: 80x24, caret 2,9
 04|error: the endpoint returned HTTP 401: invalid api key|
 05|  the provider refused the credential; run `rune connect` to store a new key|
 06|chat_completions refused the credential; /connect stores a new key|
-07|/ commands   shift-tab mode   ctrl-j newline|
+07|/ commands   @ files   shift-tab mode   ctrl-j newline|
 08|replay-fixture | auto | ctx ~###k (request bytes)|
 09|>|
 10||

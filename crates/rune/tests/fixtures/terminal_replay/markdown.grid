@@ -44,7 +44,7 @@ markdown-finished: 80x24, caret 2,22
 17|bb   │ 22|
 18||
 19|MARKDOWN-END|
-20|/ commands   shift-tab mode   ctrl-j newline|
+20|/ commands   @ files   shift-tab mode   ctrl-j newline|
 21|replay-fixture | full access | ctx ~###k (request bytes)|
 22|>|
 23||

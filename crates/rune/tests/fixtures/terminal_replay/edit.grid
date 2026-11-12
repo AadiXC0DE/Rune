@@ -14,7 +14,7 @@ edit-finished: 80x24, caret 2,17
 12||
 13|EDIT-CHECKED|
 14|  1 file +2 -1 · unverified · <t>|
-15|/ commands   shift-tab mode   ctrl-j newline|
+15|/ commands   @ files   shift-tab mode   ctrl-j newline|
 16|replay-fixture | full access | ctx ~###k (request bytes)|
 17|>|
 18||
