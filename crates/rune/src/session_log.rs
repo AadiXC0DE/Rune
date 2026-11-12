@@ -537,6 +537,16 @@ impl Recorder {
         self.store.title()
     }
 
+    /// Writes the session's event log as JSON lines, as `rune session export`
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the log cannot be read or the writer refuses the bytes.
+    pub fn export_jsonl(&self, out: impl std::io::Write) -> Result<()> {
+        load_read_only(self.store.dir())?.export_jsonl(out)
+    }
+
     /// Returns true when the session has no title yet.
     #[must_use]
     pub fn title_is_unset(&self) -> bool {

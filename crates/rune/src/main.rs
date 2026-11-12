@@ -18,6 +18,7 @@ mod cache_warming;
 mod capabilities;
 mod checkpoint;
 mod cli;
+mod clipboard;
 mod compaction_archive;
 mod completion;
 mod config_edit;

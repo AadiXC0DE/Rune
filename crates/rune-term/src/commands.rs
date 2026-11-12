@@ -129,8 +129,18 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "copy",
-        arguments: "",
-        summary: "put the last reply on the clipboard",
+        arguments: "[code [n]|all]",
+        summary: "put the last reply, a code block or the conversation on the clipboard",
+    },
+    Builtin {
+        name: "diff",
+        arguments: "[path]",
+        summary: "show the changes this session made",
+    },
+    Builtin {
+        name: "export",
+        arguments: "[path] [--json]",
+        summary: "write this conversation to a file",
     },
     Builtin {
         name: "new",

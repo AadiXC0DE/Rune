@@ -5050,23 +5050,53 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     Handled::Theme(Some(name)) => {
                         note(set_theme_named(&host, &config.paths, &name));
                     }
-                    Handled::Copy if host.accessible => {
+                    Handled::Copy(_) if host.accessible => {
                         note("accessible mode: copy the reply from terminal scrollback".to_owned());
                     }
-                    Handled::Copy => {
+                    Handled::Copy(arguments) => {
                         // The reply is read from the conversation rather than
                         // from the screen, because what is on screen has been
                         // wrapped and styled and is no longer the text.
-                        match last_reply(&history) {
-                            Some(reply) => match copy_to_clipboard(&reply) {
-                                Ok(()) => note(format!(
-                                    "copied {} character(s) to the clipboard",
-                                    reply.chars().count()
-                                )),
-                                Err(err) => note(format!("could not copy: {err}")),
+                        let title = recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .title();
+                        note(copy_command(
+                            &host,
+                            &arguments,
+                            last_reply(&history),
+                            || {
+                                export_markdown(
+                                    title.as_deref(),
+                                    &host.session_id_name(),
+                                    history.turns(),
+                                )
                             },
-                            None => note("there is no reply to copy yet".to_owned()),
+                        ));
+                    }
+                    Handled::Diff(path) => match diff_entries(&host, path.as_deref()) {
+                        Ok(entries) if reader.is_active() && !host.accessible => {
+                            view_text(reader, &host, entries)?;
                         }
+                        Ok(entries) => {
+                            for entry in entries {
+                                note(format!("{}\n", entry.text));
+                            }
+                        }
+                        Err(line) => note(line),
+                    },
+                    Handled::Export(arguments) => {
+                        let recorder = recorder
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        note(export_command(
+                            &arguments,
+                            &config.workspace,
+                            &host.session_id_name(),
+                            recorder.title().as_deref(),
+                            history.turns(),
+                            |out| recorder.export_jsonl(out),
+                        ));
                     }
                     Handled::Retry => match lock_value(&host.last_failed).clone() {
                         Some((text, _)) => return Ok(Step::Retry(text)),
@@ -6372,45 +6402,53 @@ fn turn_command(
         Err(err) => return vec![error_note(&err)],
     };
     let mut lines = output_lines(&captured);
-    let note = match handled {
-        Handled::Continue => None,
-        Handled::Effort(requested) => {
-            let reply = set_effort(host, requested.as_deref());
-            Some(
-                if requested.is_some() && reply.starts_with("effort set to") {
-                    format!("{reply}; applies from the next request")
-                } else {
-                    reply
-                },
-            )
-        }
-        Handled::Permissions(requested) => Some(set_permissions(host, requested.as_deref())),
-        Handled::Network(requested) => Some(set_network(host, requested.as_deref())),
-        Handled::StatusLine(requested) => Some(set_statusline(host, requested.as_deref())),
-        Handled::Theme(Some(theme)) => Some(set_theme_named(host, context.paths, &theme)),
-        Handled::Theme(None) => Some(format!(
-            "themes: {}; /theme <name> switches",
-            theme_names(context.paths).join(", ")
-        )),
-        Handled::Tasks => {
-            lines.extend(task_list(host));
-            None
-        }
-        Handled::Copy if host.accessible => {
-            Some("accessible mode: copy the reply from terminal scrollback".to_owned())
-        }
-        Handled::Copy => Some(match turn_reply(host) {
-            Some(reply) => match copy_to_clipboard(&reply) {
-                Ok(()) => format!(
-                    "copied {} character(s) to the clipboard",
-                    reply.chars().count()
-                ),
-                Err(err) => format!("could not copy: {err}"),
+    let note =
+        match handled {
+            Handled::Continue => None,
+            Handled::Effort(requested) => {
+                let reply = set_effort(host, requested.as_deref());
+                Some(
+                    if requested.is_some() && reply.starts_with("effort set to") {
+                        format!("{reply}; applies from the next request")
+                    } else {
+                        reply
+                    },
+                )
+            }
+            Handled::Permissions(requested) => Some(set_permissions(host, requested.as_deref())),
+            Handled::Network(requested) => Some(set_network(host, requested.as_deref())),
+            Handled::StatusLine(requested) => Some(set_statusline(host, requested.as_deref())),
+            Handled::Theme(Some(theme)) => Some(set_theme_named(host, context.paths, &theme)),
+            Handled::Theme(None) => Some(format!(
+                "themes: {}; /theme <name> switches",
+                theme_names(context.paths).join(", ")
+            )),
+            Handled::Tasks => {
+                lines.extend(task_list(host));
+                None
+            }
+            Handled::Copy(_) if host.accessible => {
+                Some("accessible mode: copy the reply from terminal scrollback".to_owned())
+            }
+            // The conversation belongs to the running turn, so `all` waits.
+            Handled::Copy(arguments) if arguments == "all" => Some(turn_command_later("copy all")),
+            Handled::Copy(arguments) => Some(copy_command(
+                host,
+                &arguments,
+                turn_reply(host),
+                String::new,
+            )),
+            Handled::Diff(path) => match diff_entries(host, path.as_deref()) {
+                Ok(entries) => {
+                    lines.extend(entries.into_iter().flat_map(|entry| {
+                        entry.text.lines().map(str::to_owned).collect::<Vec<_>>()
+                    }));
+                    None
+                }
+                Err(line) => Some(line),
             },
-            None => "there is no reply to copy yet".to_owned(),
-        }),
-        _ => Some(turn_command_later(name)),
-    };
+            _ => Some(turn_command_later(name)),
+        };
     lines.extend(note);
     lines
 }
@@ -6537,6 +6575,18 @@ fn run_steerable<T: Send>(
                         .iter()
                         .any(|command| command.name == name);
                     match turn_command_kind(&name, custom) {
+                        TurnCommandKind::Run if name == "diff" => {
+                            reader.clear();
+                            let path = (!arguments.trim().is_empty()).then(|| arguments.trim());
+                            match diff_entries(host, path) {
+                                Ok(entries) => {
+                                    let _ = view_text(reader, host, entries);
+                                    host.draw_stream_with("", 0);
+                                }
+                                Err(line) => host.draw_notice_with(&line, "", 0),
+                            }
+                            return;
+                        }
                         TurnCommandKind::Run => {
                             reader.clear();
                             let mut lines = turn_command(host, context, &name, &arguments);
@@ -9645,20 +9695,328 @@ fn last_reply(history: &History) -> Option<String> {
         .filter(|reply| !reply.trim().is_empty())
 }
 
-/// Copies text to the terminal's clipboard.
-///
-/// Uses OSC 52, which the terminal emulator handles itself. Shelling out to a
-/// platform clipboard tool would work on a desktop and fail over SSH, where the
-/// terminal is the only thing that can reach the user's clipboard. A terminal
-/// that does not implement OSC 52 ignores it rather than showing it, so the
-/// escape never becomes visible text.
-fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
+/// What `/copy` takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyRequest {
+    /// The last reply.
+    Reply,
+    /// A fenced code block of the last reply: the last one, or the n-th.
+    Code(Option<usize>),
+    /// The whole conversation as Markdown.
+    All,
+}
 
-    let encoded = base64_encode(text.as_bytes());
-    let mut stdout = std::io::stdout();
-    write!(stdout, "\u{1b}]52;c;{encoded}\u{7}")?;
-    stdout.flush()
+/// The usage line of `/copy`.
+const COPY_USAGE: &str = "usage: /copy [code [n]|all]";
+
+/// Reads `/copy`'s arguments.
+fn parse_copy(arguments: &str) -> Option<CopyRequest> {
+    let words: Vec<&str> = arguments.split_whitespace().collect();
+    match words.as_slice() {
+        [] => Some(CopyRequest::Reply),
+        ["all"] => Some(CopyRequest::All),
+        ["code"] => Some(CopyRequest::Code(None)),
+        ["code", number] => number
+            .parse::<usize>()
+            .ok()
+            .filter(|number| *number > 0)
+            .map(|number| CopyRequest::Code(Some(number))),
+        _ => None,
+    }
+}
+
+/// The bodies of the fenced code blocks in `text`, in order. A fence is three
+/// or more backticks or tildes; it closes on the same character repeated at
+/// least as often. An unclosed block runs to the end.
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(char, usize, Vec<&str>)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let fence = trimmed
+            .chars()
+            .next()
+            .filter(|ch| matches!(ch, '`' | '~'))
+            .map(|ch| (ch, trimmed.chars().take_while(|next| *next == ch).count()))
+            .filter(|(_, count)| *count >= 3);
+        match (&mut open, fence) {
+            (None, Some((ch, count))) => open = Some((ch, count, Vec::new())),
+            (Some((ch, count, body)), Some((close, length)))
+                if close == *ch
+                    && length >= *count
+                    && trimmed.trim_start_matches(close).trim().is_empty() =>
+            {
+                blocks.push(body.join("\n"));
+                open = None;
+            }
+            (Some((_, _, body)), _) => body.push(line),
+            (None, None) => {}
+        }
+    }
+    if let Some((_, _, body)) = open {
+        blocks.push(body.join("\n"));
+    }
+    blocks
+}
+
+/// Runs `/copy`: picks the text, copies it and says how, or why not.
+fn copy_command(
+    host: &SessionHost,
+    arguments: &str,
+    reply: Option<String>,
+    conversation: impl FnOnce() -> String,
+) -> String {
+    let Some(request) = parse_copy(arguments) else {
+        return COPY_USAGE.to_owned();
+    };
+    let text = match request {
+        CopyRequest::All => conversation(),
+        CopyRequest::Reply | CopyRequest::Code(_) => {
+            let Some(reply) = reply else {
+                return "there is no reply to copy yet".to_owned();
+            };
+            match request {
+                CopyRequest::Code(which) => {
+                    let blocks = code_blocks(&reply);
+                    let chosen = match which {
+                        None => blocks.last(),
+                        Some(number) => blocks.get(number.saturating_sub(1)),
+                    };
+                    match chosen {
+                        Some(block) => block.clone(),
+                        None if blocks.is_empty() => {
+                            return "the last reply has no code block".to_owned();
+                        }
+                        None => {
+                            return format!("the last reply has {} code block(s)", blocks.len());
+                        }
+                    }
+                }
+                _ => reply,
+            }
+        }
+    };
+    match crate::clipboard::copy(&text, &host.caps, &mut |bytes| host.show(bytes)) {
+        Ok(path) => format!(
+            "copied {} characters via {}",
+            text.chars().count(),
+            path.label()
+        ),
+        Err(err) => error_note(&err),
+    }
+}
+
+/// The part of a call's arguments a one-line summary names.
+fn call_subject(arguments: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    ["path", "command", "pattern", "url", "query", "source"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The conversation as Markdown: `# {title}`, then a `## You` or `## Rune`
+/// section per message. Each tool call is one line under the reply that
+/// made it, with the first line of its result; reasoning is left out.
+fn export_markdown(
+    title: Option<&str>,
+    session_id: &str,
+    turns: &[rune_agent::history::Turn],
+) -> String {
+    use rune_net::message::{ContentPart, Role};
+    let mut results: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for turn in turns {
+        for part in &turn.parts {
+            if let ContentPart::ToolResult { id, content, .. } = part {
+                let first = content
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default();
+                let first: String = first.chars().take(120).collect();
+                results.insert(id.to_string(), first);
+            }
+        }
+    }
+    let mut out = format!(
+        "# {}\n",
+        title.map_or_else(|| format!("Rune session {session_id}"), str::to_owned)
+    );
+    for turn in turns {
+        match turn.role {
+            Role::User => {
+                let text: String = turn
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.trim().is_empty() {
+                    let _ = write!(out, "\n## You\n\n{}\n", text.trim_end());
+                }
+            }
+            Role::Assistant => {
+                let _ = write!(out, "\n## Rune\n\n");
+                for part in &turn.parts {
+                    match part {
+                        ContentPart::Text { text } if !text.trim().is_empty() => {
+                            let _ = writeln!(out, "{}\n", text.trim_end());
+                        }
+                        ContentPart::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            let subject = call_subject(arguments);
+                            let result = results.get(&id.to_string()).cloned().unwrap_or_default();
+                            let line = [name.as_str(), subject.as_str()]
+                                .iter()
+                                .filter(|part| !part.is_empty())
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let _ = writeln!(out, "- {line}: {result}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Role::System | Role::Tool => {}
+        }
+    }
+    out
+}
+
+/// Runs `/export [path] [--json]`: writes the conversation as Markdown, or the
+/// event log as JSON lines, to a new file in the workspace.
+fn export_command(
+    arguments: &str,
+    workspace: &Utf8Path,
+    session_id: &str,
+    title: Option<&str>,
+    turns: &[rune_agent::history::Turn],
+    events: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> String {
+    let mut json = false;
+    let mut named = None;
+    for word in arguments.split_whitespace() {
+        if word == "--json" {
+            json = true;
+        } else if named.is_none() {
+            named = Some(word);
+        } else {
+            return "usage: /export [path] [--json]".to_owned();
+        }
+    }
+    let extension = if json { "jsonl" } else { "md" };
+    let path = named.map_or_else(
+        || workspace.join(format!("rune-session-{session_id}.{extension}")),
+        |name| {
+            let name = Utf8Path::new(name);
+            if name.is_absolute() {
+                name.to_path_buf()
+            } else {
+                workspace.join(name)
+            }
+        },
+    );
+    // Named as the user would type it: relative inside the workspace.
+    let shown = path
+        .strip_prefix(workspace)
+        .map_or_else(|_| path.to_string(), ToString::to_string);
+    if path.exists() {
+        return format!("{shown} exists; name another file");
+    }
+    let bytes = if json {
+        let mut bytes = Vec::new();
+        if let Err(err) = events(&mut bytes) {
+            return error_note(&err);
+        }
+        bytes
+    } else {
+        export_markdown(title, session_id, turns).into_bytes()
+    };
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(&bytes)
+        });
+    match written {
+        Ok(()) => format!("wrote {shown} ({} bytes)", bytes.len()),
+        Err(err) => format!("could not write {shown}: {err}"),
+    }
+}
+
+/// The changes this session's file tools made, one viewer entry per file:
+/// `--- a/{path}` and `+++ b/{path}` (or `/dev/null`), then the hunks with
+/// line numbers. Limited to paths at or under `under` when given.
+fn diff_entries(
+    host: &SessionHost,
+    under: Option<&str>,
+) -> std::result::Result<Vec<Entry>, String> {
+    let workspace = host.context.workspace().to_owned();
+    let limit = under.map(|path| {
+        let path = Utf8Path::new(path.trim_end_matches('/'));
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        }
+    });
+    let originals = lock_value(&host.undo).clone();
+    let mut entries = Vec::new();
+    for (path, original) in &originals {
+        if limit.as_ref().is_some_and(|limit| !path.starts_with(limit)) {
+            continue;
+        }
+        let current = std::fs::read(path).ok();
+        if current == *original {
+            continue;
+        }
+        let shown = path.strip_prefix(&workspace).map_or_else(
+            |_| path.to_string(),
+            |relative| relative.as_str().replace('\\', "/"),
+        );
+        let old_label = original
+            .as_ref()
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("a/{shown}"));
+        let new_label = current
+            .as_ref()
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("b/{shown}"));
+        let old = original.as_deref().unwrap_or_default();
+        let new = current.as_deref().unwrap_or_default();
+        let text = std::str::from_utf8(old)
+            .ok()
+            .zip(std::str::from_utf8(new).ok())
+            .filter(|_| !old.contains(&0) && !new.contains(&0));
+        let body = match text {
+            Some((old, new)) => rune_term::diff::render(
+                &rune_term::diff::hunks(old, new, 1),
+                &rune_term::diff::DiffStyle::plain(),
+                None,
+                usize::from(host.width()),
+                host.ascii,
+            )
+            .join("\n"),
+            None => format!("binary file {shown} changed"),
+        };
+        entries.push(Entry::notice(format!(
+            "--- {old_label}\n+++ {new_label}\n{body}"
+        )));
+    }
+    if entries.is_empty() {
+        return Err(under.map_or_else(
+            || "no changes in this session".to_owned(),
+            |path| format!("no changes under {path}"),
+        ));
+    }
+    Ok(entries)
 }
 
 /// Encodes bytes as standard base64 with padding.
@@ -12050,8 +12408,13 @@ enum Handled {
     Theme(Option<String>),
     /// Show what fills the context window.
     Context,
-    /// Put the last reply on the terminal's clipboard.
-    Copy,
+    /// Put the last reply, a code block of it or the conversation on the
+    /// clipboard.
+    Copy(String),
+    /// Show the changes this session made, under a path when one is given.
+    Diff(Option<String>),
+    /// Write the conversation to a file, as Markdown or as the event log.
+    Export(String),
     /// Start a fresh conversation in this terminal.
     NewSession,
     /// Give the session a new title.
@@ -12574,7 +12937,11 @@ fn handle_command<W: std::io::Write>(
             let _ = writeln!(output, "{}", session_log::render_tree(&tree, &state));
             Ok(Handled::Continue)
         }
-        "copy" => Ok(Handled::Copy),
+        "copy" => Ok(Handled::Copy(arguments.trim().to_owned())),
+        "diff" => Ok(Handled::Diff(
+            (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
+        )),
+        "export" => Ok(Handled::Export(arguments.trim().to_owned())),
         "tasks" => Ok(Handled::Tasks),
         "terminal-setup" => Ok(Handled::TerminalSetup),
         "retry" => Ok(Handled::Retry),
@@ -15294,6 +15661,123 @@ mod tests {
         // One hint per turn.
         assert!(written.contains("hint: @ mentions a file"), "{written}");
         assert!(!written.contains("ctrl-o opens"), "{written}");
+    }
+
+    #[test]
+    fn code_blocks_are_found_by_fence() {
+        let text = "intro\n```rust\nfn a() {}\n```\nmiddle\n~~~~\nb\n```\nnot a close\n~~~~\n````\nc\n````\n";
+        assert_eq!(code_blocks(text), ["fn a() {}", "b\n```\nnot a close", "c"]);
+        assert!(code_blocks("no code here").is_empty());
+        assert_eq!(code_blocks("```\nunclosed"), ["unclosed"]);
+    }
+
+    #[test]
+    fn copy_arguments_parse() {
+        assert_eq!(parse_copy(""), Some(CopyRequest::Reply));
+        assert_eq!(parse_copy("all"), Some(CopyRequest::All));
+        assert_eq!(parse_copy("code"), Some(CopyRequest::Code(None)));
+        assert_eq!(parse_copy("code 2"), Some(CopyRequest::Code(Some(2))));
+        for bad in ["code 0", "code x", "code 1 2", "everything"] {
+            assert_eq!(parse_copy(bad), None, "{bad}");
+        }
+        let host = test_host();
+        assert_eq!(copy_command(&host, "code 0", None, String::new), COPY_USAGE);
+        assert_eq!(
+            copy_command(&host, "", None, String::new),
+            "there is no reply to copy yet"
+        );
+        assert_eq!(
+            copy_command(&host, "code", Some("plain".to_owned()), String::new),
+            "the last reply has no code block"
+        );
+        assert_eq!(
+            copy_command(
+                &host,
+                "code 3",
+                Some("```\na\n```\n```\nb\n```".to_owned()),
+                String::new
+            ),
+            "the last reply has 2 code block(s)"
+        );
+    }
+
+    #[test]
+    fn export_markdown_summarises_tools_in_one_line() {
+        use rune_net::message::ContentPart;
+        let mut history = History::new();
+        history.push_user("read the notes");
+        history.push_assistant(vec![
+            ContentPart::Reasoning {
+                text: "SECRET THOUGHT".to_owned(),
+            },
+            ContentPart::Text {
+                text: "Reading.".to_owned(),
+            },
+            ContentPart::ToolCall {
+                id: rune_core::id::ToolCallId::new("call-1").expect("tool id"),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"notes.md"}"#.to_owned(),
+            },
+        ]);
+        history.push_tool_results(vec![ContentPart::ToolResult {
+            id: rune_core::id::ToolCallId::new("call-1").expect("tool id"),
+            name: "read_file".to_owned(),
+            content: format!("first line\n{}", "x".repeat(10)),
+            is_error: false,
+        }]);
+        let markdown = export_markdown(Some("Notes"), "abc", history.turns());
+        assert!(markdown.starts_with("# Notes\n"), "{markdown}");
+        assert!(markdown.contains("## You\n\nread the notes"), "{markdown}");
+        assert!(markdown.contains("## Rune\n\nReading."), "{markdown}");
+        assert!(
+            markdown.contains("- read_file notes.md: first line\n"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("SECRET THOUGHT"), "{markdown}");
+        assert!(export_markdown(None, "abc", &[]).starts_with("# Rune session abc"));
+    }
+
+    #[test]
+    fn diff_lists_created_and_edited_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let mut host = test_host();
+        host.context = ExecutionContext::new(root.clone());
+        std::fs::write(root.join("edited.txt"), "one\nTWO\n").expect("edited");
+        std::fs::write(root.join("created.txt"), "new\n").expect("created");
+        {
+            let mut undo = lock_value(&host.undo);
+            undo.insert(root.join("edited.txt"), Some(b"one\ntwo\n".to_vec()));
+            undo.insert(root.join("created.txt"), None);
+            // Made and removed in the session: no net change.
+            undo.insert(root.join("gone.txt"), None);
+            undo.insert(root.join("same.txt"), Some(b"same".to_vec()));
+        }
+        std::fs::write(root.join("same.txt"), "same").expect("same");
+        let entries = diff_entries(&host, None).expect("changes");
+        let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[0].starts_with("--- /dev/null\n+++ b/created.txt\n"),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            texts[1].starts_with("--- a/edited.txt\n+++ b/edited.txt\n"),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains("- two") && texts[1].contains("+ TWO"),
+            "{}",
+            texts[1]
+        );
+        let only = diff_entries(&host, Some("edited.txt")).expect("one");
+        assert_eq!(only.len(), 1);
+        assert_eq!(
+            diff_entries(&host, Some("docs")).expect_err("none"),
+            "no changes under docs"
+        );
     }
 
     #[test]
@@ -21114,7 +21598,7 @@ mod tests {
     #[test]
     fn the_copy_and_new_commands_are_recognized() {
         for (name, expected) in [
-            ("copy", Handled::Copy),
+            ("copy", Handled::Copy(String::new())),
             ("new", Handled::NewSession),
             ("fork", Handled::Fork),
         ] {
