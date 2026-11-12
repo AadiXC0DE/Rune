@@ -183,6 +183,8 @@ pub enum KeyAction {
     PullQueued,
     /// Hold the draft as a new turn that starts once the running one ends.
     Queue,
+    /// Show or hide the plan pinned above the prompt.
+    TogglePlan,
 }
 
 /// Navigation while the transcript owns the terminal.
@@ -598,6 +600,7 @@ impl KeyReader {
             // An open menu keeps the key, so it never changes the mode behind it.
             "mode_cycle" if self.menu_open => KeyAction::Ignored,
             "mode_cycle" => KeyAction::ModeCycle,
+            "toggle_plan" => KeyAction::TogglePlan,
             "line_start" => {
                 if !self.composer.move_line_start() {
                     self.composer.move_home();
@@ -1826,7 +1829,7 @@ mod tests {
     fn a_rebound_clear_key_leaves_escape_to_menus_only() {
         let mut file = std::collections::BTreeMap::new();
         file.insert("clear".to_owned(), vec!["ctrl+x".to_owned()]);
-        file.insert("interrupt".to_owned(), vec!["ctrl+t".to_owned()]);
+        file.insert("interrupt".to_owned(), vec!["ctrl+n".to_owned()]);
         let mut reader = reader();
         reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
         let escape = key(KeyCode::Esc);
@@ -1839,7 +1842,7 @@ mod tests {
         typed(&mut reader, "draft");
         assert_eq!(reader.apply(escape), KeyAction::Ignored);
         assert_eq!(reader.line(), "draft");
-        assert_eq!(reader.apply(control('t')), KeyAction::Escape);
+        assert_eq!(reader.apply(control('n')), KeyAction::Escape);
         assert_eq!(reader.apply(control('x')), KeyAction::Ignored);
         assert_eq!(reader.line(), "");
     }
@@ -1871,6 +1874,18 @@ mod tests {
         assert_eq!(reader.apply(back_tab), KeyAction::Ignored);
         reader.set_menu_open(false);
         assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+    }
+
+    #[test]
+    fn ctrl_t_toggles_the_plan_at_the_prompt_and_during_a_turn() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(reader.apply(ctrl_t), KeyAction::TogglePlan);
+        assert_eq!(reader.line(), "draft");
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(ctrl_t), KeyAction::TogglePlan);
+        assert_eq!(reader.line(), "draft");
     }
 
     #[test]

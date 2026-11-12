@@ -137,6 +137,12 @@ pub const ACTIONS: &[ActionInfo] = &[
         "cycle ask, auto and plan",
     ),
     action(
+        "toggle_plan",
+        Context::Editor,
+        &["ctrl+t"],
+        "show or hide the plan above the prompt",
+    ),
+    action(
         "word_left",
         Context::Editor,
         &["alt+b", "ctrl+b", "alt+left"],

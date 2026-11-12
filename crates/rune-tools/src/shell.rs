@@ -19,7 +19,8 @@ use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
 use crate::contract::{
-    Activity, CheckRun, ExecutionContext, Tool, ToolOutput, validate_closed_arguments,
+    Activity, BackgroundTask, CheckRun, ExecutionContext, Tool, ToolOutput,
+    validate_closed_arguments,
 };
 use crate::workspace::{
     FileLimits, bool_arg, head_and_tail_split, resolve, string_arg, truncate_to_bytes, usize_arg,
@@ -289,6 +290,8 @@ struct Session {
     timeout_ms: Option<u64>,
     /// Interactions in a row that sent nothing and saw no new output.
     idle_polls: AtomicU32,
+    /// When the command started.
+    started: Instant,
 }
 
 impl Session {
@@ -311,6 +314,7 @@ impl Session {
             network_denied,
             timeout_ms: None,
             idle_polls: AtomicU32::new(0),
+            started: Instant::now(),
         }
     }
 
@@ -713,9 +717,44 @@ impl Drop for Shell {
     }
 }
 
+/// The newest bytes a background listing reads lines from.
+const BACKGROUND_WINDOW: usize = 64 * 1024;
+
 impl Tool for Shell {
     fn name(&self) -> &'static str {
         "shell"
+    }
+
+    /// Lists running sessions from their output buffers. No reader position
+    /// moves, so the next call still returns everything it would have.
+    fn background(&self) -> Vec<BackgroundTask> {
+        let sessions: Vec<Arc<Session>> = lock(&self.state).sessions.values().cloned().collect();
+        let mut tasks: Vec<BackgroundTask> = sessions
+            .iter()
+            .filter(|session| session.process.is_running())
+            .map(|session| BackgroundTask {
+                id: session.id.clone(),
+                command: session.command.clone(),
+                started: session.started,
+                last_line: session
+                    .process
+                    .stdout()
+                    .last_lines(1, BACKGROUND_WINDOW)
+                    .pop()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        tasks.sort_by_key(|task| task.started);
+        tasks
+    }
+
+    fn background_tail(&self, id: &str, lines: usize) -> Option<String> {
+        let session = lock(&self.state).sessions.get(id).cloned()?;
+        let tail = session
+            .process
+            .stdout()
+            .last_lines(lines, BACKGROUND_WINDOW);
+        Some(tail.join("\n"))
     }
 
     /// Stops every session this tool started, each asked to exit and killed
@@ -1865,6 +1904,50 @@ mod tests {
             context,
             &serde_json::json!({ "action": "stop", "session_id": id }),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_lists_live_sessions_without_consuming_output() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 1; printf 'unseen-%s\\n' line; sleep 30",
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        assert!(!started.contains("unseen-line"), "{started}");
+        let listed = wait_until(
+            || {
+                tool.background()
+                    .iter()
+                    .any(|task| task.id == id && task.last_line == "unseen-line")
+            },
+            Duration::from_secs(20),
+        );
+        assert!(listed, "{:?}", tool.background());
+        let task = tool.background().into_iter().next().expect("one task");
+        assert!(task.command.contains("sleep 30"), "{}", task.command);
+        assert_eq!(
+            tool.background_tail(&id, 20).as_deref(),
+            Some("unseen-line")
+        );
+        assert_eq!(tool.background_tail("no-such-session", 20), None);
+
+        // The listing and the tail moved no reader position.
+        let next = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "interact", "session_id": id, "yield_time_ms": 100 }),
+        );
+        assert!(next.contains("unseen-line"), "{next}");
+        let _ = stop(&tool, &context, &id);
+        assert!(tool.background().is_empty(), "{:?}", tool.background());
     }
 
     /// Exercises the public tool, not just the terminal syscall wrappers.

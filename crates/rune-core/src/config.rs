@@ -1667,7 +1667,7 @@ pub const HYPERLINK_VALUES: [&str; 3] = ["auto", "on", "off"];
 pub const NOTIFY_VALUES: [&str; 3] = ["auto", "bell", "off"];
 
 /// The status row fields the `statusline` setting names, in the default order.
-pub const STATUSLINE_FIELDS: [&str; 12] = [
+pub const STATUSLINE_FIELDS: [&str; 13] = [
     "model",
     "mode",
     "unsandboxed",
@@ -1678,6 +1678,7 @@ pub const STATUSLINE_FIELDS: [&str; 12] = [
     "branch",
     "mcp",
     "cost",
+    "tasks",
     "workspace",
     "session",
 ];

@@ -32,7 +32,7 @@ pub mod workspace;
 pub mod write_file;
 
 pub use contract::{
-    Activity, Cancellation, CheckRun, ExecutionContext, Tool, ToolImage, ToolOutput,
+    Activity, BackgroundTask, Cancellation, CheckRun, ExecutionContext, Tool, ToolImage, ToolOutput,
 };
 pub use create_directory::CreateDirectory;
 pub use edit_file::EditFile;

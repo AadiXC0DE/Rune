@@ -84,6 +84,8 @@ pub enum StatusField {
     Mcp,
     /// Estimated spend.
     Cost,
+    /// Commands still running in the background.
+    Tasks,
     /// The working directory.
     Workspace,
     /// The short session identifier.
@@ -92,7 +94,7 @@ pub enum StatusField {
 
 impl StatusField {
     /// Every field, highest priority first, which is also the display order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Model,
         Self::Mode,
         Self::Unsandboxed,
@@ -103,6 +105,7 @@ impl StatusField {
         Self::Branch,
         Self::Mcp,
         Self::Cost,
+        Self::Tasks,
         Self::Workspace,
         Self::Session,
     ];
@@ -121,6 +124,7 @@ impl StatusField {
             Self::Branch => "branch",
             Self::Mcp => "mcp",
             Self::Cost => "cost",
+            Self::Tasks => "tasks",
             Self::Workspace => "workspace",
             Self::Session => "session",
         }
@@ -186,6 +190,8 @@ pub struct FooterState {
     pub net: bool,
     /// Connected and configured MCP servers.
     pub mcp: Option<(usize, usize)>,
+    /// Commands still running in the background.
+    pub tasks: usize,
 }
 
 /// The provider attempt shown in the renderer-owned status row.
@@ -478,6 +484,9 @@ fn field_text(
                 })
         }
         StatusField::Cost => state.cost.as_ref().map(|cost| styled(Slot::Dim, 0, cost)),
+        StatusField::Tasks => {
+            (state.tasks > 0).then(|| styled(Slot::Dim, 0, &format!("{} running", state.tasks)))
+        }
         StatusField::Workspace => (!state.workspace.is_empty())
             .then(|| styled(Slot::Dim, 0, state.workspace.trim_end_matches('/'))),
         StatusField::Session => (!state.session_id.is_empty())
@@ -1014,6 +1023,7 @@ mod tests {
             branch: Some("main".to_owned()),
             mcp: Some((1, 1)),
             cost: Some("$0.0123".to_owned()),
+            tasks: 1,
             ..state()
         }
     }
@@ -1078,10 +1088,15 @@ mod tests {
         assert_eq!(
             status_of(&state, 200),
             "replay-model-01 | auto | ctx ~2.7k (request bytes) | queued 2 | effort high | net \
-             | main | mcp 1/1 | $0.0123 | /Users/dev/rune 9f2c1a7b"
+             | main | mcp 1/1 | $0.0123 | 1 running | /Users/dev/rune 9f2c1a7b"
         );
         assert_eq!(
             status_of(&state, 120),
+            "replay-model-01 | auto | ctx ~2.7k (request bytes) | queued 2 | effort high | net \
+             | main | mcp 1/1 | $0.0123 | 1 running"
+        );
+        assert_eq!(
+            status_of(&state, 119),
             "replay-model-01 | auto | ctx ~2.7k (request bytes) | queued 2 | effort high | net \
              | main | mcp 1/1 | $0.0123"
         );

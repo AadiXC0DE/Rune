@@ -83,6 +83,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show what this session has spent",
     },
     Builtin {
+        name: "tasks",
+        arguments: "",
+        summary: "list running commands, show their output or stop them",
+    },
+    Builtin {
         name: "compact",
         arguments: "[preview]",
         summary: "summarize older turns, or preview record counts without changes",

@@ -445,6 +445,10 @@ struct SessionHost {
     steering: SteeringQueue,
     /// Messages to run as turns after the running one, oldest first.
     queued: Mutex<std::collections::VecDeque<String>>,
+    /// The newest plan the model reported, pinned above the prompt.
+    plan: Mutex<Option<rune_tools::PlanUpdate>>,
+    /// Whether the pinned plan is drawn; Ctrl+T flips it.
+    plan_visible: std::sync::atomic::AtomicBool,
     /// Drafts cleared by Escape or Control-C, newest last, for Up to recall.
     cleared: Mutex<std::collections::VecDeque<String>>,
     /// When a first Escape over a typed draft armed the interrupt.
@@ -1232,6 +1236,7 @@ impl Host for SessionHost {
                 self.commit_lines(&lines);
             }
             Event::PlanUpdated { update } => {
+                *lock_value(&self.plan) = Some(update.clone());
                 if self.accessible {
                     self.draw_notice(&plan_summary(update));
                 } else {
@@ -2807,6 +2812,7 @@ impl SessionHost {
             queued: lock_value(&self.queued).len(),
             net: self.network.load(std::sync::atomic::Ordering::Relaxed) && !self.endpoint.offline,
             mcp: self.mcp.as_ref().map(|client| client.server_count()),
+            tasks: self.background_tasks().len(),
         };
         let layout = footer::solve(
             (
@@ -3069,8 +3075,77 @@ impl SessionHost {
             .lines()
             .map(str::to_owned)
             .collect();
+        rows.extend(self.pinned_plan(width));
         rows.extend(self.lane_rows(width));
         rows
+    }
+
+    /// Returns the rows of the plan pinned above the prompt, or none when it
+    /// is hidden, finished, or the session is accessible.
+    fn pinned_plan(&self, width: usize) -> Vec<String> {
+        if self.accessible || !self.plan_visible.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let plan = lock_value(&self.plan).clone();
+        let Some(plan) = plan else {
+            return Vec::new();
+        };
+        let sgr = |slot| self.theme().sgr(slot, self.depth);
+        pinned_plan_rows(
+            &plan,
+            width,
+            &sgr(Slot::Dim),
+            &sgr(Slot::Accent),
+            self.ascii,
+        )
+    }
+
+    /// Shows or hides the pinned plan.
+    fn toggle_plan(&self) {
+        let _ = self
+            .plan_visible
+            .fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the commands the shell keeps running, oldest first.
+    fn background_tasks(&self) -> Vec<rune_tools::BackgroundTask> {
+        self.registry
+            .get("shell")
+            .map(rune_tools::Tool::background)
+            .unwrap_or_default()
+    }
+
+    /// Stops one background command through the same policy and tool as the
+    /// model's calls, and draws the result as a tool row. A rule that denies
+    /// the stop still applies.
+    fn stop_task(&self, id: &str) {
+        let arguments = serde_json::json!({ "action": "stop", "session_id": id });
+        let call = turn::PreparedCall {
+            id: String::from("user-stop"),
+            name: String::from("shell"),
+            arguments: arguments.to_string(),
+        };
+        let target = turn::permission_target_for(&self.registry, "shell", &arguments);
+        let (outcome, reason) = self.decide_with_arguments("shell", target.as_deref(), &arguments);
+        // Choosing `stop` in the picker is the user's answer to an ask.
+        if outcome == Outcome::Deny {
+            self.emit(Event::ToolDenied { call, reason });
+            return;
+        }
+        self.emit(Event::ToolStarted {
+            call: call.clone(),
+            activity: rune_tools::Activity::Execute,
+        });
+        let started = std::time::Instant::now();
+        let output = match self.execute("shell", &arguments) {
+            Ok(output) => output,
+            Err(err) => ToolOutput::from_error(&err),
+        };
+        self.emit(Event::ToolFinished {
+            call,
+            output,
+            elapsed: started.elapsed(),
+        });
     }
 
     /// Returns true when a steering or queued message can be taken back.
@@ -4434,6 +4509,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         cancellation: config.questions.cancellation.clone(),
         steering: SteeringQueue::from_limits(&limits),
         queued: Mutex::new(std::collections::VecDeque::new()),
+        plan: Mutex::new(None),
+        plan_visible: std::sync::atomic::AtomicBool::new(terminal_height() >= PLAN_PIN_MIN_HEIGHT),
         cleared: Mutex::new(std::collections::VecDeque::new()),
         escape_armed: Mutex::new(None),
         pending_steer: Mutex::new(Vec::new()),
@@ -4764,6 +4841,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                     Handled::Exit => return Ok(Step::Exit),
                     Handled::PickModel => return Ok(Step::PickModel),
                     Handled::Theme(None) => return Ok(Step::PickTheme),
+                    Handled::Tasks => return Ok(Step::Tasks),
                     Handled::Theme(Some(name)) => {
                         note(set_theme_named(&host, &config.paths, &name));
                     }
@@ -5618,6 +5696,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         flush_lines(&host, &mut sink, &[line])?;
                     }
                 }
+                Step::Tasks => {
+                    let lines = choose_task(&mut reader, &host, &out)?;
+                    flush_lines(&host, &mut sink, &lines)?;
+                }
                 Step::Restore(ask) => {
                     report_undo(&host, &mut sink, ask)?;
                 }
@@ -5661,6 +5743,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 Step::PickTheme => {
                     flush_lines(&host, &mut sink, &[THEME_USAGE.to_owned()])?;
                 }
+                Step::Tasks => {
+                    flush_lines(&host, &mut sink, &task_list(&host))?;
+                }
                 Step::Continue => {}
             }
         }
@@ -5688,6 +5773,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 }
                 Step::PickTheme => {
                     let _ = writeln!(sink, "{THEME_USAGE}");
+                    Ok(Action::Continue)
+                }
+                Step::Tasks => {
+                    for line in task_list(&host) {
+                        let _ = writeln!(sink, "{line}");
+                    }
                     Ok(Action::Continue)
                 }
             }
@@ -6053,6 +6144,10 @@ fn run_steerable<T: Send>(
                 }
                 host.draw_stream_with(reader.line(), reader.column());
             }
+            KeyAction::TogglePlan => {
+                host.toggle_plan();
+                host.draw_stream_with(reader.line(), reader.column());
+            }
             // The mode is changed only at the idle prompt.
             KeyAction::ModeCycle => {}
             // Anything else is an edit, so a half-finished cancel gesture
@@ -6307,6 +6402,7 @@ fn question_key(
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
+        | KeyAction::TogglePlan
         | KeyAction::PullQueued
         | KeyAction::Queue
         | KeyAction::Transcript
@@ -6386,6 +6482,7 @@ fn approval_key(
         | KeyAction::Ignored
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
+        | KeyAction::TogglePlan
         | KeyAction::PullQueued
         | KeyAction::Queue
         | KeyAction::Transcript
@@ -6950,6 +7047,10 @@ fn await_submission(
             }
             continue;
         };
+        if key == KeyAction::TogglePlan {
+            host.toggle_plan();
+            continue;
+        }
         if key == KeyAction::ModeCycle {
             let line = cycle_mode(host);
             flash = std::time::Instant::now()
@@ -7172,6 +7273,7 @@ fn idle_key(
         KeyAction::Suspend
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
+        | KeyAction::TogglePlan
         | KeyAction::PullQueued
         | KeyAction::Queue => Idle::Stay,
         KeyAction::Submit => {
@@ -7382,6 +7484,7 @@ fn confirm_choice(
                 KeyAction::Ignored
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
+                | KeyAction::TogglePlan
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
                     let typed = answer.line().to_owned();
@@ -7473,6 +7576,7 @@ fn run_picker(
             KeyAction::Ignored
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
+            | KeyAction::TogglePlan
             | KeyAction::PullQueued
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
@@ -7540,6 +7644,7 @@ fn search_prompt_history(
                 KeyAction::Ignored
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
+                | KeyAction::TogglePlan
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
                     picker.set_query(query.line());
@@ -9442,6 +9547,7 @@ fn choose_theme(
             KeyAction::Ignored
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
+            | KeyAction::TogglePlan
             | KeyAction::PullQueued
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
@@ -9455,6 +9561,159 @@ fn choose_theme(
     }
     host.set_theme(before);
     Ok(None)
+}
+
+/// What `/tasks` says when the shell holds no running command.
+const NO_TASKS: &str = "no commands are running";
+
+/// How many output lines `/tasks` shows for one command.
+const TASK_TAIL_LINES: usize = 20;
+
+/// Renders how long a command has run, in whole seconds, minutes or hours.
+fn task_age(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs / 60) % 60)
+    }
+}
+
+/// Returns one row per running command: its id, age, command and last line.
+fn task_rows(tasks: &[rune_tools::BackgroundTask], width: usize, ascii: bool) -> Vec<String> {
+    const COMMAND: usize = 40;
+    tasks
+        .iter()
+        .map(|task| {
+            let flat = |text: &str| -> String {
+                transcript::sanitize(text)
+                    .chars()
+                    .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                    .collect()
+            };
+            let head = format!(
+                "{}  {}  {}",
+                task.id,
+                task_age(task.started.elapsed()),
+                shorten(&flat(&task.command), COMMAND, ascii)
+            );
+            let line = flat(task.last_line.trim());
+            let room = width
+                .saturating_sub(rune_term::width::str_width(&head))
+                .saturating_sub(2);
+            if line.is_empty() || room == 0 {
+                head
+            } else {
+                format!("{head}  {}", shorten(&line, room, ascii))
+            }
+        })
+        .collect()
+}
+
+/// Returns the `/tasks` rows where no picker can run.
+fn task_list(host: &SessionHost) -> Vec<String> {
+    let tasks = host.background_tasks();
+    if tasks.is_empty() {
+        return vec![NO_TASKS.to_owned()];
+    }
+    let mut lines = vec![String::from("running commands")];
+    lines.extend(task_rows(&tasks, usize::from(host.width()), host.ascii));
+    lines
+}
+
+/// Runs a picker over `items` and returns the index of the chosen one.
+fn pick_index(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    title: &str,
+    items: &[String],
+) -> Result<Option<usize>> {
+    let mut picker =
+        rune_term::picker::Picker::new(title, items.to_vec(), rune_term::picker::DEFAULT_WINDOW);
+    let marker = rune_term::shell::prompt();
+    loop {
+        let room = host.menu_room();
+        let below = picker_menu(&mut picker, &host.theme(), host.depth, room);
+        draw_prompt(reader, host, out, &below, marker, None)?;
+        let Some(key) = next_key(reader, host) else {
+            continue;
+        };
+        match key {
+            KeyAction::Suspend => suspend_session(host, out)?,
+            KeyAction::Submit | KeyAction::Complete => {
+                if let Some(choice) = picker.selected() {
+                    return Ok(items.iter().position(|item| item == choice));
+                }
+            }
+            KeyAction::Interrupt | KeyAction::Cancel | KeyAction::Escape => return Ok(None),
+            KeyAction::Up => {
+                picker.up();
+            }
+            KeyAction::Down => {
+                picker.down();
+            }
+            KeyAction::Transcript => view_transcript(reader, host)?,
+            KeyAction::ExternalEditor | KeyAction::HistorySearch => {}
+            KeyAction::Ignored
+            | KeyAction::CycleReasoning
+            | KeyAction::ModeCycle
+            | KeyAction::TogglePlan
+            | KeyAction::PullQueued
+            | KeyAction::Queue => {
+                picker.set_query(reader.line());
+            }
+        }
+    }
+}
+
+/// Lists the running commands in a picker, then shows the chosen one's output
+/// or stops it. Returns the lines to commit.
+fn choose_task(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+) -> Result<Vec<String>> {
+    let tasks = host.background_tasks();
+    if tasks.is_empty() {
+        return Ok(vec![NO_TASKS.to_owned()]);
+    }
+    let draft = reader.line().to_owned();
+    reader.clear();
+    let rows = task_rows(&tasks, usize::from(host.width()), host.ascii);
+    let chosen = pick_index(reader, host, out, "running commands", &rows)?;
+    let Some(task) = chosen.and_then(|index| tasks.get(index)) else {
+        reader.replace(&draft);
+        return Ok(Vec::new());
+    };
+    reader.clear();
+    let actions = [String::from("show output"), String::from("stop")];
+    let action = pick_index(reader, host, out, &task.id, &actions)?;
+    reader.replace(&draft);
+    match action {
+        Some(0) => {
+            let dim = host.theme().sgr(Slot::Dim, host.depth);
+            let reset = rune_term::engine::Style::RESET;
+            let tail = host
+                .registry
+                .get("shell")
+                .and_then(|tool| tool.background_tail(&task.id, TASK_TAIL_LINES))
+                .unwrap_or_default();
+            let mut lines = vec![format!("output of {}:", task.id)];
+            lines.extend(
+                tail.lines()
+                    .map(|line| format!("{dim}{}{reset}", transcript::sanitize(line))),
+            );
+            Ok(lines)
+        }
+        Some(_) => {
+            host.stop_task(&task.id);
+            Ok(Vec::new())
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 /// The built-in theme names the picker offers, before the user's own files.
@@ -9803,6 +10062,8 @@ fn lock_value<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 enum Handled {
     /// Carry on with the session.
     Continue,
+    /// List the commands still running.
+    Tasks,
     /// End the session.
     Exit,
     /// Place this text in the composer for review, with the model the next
@@ -10248,6 +10509,8 @@ enum Step {
     PickModel,
     /// Ask the user to choose a theme.
     PickTheme,
+    /// List the commands still running, with a picker where there are keys.
+    Tasks,
     /// Put back files: undo, undo despite outside changes, or redo.
     Restore(RestoreAsk),
 }
@@ -10366,6 +10629,7 @@ fn handle_command<W: std::io::Write>(
             Ok(Handled::Continue)
         }
         "copy" => Ok(Handled::Copy),
+        "tasks" => Ok(Handled::Tasks),
         "terminal-setup" => Ok(Handled::TerminalSetup),
         "new" => Ok(Handled::NewSession),
         "undo" if arguments.trim() == "preview" => Ok(Handled::UndoPreview),
@@ -10898,6 +11162,67 @@ fn plan_rows(
     if rest > 0 {
         let ellipsis = if ascii { "..." } else { "\u{2026}" };
         rows.push(format!("{dim}  {ellipsis} {rest} more steps{reset}"));
+    }
+    rows
+}
+
+/// Terminals shorter than this start with the pinned plan hidden.
+const PLAN_PIN_MIN_HEIGHT: u16 = 20;
+
+/// Returns the rows of a plan pinned above the prompt: none once every step is
+/// completed, one per step up to five, otherwise four steps from the one
+/// before the first unfinished step and a count of the rest.
+fn pinned_plan_rows(
+    plan: &rune_tools::PlanUpdate,
+    width: usize,
+    dim: &str,
+    accent: &str,
+    ascii: bool,
+) -> Vec<String> {
+    use rune_tools::update_plan::Status;
+    const SHOWN: usize = 4;
+    let reset = rune_term::engine::Style::RESET;
+    let steps = &plan.plan;
+    let Some(first_open) = steps
+        .iter()
+        .position(|step| step.status != Status::Completed)
+    else {
+        return Vec::new();
+    };
+    let (start, shown) = if steps.len() <= PLAN_ROWS {
+        (0, steps.len())
+    } else {
+        (
+            first_open
+                .saturating_sub(1)
+                .min(steps.len().saturating_sub(SHOWN)),
+            SHOWN,
+        )
+    };
+    let room = width.saturating_sub(4);
+    let mut rows: Vec<String> = steps
+        .iter()
+        .skip(start)
+        .take(shown)
+        .map(|step| {
+            let text = shorten(&transcript::sanitize(&step.step), room, ascii);
+            match step.status {
+                Status::Completed => format!("{dim}[x] {text}{reset}"),
+                Status::InProgress => format!("{accent}[~]{reset} {text}"),
+                Status::Pending => format!("[ ] {text}"),
+            }
+        })
+        .collect();
+    if shown < steps.len() {
+        let done = steps
+            .iter()
+            .filter(|step| step.status == Status::Completed)
+            .count();
+        let more = steps.len().saturating_sub(shown);
+        rows.push(format!(
+            "{dim}{done}/{} done, {more} more{reset}",
+            steps.len()
+        ));
     }
     rows
 }
@@ -14081,6 +14406,157 @@ mod tests {
 
     fn plain_rows(rows: &[String]) -> Vec<String> {
         rows.iter().map(|row| transcript::sanitize(row)).collect()
+    }
+
+    fn plan_of(statuses: &[rune_tools::update_plan::Status]) -> rune_tools::PlanUpdate {
+        rune_tools::PlanUpdate {
+            version: 1,
+            explanation: None,
+            plan: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| rune_tools::update_plan::Step {
+                    step: format!("step {}", index.saturating_add(1)),
+                    status: *status,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn plan_rows_show_at_most_five() {
+        use rune_tools::update_plan::Status::{Completed, InProgress, Pending};
+        let five = plan_of(&[Completed, InProgress, Pending, Pending, Pending]);
+        assert_eq!(
+            plain_rows(&pinned_plan_rows(&five, 80, "", "", false)),
+            [
+                "[x] step 1",
+                "[~] step 2",
+                "[ ] step 3",
+                "[ ] step 4",
+                "[ ] step 5"
+            ]
+        );
+        let seven = plan_of(&[
+            Completed, Completed, Completed, InProgress, Pending, Pending, Pending,
+        ]);
+        assert_eq!(
+            plain_rows(&pinned_plan_rows(&seven, 80, "", "", false)),
+            [
+                "[x] step 3",
+                "[~] step 4",
+                "[ ] step 5",
+                "[ ] step 6",
+                "3/7 done, 3 more"
+            ]
+        );
+        let near_end = plan_of(&[
+            Completed, Completed, Completed, Completed, Completed, Pending,
+        ]);
+        assert_eq!(
+            plain_rows(&pinned_plan_rows(&near_end, 80, "", "", false)),
+            [
+                "[x] step 3",
+                "[x] step 4",
+                "[x] step 5",
+                "[ ] step 6",
+                "5/6 done, 2 more"
+            ]
+        );
+        let mut long = plan_of(&[InProgress]);
+        long.plan[0].step = "a".repeat(40);
+        let rows = plain_rows(&pinned_plan_rows(&long, 20, "", "", false));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ends_with('\u{2026}'), "{rows:?}");
+        assert!(rune_term::width::str_width(&rows[0]) <= 20, "{rows:?}");
+    }
+
+    #[test]
+    fn plan_rows_hide_a_finished_plan() {
+        use rune_tools::update_plan::Status::Completed;
+        let done = plan_of(&[Completed, Completed]);
+        assert!(pinned_plan_rows(&done, 80, "", "", false).is_empty());
+        assert!(pinned_plan_rows(&plan_of(&[]), 80, "", "", false).is_empty());
+    }
+
+    #[test]
+    fn plan_rows_sit_above_the_lanes_and_toggle() {
+        use rune_tools::update_plan::Status::{InProgress, Pending};
+        let host = test_host();
+        host.emit(Event::PlanUpdated {
+            update: plan_of(&[InProgress, Pending]),
+        });
+        assert_eq!(
+            plain_rows(&host.pinned_plan(80)),
+            ["[~] step 1", "[ ] step 2"]
+        );
+        lock_value(&host.queued).push_back("later".to_owned());
+        let rows = plain_rows(&host.status_rows(None));
+        let plan = rows
+            .iter()
+            .position(|row| row == "[~] step 1")
+            .expect("plan row");
+        let lane = rows
+            .iter()
+            .position(|row| row.starts_with("queued 1"))
+            .expect("lane row");
+        assert!(plan < lane, "{rows:?}");
+        host.toggle_plan();
+        assert!(host.pinned_plan(80).is_empty());
+        host.toggle_plan();
+        assert_eq!(host.pinned_plan(80).len(), 2);
+    }
+
+    #[test]
+    fn stopping_a_task_from_the_picker_answers_an_ask() {
+        let mut host = test_host();
+        host.registry
+            .insert(Box::new(rune_tools::shell::Shell::new(
+                &BudgetSet::default(),
+            )))
+            .expect("registered");
+        *host.mode.get_mut().expect("mode") = PermissionMode::Ask;
+        host.stop_task("no-such-session");
+        let events = host.events.lock().expect("events");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ToolDenied { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ToolFinished { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn task_rows_name_the_id_age_command_and_last_line() {
+        let task = rune_tools::BackgroundTask {
+            id: "s1".to_owned(),
+            command: "sleep 30".to_owned(),
+            started: std::time::Instant::now(),
+            last_line: "waiting".to_owned(),
+        };
+        assert_eq!(
+            task_rows(std::slice::from_ref(&task), 80, false),
+            ["s1  0s  sleep 30  waiting"]
+        );
+        let long = rune_tools::BackgroundTask {
+            command: "x".repeat(60),
+            last_line: "y".repeat(60),
+            ..task
+        };
+        let row = &task_rows(&[long], 70, false)[0];
+        assert!(rune_term::width::str_width(row) <= 70, "{row}");
+        assert!(
+            row.contains(&format!("{}\u{2026}", "x".repeat(39))),
+            "{row}"
+        );
+        assert_eq!(task_age(std::time::Duration::from_secs(65)), "1m05s");
+        assert_eq!(task_age(std::time::Duration::from_secs(3725)), "1h02m");
     }
 
     #[test]
@@ -19199,7 +19675,7 @@ mod tests {
         assert_eq!(
             set_statusline(&host, Some("retry")),
             "unknown status field `retry`; fields: model, mode, unsandboxed, context, queued, \
-             effort, net, branch, mcp, cost, workspace, session"
+             effort, net, branch, mcp, cost, tasks, workspace, session"
         );
     }
 
@@ -21158,6 +21634,8 @@ mod tests {
             cancellation: questions.cancellation.clone(),
             steering: SteeringQueue::new(4),
             queued: Mutex::new(std::collections::VecDeque::new()),
+            plan: Mutex::new(None),
+            plan_visible: std::sync::atomic::AtomicBool::new(true),
             cleared: Mutex::new(std::collections::VecDeque::new()),
             escape_armed: Mutex::new(None),
             pending_steer: Mutex::new(Vec::new()),

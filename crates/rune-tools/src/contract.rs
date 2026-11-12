@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::Result;
@@ -520,6 +521,19 @@ impl Cancellation {
     }
 }
 
+/// A command a tool keeps running between calls.
+#[derive(Clone, Debug)]
+pub struct BackgroundTask {
+    /// The id a later call names it by.
+    pub id: String,
+    /// The command it runs.
+    pub command: String,
+    /// When it started.
+    pub started: Instant,
+    /// The newest non-empty line it printed, or empty.
+    pub last_line: String,
+}
+
 /// One tool.
 ///
 /// Implementations are pure with respect to policy: they receive a context and
@@ -574,6 +588,19 @@ pub trait Tool: Send + Sync {
     /// Called once when the run that owns the tool stops, so nothing it
     /// started outlives the run.
     fn shutdown(&self) {}
+
+    /// Returns the commands this tool keeps running, oldest first.
+    ///
+    /// Reading them consumes no output a later call would return.
+    fn background(&self) -> Vec<BackgroundTask> {
+        Vec::new()
+    }
+
+    /// Returns up to `lines` of the newest output of one running command,
+    /// without consuming it.
+    fn background_tail(&self, _id: &str, _lines: usize) -> Option<String> {
+        None
+    }
 
     fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
         let schema = self.input_schema();
