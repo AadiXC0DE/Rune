@@ -264,6 +264,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         release_draft.set()
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

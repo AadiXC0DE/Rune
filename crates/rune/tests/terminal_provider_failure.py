@@ -250,6 +250,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
+                # A session blocked writing to the terminal ends only when it is
+                # drained while it exits.
+                drain_wait(child, master, 10, bytearray())
             child.wait(timeout=10)
         if master is not None:
             os.close(master)

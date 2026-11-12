@@ -345,6 +345,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

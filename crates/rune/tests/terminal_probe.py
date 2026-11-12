@@ -101,6 +101,9 @@ def interactive(scenario, root, environment):
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
 
@@ -125,6 +128,9 @@ def quiet(args, ready, leave, root, environment):
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
 
@@ -157,6 +163,9 @@ def piped_stdin(root, environment):
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
 
@@ -189,6 +198,9 @@ def piped_stdout(root, environment):
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(read_end)
         os.close(master)
