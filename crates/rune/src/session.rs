@@ -1531,20 +1531,13 @@ impl Host for SessionHost {
         target: Option<&str>,
         arguments: &serde_json::Value,
     ) -> (Outcome, String) {
-        let preview = if name == "edit_file" {
-            let pairs = edit_pairs(arguments);
-            let hunks = edit_hunks(&pairs, None);
-            // Plain text: the prompt measures its lines without escapes.
-            rune_term::diff::render(
-                &hunks,
-                &rune_term::diff::DiffStyle::plain(),
-                Some(APPROVAL_PREVIEW_LINES),
-                usize::from(self.width()),
-                self.ascii,
-            )
-        } else {
-            Vec::new()
-        };
+        let preview = approval_preview(
+            name,
+            arguments,
+            self.context.workspace(),
+            usize::from(self.width()),
+            self.ascii,
+        );
         if let Ok(mut slot) = self.approval_preview.lock() {
             *slot = preview;
         }
@@ -12199,8 +12192,125 @@ const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// Changed lines drawn under an edit's tool row before the rest is counted.
 const EDIT_PREVIEW_LINES: usize = 12;
 
-/// Changed lines an approval prompt shows for an edit.
-const APPROVAL_PREVIEW_LINES: usize = 12;
+/// Rows an approval prompt shows for a change.
+const APPROVAL_PREVIEW_LINES: usize = 20;
+
+/// The largest file an approval diffs against what a write would leave.
+const APPROVAL_PREVIEW_BYTES: usize = 256 * 1024;
+
+/// What an approval shows a call would change, in plain text: the diff of an
+/// edit, a patch or a write over an existing file, or the head of a new
+/// file. A command shows nothing here, since its layout already has it all.
+fn approval_preview(
+    name: &str,
+    arguments: &serde_json::Value,
+    workspace: &Utf8Path,
+    width: usize,
+    ascii: bool,
+) -> Vec<String> {
+    let render = |hunks: &[rune_term::diff::Hunk<'_>]| {
+        rune_term::diff::render(
+            hunks,
+            &rune_term::diff::DiffStyle::plain(),
+            Some(APPROVAL_PREVIEW_LINES),
+            width,
+            ascii,
+        )
+    };
+    match name {
+        "edit_file" => render(&edit_hunks(&edit_pairs(arguments), None)),
+        "apply_patch" => {
+            let input = arguments
+                .get("input")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let Ok(patch) = rune_tools::apply_patch::parse(input) else {
+                return Vec::new();
+            };
+            let pairs = patch_pairs(&patch);
+            render(&edit_hunks(&pairs, None))
+        }
+        "write_file" => write_preview(arguments, workspace, width, ascii),
+        _ => Vec::new(),
+    }
+}
+
+/// The old and new text of each part of a patch: an added file is all new,
+/// a deleted one is not diffed.
+fn patch_pairs(patch: &rune_tools::apply_patch::Patch) -> Vec<(String, String)> {
+    use rune_tools::apply_patch::Section;
+    patch
+        .sections
+        .iter()
+        .flat_map(|section| match section {
+            Section::Add { contents, .. } => vec![(String::new(), contents.clone())],
+            Section::Delete { .. } => Vec::new(),
+            Section::Update { chunks, .. } => chunks
+                .iter()
+                .map(|chunk| (chunk.old_lines().join("\n"), chunk.new_lines().join("\n")))
+                .collect(),
+        })
+        .collect()
+}
+
+/// A `write_file` preview: the diff against the file it replaces, or the head
+/// of a new one.
+fn write_preview(
+    arguments: &serde_json::Value,
+    workspace: &Utf8Path,
+    width: usize,
+    ascii: bool,
+) -> Vec<String> {
+    let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let content = arguments
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let count = content.lines().count();
+    let not_shown = || vec![format!("new content is {count} lines; diff not shown")];
+    if content.len() > APPROVAL_PREVIEW_BYTES {
+        return not_shown();
+    }
+    let target = workspace.join(path);
+    // Only files in the workspace are read for a preview, so a write aimed
+    // elsewhere never puts that file's lines on screen.
+    let inside = target.starts_with(workspace)
+        && !Utf8Path::new(path)
+            .components()
+            .any(|part| part == camino::Utf8Component::ParentDir);
+    match std::fs::metadata(&target) {
+        Ok(meta)
+            if !inside
+                || meta.len() > u64::try_from(APPROVAL_PREVIEW_BYTES).unwrap_or(u64::MAX) =>
+        {
+            not_shown()
+        }
+        Ok(_) => match std::fs::read_to_string(&target) {
+            Ok(current) => rune_term::diff::render(
+                &rune_term::diff::hunks(&current, content, 1),
+                &rune_term::diff::DiffStyle::plain(),
+                Some(APPROVAL_PREVIEW_LINES),
+                width,
+                ascii,
+            ),
+            Err(_) => not_shown(),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let noun = if count == 1 { "line" } else { "lines" };
+            std::iter::once(format!("new file, {count} {noun}"))
+                .chain(
+                    content
+                        .lines()
+                        .take(APPROVAL_PREVIEW_LINES)
+                        .map(|line| format!("+ {}", transcript::sanitize(line))),
+                )
+                .collect()
+        }
+        Err(_) => not_shown(),
+    }
+}
 
 /// Returns the old and new text of each replacement an `edit_file` call asks for.
 fn edit_pairs(arguments: &serde_json::Value) -> Vec<(String, String)> {
@@ -16179,6 +16289,85 @@ mod tests {
         assert_eq!(
             approval_key(ChoiceKey::Action(KeyAction::ExternalEditor), &mut menu),
             ApprovalStep::Stay
+        );
+    }
+
+    #[test]
+    fn write_file_preview_diffs_an_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        std::fs::write(root.join("notes.txt"), "one\ntwo\nthree\n").expect("write");
+        let arguments = serde_json::json!({ "path": "notes.txt", "content": "one\nTWO\nthree\n" });
+        let rows = approval_preview("write_file", &arguments, &root, 80, true);
+        let text = rows.join("\n");
+        assert!(rows.iter().any(|row| row.contains("- two")), "{text}");
+        assert!(rows.iter().any(|row| row.contains("+ TWO")), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        let long: String = (0..60).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "line {n}");
+            text
+        });
+        let arguments = serde_json::json!({ "path": "notes.txt", "content": long });
+        let rows = approval_preview("write_file", &arguments, &root, 80, true);
+        assert!(rows.len() <= APPROVAL_PREVIEW_LINES + 1, "{rows:?}");
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.contains("more changed lines")),
+            "{rows:?}"
+        );
+        let huge = "x\n".repeat(APPROVAL_PREVIEW_BYTES);
+        let arguments = serde_json::json!({ "path": "notes.txt", "content": huge });
+        assert_eq!(
+            approval_preview("write_file", &arguments, &root, 80, true),
+            [format!(
+                "new content is {APPROVAL_PREVIEW_BYTES} lines; diff not shown"
+            )]
+        );
+    }
+
+    #[test]
+    fn write_file_preview_shows_the_head_of_a_new_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let content: String = (1..=25).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "row {n}");
+            text
+        });
+        let arguments = serde_json::json!({ "path": "new.txt", "content": content });
+        let rows = approval_preview("write_file", &arguments, &root, 80, true);
+        assert_eq!(rows[0], "new file, 25 lines");
+        assert_eq!(rows[1], "+ row 1");
+        assert_eq!(rows.len(), APPROVAL_PREVIEW_LINES + 1);
+        assert_eq!(rows.last().map(String::as_str), Some("+ row 20"));
+        let patch = serde_json::json!({
+            "input": "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n",
+        });
+        let rows = approval_preview("apply_patch", &patch, &root, 80, true);
+        assert!(rows.iter().any(|row| row.contains("- old")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("+ new")), "{rows:?}");
+        assert!(
+            approval_preview(
+                "shell",
+                &serde_json::json!({"command": "ls"}),
+                &root,
+                80,
+                true
+            )
+            .is_empty()
+        );
+        // An existing file outside the workspace is never read for a preview.
+        let inner = root.join("inner");
+        std::fs::create_dir(&inner).expect("inner");
+        std::fs::write(root.join("secret.txt"), "hidden\n").expect("secret");
+        let arguments = serde_json::json!({ "path": "../secret.txt", "content": "a\n" });
+        assert_eq!(
+            approval_preview("write_file", &arguments, &inner, 80, true),
+            ["new content is 1 lines; diff not shown"]
+        );
+        let arguments = serde_json::json!({ "path": "../fresh.txt", "content": "a\n" });
+        assert_eq!(
+            approval_preview("write_file", &arguments, &inner, 80, true),
+            ["new file, 1 line", "+ a"]
         );
     }
 

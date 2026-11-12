@@ -48,3 +48,28 @@ approval-cancelled: 80x24, caret 2,13
 21||
 22||
 23||
+approval-write: 80x24, caret 0,18
+00|shell wants to run:|
+01|  echo GRID-APPROVAL|
+02|  in <dir>|
+03|  why: ask: no rule matched `echo GRID-APPROVAL`, so the mode's default applies|
+04|[refused shell: ask: no rule matched `echo GRID-APPROVAL`, so the mode's]|
+05|[default applies; approval was cancelled]|
+06|[interrupted]|
+07||
+08|▌ write|
+09||
+10|write_file wants to change grid-notes.txt:|
+11|  why: ask: matched `write_file *` at the user layer|
+12|new file, 2 lines|
+13|+ first note|
+14|+ second note|
+15|permission required|
+16|y once   a session   n deny   tab comment|
+17|replay-fixture | ask | ctx ~###k (request bytes)|
+18||
+19|  y  run once|
+20|  a  allow for this session|
+21|  p  always allow in this project|
+22|  n  deny|
+23|  tab  deny and say what to do instead|

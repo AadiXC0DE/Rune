@@ -120,9 +120,15 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 ))
                 return
             if scenario == "approval":
-                self.answer_choices(tool_step(tool_call(0, "shell", {
-                    "command": "echo GRID-APPROVAL",
-                })))
+                if prompts[-1] == "write":
+                    self.answer_choices(tool_step(tool_call(0, "write_file", {
+                        "path": "grid-notes.txt",
+                        "content": "first note\nsecond note\n",
+                    })))
+                else:
+                    self.answer_choices(tool_step(tool_call(0, "shell", {
+                        "command": "echo GRID-APPROVAL",
+                    })))
                 return
             if scenario in {"reasoning", "reasoning-full"}:
                 self.answer_choices(
@@ -264,7 +270,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     config = root / "config" / "rune"
     config.mkdir(parents=True, mode=0o700)
     config_file = config / "config.toml"
-    config_file.write_text("auto_upgrade = false\n")
+    config_file.write_text("auto_upgrade = false\n" + (
+        '[[permission.rules]]\ntool = "write_file"\nmatch = "*"\ndecision = "ask"\n'
+        if scenario == "approval" else ""
+    ))
     config_file.chmod(0o600)
     if scenario == "transcript":
         (root / "transcript.txt").write_text(
@@ -531,8 +540,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("approval-open", b"approve\r", "permission required",
                     repaint=b"\x1b[?25l\r\x1b[1G\x1b[?25h")
             time.sleep(0.4)
+            cancelled_at = len(transcript)
             capture("approval-cancelled", b"\x03", "cancelled")
-            assert prompts == ["approve"], prompts
+            # The interrupted turn ends before the next prompt is typed.
+            wait_for("/ commands", cancelled_at)
+            capture("approval-write", b"write\r", "+ second note",
+                    repaint=b"\x1b[?25l\r\x1b[1G\x1b[?25h")
+            time.sleep(0.4)
+            os.write(master, b"\x03")
+            assert prompts == ["approve", "write"], prompts
         elif scenario == "reasoning":
             capture("reasoning-finished", b"think\r", "REASONED\r\n")
             assert prompts == ["think"], prompts

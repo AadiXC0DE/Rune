@@ -531,6 +531,13 @@ fn approval_prompt_grids() {
     assert!(open.contains("  n  deny"), "{actual}");
     let cancelled = stage_rows(&actual, "approval-cancelled").join("\n");
     assert!(cancelled.contains("cancelled"), "{actual}");
+    let write = stage_rows(&actual, "approval-write").join("\n");
+    assert!(
+        write.contains("wants to change grid-notes.txt:"),
+        "{actual}"
+    );
+    assert!(write.contains("new file, 2 lines"), "{actual}");
+    assert!(write.contains("+ first note"), "{actual}");
 }
 
 #[test]
