@@ -577,6 +577,9 @@ struct SessionHost {
     frame: Mutex<()>,
     /// Complete recorded conversation, retained even when model context compacts.
     transcript: Mutex<Vec<Entry>>,
+    /// The conversation's stored tool results as of the last finished turn,
+    /// which the transcript viewer reads full outputs from.
+    results: Mutex<Option<rune_tools::result_store::Store>>,
     /// History turns already captured, adjusted whenever compaction renumbers it.
     transcript_history_len: std::sync::atomic::AtomicUsize,
     /// Prevents streaming frames from painting over the transcript or editor.
@@ -2673,6 +2676,7 @@ impl SessionHost {
             .extend(history_entries(&history.turns()[start..]));
         self.transcript_history_len
             .store(history.len(), std::sync::atomic::Ordering::Relaxed);
+        *lock_value(&self.results) = Some(history.result_store().clone());
     }
 
     /// Forgets the context reading, for a conversation that has been replaced.
@@ -4709,6 +4713,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         inline: Mutex::new(rune_term::inline::Inline::new(terminal_width())),
         frame: Mutex::new(()),
         transcript: Mutex::new(transcript),
+        results: Mutex::new(Some(history.result_store().clone())),
         transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
         typed: Mutex::new((String::new(), 0)),
@@ -5050,6 +5055,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clear();
+                        *lock_value(&host.results) = None;
                         host.set_session_id(id.as_str());
                         // Approvals were given for the conversation that ended.
                         if let Ok(mut grants) = host.grants.lock() {
@@ -5210,6 +5216,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                     let results = attach_results(&mut resumed, &config.paths, &key);
                                     history = resumed;
                                     let entries = resumed_entries(&history, &state);
+                                    *lock_value(&host.results) =
+                                        Some(history.result_store().clone());
                                     host.transcript_history_len
                                         .store(history.len(), std::sync::atomic::Ordering::Relaxed);
                                     host.transcript
@@ -7551,29 +7559,256 @@ impl Drop for TranscriptScreen<'_> {
     }
 }
 
-/// Reads a stable snapshot on the alternate screen. The reader's composer is
-/// never replaced, so its caret, recall state and kill buffer survive intact.
-fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
-    use rune_term::input::TranscriptAction;
+/// What the viewer reads keys for.
+enum ViewerMode {
+    /// Scrolling, selecting and expanding.
+    Browse,
+    /// Typing a search query.
+    Search(String),
+}
 
-    let mut entries = host
-        .transcript
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+/// The entries the viewer shows: the recorded conversation, the running
+/// turn's events and the answer streaming now.
+fn viewer_entries(host: &SessionHost) -> Vec<Entry> {
+    let mut entries = lock_value(&host.transcript).clone();
     entries.extend(event_entries(host));
     let partial = host.partial_answer();
     if !partial.is_empty() {
         entries.push(Entry::assistant(partial));
     }
+    entries
+}
+
+/// Changes when anything the viewer shows may have changed.
+fn viewer_signature(host: &SessionHost) -> (usize, usize, usize) {
+    (
+        lock_value(&host.transcript).len(),
+        host.events.lock().map_or(0, |events| events.len()),
+        host.partial_answer().len(),
+    )
+}
+
+/// The row saying output arrived below while the viewer is not following.
+fn follow_row(new_rows: usize, following: bool) -> Option<String> {
+    (!following && new_rows > 0).then(|| format!("{new_rows} new lines below, G to follow"))
+}
+
+/// The most bytes of a stored result the viewer reads for one entry.
+const VIEWER_RESULT_BYTES: usize = 1024 * 1024;
+
+/// The last retained result handle a tool text names: `result-` and 24
+/// lowercase hex characters.
+fn result_handle(text: &str) -> Option<rune_tools::result_store::Handle> {
+    const DIGITS: usize = 24;
+    let mut found = None;
+    for (at, _) in text.match_indices("result-") {
+        let start = at.saturating_add("result-".len());
+        let digits = text.get(start..start.saturating_add(DIGITS));
+        let bounded = |byte: Option<&u8>| byte.is_none_or(|byte| !byte.is_ascii_alphanumeric());
+        let whole = bounded(
+            at.checked_sub(1)
+                .and_then(|before| text.as_bytes().get(before)),
+        ) && bounded(text.as_bytes().get(start.saturating_add(DIGITS)));
+        if whole
+            && digits.is_some_and(|digits| {
+                digits
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            && let Ok(handle) =
+                rune_tools::result_store::Handle::parse(&text[at..start.saturating_add(DIGITS)])
+        {
+            found = Some(handle);
+        }
+    }
+    found
+}
+
+/// Up to [`VIEWER_RESULT_BYTES`] of a stored result, with a row naming how
+/// much more the store holds. `None` when the store no longer has it.
+fn stored_result(
+    store: &rune_tools::result_store::Store,
+    handle: &rune_tools::result_store::Handle,
+) -> Option<String> {
+    let (_, total, _) = store.describe(handle)?;
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let mut body = String::new();
+    while body.len() < total.min(VIEWER_RESULT_BYTES) {
+        let want = VIEWER_RESULT_BYTES
+            .saturating_sub(body.len())
+            .min(rune_tools::result_store::MAX_READ_BYTES);
+        let read = store.read(handle, body.len(), want).ok()?;
+        if read.text.is_empty() {
+            break;
+        }
+        body.push_str(&read.text);
+    }
+    let more = total.saturating_sub(body.len());
+    if more > 0 {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let _ = write!(body, "[{more} more bytes in {handle}]");
+    }
+    Some(body)
+}
+
+/// The diff an `edit_file` or `apply_patch` call entry stands for.
+fn call_diff(
+    text: &str,
+    style: &rune_term::diff::DiffStyle,
+    width: usize,
+    ascii: bool,
+) -> Option<Vec<String>> {
+    use rune_term::diff::{DiffLine, Hunk, Op};
+    let (name, arguments) = text.split_once(' ')?;
+    let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let render = |hunks: &[Hunk<'_>]| {
+        (!hunks.is_empty()).then(|| rune_term::diff::render(hunks, style, None, width, ascii))
+    };
+    match name {
+        "edit_file" => {
+            let pairs = edit_pairs(&arguments);
+            if pairs
+                .iter()
+                .all(|(old, new)| old.is_empty() && new.is_empty())
+            {
+                return None;
+            }
+            render(&edit_hunks(&pairs, None))
+        }
+        "apply_patch" => {
+            let input = arguments.get("input")?.as_str()?;
+            let mut hunks = vec![Hunk { lines: Vec::new() }];
+            for line in input.lines() {
+                let (op, rest) = match line.split_at_checked(1) {
+                    Some(("+", rest)) => (Op::Added, rest),
+                    Some(("-", rest)) => (Op::Removed, rest),
+                    Some((" ", rest)) => (Op::Context, rest),
+                    _ => {
+                        if hunks.last().is_some_and(|hunk| !hunk.lines.is_empty()) {
+                            hunks.push(Hunk { lines: Vec::new() });
+                        }
+                        continue;
+                    }
+                };
+                if let Some(hunk) = hunks.last_mut() {
+                    hunk.lines.push(DiffLine {
+                        op,
+                        old: None,
+                        new: None,
+                        text: rest,
+                    });
+                }
+            }
+            hunks.retain(|hunk| !hunk.lines.is_empty());
+            render(&hunks)
+        }
+        _ => None,
+    }
+}
+
+/// What an expanded tool entry shows: its diff, its stored result, or the
+/// recorded text.
+fn tool_expansion(
+    entry: &Entry,
+    store: Option<&rune_tools::result_store::Store>,
+    style: &rune_term::diff::DiffStyle,
+    width: usize,
+    ascii: bool,
+) -> transcript::Expansion {
+    if let Some(rows) = call_diff(&entry.text, style, width, ascii) {
+        return transcript::Expansion::Rows(rows);
+    }
+    let Some(handle) = result_handle(&entry.text) else {
+        return transcript::Expansion::Recorded;
+    };
+    match store.and_then(|store| stored_result(store, &handle)) {
+        Some(body) => transcript::Expansion::Text(body),
+        None => transcript::Expansion::Text(format!(
+            "{}\n[full output no longer stored]",
+            entry.text.trim_end()
+        )),
+    }
+}
+
+/// Supplies an expansion for every expanded tool entry that has none yet.
+fn fill_expansions(
+    details: &mut transcript::ToolDetails,
+    store: Option<&rune_tools::result_store::Store>,
+    style: &rune_term::diff::DiffStyle,
+    width: usize,
+    ascii: bool,
+) {
+    for index in details.pending() {
+        let expansion = tool_expansion(&details.entries()[index], store, style, width, ascii);
+        details.set_expansion(index, expansion);
+    }
+}
+
+/// The whole transcript as plain text at 100 columns, everything expanded.
+fn pager_text(
+    entries: Vec<Entry>,
+    store: Option<&rune_tools::result_store::Store>,
+    ascii: bool,
+) -> String {
+    const WIDTH: usize = 100;
+    let mut details = transcript::ToolDetails::new(entries);
+    details.toggle_all();
+    let style = rune_term::diff::DiffStyle::plain();
+    fill_expansions(&mut details, store, &style, WIDTH, ascii);
+    let rows = details
+        .expanded_rows(Display {
+            width: WIDTH,
+            ascii,
+            ..Display::default()
+        })
+        .rows;
+    let mut text = String::new();
+    for row in rows {
+        text.push_str(transcript::sanitize(&row).trim_end());
+        text.push('\n');
+    }
+    text
+}
+
+/// Shows the conversation on the alternate screen and keeps it current while
+/// a turn streams. The reader's composer is never replaced, so its caret,
+/// recall state and kill buffer survive intact.
+fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost) -> Result<()> {
+    use rune_term::input::TranscriptAction;
+
     host.refresh_size();
     let mut size = (
         host.width(),
         host.height.load(std::sync::atomic::Ordering::Relaxed),
     );
-    let mut view =
-        rune_term::screen::Transcript::new(full_transcript_rows(&entries, size.0, host.ascii));
-    let mut details = transcript::ToolDetails::new(entries);
+    let mut signature = viewer_signature(host);
+    let mut details = transcript::ToolDetails::new(viewer_entries(host));
+    let style = host.diff_style();
+    let display = |width: u16| Display {
+        width: usize::from(width),
+        ascii: host.ascii,
+        ..Display::default()
+    };
+    let expand = |details: &mut transcript::ToolDetails, width: u16| {
+        let store = lock_value(&host.results);
+        fill_expansions(
+            details,
+            store.as_ref(),
+            &style,
+            usize::from(width),
+            host.ascii,
+        );
+    };
+    let mut built = details.rows(display(size.0));
+    let mut view = rune_term::screen::Transcript::new(std::mem::take(&mut built.rows));
+    view.jump(usize::MAX, view.body(size.1.saturating_sub(1)));
+    let mut starts = built.starts;
+    let mut mode = ViewerMode::Browse;
+    let mut following = true;
+    let mut new_rows = 0_usize;
+    let mut notice: Option<String> = None;
     let mut surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
     let _screen = {
         let _frame = host
@@ -7587,6 +7822,17 @@ fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost)
         rune_term::modes::mark(|modes| modes.alternate_screen = true);
         screen
     };
+    // Rebuilds the rows, keeping the top row and the search unless `top` says
+    // where the view goes.
+    let rebuild =
+        |view: &mut rune_term::screen::Transcript, rows: Vec<String>, top: usize, height: usize| {
+            let query = view.query().map(str::to_owned);
+            *view = rune_term::screen::Transcript::new(rows);
+            if let Some(query) = query {
+                view.search(&query, height);
+            }
+            view.jump(top, height);
+        };
 
     let mut redraw = true;
     loop {
@@ -7595,68 +7841,172 @@ fn view_transcript(reader: &mut rune_term::input::KeyReader, host: &SessionHost)
             host.width(),
             host.height.load(std::sync::atomic::Ordering::Relaxed),
         );
-        if next_size != size {
-            let top = view.top();
+        let resized = next_size != size;
+        let next_signature = viewer_signature(host);
+        let grown = next_signature != signature;
+        if resized || grown {
             size = next_size;
-            view = rune_term::screen::Transcript::new(
-                details
-                    .rows(Display {
-                        width: usize::from(size.0),
-                        ascii: host.ascii,
-                        ..Display::default()
-                    })
-                    .0,
-            );
-            view.jump(top, usize::from(size.1.saturating_sub(1)));
-            // Resizing can leave stale cells anywhere on the alternate screen.
-            host.show(b"\x1b[2J");
+            if grown {
+                signature = next_signature;
+                details.replace(viewer_entries(host));
+            }
+            if resized {
+                // Expansions drawn as rows were cut to the old width.
+                details.forget_expansions();
+                surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
+                // Resizing can leave stale cells anywhere on the alternate screen.
+                host.show(b"\x1b[2J");
+            }
+            expand(&mut details, size.0);
+            let height = view.body(size.1.saturating_sub(1));
+            let before = view.len();
+            let built = details.rows(display(size.0));
+            starts = built.starts;
+            let top = if following { usize::MAX } else { view.top() };
+            rebuild(&mut view, built.rows, top, height);
+            if !following {
+                new_rows = new_rows.saturating_add(view.len().saturating_sub(before));
+            }
             redraw = true;
         }
-        let height = usize::from(size.1.saturating_sub(1));
+        let height = view.body(size.1.saturating_sub(1));
         if redraw {
-            let mut lines = view.visible(height).to_vec();
-            lines.resize(height, String::new());
-            let footer = vec![String::from(
-                "Transcript | Tab tool Space toggle | Up/Down PgUp/PgDn Home/End | Esc/Ctrl-O close",
-            )];
+            let mut lines = Vec::with_capacity(size.1.into());
+            if let Some(header) = view.header() {
+                lines.push(header);
+            }
+            lines.extend(view.visible(height).iter().cloned());
+            lines.resize(usize::from(size.1.saturating_sub(1)), String::new());
+            let below = view.len().saturating_sub(view.top().saturating_add(height));
+            let dim = |text: &str| {
+                let theme = host.theme();
+                format!(
+                    "{}{text}{}",
+                    theme.sgr(Slot::Dim, host.depth),
+                    rune_term::engine::Style::RESET
+                )
+            };
+            let width = usize::from(size.0);
+            let footer = match &mode {
+                ViewerMode::Search(query) => format!("/{query}"),
+                ViewerMode::Browse => notice
+                    .clone()
+                    .or_else(|| follow_row(new_rows.min(below), following).map(|row| dim(&row)))
+                    .unwrap_or_else(|| dim(&footer::fitted_hints(UiState::Viewer, width))),
+            };
             let target = rune_term::frame::compose(
-                &rune_term::frame::Regions::new(&lines, &footer),
+                &rune_term::frame::Regions::new(&lines, &[footer]),
                 size.0,
                 size.1,
             )?;
             let painted = surface.commit(&target)?;
             host.show(&painted.bytes);
         }
-        let action = reader.poll_transcript(std::time::Duration::from_millis(50));
+        let typing = matches!(mode, ViewerMode::Search(_));
+        let action = reader.poll_transcript(std::time::Duration::from_millis(50), typing);
         redraw = !matches!(action, Some(TranscriptAction::Ignored) | None);
+        let Some(action) = action else {
+            continue;
+        };
+        if redraw {
+            notice = None;
+        }
+        if let ViewerMode::Search(query) = &mut mode {
+            match action {
+                TranscriptAction::Char(c) => query.push(c),
+                TranscriptAction::Backspace => {
+                    query.pop();
+                }
+                TranscriptAction::Enter => {
+                    let query = std::mem::take(query);
+                    mode = ViewerMode::Browse;
+                    if !view
+                        .search(&query, view.body(size.1.saturating_sub(1)))
+                        .is_empty()
+                    {
+                        following = false;
+                    }
+                }
+                TranscriptAction::Close => mode = ViewerMode::Browse,
+                _ => {}
+            }
+            continue;
+        }
         match action {
-            Some(TranscriptAction::Close) => break,
-            Some(TranscriptAction::Up) => view.scroll_up(1),
-            Some(TranscriptAction::Down) => view.scroll_down(1, height),
-            Some(TranscriptAction::PageUp) => view.page_up(height),
-            Some(TranscriptAction::PageDown) => view.page_down(height),
-            Some(TranscriptAction::Home) => view.jump(0, height),
-            Some(TranscriptAction::End) => view.jump(usize::MAX, height),
-            Some(
-                action @ (TranscriptAction::NextTool
-                | TranscriptAction::PreviousTool
-                | TranscriptAction::ToggleTool),
-            ) => {
+            TranscriptAction::Close => break,
+            TranscriptAction::Up => {
+                view.scroll_up(1);
+                following = false;
+            }
+            TranscriptAction::Down => view.scroll_down(1, height),
+            TranscriptAction::PageUp => {
+                view.page_up(height);
+                following = false;
+            }
+            TranscriptAction::PageDown => view.page_down(height),
+            TranscriptAction::Top => {
+                view.jump(0, height);
+                following = false;
+            }
+            TranscriptAction::Bottom => {
+                view.jump(usize::MAX, height);
+                following = true;
+                new_rows = 0;
+            }
+            TranscriptAction::Search => mode = ViewerMode::Search(String::new()),
+            TranscriptAction::NextMatch | TranscriptAction::PreviousMatch => {
+                if !view.matches().is_empty() {
+                    if action == TranscriptAction::NextMatch {
+                        view.next_match(height);
+                    } else {
+                        view.previous_match(height);
+                    }
+                    following = false;
+                }
+            }
+            TranscriptAction::Pager => {
+                let text = pager_text(
+                    details.entries().to_vec(),
+                    lock_value(&host.results).as_ref(),
+                    host.ascii,
+                );
+                if let Err(error) = reader.page(&text) {
+                    notice = Some(format!("could not open a pager: {error}"));
+                }
+                host.show(b"\x1b[0m\x1b[2J\x1b[H\x1b[?25l");
+                surface = rune_term::frame::FrameSurface::new(size.0, size.1)?;
+            }
+            TranscriptAction::NextTool
+            | TranscriptAction::PreviousTool
+            | TranscriptAction::ToggleTool
+            | TranscriptAction::Expand
+            | TranscriptAction::ExpandAll => {
                 match action {
                     TranscriptAction::NextTool => details.select(false),
                     TranscriptAction::PreviousTool => details.select(true),
-                    _ => details.toggle(),
+                    TranscriptAction::ExpandAll => details.toggle_all(),
+                    _ => {
+                        if details.selected().is_none() {
+                            details.select_from_row(view.top(), &starts);
+                        }
+                        details.toggle();
+                    }
                 }
-                let (rows, selected) = details.rows(Display {
-                    width: usize::from(size.0),
-                    ascii: host.ascii,
-                    ..Display::default()
-                });
-                let top = selected.unwrap_or(view.top());
-                view = rune_term::screen::Transcript::new(rows);
-                view.jump(top, height);
+                expand(&mut details, size.0);
+                let built = details.rows(display(size.0));
+                starts = built.starts;
+                let top = if action == TranscriptAction::ExpandAll {
+                    if following { usize::MAX } else { view.top() }
+                } else {
+                    following = false;
+                    built.selected.unwrap_or(view.top())
+                };
+                rebuild(&mut view, built.rows, top, height);
             }
-            Some(TranscriptAction::Ignored) | None => {}
+            TranscriptAction::Char(_)
+            | TranscriptAction::Backspace
+            | TranscriptAction::Enter
+            | TranscriptAction::Ignored => {}
         }
     }
     Ok(())
@@ -7743,20 +8093,16 @@ fn history_entries(turns: &[rune_agent::history::Turn]) -> Vec<Entry> {
         .collect()
 }
 
-/// Expands every recorded tool line using the same wrapping as the inline view.
+/// The viewer's rows for entries nobody has expanded or selected yet.
+#[cfg(test)]
 fn full_transcript_rows(entries: &[Entry], cols: u16, ascii: bool) -> Vec<String> {
-    transcript::render(
-        entries,
-        Display {
+    transcript::ToolDetails::new(entries.to_vec())
+        .rows(Display {
             width: usize::from(cols),
             ascii,
-            tool_lines: usize::MAX,
             ..Display::default()
-        },
-    )
-    .lines()
-    .map(str::to_owned)
-    .collect()
+        })
+        .rows
 }
 
 /// Waits for a line to be submitted, drawing the prompt as it is typed.
@@ -24028,6 +24374,7 @@ mod tests {
             inline: Mutex::new(rune_term::inline::Inline::new(80)),
             frame: Mutex::new(()),
             transcript: Mutex::new(Vec::new()),
+            results: Mutex::new(None),
             transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
             transcript_open: std::sync::atomic::AtomicBool::new(false),
             typed: Mutex::new((String::new(), 0)),
@@ -24251,6 +24598,128 @@ for line in sys.stdin:
         assert_eq!(std::fs::read_to_string(&log).expect("log"), before);
         assert!(!before.contains("tools/call"));
         client.shutdown();
+    }
+
+    mod viewer {
+        use super::super::*;
+
+        #[test]
+        fn result_handles_are_found_in_tool_text() {
+            let handle = "result-0123456789abcdef01234567";
+            let text = format!(
+                "read_file:\nhead\n\n[70000 bytes retained; read more with read_tool_result and handle {handle}]"
+            );
+            assert_eq!(
+                result_handle(&text).map(|found| found.as_str().to_owned()),
+                Some(handle.to_owned())
+            );
+            let later = format!("`{handle}` then result-ffffffffffffffffffffffff.");
+            assert_eq!(
+                result_handle(&later).map(|found| found.as_str().to_owned()),
+                Some("result-ffffffffffffffffffffffff".to_owned())
+            );
+            for text in [
+                "result-0123456789ABCDEF01234567",
+                "result-0123456789abcdef0123456",
+                "result-0123456789abcdef012345678",
+                "xresult-0123456789abcdef01234567",
+                "no handle here",
+            ] {
+                assert!(result_handle(text).is_none(), "{text}");
+            }
+        }
+
+        #[test]
+        fn new_rows_below_are_counted_when_not_following() {
+            assert_eq!(follow_row(0, false), None);
+            assert_eq!(follow_row(12, true), None);
+            assert_eq!(
+                follow_row(12, false).as_deref(),
+                Some("12 new lines below, G to follow")
+            );
+        }
+
+        #[test]
+        fn viewer_expands_stored_results_and_marks_missing_ones() {
+            let mut store = rune_tools::result_store::Store::new("session");
+            let mut body = String::new();
+            for row in 0..30_000 {
+                let _ = writeln!(body, "row {row:05} {}", "y".repeat(40));
+            }
+            assert!(body.len() > VIEWER_RESULT_BYTES);
+            let preview = store
+                .spill("read_file", "call", body.clone(), false, 1024)
+                .expect("spill");
+            let entry = Entry::tool(format!("read_file:\n{}", preview.render()));
+            let style = rune_term::diff::DiffStyle::plain();
+            let transcript::Expansion::Text(text) =
+                tool_expansion(&entry, Some(&store), &style, 80, false)
+            else {
+                panic!("a stored result expands to text");
+            };
+            assert!(text.starts_with(&body[..VIEWER_RESULT_BYTES - 1]));
+            assert!(text.ends_with(&format!(
+                "[{} more bytes in {}]",
+                body.len() - VIEWER_RESULT_BYTES,
+                preview.handle
+            )));
+            let empty = rune_tools::result_store::Store::new("session");
+            let transcript::Expansion::Text(missing) =
+                tool_expansion(&entry, Some(&empty), &style, 80, false)
+            else {
+                panic!("a missing result keeps its inline copy");
+            };
+            assert!(missing.starts_with("read_file:\n"));
+            assert!(missing.ends_with("[full output no longer stored]"));
+            assert_eq!(
+                tool_expansion(&Entry::tool("shell: ok"), None, &style, 80, false),
+                transcript::Expansion::Recorded
+            );
+        }
+
+        #[test]
+        fn viewer_expands_edits_to_their_diff() {
+            let style = rune_term::diff::DiffStyle::plain();
+            let edit = Entry::tool(
+                r#"edit_file {"path":"a.rs","old_string":"one\ntwo","new_string":"one\nTWO"}"#,
+            );
+            let transcript::Expansion::Rows(rows) = tool_expansion(&edit, None, &style, 80, true)
+            else {
+                panic!("an edit expands to its diff");
+            };
+            let rows = rows.join("\n");
+            assert!(rows.contains("- two") || rows.contains("-two"), "{rows}");
+            assert!(rows.contains("TWO"), "{rows}");
+            let patch = Entry::tool(
+                r#"apply_patch {"input":"*** Begin Patch\n*** Update File: a.rs\n@@\n keep\n-old line\n+new line\n*** End Patch"}"#,
+            );
+            let transcript::Expansion::Rows(rows) = tool_expansion(&patch, None, &style, 80, true)
+            else {
+                panic!("a patch expands to its diff");
+            };
+            let rows = rows.join("\n");
+            assert!(
+                rows.contains("old line") && rows.contains("new line"),
+                "{rows}"
+            );
+            assert!(!rows.contains("Begin Patch"), "{rows}");
+        }
+
+        #[test]
+        fn viewer_pager_text_is_plain_and_fully_expanded() {
+            let entries = vec![
+                Entry::user("question"),
+                Entry::reasoning("first thought\nsecond thought"),
+                Entry::tool(format!("shell:\n{}", "z".repeat(150))),
+                Entry::assistant("**answer**"),
+            ];
+            let text = pager_text(entries, None, false);
+            assert!(text.contains("second thought"), "{text}");
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(text.lines().all(|line| line.chars().count() <= 100));
+            assert!(!text.contains("tool 3"), "no viewer headers: {text}");
+            assert!(text.contains("answer"));
+        }
     }
 }
 

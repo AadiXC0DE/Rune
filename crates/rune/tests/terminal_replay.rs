@@ -629,7 +629,9 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
         let text = grid.text();
         match capture.stage.as_str() {
             "draft" => draft = Some(grid.clone()),
-            "opened" => {
+            // The viewer opens at the newest row and follows it.
+            "opened" => assert!(text.contains("REPLY-40"), "{text}"),
+            "top" => {
                 assert!(text.contains("\u{258c} inspect"), "{text}");
                 assert!(text.contains("read_file"), "{text}");
                 opened = Some(grid.clone());
@@ -641,32 +643,29 @@ fn full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret()
                 assert!(!text.contains("REPLY-40"), "{text}");
             }
             "home" => assert_eq!(Some(&grid), opened.as_ref()),
-            "tool-selected" => assert!(text.contains("> tool 3: full"), "{text}"),
-            "tool-collapsed" | "tool-recollapsed" => {
-                assert!(text.contains("collapsed"), "{text}");
-                assert!(text.contains("more line(s)"), "{text}");
-                assert!(!text.contains("TOOL-20"), "{text}");
-            }
-            "tool-expanded" => {
-                assert!(text.contains("expanded"), "{text}");
+            "tool-selected" | "tool-collapsed" => {
+                assert!(text.contains("> tool 3: collapsed"), "{text}");
                 assert!(text.contains("TOOL-20"), "{text}");
+            }
+            "tool-expanded" | "tool-reexpanded" => {
+                assert!(text.contains("> tool 3: expanded"), "{text}");
+                assert!(text.contains("TOOL-20"), "{text}");
+                assert!(!text.contains("more line(s)"), "{text}");
             }
             "tool-surrounding-start" => assert!(text.contains("\u{258c} inspect"), "{text}"),
             "tool-surrounding-end" => assert!(text.contains("REPLY-40"), "{text}"),
             "closed" => assert_eq!(Some(&grid), draft.as_ref(), "draft screen or caret changed"),
             "edited" => assert!(text.contains("draft Z界 tail"), "{text}"),
-            "resized" => assert!(text.contains("Transcript"), "{text}"),
+            "resized" => assert!(text.contains("/ search"), "{text}"),
             "live-end" => {
                 assert!(text.contains("LIVE-PARTIAL"), "{text}");
-                assert!(
-                    !text.contains("LIVE-END"),
-                    "snapshot contained future output"
-                );
+                assert!(!text.contains("LIVE-END"), "{text}");
             }
+            "live-followed" => assert!(text.contains("LIVE-PARTIAL LIVE-END"), "{text}"),
             "live-closed" => assert!(text.contains("live draft"), "{text}"),
             "live-edited" => assert!(text.contains("live dZraft"), "{text}"),
             "empty" => {
-                assert!(text.contains("Transcript"), "{text}");
+                assert!(text.contains("q close"), "{text}");
                 assert!(!text.contains("TOOL-"), "old tools leaked into new session");
                 assert!(
                     !text.contains("REPLY-"),

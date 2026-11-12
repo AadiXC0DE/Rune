@@ -212,7 +212,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     action(
         "viewer_close",
         Context::Viewer,
-        &["esc", "ctrl+o", "ctrl+d"],
+        &["q", "esc", "ctrl+o", "ctrl+d"],
         "close the transcript",
     ),
     action(
@@ -239,6 +239,42 @@ pub const ACTIONS: &[ActionInfo] = &[
         Context::Approval,
         &["tab"],
         "deny and tell the model what to do instead",
+    ),
+    action(
+        "viewer_search",
+        Context::Viewer,
+        &["/"],
+        "search the transcript",
+    ),
+    action(
+        "viewer_next",
+        Context::Viewer,
+        &["n"],
+        "go to the next match",
+    ),
+    action(
+        "viewer_previous",
+        Context::Viewer,
+        &["shift+n"],
+        "go to the previous match",
+    ),
+    action(
+        "viewer_expand",
+        Context::Viewer,
+        &["e"],
+        "expand or collapse the selected entry",
+    ),
+    action(
+        "viewer_expand_all",
+        Context::Viewer,
+        &["shift+e"],
+        "expand every entry, or collapse them all",
+    ),
+    action(
+        "viewer_pager",
+        Context::Viewer,
+        &["v"],
+        "open the whole transcript in a pager",
     ),
 ];
 

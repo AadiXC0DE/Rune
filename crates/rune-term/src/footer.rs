@@ -48,6 +48,8 @@ pub enum UiState {
     Menu,
     /// An approval or question picker is open.
     Approval,
+    /// The transcript viewer is open.
+    Viewer,
 }
 
 /// Returns the key hints that work in an interface state.
@@ -58,7 +60,28 @@ pub const fn hints(ui: UiState) -> &'static str {
         UiState::Running => "ctrl-c interrupt   enter steer",
         UiState::Menu => "up/down select   tab complete   esc close",
         UiState::Approval => "up/down select   enter confirm   esc cancel",
+        UiState::Viewer => "/ search   n/N next   e expand   v pager   G follow   q close",
     }
+}
+
+/// Returns the hints of an interface state that fit `width`, dropping whole
+/// hints from the right.
+#[must_use]
+pub fn fitted_hints(ui: UiState, width: usize) -> String {
+    let mut text = String::new();
+    for hint in hints(ui).split(HINT_GAP) {
+        let gap = if text.is_empty() { "" } else { HINT_GAP };
+        if str_width(&text)
+            .saturating_add(gap.len())
+            .saturating_add(str_width(hint))
+            > width
+        {
+            break;
+        }
+        text.push_str(gap);
+        text.push_str(hint);
+    }
+    text
 }
 
 /// One field of the status row.
@@ -366,7 +389,7 @@ fn hint_row(state: &FooterState, theme: &Theme, depth: ColorDepth, width: usize)
         _ if state.gesture_hint.is_some() => &[],
         UiState::Idle => &state.idle_hints,
         UiState::Running => &state.running_hints,
-        UiState::Menu | UiState::Approval => &[],
+        UiState::Menu | UiState::Approval | UiState::Viewer => &[],
     };
     for hint in extra {
         let wider = str_width(&text)
@@ -1040,6 +1063,19 @@ mod tests {
             tasks: 1,
             ..state()
         }
+    }
+
+    #[test]
+    fn viewer_hints_drop_from_the_right() {
+        assert_eq!(
+            fitted_hints(UiState::Viewer, 200),
+            "/ search   n/N next   e expand   v pager   G follow   q close"
+        );
+        assert_eq!(
+            fitted_hints(UiState::Viewer, 30),
+            "/ search   n/N next   e expand"
+        );
+        assert_eq!(fitted_hints(UiState::Viewer, 5), "");
     }
 
     #[test]

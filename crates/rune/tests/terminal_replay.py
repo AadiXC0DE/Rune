@@ -457,7 +457,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert len(prompts) == 2, prompts
             assert "TOOL-30" in prompts[1], prompts[1]
             capture("draft", "draft 界 tail".encode() + b"\x1b[D" * 6)
-            capture("opened", b"\x0f", "Esc/Ctrl-O")
+            capture("opened", b"\x0f", "pager")
+            capture("top", b"g", "\x1b[24;1H")
             capture("page-down", b"\x1b[6~", "\x1b[24;1H")
             capture("end", b"\x1b[F", "\x1b[24;1H")
             capture("up", b"\x1b[A", "\x1b[24;1H")
@@ -467,17 +468,17 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             # Select the result after its call, then exercise disclosure without
             # sending any of these keys to the saved composer draft.
             capture("tool-selected", b"\t\t", "\x1b[24;1H")
-            capture("tool-collapsed", b" ", "\x1b[24;1H")
             capture("tool-expanded", b" ", "\x1b[24;1H")
-            capture("tool-recollapsed", b" ", "\x1b[24;1H")
+            capture("tool-collapsed", b" ", "\x1b[24;1H")
+            capture("tool-reexpanded", b"e", "\x1b[24;1H")
             capture("tool-surrounding-start", b"\x1b[H", "\x1b[24;1H")
             capture("tool-surrounding-end", b"\x1b[F", "\x1b[24;1H")
             # Editing keys, Enter and a paste must never reach the composer.
             capture("closed", b"ignored\r\x1b[200~pasted\ntext\x1b[201~\x1b",
                     "\x1b[?1049l")
             capture("edited", b"Z", "draft Z")
-            capture("reopened", b"\x0f", "Esc/Ctrl-O")
-            capture("resized", expected="Transcript", size=(32, 8))
+            capture("reopened", b"\x0f", "pager")
+            capture("resized", expected="search", size=(32, 8))
             capture("closed-resized", b"\x0f", "\x1b[?1049l")
             # Restore size, then send the saved draft and verify its exact bytes.
             capture("restored-size", size=(80, 24))
@@ -485,19 +486,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             assert prompts[2] == "draft Z界 tail", prompts
             capture("live-started", b"live\r", "LIVE-PARTIAL")
             capture("live-draft", b"live draft" + b"\x1b[D" * 4)
-            capture("live-opened", b"\x0f", "Esc/Ctrl-O")
-            capture("live-end", b"\x1b[F", "\x1b[24;1H")
+            capture("live-opened", b"\x0f", "pager")
+            # Already at the end, which is where the viewer opens.
+            capture("live-end", expected="")
             transcript_live_step.set()
             assert transcript_live_finished.wait(10), "provider did not finish"
-            # The provider finished while the snapshot owned the terminal.
-            # No streaming frame may overwrite its rows or footer.
-            assert not select.select([master], [], [], 0.2)[0], "live output painted over the viewer"
+            # The viewer follows the answer while it owns the terminal.
+            capture("live-followed", expected="LIVE-END")
             capture("live-closed", b"\x1b", "LIVE-PARTIAL LIVE-END\r\n")
             capture("live-edited", b"Z", "live dZraft")
             os.write(master, b"\x03")
             wait_for("\x1b[?25h", len(transcript))
             capture("new-session", b"/new\r", "started session")
-            capture("empty", b"\x0f", "Esc/Ctrl-O")
+            capture("empty", b"\x0f", "pager")
             capture("empty-closed", b"\x1b", "\x1b[?1049l")
             assert len(prompts) == 4, prompts
         elif scenario == "tools":

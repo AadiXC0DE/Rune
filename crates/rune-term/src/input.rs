@@ -95,11 +95,13 @@ Interrupting:
 
 Transcript:
 {}
-  Up / Down     scroll one row
+  Up / Down / k / j  scroll one row
   PageUp / PageDown  scroll one page
-  Home / End    jump to the beginning / end
-  Tab / Shift-Tab  select the next / previous tool
-  Space         collapse or expand the selected tool (16 KiB / 200 rows)
+  Home / End    jump to the beginning / end; the end follows new output
+  g / G         the same as Home / End
+  Enter         run a search while one is typed
+  Tab / Shift-Tab  select the next / previous entry
+  Space         collapse or expand the selected entry
   Ctrl-C        close and restore the draft and caret
 
 Paste:
@@ -201,7 +203,8 @@ pub enum ChoiceKey {
 /// Navigation while the transcript owns the terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TranscriptAction {
-    /// Leave the viewer and restore the draft.
+    /// Leave the viewer and restore the draft; while typing a search, leave
+    /// the search.
     Close,
     /// Scroll one row up.
     Up,
@@ -212,15 +215,33 @@ pub enum TranscriptAction {
     /// Scroll one page down.
     PageDown,
     /// Jump to the beginning.
-    Home,
-    /// Jump to the end.
-    End,
-    /// Select the next tool entry.
+    Top,
+    /// Jump to the end and follow new rows.
+    Bottom,
+    /// Select the next collapsible entry.
     NextTool,
-    /// Select the previous tool entry.
+    /// Select the previous collapsible entry.
     PreviousTool,
-    /// Collapse or expand the selected tool entry.
+    /// Collapse or expand the selected entry.
     ToggleTool,
+    /// Start typing a search.
+    Search,
+    /// Jump to the next match.
+    NextMatch,
+    /// Jump to the previous match.
+    PreviousMatch,
+    /// Expand or collapse the selected entry, choosing one when none is.
+    Expand,
+    /// Expand every entry, or collapse them all when all are expanded.
+    ExpandAll,
+    /// Hand the whole transcript to a pager.
+    Pager,
+    /// A plain character no action holds.
+    Char(char),
+    /// Backspace.
+    Backspace,
+    /// Enter.
+    Enter,
     /// Ignore editing, paste, and non-input events.
     Ignored,
 }
@@ -234,21 +255,67 @@ pub fn transcript_event(keymap: &Keymap, event: &Event) -> TranscriptAction {
     if key.kind == KeyEventKind::Release {
         return TranscriptAction::Ignored;
     }
-    if keymap.action(Context::Viewer, key) == Some("viewer_close") {
-        return TranscriptAction::Close;
+    let bound = match keymap.action(Context::Viewer, key) {
+        Some("viewer_close") => Some(TranscriptAction::Close),
+        Some("viewer_search") => Some(TranscriptAction::Search),
+        Some("viewer_next") => Some(TranscriptAction::NextMatch),
+        Some("viewer_previous") => Some(TranscriptAction::PreviousMatch),
+        Some("viewer_expand") => Some(TranscriptAction::Expand),
+        Some("viewer_expand_all") => Some(TranscriptAction::ExpandAll),
+        Some("viewer_pager") => Some(TranscriptAction::Pager),
+        _ => None,
+    };
+    if let Some(action) = bound {
+        return action;
     }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    match (key.code, control) {
-        (KeyCode::Char('c'), true) => TranscriptAction::Close,
-        (KeyCode::Up, _) => TranscriptAction::Up,
-        (KeyCode::Down, _) => TranscriptAction::Down,
-        (KeyCode::PageUp, _) => TranscriptAction::PageUp,
-        (KeyCode::PageDown, _) => TranscriptAction::PageDown,
-        (KeyCode::Home, _) => TranscriptAction::Home,
-        (KeyCode::End, _) => TranscriptAction::End,
-        (KeyCode::Tab, false) => TranscriptAction::NextTool,
-        (KeyCode::BackTab, false) => TranscriptAction::PreviousTool,
-        (KeyCode::Char(' '), false) => TranscriptAction::ToggleTool,
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('c') if control => TranscriptAction::Close,
+        KeyCode::Up => TranscriptAction::Up,
+        KeyCode::Down => TranscriptAction::Down,
+        KeyCode::PageUp => TranscriptAction::PageUp,
+        KeyCode::PageDown => TranscriptAction::PageDown,
+        KeyCode::Home => TranscriptAction::Top,
+        KeyCode::End => TranscriptAction::Bottom,
+        KeyCode::Tab if !control => TranscriptAction::NextTool,
+        KeyCode::BackTab if !control => TranscriptAction::PreviousTool,
+        KeyCode::Enter => TranscriptAction::Enter,
+        KeyCode::Backspace => TranscriptAction::Backspace,
+        KeyCode::Char(c) if plain => match c {
+            'k' => TranscriptAction::Up,
+            'j' => TranscriptAction::Down,
+            'g' => TranscriptAction::Top,
+            'G' => TranscriptAction::Bottom,
+            ' ' => TranscriptAction::ToggleTool,
+            c => TranscriptAction::Char(c),
+        },
+        _ => TranscriptAction::Ignored,
+    }
+}
+
+/// Maps input while a viewer search is typed: every plain character is text.
+#[must_use]
+pub fn search_event(keymap: &Keymap, event: &Event) -> TranscriptAction {
+    let Event::Key(key) = event else {
+        return TranscriptAction::Ignored;
+    };
+    if key.kind == KeyEventKind::Release {
+        return TranscriptAction::Ignored;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => TranscriptAction::Close,
+        KeyCode::Char('c') if control => TranscriptAction::Close,
+        KeyCode::Enter => TranscriptAction::Enter,
+        KeyCode::Backspace => TranscriptAction::Backspace,
+        KeyCode::Char(c) if plain => TranscriptAction::Char(c),
+        _ if keymap.action(Context::Viewer, key) == Some("viewer_close") => TranscriptAction::Close,
         _ => TranscriptAction::Ignored,
     }
 }
@@ -470,6 +537,22 @@ impl KeyReader {
         Ok(())
     }
 
+    /// Shows `text` in the user's pager with the terminal handed over, and
+    /// takes it back after.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no pager could be started.
+    pub fn page(&self, text: &str) -> std::io::Result<()> {
+        if !self.active {
+            return crate::external_editor::page(text);
+        }
+        let suspension = TerminalSuspension::new()?;
+        let result = crate::external_editor::page(text);
+        suspension.resume()?;
+        result
+    }
+
     /// Waits for one key and applies it.
     ///
     /// Blocks until a key arrives, so the caller can render between keystrokes
@@ -580,13 +663,18 @@ impl KeyReader {
     }
 
     /// Polls viewer navigation, leaving the complete composer untouched.
-    pub fn poll_transcript(&mut self, timeout: Duration) -> Option<TranscriptAction> {
+    /// While `typing` a search, characters arrive as text.
+    pub fn poll_transcript(&mut self, timeout: Duration, typing: bool) -> Option<TranscriptAction> {
         if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
             return None;
         }
         let event = crossterm::event::read().ok()?;
         self.note_focus(&event);
-        Some(transcript_event(&self.keymap, &event))
+        Some(if typing {
+            search_event(&self.keymap, &event)
+        } else {
+            transcript_event(&self.keymap, &event)
+        })
     }
 
     /// Records a focus report.
@@ -1147,8 +1235,8 @@ mod tests {
                 Event::Key(key(KeyCode::PageDown)),
                 TranscriptAction::PageDown,
             ),
-            (Event::Key(key(KeyCode::Home)), TranscriptAction::Home),
-            (Event::Key(key(KeyCode::End)), TranscriptAction::End),
+            (Event::Key(key(KeyCode::Home)), TranscriptAction::Top),
+            (Event::Key(key(KeyCode::End)), TranscriptAction::Bottom),
             (Event::Key(key(KeyCode::Tab)), TranscriptAction::NextTool),
             (
                 Event::Key(key(KeyCode::BackTab)),
@@ -1160,13 +1248,13 @@ mod tests {
             ),
             (
                 Event::Key(key(KeyCode::Char('x'))),
-                TranscriptAction::Ignored,
+                TranscriptAction::Char('x'),
             ),
             (
                 Event::Paste(String::from("replace\nthis")),
                 TranscriptAction::Ignored,
             ),
-            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Ignored),
+            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Enter),
             (Event::Resize(32, 8), TranscriptAction::Ignored),
             (Event::Key(key(KeyCode::Esc)), TranscriptAction::Close),
             (Event::Key(control('o')), TranscriptAction::Close),
@@ -1178,6 +1266,81 @@ mod tests {
         reader.recall_previous(&history);
         reader.recall_next(&history);
         assert_eq!((reader.line().to_owned(), reader.column()), before);
+    }
+
+    #[test]
+    fn viewer_keys_map_to_actions() {
+        let keymap = Keymap::defaults();
+        let shifted = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        for (event, expected) in [
+            (key(KeyCode::Char('j')), TranscriptAction::Down),
+            (key(KeyCode::Down), TranscriptAction::Down),
+            (key(KeyCode::Char('k')), TranscriptAction::Up),
+            (key(KeyCode::Up), TranscriptAction::Up),
+            (key(KeyCode::PageUp), TranscriptAction::PageUp),
+            (key(KeyCode::PageDown), TranscriptAction::PageDown),
+            (key(KeyCode::Char('g')), TranscriptAction::Top),
+            (key(KeyCode::Home), TranscriptAction::Top),
+            (shifted('G'), TranscriptAction::Bottom),
+            (key(KeyCode::End), TranscriptAction::Bottom),
+            (key(KeyCode::Char('q')), TranscriptAction::Close),
+            (key(KeyCode::Esc), TranscriptAction::Close),
+            (control('o'), TranscriptAction::Close),
+            (control('c'), TranscriptAction::Close),
+            (control('d'), TranscriptAction::Close),
+            (key(KeyCode::Tab), TranscriptAction::NextTool),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                TranscriptAction::PreviousTool,
+            ),
+            (key(KeyCode::Char(' ')), TranscriptAction::ToggleTool),
+            (key(KeyCode::Enter), TranscriptAction::Enter),
+            (key(KeyCode::Backspace), TranscriptAction::Backspace),
+            (key(KeyCode::Char('/')), TranscriptAction::Search),
+            (key(KeyCode::Char('n')), TranscriptAction::NextMatch),
+            (shifted('N'), TranscriptAction::PreviousMatch),
+            (key(KeyCode::Char('e')), TranscriptAction::Expand),
+            (shifted('E'), TranscriptAction::ExpandAll),
+            (key(KeyCode::Char('v')), TranscriptAction::Pager),
+            (key(KeyCode::Char('z')), TranscriptAction::Char('z')),
+            (control('z'), TranscriptAction::Ignored),
+        ] {
+            assert_eq!(
+                transcript_event(&keymap, &Event::Key(event)),
+                expected,
+                "{event:?}"
+            );
+        }
+        for (event, expected) in [
+            (key(KeyCode::Char('q')), TranscriptAction::Char('q')),
+            (key(KeyCode::Char('n')), TranscriptAction::Char('n')),
+            (key(KeyCode::Char('/')), TranscriptAction::Char('/')),
+            (shifted('G'), TranscriptAction::Char('G')),
+            (key(KeyCode::Char(' ')), TranscriptAction::Char(' ')),
+            (key(KeyCode::Backspace), TranscriptAction::Backspace),
+            (key(KeyCode::Enter), TranscriptAction::Enter),
+            (key(KeyCode::Esc), TranscriptAction::Close),
+            (control('c'), TranscriptAction::Close),
+            (control('o'), TranscriptAction::Close),
+            (key(KeyCode::Up), TranscriptAction::Ignored),
+        ] {
+            assert_eq!(
+                search_event(&keymap, &Event::Key(event)),
+                expected,
+                "{event:?}"
+            );
+        }
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("viewer_search".to_owned(), vec!["ctrl+f".to_owned()]);
+        let moved = Keymap::with_overrides(&file).expect("valid");
+        assert_eq!(
+            transcript_event(&moved, &Event::Key(control('f'))),
+            TranscriptAction::Search
+        );
+        assert_eq!(
+            transcript_event(&moved, &Event::Key(key(KeyCode::Char('/')))),
+            TranscriptAction::Char('/')
+        );
     }
 
     /// Builds a reader with keys enabled, without touching a real terminal.
