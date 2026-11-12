@@ -12,6 +12,7 @@
 //! which is what makes a mistaken kill recoverable.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::width::{grapheme_width, graphemes, str_width};
 
@@ -20,6 +21,110 @@ pub const HISTORY_LIMIT: usize = 128;
 
 /// How many killed texts are kept for a yank.
 pub const KILL_RING_LIMIT: usize = 8;
+
+/// A paste longer than this many characters becomes a chip.
+pub const CHIP_CHARS: usize = 800;
+
+/// A paste with more lines than this becomes a chip.
+pub const CHIP_LINES: usize = 3;
+
+/// A paste held out of the drawn draft, standing behind its marker.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Chip {
+    /// Number shown in the marker, unique within the draft.
+    pub id: u32,
+    /// Text drawn in the draft in place of the paste.
+    pub marker: String,
+    /// The pasted text the marker stands for.
+    pub text: String,
+}
+
+/// Returns the byte ranges of text shaped like a chip marker:
+/// `[pasted #N: N lines]` or `[pasted #N: N characters]`.
+#[must_use]
+pub fn marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    const OPEN: &str = "[pasted #";
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let mut spans = Vec::new();
+    let mut from = 0usize;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find(OPEN)) {
+        let start = from.saturating_add(found);
+        let rest = text
+            .get(start.saturating_add(OPEN.len())..)
+            .unwrap_or_default();
+        let id = digits(rest);
+        let after = rest.get(id..).unwrap_or_default();
+        let count = after.strip_prefix(": ").map_or(0, digits);
+        let tail = after
+            .get(2usize.saturating_add(count)..)
+            .unwrap_or_default();
+        let close = [" lines]", " characters]"]
+            .iter()
+            .find(|close| tail.starts_with(**close));
+        match close {
+            Some(close) if id > 0 && count > 0 => {
+                let end = start
+                    .saturating_add(OPEN.len())
+                    .saturating_add(id)
+                    .saturating_add(2)
+                    .saturating_add(count)
+                    .saturating_add(close.len());
+                spans.push(start..end);
+                from = end;
+            }
+            _ => from = start.saturating_add(1),
+        }
+    }
+    spans
+}
+
+/// Returns the lines a paste holds; a final line break does not start one.
+fn line_count(text: &str) -> usize {
+    text.lines().count().max(1)
+}
+
+/// Returns whether a paste is large enough to become a chip.
+#[must_use]
+pub fn exceeds_chip_thresholds(text: &str) -> bool {
+    text.chars().count() > CHIP_CHARS || line_count(text) > CHIP_LINES
+}
+
+/// Splits one logical line into the units a row break may fall between:
+/// grapheme clusters, except that a chip marker stays whole when it fits
+/// on a row of `room` columns.
+fn units(part: &str, room: usize) -> Vec<&str> {
+    let spans = marker_spans(part);
+    let mut out = Vec::new();
+    let mut byte = 0usize;
+    let mut spans = spans.iter().peekable();
+    for grapheme in graphemes(part) {
+        let end = byte.saturating_add(grapheme.len());
+        while spans.peek().is_some_and(|span| span.end <= byte) {
+            spans.next();
+        }
+        let inside = spans
+            .peek()
+            .filter(|span| span.start <= byte && byte < span.end)
+            .map(|span| (*span).clone());
+        match inside {
+            Some(span) if span.start == byte => {
+                let marker = part.get(span.clone()).unwrap_or_default();
+                if str_width(marker) <= room {
+                    out.push(marker);
+                } else {
+                    out.push(grapheme);
+                }
+            }
+            Some(span)
+                if part
+                    .get(span.clone())
+                    .is_some_and(|marker| str_width(marker) <= room) => {}
+            _ => out.push(grapheme),
+        }
+        byte = end;
+    }
+    out
+}
 
 /// One row of a draft as it is drawn, in character indexes.
 ///
@@ -58,7 +163,7 @@ pub fn layout(text: &str, first_indent: usize, indent: usize, width: usize) -> V
         // The character after the last space on the row, and the columns after it.
         let mut space: Option<usize> = None;
         let mut after_space = 0usize;
-        for grapheme in graphemes(part) {
+        for grapheme in units(part, room_for(1).min(room_for(0))) {
             let cells = cell_width(grapheme);
             while col.saturating_add(cells) > room_for(rows.len()) && pos > start {
                 if let Some(brk) = space.take().filter(|brk| *brk > start) {
@@ -120,10 +225,12 @@ pub fn caret_in(text: &str, rows: &[VisualRow], caret: usize) -> (usize, usize) 
     (row, span_width(text, start, caret))
 }
 
-/// Returns the columns a cluster takes in a draft row; a tab takes one.
+/// Returns the columns a unit takes in a draft row; a tab takes one.
 fn cell_width(grapheme: &str) -> usize {
     if grapheme == "\t" {
         1
+    } else if grapheme.chars().nth(1).is_some() && grapheme.starts_with('[') {
+        str_width(grapheme)
     } else {
         grapheme_width(grapheme)
     }
@@ -182,6 +289,8 @@ fn position_in(text: &str, rows: &[VisualRow], row: usize, column: usize) -> usi
 struct Snapshot {
     text: String,
     cursor: usize,
+    chips: Arc<Vec<Chip>>,
+    next_chip: u32,
 }
 
 /// The outcome of a paste.
@@ -227,7 +336,12 @@ pub struct Completions {
 }
 
 /// A single line editor.
-#[derive(Clone, Default, Debug)]
+///
+/// A large paste is held as a [`Chip`]: the draft shows its marker, the caret
+/// and row breaks never land inside the marker, and [`Composer::expanded`]
+/// puts the pasted text back. Chips are part of every undo state, so undoing
+/// the removal of a marker brings its text back with it.
+#[derive(Clone, Debug)]
 pub struct Composer {
     text: String,
     cursor: usize,
@@ -237,6 +351,25 @@ pub struct Composer {
     last_yank: Option<(usize, usize, usize)>,
     recall: Option<usize>,
     draft: String,
+    chips: Arc<Vec<Chip>>,
+    next_chip: u32,
+}
+
+impl Default for Composer {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            kill_ring: VecDeque::new(),
+            last_yank: None,
+            recall: None,
+            draft: String::new(),
+            chips: Arc::default(),
+            next_chip: 1,
+        }
+    }
 }
 
 impl Composer {
@@ -349,6 +482,7 @@ impl Composer {
         self.cursor = caret;
         self.recall = None;
         self.draft.clear();
+        self.prune();
         self.settle();
     }
 
@@ -376,17 +510,24 @@ impl Composer {
         self.last_yank = None;
         self.recall = None;
         self.draft.clear();
-        if self.text.is_empty() {
-            return;
+        if !self.text.is_empty() {
+            self.record();
+            self.text.clear();
+            self.cursor = 0;
+            self.prune();
         }
-        self.record();
-        self.text.clear();
-        self.cursor = 0;
+        if self.chips.is_empty() {
+            self.next_chip = 1;
+        }
     }
 
-    /// Removes the cluster before the cursor.
+    /// Removes the cluster before the cursor, or the whole chip marker it
+    /// ends.
     pub fn delete_back(&mut self) -> bool {
         self.last_yank = None;
+        if let Some((start, end)) = self.chip_at(self.cursor) {
+            return self.remove_chars(start, end);
+        }
         let start = self.floor(self.cursor.saturating_sub(1));
         if start == self.cursor {
             return false;
@@ -399,9 +540,12 @@ impl Composer {
         true
     }
 
-    /// Removes the cluster at the cursor.
+    /// Removes the cluster at the cursor, or the whole chip marker it starts.
     pub fn delete_forward(&mut self) -> bool {
         self.last_yank = None;
+        if let Some((start, end)) = self.chip_at(self.cursor.saturating_add(1)) {
+            return self.remove_chars(start, end);
+        }
         let end = self.ceil(self.cursor);
         if end == self.cursor {
             return false;
@@ -413,19 +557,19 @@ impl Composer {
         true
     }
 
-    /// Moves the cursor one cluster left.
+    /// Moves the cursor one cluster left, or over a whole chip marker.
     pub fn move_left(&mut self) -> bool {
         self.last_yank = None;
-        let at = self.floor(self.cursor.saturating_sub(1));
+        let at = self.snap(self.floor(self.cursor.saturating_sub(1)), false);
         let moved = at != self.cursor;
         self.cursor = at;
         moved
     }
 
-    /// Moves the cursor one cluster right.
+    /// Moves the cursor one cluster right, or over a whole chip marker.
     pub fn move_right(&mut self) -> bool {
         self.last_yank = None;
-        let at = self.ceil(self.cursor);
+        let at = self.snap(self.ceil(self.cursor), true);
         let moved = at != self.cursor;
         self.cursor = at;
         moved
@@ -549,8 +693,7 @@ impl Composer {
             return false;
         };
         self.push_redo(self.snapshot());
-        self.text = previous.text;
-        self.cursor = previous.cursor;
+        self.restore(previous);
         true
     }
 
@@ -561,8 +704,7 @@ impl Composer {
             return false;
         };
         self.push_undo(self.snapshot());
-        self.text = next.text;
-        self.cursor = next.cursor;
+        self.restore(next);
         true
     }
 
@@ -583,6 +725,102 @@ impl Composer {
         }
     }
 
+    /// Inserts pasted text at the cursor, or a chip standing for it when it
+    /// holds more than [`CHIP_CHARS`] characters or [`CHIP_LINES`] lines.
+    pub fn paste_text(&mut self, text: &str) -> Paste {
+        let chars = text.chars().count();
+        if !exceeds_chip_thresholds(text) {
+            self.insert(text);
+            return Paste::Inserted { chars };
+        }
+        let marker = self.next_marker(text);
+        self.insert(&marker);
+        self.add_chip(&marker, text);
+        Paste::Placeholder { marker, chars }
+    }
+
+    /// Turns a character range of the draft into a chip, as one edit.
+    /// Returns false, changing nothing, for an empty or invalid range.
+    pub fn collapse_into_chip(&mut self, start: usize, end: usize) -> bool {
+        let total = self.text.chars().count();
+        if start >= end || end > total {
+            return false;
+        }
+        let text = char_slice(&self.text, start, end).to_owned();
+        let marker = self.next_marker(&text);
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(end);
+        self.text.replace_range(from..to, &marker);
+        self.cursor = start.saturating_add(marker.chars().count());
+        self.add_chip(&marker, &text);
+        self.prune();
+        true
+    }
+
+    /// Returns the chips whose markers are in the draft.
+    #[must_use]
+    pub fn chips(&self) -> &[Chip] {
+        &self.chips
+    }
+
+    /// Returns the character range of the chip marker that contains `at` or
+    /// ends at it.
+    #[must_use]
+    pub fn chip_at(&self, at: usize) -> Option<(usize, usize)> {
+        self.marker_ranges()
+            .into_iter()
+            .find(|(start, end, _)| *start < at && at <= *end)
+            .map(|(start, end, _)| (start, end))
+    }
+
+    /// Returns whether the caret is inside a chip marker or at either edge.
+    #[must_use]
+    pub fn caret_on_chip(&self) -> bool {
+        self.chip_touching().is_some()
+    }
+
+    /// Returns the draft with every chip marker replaced by its text.
+    #[must_use]
+    pub fn expanded(&self) -> String {
+        if self.chips.is_empty() {
+            return self.text.clone();
+        }
+        let mut ranges = self.marker_bytes();
+        ranges.sort_by_key(|(range, _)| range.start);
+        let mut out = String::with_capacity(self.text.len());
+        let mut at = 0usize;
+        for (range, chip) in ranges {
+            if range.start < at {
+                continue;
+            }
+            out.push_str(self.text.get(at..range.start).unwrap_or_default());
+            out.push_str(&chip.text);
+            at = range.end;
+        }
+        out.push_str(self.text.get(at..).unwrap_or_default());
+        out
+    }
+
+    /// Replaces the chip marker the caret touches with its text, as one
+    /// edit, leaving the caret after the text. Returns whether there was one.
+    pub fn expand_chip_at_caret(&mut self) -> bool {
+        let Some((start, end, index)) = self.chip_touching() else {
+            return false;
+        };
+        let Some(text) = self.chips.get(index).map(|chip| chip.text.clone()) else {
+            return false;
+        };
+        self.last_yank = None;
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(end);
+        self.text.replace_range(from..to, &text);
+        self.cursor = start.saturating_add(text.chars().count());
+        self.prune();
+        true
+    }
+
     /// Replaces the line with `text`, placing the cursor after it.
     ///
     /// Recall state is dropped, because text put on the line by a caller is
@@ -591,6 +829,7 @@ impl Composer {
         self.show(text);
         self.recall = None;
         self.draft.clear();
+        self.prune();
     }
 
     /// Replaces an externally edited draft as one undoable edit.
@@ -604,6 +843,7 @@ impl Composer {
         self.cursor = self.text.chars().count();
         self.recall = None;
         self.draft.clear();
+        self.prune();
     }
 
     /// Recalls the previous entry of a history.
@@ -682,12 +922,14 @@ impl Composer {
         self.undo.clear();
         self.redo.clear();
         self.cursor = self.text.chars().count();
+        self.prune();
     }
 
-    /// Moves the cursor to `at`, keeping it on a cluster boundary.
+    /// Moves the cursor to `at`, keeping it on a cluster boundary and off
+    /// the inside of a chip marker.
     fn jump(&mut self, at: usize) -> bool {
         self.last_yank = None;
-        let at = self.floor(at);
+        let at = self.snap(self.floor(at), at > self.cursor);
         let moved = at != self.cursor;
         self.cursor = at;
         moved
@@ -698,7 +940,143 @@ impl Composer {
         Snapshot {
             text: self.text.clone(),
             cursor: self.cursor,
+            chips: Arc::clone(&self.chips),
+            next_chip: self.next_chip,
         }
+    }
+
+    /// Puts back a state from the undo or redo stack.
+    fn restore(&mut self, state: Snapshot) {
+        self.text = state.text;
+        self.cursor = state.cursor;
+        self.chips = state.chips;
+        self.next_chip = state.next_chip;
+    }
+
+    /// Returns the marker the next chip made from `text` gets.
+    fn next_marker(&self, text: &str) -> String {
+        let id = self.next_chip;
+        let lines = line_count(text);
+        if lines > 1 {
+            format!("[pasted #{id}: {lines} lines]")
+        } else {
+            format!("[pasted #{id}: {} characters]", text.chars().count())
+        }
+    }
+
+    /// Records a chip for a marker just put in the draft.
+    fn add_chip(&mut self, marker: &str, text: &str) {
+        Arc::make_mut(&mut self.chips).push(Chip {
+            id: self.next_chip,
+            marker: marker.to_owned(),
+            text: text.to_owned(),
+        });
+        self.next_chip = self.next_chip.saturating_add(1);
+    }
+
+    /// Drops the chips whose markers are neither in the draft nor in the
+    /// draft parked by a history walk.
+    fn prune(&mut self) {
+        let live =
+            |chip: &Chip| self.text.contains(&chip.marker) || self.draft.contains(&chip.marker);
+        if self.chips.iter().all(live) {
+            return;
+        }
+        let kept: Vec<Chip> = self
+            .chips
+            .iter()
+            .filter(|chip| live(chip))
+            .cloned()
+            .collect();
+        self.chips = Arc::new(kept);
+    }
+
+    /// Returns the byte range of every chip marker in the draft, with its chip.
+    fn marker_bytes(&self) -> Vec<(std::ops::Range<usize>, &Chip)> {
+        self.chips
+            .iter()
+            .flat_map(|chip| {
+                self.text
+                    .match_indices(chip.marker.as_str())
+                    .map(move |(byte, found)| (byte..byte.saturating_add(found.len()), chip))
+            })
+            .collect()
+    }
+
+    /// Returns the character range of every chip marker, with the chip's
+    /// index.
+    fn marker_ranges(&self) -> Vec<(usize, usize, usize)> {
+        self.chips
+            .iter()
+            .enumerate()
+            .flat_map(|(index, chip)| {
+                self.text
+                    .match_indices(chip.marker.as_str())
+                    .map(move |(byte, found)| (byte, byte.saturating_add(found.len()), index))
+            })
+            .map(|(from, to, index)| {
+                let start = self.text.get(..from).map_or(0, |head| head.chars().count());
+                let len = self
+                    .text
+                    .get(from..to)
+                    .map_or(0, |marker| marker.chars().count());
+                (start, start.saturating_add(len), index)
+            })
+            .collect()
+    }
+
+    /// Returns the marker the caret is inside or at either edge of.
+    fn chip_touching(&self) -> Option<(usize, usize, usize)> {
+        let at = self.cursor;
+        let ranges = self.marker_ranges();
+        ranges
+            .iter()
+            .find(|(start, end, _)| *start < at && at <= *end)
+            .or_else(|| ranges.iter().find(|(start, _, _)| *start == at))
+            .copied()
+    }
+
+    /// Moves an index inside a chip marker to the marker's end when
+    /// `forward`, else to its start.
+    fn snap(&self, at: usize, forward: bool) -> usize {
+        self.marker_ranges()
+            .into_iter()
+            .find(|(start, end, _)| *start < at && at < *end)
+            .map_or(at, |(start, end, _)| if forward { end } else { start })
+    }
+
+    /// Removes a character range as one edit, dropping the chips it held.
+    fn remove_chars(&mut self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.record();
+        let from = self.byte_of(start);
+        let to = self.byte_of(end);
+        self.text.replace_range(from..to, "");
+        self.cursor = start;
+        self.prune();
+        true
+    }
+
+    /// Returns a slice of the draft with chip markers replaced by their text.
+    fn expanded_slice(&self, start: usize, end: usize) -> String {
+        let mut out = String::new();
+        let mut at = start;
+        let mut ranges = self.marker_ranges();
+        ranges.sort_by_key(|(start, _, _)| *start);
+        for (from, to, index) in ranges {
+            if from < at || to > end {
+                continue;
+            }
+            out.push_str(char_slice(&self.text, at, from));
+            if let Some(chip) = self.chips.get(index) {
+                out.push_str(&chip.text);
+            }
+            at = to;
+        }
+        out.push_str(char_slice(&self.text, at, end));
+        out
     }
 
     /// Records the state an edit is about to replace.
@@ -800,16 +1178,19 @@ impl Composer {
 
     /// Removes a character range as one edit, keeping it in the kill ring.
     fn kill_range(&mut self, start: usize, end: usize) -> bool {
+        let start = self.snap(start, false);
+        let end = self.snap(end, true);
         if start >= end {
             self.last_yank = None;
             return false;
         }
+        let killed = self.expanded_slice(start, end);
         self.record();
         let from = self.byte_of(start);
         let to = self.byte_of(end);
-        let killed = self.text.get(from..to).unwrap_or_default().to_owned();
         self.text.replace_range(from..to, "");
         self.cursor = start;
+        self.prune();
         self.kill_ring.push_back(killed);
         while self.kill_ring.len() > KILL_RING_LIMIT {
             self.kill_ring.pop_front();
@@ -878,14 +1259,14 @@ impl Composer {
         let indent_of = |row: usize| if row == 0 { first_indent } else { indent };
         let screen = column.saturating_add(indent_of(row));
         let column = screen.saturating_sub(indent_of(target));
-        self.cursor = position_in(&self.text, &rows, target, column);
+        self.cursor = self.snap(position_in(&self.text, &rows, target, column), false);
         true
     }
 
     /// Keeps the cursor inside the line and off the interior of a cluster.
     fn settle(&mut self) {
         let total = self.text.chars().count();
-        self.cursor = self.floor(self.cursor.min(total));
+        self.cursor = self.snap(self.floor(self.cursor.min(total)), false);
     }
 }
 
@@ -1535,5 +1916,236 @@ mod tests {
         let completions = composer.completions(&candidates);
         assert_eq!(completions.matches, vec!["/help", "/hello"]);
         assert_eq!(completions.common, "/hel");
+    }
+
+    /// Returns `count` short lines, each ending in a line break but the last.
+    fn lines(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_paste_over_the_thresholds_becomes_a_chip() {
+        let mut composer = Composer::new();
+        let exact = "a".repeat(CHIP_CHARS);
+        assert_eq!(
+            composer.paste_text(&exact),
+            Paste::Inserted { chars: CHIP_CHARS }
+        );
+        assert_eq!(composer.text(), exact);
+        composer.clear();
+
+        let long = "b".repeat(CHIP_CHARS + 1);
+        let outcome = composer.paste_text(&long);
+        assert_eq!(outcome.marker(), Some("[pasted #1: 801 characters]"));
+        assert_eq!(composer.text(), "[pasted #1: 801 characters]");
+        assert_eq!(composer.expanded(), long);
+        composer.clear();
+
+        let three = lines(3);
+        composer.paste_text(&three);
+        assert_eq!(composer.text(), three);
+        composer.clear();
+
+        composer.insert("see ");
+        composer.paste_text(&lines(4));
+        assert_eq!(composer.text(), "see [pasted #1: 4 lines]");
+        assert_eq!(composer.expanded(), format!("see {}", lines(4)));
+
+        // A final line break does not count as a line of its own.
+        let mut trailing = Composer::new();
+        trailing.paste_text("a\nb\nc\n");
+        assert_eq!(trailing.text(), "a\nb\nc\n");
+        trailing.clear();
+        trailing.paste_text("a\nb\nc\nd\n");
+        assert_eq!(trailing.text(), "[pasted #1: 4 lines]");
+        assert_eq!(trailing.expanded(), "a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn a_chip_deletes_as_one_unit() {
+        let mut composer = Composer::new();
+        composer.insert("x ");
+        composer.paste_text(&lines(5));
+        composer.insert(" y");
+        let marker = "[pasted #1: 5 lines]";
+        assert_eq!(composer.text(), format!("x {marker} y"));
+
+        // Backspace at the end of the marker removes it whole.
+        composer.move_left();
+        composer.move_left();
+        assert!(composer.delete_back());
+        assert_eq!(composer.text(), "x  y");
+        assert!(composer.chips().is_empty());
+        assert_eq!(composer.expanded(), "x  y");
+
+        // One undo brings it back, chip included.
+        assert!(composer.undo());
+        assert_eq!(composer.text(), format!("x {marker} y"));
+        assert_eq!(composer.expanded(), format!("x {} y", lines(5)));
+
+        // Delete at the start of the marker removes it whole too.
+        composer.move_home();
+        composer.move_right();
+        composer.move_right();
+        assert_eq!(composer.cursor(), 2);
+        assert!(composer.delete_forward());
+        assert_eq!(composer.text(), "x  y");
+        composer.undo();
+
+        // A kill covering part of the marker takes all of it, and the ring
+        // keeps the pasted text, so a yank brings it back as plain text.
+        composer.move_end();
+        composer.move_left();
+        composer.move_left();
+        assert!(composer.kill_word_back());
+        assert_eq!(composer.text(), "x  y");
+        assert!(composer.yank());
+        assert_eq!(composer.text(), format!("x {} y", lines(5)));
+        assert!(composer.chips().is_empty());
+    }
+
+    #[test]
+    fn motion_skips_over_a_chip() {
+        let mut composer = Composer::new();
+        composer.insert("ab");
+        composer.paste_text(&lines(4));
+        composer.insert("cd");
+        let marker_len = "[pasted #1: 4 lines]".chars().count();
+        let end = 4 + marker_len;
+        assert_eq!(composer.cursor(), end);
+
+        composer.move_left();
+        composer.move_left();
+        assert_eq!(composer.cursor(), 2 + marker_len);
+        assert!(composer.move_left());
+        assert_eq!(composer.cursor(), 2);
+        assert!(composer.move_right());
+        assert_eq!(composer.cursor(), 2 + marker_len);
+
+        // Word motion and vertical motion stop at the marker's edges too.
+        composer.move_word_left();
+        assert!(composer.cursor() == 2 || composer.cursor() == 0);
+        composer.move_word_right();
+        assert!(
+            composer
+                .chip_at(composer.cursor())
+                .is_none_or(|(_, e)| e == composer.cursor())
+        );
+
+        // Rows break around the marker, never inside it, wherever it fits on
+        // a row (20 columns of marker after a 2-column indent).
+        let text = composer.text().to_owned();
+        for width in 22..48 {
+            for row in layout(&text, 2, 2, width) {
+                assert!(
+                    composer
+                        .chip_at(row.start)
+                        .is_none_or(|(_, end)| end == row.start),
+                    "width {width} breaks inside the marker: {row:?}"
+                );
+            }
+        }
+        let mut wrapped = Composer::new();
+        wrapped.insert("abcdefgh ");
+        wrapped.paste_text(&lines(4));
+        let width = 24;
+        assert!(wrapped.move_up(2, 2, width));
+        let at = wrapped.cursor();
+        assert!(wrapped.chip_at(at).is_none_or(|(_, end)| end == at));
+    }
+
+    #[test]
+    fn expanded_replaces_every_marker() {
+        let mut composer = Composer::new();
+        composer.insert("first ");
+        composer.paste_text(&lines(4));
+        composer.insert(" then ");
+        composer.paste_text(&"z".repeat(900));
+        composer.insert(" end");
+        assert_eq!(
+            composer.text(),
+            "first [pasted #1: 4 lines] then [pasted #2: 900 characters] end"
+        );
+        assert_eq!(
+            composer.expanded(),
+            format!("first {} then {} end", lines(4), "z".repeat(900))
+        );
+
+        // A pasted text that looks like a marker is not expanded again.
+        let mut nested = Composer::new();
+        nested.paste_text(&format!("[pasted #2: 4 lines]\n{}", lines(4)));
+        nested.paste_text(&lines(6));
+        assert_eq!(
+            nested.expanded(),
+            format!("[pasted #2: 4 lines]\n{}{}", lines(4), lines(6))
+        );
+    }
+
+    #[test]
+    fn chip_ids_keep_counting() {
+        let mut composer = Composer::new();
+        composer.paste_text(&lines(4));
+        composer.insert(" ");
+        composer.paste_text(&lines(5));
+        assert_eq!(composer.text(), "[pasted #1: 4 lines] [pasted #2: 5 lines]");
+
+        composer.move_home();
+        assert!(composer.delete_forward());
+        assert_eq!(composer.text(), " [pasted #2: 5 lines]");
+        composer.move_end();
+        composer.paste_text(&lines(6));
+        assert_eq!(composer.text(), " [pasted #2: 5 lines][pasted #3: 6 lines]");
+        assert_eq!(composer.expanded(), format!(" {}{}", lines(5), lines(6)));
+
+        // A cleared draft has no chips left, so numbering starts again.
+        composer.clear();
+        composer.paste_text(&lines(4));
+        assert_eq!(composer.text(), "[pasted #1: 4 lines]");
+    }
+
+    #[test]
+    fn a_chip_expands_in_place_as_one_edit() {
+        let mut composer = Composer::new();
+        composer.insert("a ");
+        composer.paste_text(&lines(4));
+        assert!(composer.caret_on_chip());
+        assert!(composer.expand_chip_at_caret());
+        assert_eq!(composer.text(), format!("a {}", lines(4)));
+        assert!(!composer.caret_on_chip());
+        assert!(!composer.expand_chip_at_caret());
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "a [pasted #1: 4 lines]");
+        composer.move_home();
+        assert!(!composer.caret_on_chip());
+        composer.move_right();
+        composer.move_right();
+        assert!(composer.caret_on_chip());
+    }
+
+    #[test]
+    fn a_range_collapses_into_a_chip_as_one_edit() {
+        let mut composer = Composer::new();
+        composer.insert("keep ");
+        composer.insert(&lines(4));
+        assert!(composer.collapse_into_chip(5, composer.text().chars().count()));
+        assert_eq!(composer.text(), "keep [pasted #1: 4 lines]");
+        assert_eq!(composer.expanded(), format!("keep {}", lines(4)));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), format!("keep {}", lines(4)));
+    }
+
+    #[test]
+    fn a_history_walk_keeps_the_chips_of_the_parked_draft() {
+        let mut composer = Composer::new();
+        composer.paste_text(&lines(4));
+        let entries = vec!["older".to_owned()];
+        assert!(composer.history_previous(&entries));
+        assert_eq!(composer.expanded(), "older");
+        assert!(composer.history_next(&entries));
+        assert_eq!(composer.text(), "[pasted #1: 4 lines]");
+        assert_eq!(composer.expanded(), lines(4));
     }
 }

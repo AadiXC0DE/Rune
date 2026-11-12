@@ -10,7 +10,7 @@
 //! it rather than where the editor thinks it is.
 
 use std::io::IsTerminal;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -26,6 +26,42 @@ const DEFAULT_WIDTH: usize = 80;
 
 /// How long a blocking key read waits before checking for a redraw request.
 const REDRAW_POLL: Duration = Duration::from_millis(100);
+
+/// The longest gap between two keys of a paste that arrives as keystrokes.
+const BURST_GAP: Duration = Duration::from_millis(8);
+
+/// Keys that arrive this close together before they count as a paste.
+const BURST_MIN: usize = 3;
+
+/// How long after a paste's last key an Enter still inserts a line break.
+const BURST_ENTER_GRACE: Duration = Duration::from_millis(120);
+
+/// How long without a key ends a paste that arrives as keystrokes.
+#[cfg(windows)]
+const BURST_IDLE: Duration = Duration::from_millis(60);
+#[cfg(not(windows))]
+const BURST_IDLE: Duration = Duration::from_millis(8);
+
+/// Tracks keys that arrive faster than anyone types, which is how a paste
+/// looks on a terminal that does not bracket it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Burst {
+    /// When the last key of the current run arrived.
+    last: Option<Instant>,
+    /// Keys in the current run.
+    run: usize,
+    /// Caret position where the current run began.
+    start_char: usize,
+    /// Until when Enter and Tab are taken as pasted text.
+    active_until: Option<Instant>,
+}
+
+impl Burst {
+    /// Returns whether the current run is long enough to be a paste.
+    const fn active(&self) -> bool {
+        self.run >= BURST_MIN
+    }
+}
 
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
@@ -187,6 +223,8 @@ pub enum KeyAction {
     Queue,
     /// Show or hide the plan pinned above the prompt.
     TogglePlan,
+    /// Replace the paste chip at the caret with its text.
+    ExpandChip,
 }
 
 /// A key read while a one-key answer is awaited.
@@ -334,6 +372,8 @@ pub struct KeyReader {
     focus: Tri,
     keymap: Keymap,
     context: Context,
+    burst_enabled: bool,
+    burst: Burst,
 }
 
 impl KeyReader {
@@ -372,6 +412,11 @@ impl KeyReader {
             focus: Tri::Unknown,
             keymap: Keymap::defaults(),
             context: Context::Menu,
+            // Bracketed paste covers other terminals, and keys written
+            // quickly by a test harness would otherwise look like a paste.
+            burst_enabled: cfg!(windows)
+                || std::env::var_os("RUNE_PASTE_BURST").is_some_and(|value| value == "1"),
+            burst: Burst::default(),
         }
     }
 
@@ -387,6 +432,8 @@ impl KeyReader {
             focus: Tri::Unknown,
             keymap: Keymap::defaults(),
             context: Context::Menu,
+            burst_enabled: false,
+            burst: Burst::default(),
         }
     }
 
@@ -433,10 +480,30 @@ impl KeyReader {
         self.active
     }
 
-    /// Returns the line being edited.
+    /// Returns the line being edited, as drawn: a paste chip shows as its
+    /// marker.
     #[must_use]
     pub fn line(&self) -> &str {
         self.composer.text()
+    }
+
+    /// Returns the line with every paste chip replaced by its text, which
+    /// is what a submitted or queued draft sends.
+    #[must_use]
+    pub fn expanded_line(&self) -> String {
+        self.composer.expanded()
+    }
+
+    /// Replaces the paste chip at or before the caret with its text, as one
+    /// undoable edit. Returns whether there was one.
+    pub fn expand_chip_at_caret(&mut self) -> bool {
+        self.composer.expand_chip_at_caret()
+    }
+
+    /// Returns whether the caret touches a paste chip.
+    #[must_use]
+    pub fn caret_on_chip(&self) -> bool {
+        self.composer.caret_on_chip()
     }
 
     /// Returns the displayed prefix width, counting each newline and tab as
@@ -565,18 +632,29 @@ impl KeyReader {
         }
         // Polled rather than blocking, so a resumed process redraws without
         // waiting for a key.
+        let queued = self.queued();
         loop {
             if crate::modes::redraw_pending() {
                 return KeyAction::Ignored;
             }
-            if crossterm::event::poll(REDRAW_POLL).unwrap_or(true) {
+            let wait = if self.burst.active() {
+                BURST_IDLE
+            } else {
+                REDRAW_POLL
+            };
+            if crossterm::event::poll(wait).unwrap_or(true) {
                 break;
+            }
+            if self.burst.active() {
+                self.end_burst();
+                return KeyAction::Ignored;
             }
         }
         let Ok(event) = crossterm::event::read() else {
             return KeyAction::Ignored;
         };
-        self.handle(event).unwrap_or(KeyAction::Ignored)
+        self.handle_at(event, Instant::now(), queued)
+            .unwrap_or(KeyAction::Ignored)
     }
 
     /// Returns the next key if one is already waiting, without blocking.
@@ -585,13 +663,37 @@ impl KeyReader {
     /// that may never come: the turn's own progress still has to be drawn.
     /// Returns `None` when nothing is ready.
     pub fn poll_key(&mut self, timeout: Duration) -> Option<KeyAction> {
-        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+        if !self.active {
+            return None;
+        }
+        let queued = self.queued();
+        let wait = if self.burst.active() {
+            timeout.min(BURST_IDLE)
+        } else {
+            timeout
+        };
+        if !crossterm::event::poll(wait).unwrap_or(false) {
+            let idle = self
+                .burst
+                .last
+                .is_none_or(|last| last.elapsed() >= BURST_IDLE);
+            if self.burst.active() && idle {
+                self.end_burst();
+                return Some(KeyAction::Ignored);
+            }
             return None;
         }
         let Ok(event) = crossterm::event::read() else {
             return None;
         };
-        self.handle(event)
+        self.handle_at(event, Instant::now(), queued)
+    }
+
+    /// Returns whether an event is already waiting, which means it arrived
+    /// while the last one was being handled: as part of a paste, when the
+    /// burst check is on.
+    fn queued(&self) -> bool {
+        self.burst_enabled && crossterm::event::poll(Duration::ZERO).unwrap_or(false)
     }
 
     /// Polls a choice without changing the draft, caret, or editing history.
@@ -691,10 +793,18 @@ impl KeyReader {
     /// Shared by both ways of reading, so a paste means the same thing whether
     /// it arrives at the prompt or while a turn runs.
     pub fn handle(&mut self, event: Event) -> Option<KeyAction> {
+        self.handle_at(event, Instant::now(), false)
+    }
+
+    /// Applies one event that arrived at `now`; `queued` says it was
+    /// already waiting when the read began.
+    fn handle_at(&mut self, event: Event, now: Instant, queued: bool) -> Option<KeyAction> {
         match event {
             // A release also arrives on some terminals, and acting on it would
             // insert every character twice.
-            Event::Key(key) if key.kind != KeyEventKind::Release => Some(self.apply(key)),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                Some(self.apply_burst(key, now, queued))
+            }
             Event::Paste(text) => {
                 self.paste(&text);
                 Some(KeyAction::Ignored)
@@ -716,11 +826,84 @@ impl KeyReader {
     /// the terminal and a pasted sequence would act on it.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        // Nothing is withheld: the line is what is submitted, and a marker in
-        // place of the text would send the marker. The drawn row is cut to the
-        // window whatever its length.
+        // A large paste is drawn as a chip; the submitted line is expanded.
         self.composer
-            .paste(&crate::transcript::sanitize(&text), usize::MAX);
+            .paste_text(&crate::transcript::sanitize(&text));
+    }
+
+    /// Applies one key as though it arrived at `now`, so a test can control
+    /// the time that paste burst detection sees.
+    pub fn apply_at(&mut self, key: KeyEvent, now: Instant) -> KeyAction {
+        self.apply_burst(key, now, false)
+    }
+
+    /// Applies a key, first taking Enter and Tab as text inside a burst of
+    /// keys that arrive faster than anyone types.
+    fn apply_burst(&mut self, key: KeyEvent, now: Instant, queued: bool) -> KeyAction {
+        if !self.burst_enabled {
+            return self.apply(key);
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let counted = match key.code {
+            KeyCode::Char(_) => plain,
+            KeyCode::Enter | KeyCode::Tab => key.modifiers.is_empty(),
+            _ => false,
+        };
+        if !counted {
+            self.end_burst();
+            self.burst.last = None;
+            return self.apply(key);
+        }
+        let close = queued
+            || self
+                .burst
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) <= BURST_GAP);
+        if close && self.burst.run > 0 {
+            self.burst.run = self.burst.run.saturating_add(1);
+        } else {
+            self.end_burst();
+            self.burst.run = 1;
+            self.burst.start_char = self.composer.cursor();
+        }
+        self.burst.last = Some(now);
+        if self.burst.active() {
+            self.burst.active_until = now.checked_add(BURST_ENTER_GRACE);
+        }
+        let pasting = self.burst.active_until.is_some_and(|until| now <= until);
+        match key.code {
+            KeyCode::Enter if pasting => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
+            KeyCode::Tab if pasting => {
+                self.composer.insert("\t");
+                KeyAction::Ignored
+            }
+            _ => self.apply(key),
+        }
+    }
+
+    /// Ends a burst of pasted keys, turning its text into a chip when it is
+    /// as large as a bracketed paste that would become one.
+    fn end_burst(&mut self) {
+        if self.burst.active() {
+            let start = self.burst.start_char;
+            let end = self.composer.cursor();
+            let pasted: String = self
+                .composer
+                .text()
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect();
+            if end > start && crate::editor::exceeds_chip_thresholds(&pasted) {
+                self.composer.collapse_into_chip(start, end);
+            }
+        }
+        self.burst.run = 0;
     }
 
     /// Applies one key to the line.
@@ -763,6 +946,11 @@ impl KeyReader {
             }
             "clear" => KeyAction::Escape,
             "history_search" => KeyAction::HistorySearch,
+            // On a paste chip at the idle prompt Ctrl-O opens the paste
+            // instead; during a turn it always opens the viewer.
+            "transcript" if self.context != Context::Turn && self.composer.caret_on_chip() => {
+                KeyAction::ExpandChip
+            }
             "transcript" => KeyAction::Transcript,
             "external_editor" => KeyAction::ExternalEditor,
             // An open menu keeps the key, so it never changes the mode behind it.
@@ -1354,6 +1542,8 @@ mod tests {
             focus: Tri::Unknown,
             keymap: Keymap::defaults(),
             context: Context::Menu,
+            burst_enabled: false,
+            burst: Burst::default(),
         }
     }
 
@@ -2194,5 +2384,123 @@ mod tests {
         let mut reader = reader();
         typed(&mut reader, "書");
         assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn ctrl_o_on_a_chip_expands_it() {
+        let mut reader = reader();
+        reader.set_context(Context::Editor);
+        typed(&mut reader, "x ");
+        reader.paste("one\ntwo\nthree\nfour");
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        assert_eq!(reader.expanded_line(), "x one\ntwo\nthree\nfour");
+        assert!(reader.caret_on_chip());
+        assert_eq!(reader.apply(control('o')), KeyAction::ExpandChip);
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        assert!(reader.expand_chip_at_caret());
+        assert_eq!(reader.line(), "x one\ntwo\nthree\nfour");
+        // Off the chip, and always during a turn, the key opens the viewer.
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        reader.set_context(Context::Editor);
+        reader.apply(key(KeyCode::Home));
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+    }
+
+    #[test]
+    fn burst_enter_inserts_a_newline() {
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        for (ms, code) in [
+            (0, KeyCode::Char('a')),
+            (2, KeyCode::Char('b')),
+            (4, KeyCode::Enter),
+            (6, KeyCode::Char('c')),
+            (8, KeyCode::Char('d')),
+        ] {
+            assert_eq!(reader.apply_at(key(code), at(ms)), KeyAction::Ignored);
+        }
+        assert_eq!(reader.line(), "ab\ncd");
+        // Inside the grace after the last pasted key Enter is still text,
+        // and Tab is a tab rather than a completion.
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Tab), at(100)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(110)),
+            KeyAction::Ignored
+        );
+        assert_eq!(reader.line(), "ab\ncd\t\n");
+        // After it, Enter submits again.
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(400)),
+            KeyAction::Submit
+        );
+    }
+
+    #[test]
+    fn slow_typing_is_not_a_burst() {
+        let mut plain = reader();
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Char('a')), at(0)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Char('b')), at(90)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(180)),
+            KeyAction::Submit
+        );
+        assert_eq!(reader.line(), "ab");
+        // Two quick keys are not yet a burst.
+        reader.clear();
+        reader.apply_at(key(KeyCode::Char('o')), at(1000));
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(1003)),
+            KeyAction::Submit
+        );
+        // Off, as it is by default where the terminal brackets pastes, a
+        // fast Enter submits.
+        typed(&mut plain, "ab");
+        assert_eq!(
+            plain.apply_at(key(KeyCode::Enter), at(0)),
+            KeyAction::Submit
+        );
+    }
+
+    #[test]
+    fn a_large_burst_becomes_a_chip_when_it_ends() {
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        typed(&mut reader, "see ");
+        let start = Instant::now();
+        let mut ms = 1000u64;
+        for line in ["l1", "l2", "l3", "l4"] {
+            for c in line.chars() {
+                reader.apply_at(key(KeyCode::Char(c)), start + Duration::from_millis(ms));
+                ms += 1;
+            }
+            reader.apply_at(key(KeyCode::Enter), start + Duration::from_millis(ms));
+            ms += 1;
+        }
+        assert_eq!(reader.line(), "see l1\nl2\nl3\nl4\n");
+        reader.end_burst();
+        assert_eq!(reader.line(), "see [pasted #1: 4 lines]");
+        assert_eq!(reader.expanded_line(), "see l1\nl2\nl3\nl4\n");
+        // The collapse is one edit.
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "see l1\nl2\nl3\nl4\n");
     }
 }

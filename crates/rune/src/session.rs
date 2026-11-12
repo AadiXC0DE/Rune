@@ -488,6 +488,8 @@ struct SessionHost {
     cleared: Mutex<std::collections::VecDeque<String>>,
     /// When a first Escape over a typed draft armed the interrupt.
     escape_armed: Mutex<Option<std::time::Instant>>,
+    /// Whether the idle caret touches a paste chip, which Ctrl-O expands.
+    on_chip: std::sync::atomic::AtomicBool,
     /// Steering submitted and not yet taken in by the turn, oldest first.
     pending_steer: Mutex<Vec<String>>,
     events: Arc<Mutex<Vec<Event>>>,
@@ -2903,10 +2905,16 @@ impl SessionHost {
                 UiState::Idle
             }),
             // Shown only when each fits whole; the newline key is the lowest priority.
-            idle_hints: if self.accessible {
-                vec![self.caps.newline_hint()]
-            } else {
-                vec!["shift-tab mode", self.caps.newline_hint()]
+            idle_hints: {
+                let mut hints = if self.accessible {
+                    vec![self.caps.newline_hint()]
+                } else {
+                    vec!["shift-tab mode", self.caps.newline_hint()]
+                };
+                if self.on_chip.load(std::sync::atomic::Ordering::Relaxed) {
+                    hints.insert(0, "ctrl-o expands the paste");
+                }
+                hints
             },
             running_hints: {
                 let mut hints = Vec::new();
@@ -4650,6 +4658,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         touched: Mutex::new(std::collections::BTreeSet::new()),
         cleared: Mutex::new(std::collections::VecDeque::new()),
         escape_armed: Mutex::new(None),
+        on_chip: std::sync::atomic::AtomicBool::new(false),
         pending_steer: Mutex::new(Vec::new()),
         events: Arc::new(Mutex::new(Vec::new())),
         goal_judge: std::sync::atomic::AtomicBool::new(false),
@@ -6506,7 +6515,7 @@ fn run_steerable<T: Send>(
                     host.interrupt();
                     host.draw_notice("interrupting");
                 } else {
-                    host.save_cleared(reader.line());
+                    host.save_cleared(&reader.expanded_line());
                     reader.clear();
                     host.draw_stream_with("", 0);
                 }
@@ -6552,7 +6561,7 @@ fn run_steerable<T: Send>(
                 let Some(text) = recovered else {
                     return;
                 };
-                let typed = reader.line().to_owned();
+                let typed = reader.expanded_line();
                 if typed.trim().is_empty() {
                     reader.replace(&text);
                 } else {
@@ -7189,6 +7198,7 @@ fn question_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
+        | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue
         | KeyAction::Transcript
@@ -7430,9 +7440,9 @@ enum Lane {
     Queue,
 }
 
-/// Returns the text a draft sends to either lane.
+/// Returns the text a draft sends to either lane, paste chips expanded.
 fn lane_text(reader: &rune_term::input::KeyReader) -> String {
-    reader.line().trim().to_owned()
+    reader.expanded_line().trim().to_owned()
 }
 
 /// Draws the frame that closes a turn: its settled lines, then the input row.
@@ -7460,7 +7470,7 @@ fn close_turn(
     if !returned.is_empty() {
         let count = returned.len();
         if !reader.line().trim().is_empty() {
-            returned.push(reader.line().to_owned());
+            returned.push(reader.expanded_line());
         }
         reader.replace(&returned.join("\n\n"));
         notice = Some(if ended_early {
@@ -8204,6 +8214,8 @@ fn await_submission(
             )
         };
         let notice = flash.as_ref().map(|(line, _)| line.as_str());
+        host.on_chip
+            .store(reader.caret_on_chip(), std::sync::atomic::Ordering::Relaxed);
         draw_prompt(reader, host, out, &rows, &prompt_marker(host), notice)?;
 
         let draft = reader.line().to_owned();
@@ -8254,6 +8266,12 @@ fn await_submission(
         }
         if key == KeyAction::Transcript {
             view_transcript(reader, host)?;
+            continue;
+        }
+        if key == KeyAction::ExpandChip {
+            reader.expand_chip_at_caret();
+            selected = 0;
+            paths = None;
             continue;
         }
         if key == KeyAction::ExternalEditor {
@@ -8346,8 +8364,14 @@ fn await_submission(
                 lock_value(&host.pending_model).take();
             }
             Idle::Stay => {}
-            Idle::Leave => return Ok(None),
+            Idle::Leave => {
+                host.on_chip
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
             Idle::Submit(input) => {
+                host.on_chip
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Input::Prompt(text) = &input {
                     for path in mentions(text) {
                         host.touch(&path);
@@ -8691,6 +8715,7 @@ fn idle_key(
         | KeyAction::CycleReasoning
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
+        | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue => Idle::Stay,
         KeyAction::Submit => {
@@ -8704,7 +8729,7 @@ fn idle_key(
                 *selected = 0;
                 return Idle::Stay;
             }
-            let text = reader.line().trim().to_owned();
+            let text = reader.expanded_line().trim().to_owned();
             reader.clear();
             if text.is_empty() {
                 return Idle::Stay;
@@ -8719,7 +8744,7 @@ fn idle_key(
         // would end the session the user only meant to stop a turn in.
         KeyAction::Escape => {
             if !reader.line().is_empty() {
-                gestures.cleared = Some(reader.line().to_owned());
+                gestures.cleared = Some(reader.expanded_line());
             }
             reader.clear();
             *selected = 0;
@@ -8737,7 +8762,7 @@ fn idle_key(
                 return Idle::Stay;
             }
             gestures.interrupts.clear();
-            gestures.cleared = Some(reader.line().to_owned());
+            gestures.cleared = Some(reader.expanded_line());
             reader.clear();
             *selected = 0;
             Idle::Stay
@@ -8902,6 +8927,7 @@ fn confirm_choice(
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
+                | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
                     let typed = answer.line().to_owned();
@@ -8994,6 +9020,7 @@ fn run_picker(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
@@ -9062,6 +9089,7 @@ fn search_prompt_history(
                 | KeyAction::CycleReasoning
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
+                | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
                     picker.set_query(query.line());
@@ -11197,6 +11225,7 @@ fn choose_theme(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
@@ -11400,6 +11429,7 @@ fn pick_index(
             | KeyAction::CycleReasoning
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
+            | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
@@ -15685,6 +15715,22 @@ mod tests {
     }
 
     #[test]
+    fn the_idle_hint_row_offers_to_expand_a_paste_under_the_caret() {
+        let host = test_host();
+        let plain = host.status_line_in(120, Some(UiState::Idle));
+        assert!(!plain.contains("ctrl-o expands the paste"), "{plain:?}");
+        host.on_chip
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let idle = host.status_line_in(120, Some(UiState::Idle));
+        assert!(
+            idle.contains("/ commands   ctrl-o expands the paste   shift-tab mode"),
+            "{idle:?}"
+        );
+        let running = host.status_line_in(120, Some(UiState::Running));
+        assert!(!running.contains("expands the paste"), "{running:?}");
+    }
+
+    #[test]
     fn collapsed_reasoning_shows_a_thinking_row_and_commits_one_line() {
         let (host, sink) = reasoning_host(ReasoningMode::Collapsed);
         reason(&host, "THINK-1\n");
@@ -16088,6 +16134,83 @@ mod tests {
         assert_eq!(reader.line(), "");
         assert_eq!(gestures.cleared.as_deref(), Some("draft one"));
         assert_eq!(gestures.hint, None);
+    }
+
+    #[test]
+    fn paste_chips_are_sent_and_kept_expanded() {
+        let commands = command_candidates(&[]);
+        let pasted = "one\ntwo\nthree\nfour";
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut selected = 0;
+        let mut gestures = IdleGestures::default();
+
+        // A turn's lanes and the idle prompt both send the pasted text.
+        reader.replace("see ");
+        reader.paste(pasted);
+        assert_eq!(reader.line(), "see [pasted #1: 4 lines]");
+        assert_eq!(lane_text(&reader), format!("see {pasted}"));
+        let step = idle_key(
+            &commands,
+            KeyAction::Submit,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+            &mut gestures,
+        );
+        let Idle::Submit(Input::Prompt(text)) = step else {
+            panic!("the draft was not submitted");
+        };
+        assert_eq!(text, format!("see {pasted}"));
+
+        // A cleared draft is kept with its paste, not with the marker alone.
+        reader.paste(pasted);
+        idle_key(
+            &commands,
+            KeyAction::Escape,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+            &mut gestures,
+        );
+        assert_eq!(gestures.cleared.as_deref(), Some(pasted));
+
+        // A chip holding only whitespace sends nothing.
+        reader.paste(" \n \n \n \n");
+        assert!(reader.line().starts_with("[pasted #1"));
+        let step = idle_key(
+            &commands,
+            KeyAction::Submit,
+            &mut reader,
+            &mut selected,
+            &[],
+            &[],
+            &mut gestures,
+        );
+        assert!(matches!(step, Idle::Stay));
+    }
+
+    #[test]
+    fn returned_messages_keep_the_paste_typed_beside_them() {
+        let host = test_host();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut locked = LockedSink {
+            stream: Arc::new(Mutex::new(SharedSink(Arc::clone(&sink)))),
+        };
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        reader.paste("one\ntwo\nthree\nfour");
+        close_turn(
+            &host,
+            &mut locked,
+            &mut reader,
+            &[],
+            None,
+            &["unsent".to_owned()],
+            true,
+        )
+        .expect("close turn");
+        assert_eq!(reader.line(), "unsent\n\none\ntwo\nthree\nfour");
     }
 
     #[test]
@@ -24339,6 +24462,7 @@ mod tests {
             touched: Mutex::new(std::collections::BTreeSet::new()),
             cleared: Mutex::new(std::collections::VecDeque::new()),
             escape_armed: Mutex::new(None),
+            on_chip: std::sync::atomic::AtomicBool::new(false),
             pending_steer: Mutex::new(Vec::new()),
             events: Arc::new(Mutex::new(Vec::new())),
             goal_judge: std::sync::atomic::AtomicBool::new(false),
