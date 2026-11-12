@@ -24,6 +24,7 @@ mod config_edit;
 mod connect_flow;
 mod context_watch;
 mod diagnostics;
+mod file_index;
 mod help;
 mod helper_usage;
 mod hooks;

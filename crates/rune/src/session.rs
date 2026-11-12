@@ -480,6 +480,10 @@ struct SessionHost {
     plan: Mutex<Option<rune_tools::PlanUpdate>>,
     /// Whether the pinned plan is drawn; Ctrl+T flips it.
     plan_visible: std::sync::atomic::AtomicBool,
+    /// Workspace paths offered by `@` mentions and Tab completion.
+    files: crate::file_index::SharedIndex,
+    /// Workspace-relative paths this session read, changed or mentioned.
+    touched: Mutex<std::collections::BTreeSet<String>>,
     /// Drafts cleared by Escape or Control-C, newest last, for Up to recall.
     cleared: Mutex<std::collections::VecDeque<String>>,
     /// When a first Escape over a typed draft armed the interrupt.
@@ -1247,6 +1251,7 @@ impl Host for SessionHost {
                 output,
                 elapsed,
             } => {
+                self.touch_tool_paths(call);
                 if let Ok(mut running) = self.running.lock() {
                     running.retain(|running| running.id != call.id);
                 }
@@ -2296,6 +2301,36 @@ impl SessionHost {
             {
                 self.draw_notice(&format!("helper usage was not recorded: {error}"));
             }
+        }
+    }
+
+    /// Records a path for `@` ranking, when it lies in the workspace.
+    fn touch(&self, raw: &str) {
+        if let Some(path) = workspace_relative(self.context.workspace(), raw) {
+            lock_value(&self.touched).insert(path);
+        }
+    }
+
+    /// Records the paths a finished file tool named.
+    fn touch_tool_paths(&self, call: &turn::PreparedCall) {
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or_default();
+        let paths = match call.name.as_str() {
+            "read_file" | "edit_file" | "write_file" => arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            "apply_patch" => arguments
+                .get("input")
+                .and_then(serde_json::Value::as_str)
+                .map(rune_tools::apply_patch::paths)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for path in paths {
+            self.touch(&path);
         }
     }
 
@@ -4556,7 +4591,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     } else {
         Channel::None
     };
-    let host = SessionHost {
+    let mut host = SessionHost {
         cache_key: std::sync::OnceLock::new(),
         usage_paths: Some(config.paths.clone()),
         hooks: config
@@ -4607,6 +4642,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         last_failed: Mutex::new(None),
         plan: Mutex::new(None),
         plan_visible: std::sync::atomic::AtomicBool::new(terminal_height() >= PLAN_PIN_MIN_HEIGHT),
+        files: crate::file_index::SharedIndex::default(),
+        touched: Mutex::new(std::collections::BTreeSet::new()),
         cleared: Mutex::new(std::collections::VecDeque::new()),
         escape_armed: Mutex::new(None),
         pending_steer: Mutex::new(Vec::new()),
@@ -4825,6 +4862,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             std::env::var("RUNE_DEBUG_PANIC_AFTER_FIRST_FRAME").as_deref() != Ok("1"),
             "debug panic after the first frame"
         );
+    }
+    // Built after the first frame, so the banner never waits on a walk.
+    if keyed && !config.accessible {
+        host.files = crate::file_index::SharedIndex::start(host.context.workspace().to_owned());
     }
 
     host.with_event_hooks(&Cancellation::new(), |hooks| {
@@ -7744,6 +7785,9 @@ fn await_submission(
     // what the user is looking at.
     let mut selected = 0_usize;
     let mut paths: Option<crate::path_completion::Paths> = None;
+    // The draft an `@` menu was closed over; it stays closed until the draft changes.
+    let mut dismissed: Option<String> = None;
+    let mut mention_open = false;
     // The line naming a mode just chosen, and when it is taken down.
     let mut flash: Option<(String, std::time::Instant)> = None;
     // The values of the command whose argument is being typed, read once when
@@ -7773,29 +7817,46 @@ fn await_submission(
                     host.menu_room(),
                 )
             });
-        let rows = paths.as_ref().map_or_else(
-            || {
-                value_menu.clone().unwrap_or_else(|| {
-                    completion_rows(
-                        commands,
-                        reader.line(),
-                        selected,
-                        &host.theme(),
-                        host.depth(),
-                        host.menu_room(),
-                    )
-                })
-            },
-            |paths| {
-                path_completion_rows(
-                    paths,
-                    selected,
-                    &host.theme(),
-                    host.depth(),
-                    host.menu_room(),
-                )
-            },
-        );
+        if dismissed.as_deref() != Some(reader.line()) {
+            dismissed = None;
+        }
+        let mention = if paths.is_none() && dismissed.is_none() {
+            Mentions::at(host, reader.line(), reader.cursor_byte())
+        } else {
+            None
+        };
+        if mention.is_some() && !mention_open {
+            host.files.refresh_if_stale(context.workspace());
+        }
+        mention_open = mention.is_some();
+        let rows = if let Some(paths) = &paths {
+            path_completion_rows(
+                paths,
+                selected,
+                &host.theme(),
+                host.depth(),
+                host.menu_room(),
+            )
+        } else if let Some(menu) = &mention {
+            mention_rows(
+                menu,
+                selected,
+                &host.theme(),
+                host.depth(),
+                host.menu_room(),
+            )
+        } else if let Some(rows) = value_menu.clone() {
+            rows
+        } else {
+            completion_rows(
+                commands,
+                reader.line(),
+                selected,
+                &host.theme(),
+                host.depth(),
+                host.menu_room(),
+            )
+        };
         let notice = flash.as_ref().map(|(line, _)| line.as_str());
         draw_prompt(reader, host, out, &rows, &prompt_marker(host), notice)?;
 
@@ -7804,15 +7865,19 @@ fn await_submission(
         reader.set_menu_open(!rows.is_empty());
         // A size that has not settled yet is drawn once it has, so the wait
         // for a key ends then.
-        let resize = host.resize_wait();
+        let mut wait = host.resize_wait();
+        if let Some((_, until)) = &flash {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            wait = Some(wait.map_or(left, |wait| wait.min(left)));
+        }
+        // The first index build is drawn when it lands, without a key.
+        if mention.as_ref().is_some_and(|menu| menu.matches.is_none()) {
+            wait = Some(wait.map_or(INDEX_POLL, |wait| wait.min(INDEX_POLL)));
+        }
         reader.set_context(rune_term::keys::Context::Editor);
-        let key = match (&flash, resize) {
-            (Some((_, until)), _) => {
-                let left = until.saturating_duration_since(std::time::Instant::now());
-                reader.poll_key(resize.map_or(left, |wait| wait.min(left)))
-            }
-            (None, Some(wait)) => reader.poll_key(wait),
-            (None, None) => Some(reader.read_key()),
+        let key = match wait {
+            Some(wait) => reader.poll_key(wait),
+            None => Some(reader.read_key()),
         };
         reader.set_context(rune_term::keys::Context::Menu);
         reader.set_menu_open(false);
@@ -7863,6 +7928,11 @@ fn await_submission(
         {
             continue;
         }
+        if let Some(menu) = &mention
+            && mention_key(key, reader, menu, &mut selected, &mut dismissed)
+        {
+            continue;
+        }
         if path_key(
             commands,
             key,
@@ -7871,6 +7941,7 @@ fn await_submission(
             &mut selected,
             context,
             limits,
+            &host.files,
         ) {
             continue;
         }
@@ -7930,12 +8001,20 @@ fn await_submission(
             }
             Idle::Stay => {}
             Idle::Leave => return Ok(None),
-            Idle::Submit(input) => return Ok(Some(input)),
+            Idle::Submit(input) => {
+                if let Input::Prompt(text) = &input {
+                    for path in mentions(text) {
+                        host.touch(&path);
+                    }
+                }
+                return Ok(Some(input));
+            }
         }
     }
 }
 
 /// A filesystem menu is opened only by Tab and discarded when the draft changes.
+#[allow(clippy::too_many_arguments)]
 fn path_key(
     commands: &[CommandCandidate<'_>],
     key: KeyAction,
@@ -7944,6 +8023,7 @@ fn path_key(
     selected: &mut usize,
     context: &ExecutionContext,
     limits: &rune_tools::workspace::FileLimits,
+    files: &crate::file_index::SharedIndex,
 ) -> bool {
     if let Some(open) = paths {
         match key {
@@ -7984,6 +8064,7 @@ fn path_key(
         reader.cursor_byte(),
         context,
         limits,
+        files.snapshot().as_deref().map(Vec::as_slice),
     );
     *selected = 0;
     if choices.matches.len() == 1 {
@@ -8030,6 +8111,195 @@ fn path_completion_rows(
         ));
     }
     rows
+}
+
+/// Paths a menu ranks for one `@` mention.
+const MENTION_LIMIT: usize = 50;
+/// How often an open `@` menu looks for the first index build.
+const INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The `@` token ending at the caret: its range and the query typed after `@`.
+///
+/// The `@` must start the line or follow whitespace, so an email address
+/// stays text.
+fn mention_at(line: &str, caret: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let head = line.get(..caret)?;
+    let start = head
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(at, ch)| at.saturating_add(ch.len_utf8()));
+    let query = head.get(start..)?.strip_prefix('@')?;
+    let end = line
+        .get(caret..)?
+        .find(char::is_whitespace)
+        .map_or(line.len(), |offset| caret.saturating_add(offset));
+    Some((start..end, query))
+}
+
+/// The open `@` menu.
+#[derive(Debug)]
+struct Mentions {
+    range: std::ops::Range<usize>,
+    query: String,
+    /// `None` until the first index build finishes.
+    matches: Option<Vec<String>>,
+    truncated: bool,
+}
+
+impl Mentions {
+    fn at(host: &SessionHost, line: &str, caret: usize) -> Option<Self> {
+        let (range, query) = mention_at(line, caret)?;
+        let matches = host.files.snapshot().map(|paths| {
+            let touched = lock_value(&host.touched);
+            crate::file_index::rank(&paths, query, &touched, MENTION_LIMIT)
+        });
+        Some(Self {
+            range,
+            query: query.to_owned(),
+            matches,
+            truncated: host.files.truncated(),
+        })
+    }
+}
+
+fn mention_rows(
+    menu: &Mentions,
+    selected: usize,
+    theme: &Theme,
+    depth: ColorDepth,
+    room: usize,
+) -> Vec<String> {
+    let dim = theme.sgr(Slot::Dim, depth);
+    let Some(matches) = &menu.matches else {
+        return vec![styled(&dim, "  indexing files...")];
+    };
+    if matches.is_empty() {
+        return vec![styled(&dim, &format!("  no file matches @{}", menu.query))];
+    }
+    let paths = crate::path_completion::Paths {
+        range: menu.range.clone(),
+        matches: matches.clone(),
+    };
+    let mut rows = path_completion_rows(&paths, selected, theme, depth, room);
+    if menu.truncated && rows.len() < room {
+        rows.push(styled(
+            &dim,
+            &format!("  index stopped at {} files", crate::file_index::INDEX_CAP),
+        ));
+    }
+    rows
+}
+
+/// The text a chosen path becomes. A directory keeps the menu open on its
+/// children, so no space follows it.
+fn mention_text(path: &str) -> String {
+    let body = if path.contains(' ') {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    } else {
+        path.to_owned()
+    };
+    if path.ends_with('/') {
+        format!("@{body}")
+    } else {
+        format!("@{body} ")
+    }
+}
+
+/// Keys while the `@` menu is open; returns whether the key was used.
+///
+/// Escape closes the menu over the draft it was pressed on, which is kept.
+fn mention_key(
+    key: KeyAction,
+    reader: &mut rune_term::input::KeyReader,
+    menu: &Mentions,
+    selected: &mut usize,
+    dismissed: &mut Option<String>,
+) -> bool {
+    let count = menu.matches.as_ref().map_or(0, Vec::len);
+    match key {
+        KeyAction::Up => {
+            *selected = selected.saturating_sub(1);
+            true
+        }
+        KeyAction::Down => {
+            *selected = selected.saturating_add(1).min(count.saturating_sub(1));
+            true
+        }
+        KeyAction::Submit | KeyAction::Complete => {
+            let Some(chosen) = menu.matches.as_ref().and_then(|paths| paths.get(*selected)) else {
+                // Enter with nothing to choose sends the draft as typed.
+                return key == KeyAction::Complete;
+            };
+            reader.complete_path(menu.range.clone(), &mention_text(chosen));
+            *selected = 0;
+            true
+        }
+        KeyAction::Escape => {
+            *dismissed = Some(reader.line().to_owned());
+            *selected = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Every path mentioned with `@` at a word start, unquoted.
+fn mentions(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    let mut at_start = true;
+    while let Some(ch) = rest.chars().next() {
+        let width = ch.len_utf8();
+        if ch == '@' && at_start {
+            let token = rest.get(width..).unwrap_or_default();
+            let (path, used) = if let Some(quoted) = token.strip_prefix('\'') {
+                let close = quoted.find('\'').unwrap_or(quoted.len());
+                (
+                    quoted.get(..close).unwrap_or_default(),
+                    close.saturating_add(2),
+                )
+            } else {
+                let end = token.find(char::is_whitespace).unwrap_or(token.len());
+                (token.get(..end).unwrap_or_default(), end)
+            };
+            if !path.is_empty() {
+                found.push(path.to_owned());
+            }
+            rest = token.get(used.min(token.len())..).unwrap_or_default();
+            at_start = false;
+            continue;
+        }
+        at_start = ch.is_whitespace();
+        rest = rest.get(width..).unwrap_or_default();
+    }
+    found
+}
+
+/// The workspace-relative form of a path a tool or a mention named.
+fn workspace_relative(workspace: &Utf8Path, raw: &str) -> Option<String> {
+    let path = Utf8Path::new(raw);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace).ok()?
+    } else {
+        path
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            camino::Utf8Component::Normal(part) => parts.push(part),
+            camino::Utf8Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut joined = parts.join("/");
+    if raw.ends_with('/') {
+        joined.push('/');
+    }
+    Some(joined)
 }
 
 /// What a key pressed at the idle prompt leads to.
@@ -20278,6 +20548,7 @@ mod tests {
                 &mut selected,
                 &context,
                 &limits,
+                &crate::file_index::SharedIndex::default(),
             ));
             assert!(matches!(
                 idle_key(
@@ -20515,7 +20786,8 @@ mod tests {
             &mut paths,
             &mut selected,
             &context,
-            &limits
+            &limits,
+            &crate::file_index::SharedIndex::default(),
         ));
         assert_eq!(reader.line(), "read './fixture space.txt'");
         assert!(paths.is_none());
@@ -20528,7 +20800,8 @@ mod tests {
                 &mut paths,
                 &mut selected,
                 &context,
-                &limits
+                &limits,
+                &crate::file_index::SharedIndex::default(),
             ));
             assert_eq!(reader.line(), line);
         }
@@ -23533,6 +23806,140 @@ mod tests {
         assert_eq!(again, ["", "\u{258c} next"]);
     }
 
+    #[test]
+    fn mention_needs_a_word_start() {
+        assert_eq!(mention_at("@mai", 4), Some((0..4, "mai")));
+        assert_eq!(mention_at("look at @mai", 12), Some((8..12, "mai")));
+        assert_eq!(mention_at("look at @", 9), Some((8..9, "")));
+        assert_eq!(mention_at("look\t@src/ma", 12), Some((5..12, "src/ma")));
+        assert_eq!(mention_at("@src/main.rs next", 4), Some((0..12, "src")));
+        assert_eq!(mention_at("mail a@b", 8), None);
+        assert_eq!(mention_at("@src/main.rs ", 13), None);
+        assert_eq!(mention_at("look", 4), None);
+        assert_eq!(
+            mentions("read @src/main.rs, a@b.c and @'my file.txt' @"),
+            ["src/main.rs,", "my file.txt"]
+        );
+        assert_eq!(mention_text("src/main.rs"), "@src/main.rs ");
+        assert_eq!(mention_text("my file.txt"), "@'my file.txt' ");
+        assert_eq!(mention_text("src/"), "@src/");
+    }
+
+    #[test]
+    fn choosing_a_directory_keeps_the_menu_open() {
+        let mut host = test_host();
+        host.files = crate::file_index::SharedIndex::from_paths(
+            [
+                "docs/",
+                "docs/guide.md",
+                "src/",
+                "src/lib.rs",
+                "src/main.rs",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        );
+        let mut reader = rune_term::input::KeyReader::line_mode();
+        let mut selected = 0;
+        let mut dismissed = None;
+        reader.replace("look at @sr");
+        let menu = Mentions::at(&host, reader.line(), reader.cursor_byte()).expect("menu");
+        assert_eq!(
+            menu.matches.as_deref(),
+            Some(&["src/", "src/lib.rs", "src/main.rs"].map(str::to_owned)[..])
+        );
+        assert!(mention_key(
+            KeyAction::Submit,
+            &mut reader,
+            &menu,
+            &mut selected,
+            &mut dismissed
+        ));
+        assert_eq!(reader.line(), "look at @src/");
+        let menu = Mentions::at(&host, reader.line(), reader.cursor_byte()).expect("still open");
+        assert_eq!(
+            menu.matches.as_deref(),
+            Some(&["src/lib.rs", "src/main.rs"].map(str::to_owned)[..])
+        );
+        assert!(mention_key(
+            KeyAction::Down,
+            &mut reader,
+            &menu,
+            &mut selected,
+            &mut dismissed
+        ));
+        assert!(mention_key(
+            KeyAction::Complete,
+            &mut reader,
+            &menu,
+            &mut selected,
+            &mut dismissed
+        ));
+        assert_eq!(reader.line(), "look at @src/main.rs ");
+        assert!(Mentions::at(&host, reader.line(), reader.cursor_byte()).is_none());
+
+        reader.replace("look at @zz");
+        let menu = Mentions::at(&host, reader.line(), reader.cursor_byte()).expect("menu");
+        let theme = Theme::no_color();
+        assert_eq!(
+            mention_rows(&menu, 0, &theme, ColorDepth::Ansi256, 8),
+            ["  no file matches @zz"]
+        );
+        assert!(!mention_key(
+            KeyAction::Submit,
+            &mut reader,
+            &menu,
+            &mut selected,
+            &mut dismissed
+        ));
+        assert!(mention_key(
+            KeyAction::Escape,
+            &mut reader,
+            &menu,
+            &mut selected,
+            &mut dismissed
+        ));
+        assert_eq!(reader.line(), "look at @zz");
+        assert_eq!(dismissed.as_deref(), Some("look at @zz"));
+
+        host.files = crate::file_index::SharedIndex::default();
+        let menu = Mentions::at(&host, "@a", 2).expect("menu");
+        assert_eq!(
+            mention_rows(&menu, 0, &theme, ColorDepth::Ansi256, 8),
+            ["  indexing files..."]
+        );
+    }
+
+    #[test]
+    fn finished_file_tools_and_mentions_are_touched() {
+        let host = test_host();
+        for (name, arguments) in [
+            ("read_file", r#"{"path":"/tmp/src/main.rs"}"#),
+            ("edit_file", r#"{"path":"./docs/guide.md"}"#),
+            ("grep_files", r#"{"path":"ignored.rs"}"#),
+            ("write_file", r#"{"path":"/elsewhere/x.rs"}"#),
+            (
+                "apply_patch",
+                r#"{"input":"*** Begin Patch\n*** Add File: notes.txt\n+hi\n*** End Patch\n"}"#,
+            ),
+        ] {
+            host.touch_tool_paths(&turn::PreparedCall {
+                id: "call".to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            });
+        }
+        host.touch("../outside.rs");
+        host.touch("src/");
+        assert_eq!(
+            *lock_value(&host.touched),
+            ["docs/guide.md", "notes.txt", "src/", "src/main.rs"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+    }
+
     fn test_host() -> SessionHost {
         let mut registry = Registry::new();
         registry
@@ -23582,6 +23989,8 @@ mod tests {
             last_failed: Mutex::new(None),
             plan: Mutex::new(None),
             plan_visible: std::sync::atomic::AtomicBool::new(true),
+            files: crate::file_index::SharedIndex::default(),
+            touched: Mutex::new(std::collections::BTreeSet::new()),
             cleared: Mutex::new(std::collections::VecDeque::new()),
             escape_armed: Mutex::new(None),
             pending_steer: Mutex::new(Vec::new()),
