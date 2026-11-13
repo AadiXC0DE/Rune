@@ -70,6 +70,12 @@ pub struct Command {
     pub argument_hint: Option<String>,
     /// Body, with the frontmatter removed.
     pub body: String,
+    /// Model the turn started by this command runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Directives the file declares that are not honoured, each named once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored: Vec<String>,
     /// Where it came from.
     pub origin: Origin,
     /// File it was read from, absent for a built-in.
@@ -82,6 +88,14 @@ impl Command {
     #[must_use]
     pub const fn is_project(&self) -> bool {
         matches!(self.origin, Origin::Project)
+    }
+
+    /// Returns the line naming what this command's file declares but is not
+    /// honoured, or `None` when nothing was ignored.
+    #[must_use]
+    pub fn ignored_notice(&self) -> Option<String> {
+        (!self.ignored.is_empty())
+            .then(|| format!("/{}: ignored {}", self.name, self.ignored.join(", ")))
     }
 
     /// Expands the body with the arguments the user typed.
@@ -314,12 +328,17 @@ fn load_one(
         return;
     }
 
+    let mut ignored = frontmatter.ignored;
+    ignored.extend(body_directives(&body));
+
     seen.insert(name.to_owned(), origin);
     out.commands.push(Command {
         name: name.to_owned(),
         description: description.trim().to_owned(),
         argument_hint: frontmatter.argument_hint,
         body,
+        model: frontmatter.model,
+        ignored,
         origin,
         source: Some(path.to_owned()),
     });
@@ -358,6 +377,8 @@ fn read_command(path: &Utf8Path) -> std::result::Result<String, String> {
 struct Frontmatter {
     description: Option<String>,
     argument_hint: Option<String>,
+    model: Option<String>,
+    ignored: Vec<String>,
 }
 
 /// Splits a file into its frontmatter and its body.
@@ -387,8 +408,8 @@ fn split_frontmatter(text: &str) -> std::result::Result<(Frontmatter, String), S
 
 /// Reads the frontmatter fields this module understands.
 ///
-/// Only a small set of keys is read. An unknown key is ignored rather than
-/// rejected, so a file written for another tool still loads.
+/// Only a small set of keys is read. An unknown key is recorded as ignored
+/// rather than rejected, so a file written for another tool still loads.
 fn parse_frontmatter(header: &str) -> std::result::Result<Frontmatter, String> {
     let mut out = Frontmatter::default();
     for line in header.lines() {
@@ -403,8 +424,116 @@ fn parse_frontmatter(header: &str) -> std::result::Result<Frontmatter, String> {
         match key.trim() {
             "description" => out.description = Some(value),
             "argument-hint" | "argument_hint" => out.argument_hint = Some(value),
-            _ => {}
+            "model" => {
+                let value = value.trim();
+                out.model = (!value.is_empty()).then(|| value.to_owned());
+            }
+            other => {
+                let entry = format!("frontmatter key {other}");
+                if !out.ignored.contains(&entry) {
+                    out.ignored.push(entry);
+                }
+            }
         }
+    }
+    Ok(out)
+}
+
+/// Lists the directives in a body that are kept as literal text.
+///
+/// A `` !`command` `` line and an `@file` reference are never executed or read;
+/// they are counted so the listing can say they were ignored.
+fn body_directives(body: &str) -> Vec<String> {
+    let commands = body.matches("!`").count();
+    let mut files = 0usize;
+    let mut previous: Option<char> = None;
+    let mut chars = body.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current == '@'
+            && previous.is_none_or(char::is_whitespace)
+            && chars
+                .peek()
+                .is_some_and(|next| !next.is_whitespace() && *next != '@')
+        {
+            files = files.saturating_add(1);
+        }
+        previous = Some(current);
+    }
+
+    let mut out = Vec::new();
+    if commands > 0 {
+        out.push(format!("!`command` lines ({commands})"));
+    }
+    if files > 0 {
+        out.push(format!("@file references ({files})"));
+    }
+    out
+}
+
+/// Splits typed arguments into words with shell-style quoting.
+///
+/// Whitespace separates words. Single quotes keep their contents literally;
+/// double quotes allow `\"` and `\\` escapes; a backslash outside quotes escapes
+/// the next character.
+pub fn split_arguments(text: &str) -> Result<Vec<String>> {
+    let unterminated = || {
+        RuneError::invalid_field("arguments", "unterminated quote")
+            .with_hint("close the quote, or escape it with a backslash")
+    };
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars();
+    while let Some(current) = chars.next() {
+        match current {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(inner) => word.push(inner),
+                        None => return Err(unterminated()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(escaped @ ('"' | '\\')) => word.push(escaped),
+                            Some(other) => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                            None => return Err(unterminated()),
+                        },
+                        Some(inner) => word.push(inner),
+                        None => return Err(unterminated()),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            }
+            blank if blank.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                word.push(other);
+            }
+        }
+    }
+    if in_word {
+        out.push(word);
     }
     Ok(out)
 }
@@ -493,6 +622,8 @@ mod tests {
             description: "does a thing".to_owned(),
             argument_hint: None,
             body: body.to_owned(),
+            model: None,
+            ignored: Vec::new(),
             origin: Origin::Project,
             source: None,
         }
@@ -872,6 +1003,96 @@ mod tests {
         for origin in [Origin::Builtin, Origin::User, Origin::Project] {
             assert!(!origin.as_str().is_empty());
         }
+    }
+
+    fn words(text: &str) -> Vec<String> {
+        split_arguments(text).expect("split")
+    }
+
+    #[test]
+    fn split_arguments_follows_shell_quoting() {
+        assert_eq!(words("\"two words\" three"), ["two words", "three"]);
+        assert_eq!(words("it\\'s"), ["it's"]);
+        assert_eq!(words("'a \\ b' c"), ["a \\ b", "c"]);
+        assert_eq!(words("\"say \\\"hi\\\" \\\\ \\n\""), ["say \"hi\" \\ \\n"]);
+        assert_eq!(words("  one\ttwo  "), ["one", "two"]);
+        assert_eq!(words("a\\ b"), ["a b"]);
+        assert_eq!(words("\"\" x"), ["", "x"]);
+        assert!(words("   ").is_empty());
+
+        for open in ["\"open", "'open", "\"a\\"] {
+            let err = split_arguments(open).expect_err("refused");
+            assert_eq!(err.code(), ErrorCode::InvalidField, "{open}");
+            assert_eq!(err.message(), "unterminated quote");
+            assert_eq!(
+                err.hint(),
+                Some("close the quote, or escape it with a backslash")
+            );
+        }
+    }
+
+    #[test]
+    fn model_frontmatter_is_read() {
+        let (front, _) =
+            split_frontmatter("---\nmodel:  claude-haiku-4-5 \n---\nBody").expect("split");
+        assert_eq!(front.model.as_deref(), Some("claude-haiku-4-5"));
+        assert!(front.ignored.is_empty(), "{:?}", front.ignored);
+
+        let (blank, _) = split_frontmatter("---\nmodel: \"\"\n---\nBody").expect("split");
+        assert!(blank.model.is_none());
+
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        write(
+            root,
+            ".claude/commands/quick.md",
+            "---\ndescription: Quick\nmodel: claude-haiku-4-5\n---\nBody",
+        );
+        let discovery = discover(root, root).expect("discovered");
+        assert_eq!(
+            discovery.commands[0].model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+    }
+
+    #[test]
+    fn ignored_directives_are_listed() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        write(
+            root,
+            ".claude/commands/commit.md",
+            "---\ndescription: Commit\nallowed-tools: Bash(git *)\nallowed_tools: Read\n\
+             color: blue\n---\n@README.md first\n!`git status`\nthen !`git diff` and @src/main.rs\n",
+        );
+
+        let discovery = discover(root, root).expect("discovered");
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        let command = &discovery.commands[0];
+        assert_eq!(
+            command.ignored,
+            [
+                "frontmatter key allowed-tools",
+                "frontmatter key allowed_tools",
+                "frontmatter key color",
+                "!`command` lines (2)",
+                "@file references (2)",
+            ]
+        );
+        assert!(command.body.contains("!`git status`"), "{}", command.body);
+        assert!(command.body.contains("@README.md"), "{}", command.body);
+        let expanded = command.expand(&[]).expect("expanded");
+        assert!(
+            expanded.contains("!`git diff` and @src/main.rs"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn email_addresses_are_not_file_references() {
+        assert!(body_directives("email me@host about it").is_empty());
+        assert!(body_directives("a @ b and @@twice").is_empty());
+        assert_eq!(body_directives("see\n@notes.md"), ["@file references (1)"]);
     }
 
     #[test]

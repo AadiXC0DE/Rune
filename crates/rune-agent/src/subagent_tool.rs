@@ -148,17 +148,28 @@ impl Subagent {
                 delegate.message(name, text)
             }
             crate::subagent::SubagentAction::Run => {
-                let mut started = self.started.lock().map_err(|_| {
-                    RuneError::new(ErrorCode::Internal, "the child list lock was poisoned")
-                })?;
-                if let Some(ChildKind::Named(name)) = request.child_kind()
-                    && started.iter().any(|label| label.as_str() == name)
-                {
-                    return Ok(ToolOutput::failure(format!(
-                        "a child named `{name}` is already running"
-                    )));
+                // The lock is held only to check and reserve a name, so other
+                // children run while this one does.
+                let reserved = match request.child_kind() {
+                    Some(ChildKind::Named(name)) => Some(name),
+                    _ => None,
+                };
+                if let Some(name) = &reserved {
+                    let mut started = self.started_children()?;
+                    if started.iter().any(|label| label == name) {
+                        return Ok(ToolOutput::failure(format!(
+                            "a child named `{name}` is already running"
+                        )));
+                    }
+                    started.push(name.clone());
                 }
                 let outcome = delegate.delegate(&request, &self.parent.admission);
+                let mut started = self.started_children()?;
+                if let Some(name) = &reserved
+                    && let Some(index) = started.iter().position(|label| label == name)
+                {
+                    started.remove(index);
+                }
                 if let Ok(outcome) = &outcome
                     && let Some(name) = outcome.name.clone()
                 {
@@ -186,6 +197,13 @@ impl Subagent {
                 err.message()
             ))),
         }
+    }
+
+    /// The names of the children started so far.
+    fn started_children(&self) -> Result<std::sync::MutexGuard<'_, Vec<String>>> {
+        self.started
+            .lock()
+            .map_err(|_| RuneError::new(ErrorCode::Internal, "the child list lock was poisoned"))
     }
 
     /// Re-checks the parent's authority before a child acts.
@@ -236,15 +254,13 @@ impl Tool for Subagent {
                 },
                 "instructions": {
                     "type": "string",
-                    "description": "Instructions for the child, replacing the default."
+                    "description": "Replaces the default instructions."
                 },
                 "model": {
-                    "type": "string",
-                    "description": "Model for the child."
+                    "type": "string"
                 },
                 "effort": {
-                    "type": "string",
-                    "description": "Reasoning effort for the child."
+                    "type": "string"
                 }
             },
             "required": ["action"],

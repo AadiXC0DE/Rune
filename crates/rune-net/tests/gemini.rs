@@ -174,7 +174,7 @@ fn native_text_tool_result_signature_and_usage_round_trip() {
         assert_eq!(outcome.text(), "looking up");
         assert_eq!(outcome.finish, Some(FinishReason::ToolCalls));
         assert_eq!(outcome.usage.input_tokens, Some(12));
-        assert_eq!(outcome.usage.output_tokens, Some(4));
+        assert_eq!(outcome.usage.output_tokens, Some(6));
         assert_eq!(outcome.usage.cache_read_tokens, Some(0));
         assert_eq!(outcome.usage.reasoning_tokens, Some(2));
         assert_eq!(outcome.usage.cache_write_tokens, None);
@@ -210,6 +210,7 @@ fn native_text_tool_result_signature_and_usage_round_trip() {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         });
         let outcome = stream_completion_observed(
             &client,

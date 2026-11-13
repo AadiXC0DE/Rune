@@ -5,6 +5,9 @@
 
 pub mod compaction;
 pub mod history;
+pub mod ledger;
+pub mod prune;
+pub mod repair;
 pub mod retry;
 pub mod steering;
 pub mod subagent;
@@ -12,9 +15,10 @@ pub mod subagent_role;
 pub mod subagent_tool;
 pub mod tokens;
 pub mod turn;
+pub mod verify;
 
 pub use compaction::{CompactionStats, Plan, Trigger};
-pub use history::{History, Turn};
+pub use history::{History, JournalQueue, Turn};
 pub use steering::{Boundary, Cancellation, Steering, SteeringQueue};
 pub use subagent::{
     Admission, AdmissionVerdict, Authority, AuthoritySource, Child, ChildBrief, ChildId, ChildKind,

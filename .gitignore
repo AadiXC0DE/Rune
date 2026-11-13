@@ -11,12 +11,21 @@ build/
 # Node bindings
 node_modules/
 
+# Python bytecode
+__pycache__/
+
 # Editors and operating system files
 .DS_Store
 .idea/
 .vscode/
 *.swp
 
+# Benchmark run output
+bench/results/
+
 # Local documentation and planning notes
 docs/
+/PLAN.md
+/AUDIT.md
+/NEXT-PHASE.md
 target/dist/

@@ -58,8 +58,12 @@ pub mod names {
     pub const TRACE_FILE: &str = "trace.log";
     /// Project instructions file name.
     pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
+    /// Instruction file read in a directory that has no `AGENTS.md`.
+    pub const FALLBACK_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
     /// User system prompt override in the config root.
     pub const SYSTEM_PROMPT_FILE: &str = "SYSTEM.md";
+    /// Key bindings in the config root.
+    pub const KEYS_FILE: &str = "keys.toml";
     /// Project configuration file name.
     pub const PROJECT_CONFIG_FILE: &str = ".rune.toml";
     /// Legacy directory used before the XDG move.
@@ -88,16 +92,35 @@ impl Paths {
     #[must_use]
     pub fn from_process() -> Self {
         let home = home_directory();
-        Self::resolve(
-            home.as_deref().map(Utf8Path::as_str),
-            std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-            std::env::var("XDG_STATE_HOME").ok().as_deref(),
-            std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            std::env::var("RUNE_HOME").ok().as_deref(),
-        )
+        let variable = |name: &str| std::env::var(name).ok();
+        let (xdg_config, xdg_state, xdg_data, rune_home, appdata, local_appdata) = (
+            variable("XDG_CONFIG_HOME"),
+            variable("XDG_STATE_HOME"),
+            variable("XDG_DATA_HOME"),
+            variable("RUNE_HOME"),
+            variable("APPDATA"),
+            variable("LOCALAPPDATA"),
+        );
+        let windows = cfg!(windows);
+        let legacy_config_exists = windows
+            && home
+                .as_deref()
+                .is_some_and(|home| home.join(".config").join("rune").exists());
+        resolve_roots(&RootInputs {
+            home: home.as_deref().map(Utf8Path::as_str),
+            xdg_config: xdg_config.as_deref(),
+            xdg_state: xdg_state.as_deref(),
+            xdg_data: xdg_data.as_deref(),
+            rune_home: rune_home.as_deref(),
+            appdata: appdata.as_deref(),
+            local_appdata: local_appdata.as_deref(),
+            legacy_config_exists,
+            windows,
+        })
     }
 
-    /// Resolves paths from explicit inputs.
+    /// Resolves paths from explicit inputs, with the layout every system but
+    /// Windows uses.
     ///
     /// Kept separate from [`Paths::from_process`] so the resolution matrix can
     /// be tested without mutating the process environment.
@@ -181,6 +204,12 @@ impl Paths {
     #[must_use]
     pub fn system_prompt_file(&self) -> Utf8PathBuf {
         self.config_root.join(names::SYSTEM_PROMPT_FILE)
+    }
+
+    /// Path of the optional key binding file.
+    #[must_use]
+    pub fn keys_file(&self) -> Utf8PathBuf {
+        self.config_root.join(names::KEYS_FILE)
     }
 
     /// Path of the directory skills are installed into.
@@ -319,6 +348,63 @@ fn home_from(lookup: impl Fn(&str) -> Option<String>) -> Option<Utf8PathBuf> {
         .find(|path| path.is_absolute())
 }
 
+/// Inputs that decide the roots.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RootInputs<'a> {
+    /// The home directory.
+    pub home: Option<&'a str>,
+    /// `XDG_CONFIG_HOME`.
+    pub xdg_config: Option<&'a str>,
+    /// `XDG_STATE_HOME`.
+    pub xdg_state: Option<&'a str>,
+    /// `XDG_DATA_HOME`.
+    pub xdg_data: Option<&'a str>,
+    /// `RUNE_HOME`.
+    pub rune_home: Option<&'a str>,
+    /// `APPDATA`, the roaming folder on Windows.
+    pub appdata: Option<&'a str>,
+    /// `LOCALAPPDATA`, the machine-local folder on Windows.
+    pub local_appdata: Option<&'a str>,
+    /// Whether `<home>/.config/rune` already exists.
+    pub legacy_config_exists: bool,
+    /// Whether the roots are for Windows.
+    pub windows: bool,
+}
+
+/// Resolves the roots. On Windows, with no `XDG_*` variable set, no existing
+/// `~/.config/rune`, and both application data folders known, configuration
+/// lives in `%APPDATA%\rune`, state in `%LOCALAPPDATA%\rune` (unless
+/// `RUNE_HOME` places it) and data in `%LOCALAPPDATA%\rune\data`. Everything
+/// else keeps the layout of [`Paths::resolve`], so an existing setup is never
+/// moved.
+#[must_use]
+pub fn resolve_roots(inputs: &RootInputs<'_>) -> Paths {
+    let any_xdg = [inputs.xdg_config, inputs.xdg_state, inputs.xdg_data]
+        .into_iter()
+        .any(|value| non_empty(value).is_some());
+    if inputs.windows
+        && !any_xdg
+        && !inputs.legacy_config_exists
+        && let (Some(appdata), Some(local)) =
+            (non_empty(inputs.appdata), non_empty(inputs.local_appdata))
+    {
+        let local = Utf8PathBuf::from(local).join("rune");
+        return Paths {
+            config_root: Utf8PathBuf::from(appdata).join("rune"),
+            state_root: non_empty(inputs.rune_home)
+                .map_or_else(|| local.clone(), Utf8PathBuf::from),
+            data_root: local.join("data"),
+        };
+    }
+    Paths::resolve(
+        inputs.home,
+        inputs.xdg_config,
+        inputs.xdg_state,
+        inputs.xdg_data,
+        inputs.rune_home,
+    )
+}
+
 /// Returns the value when it is present and not empty.
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.is_empty())
@@ -400,6 +486,11 @@ fn verify_dir_mode(_path: &Utf8Path, _meta: &std::fs::Metadata) -> Result<()> {
 
 /// Writes a file with mode 0600, refusing to replace a symlink.
 pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
+    write_private_bytes(path, contents.as_bytes())
+}
+
+/// Writes `bytes` to a private file, as [`write_private`] writes text.
+pub fn write_private_bytes(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     // Parent directories are created without a mode check: they may be
@@ -422,7 +513,7 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
     set_open_mode(&mut options, FILE_MODE);
 
     let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     set_mode(path, FILE_MODE)?;
@@ -620,6 +711,75 @@ fn set_open_mode(_options: &mut std::fs::OpenOptions, _mode: u32) {}
 mod tests {
     use super::*;
 
+    fn windows_inputs<'a>() -> RootInputs<'a> {
+        RootInputs {
+            home: Some("C:\\Users\\ada"),
+            appdata: Some("C:\\Users\\ada\\AppData\\Roaming"),
+            local_appdata: Some("C:\\Users\\ada\\AppData\\Local"),
+            windows: true,
+            ..RootInputs::default()
+        }
+    }
+
+    #[test]
+    fn windows_uses_appdata_and_localappdata() {
+        let paths = resolve_roots(&windows_inputs());
+        let roaming = Utf8PathBuf::from("C:\\Users\\ada\\AppData\\Roaming");
+        let local = Utf8PathBuf::from("C:\\Users\\ada\\AppData\\Local").join("rune");
+        assert_eq!(paths.config_root, roaming.join("rune"));
+        assert_eq!(paths.state_root, local);
+        assert_eq!(paths.data_root, local.join("data"));
+    }
+
+    #[test]
+    fn windows_keeps_an_existing_dot_config() {
+        let inputs = RootInputs {
+            legacy_config_exists: true,
+            ..windows_inputs()
+        };
+        assert_eq!(
+            resolve_roots(&inputs),
+            Paths::resolve(Some("C:\\Users\\ada"), None, None, None, None)
+        );
+    }
+
+    #[test]
+    fn xdg_variables_win_on_windows() {
+        let inputs = RootInputs {
+            xdg_config: Some("D:\\xdg"),
+            ..windows_inputs()
+        };
+        let paths = resolve_roots(&inputs);
+        assert_eq!(paths.config_root, Utf8PathBuf::from("D:\\xdg").join("rune"));
+        assert_eq!(
+            paths,
+            Paths::resolve(Some("C:\\Users\\ada"), Some("D:\\xdg"), None, None, None)
+        );
+        // Off Windows the folders are never used.
+        let unix = RootInputs {
+            windows: false,
+            ..windows_inputs()
+        };
+        assert_eq!(
+            resolve_roots(&unix),
+            Paths::resolve(Some("C:\\Users\\ada"), None, None, None, None)
+        );
+    }
+
+    #[test]
+    fn rune_home_wins_for_state_on_windows() {
+        let inputs = RootInputs {
+            rune_home: Some("E:\\rune-state"),
+            ..windows_inputs()
+        };
+        let paths = resolve_roots(&inputs);
+        assert_eq!(paths.state_root, Utf8PathBuf::from("E:\\rune-state"));
+        assert_eq!(
+            paths.config_root,
+            Utf8PathBuf::from("C:\\Users\\ada\\AppData\\Roaming").join("rune")
+        );
+    }
+
     #[test]
     fn xdg_variables_are_used_when_present() {
         let paths = Paths::resolve(
@@ -632,6 +792,7 @@ mod tests {
         assert_eq!(paths.config_root, "/cfg/rune");
         assert_eq!(paths.state_root, "/st/rune");
         assert_eq!(paths.data_root, "/data/rune");
+        assert_eq!(paths.keys_file(), "/cfg/rune/keys.toml");
     }
 
     #[test]

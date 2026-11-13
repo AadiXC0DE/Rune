@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_core::error::Result;
@@ -114,6 +115,35 @@ pub struct ToolOutput {
     /// The complete text when `text` is a shortened view of it. The turn loop
     /// retains it and names its handle, so nothing left out is out of reach.
     pub full_text: Option<String>,
+    /// The change as `- ` and `+ ` lines, for a person to see under the
+    /// call's row. It is never sent to the model, which already knows what it
+    /// asked to change.
+    pub diff: Option<String>,
+    /// An image for the model to see, attached to the result by the host.
+    pub image: Option<ToolImage>,
+    /// What a command reported when the call saw it end.
+    pub check: Option<CheckRun>,
+}
+
+/// What a finished command reported, for the turn's verification state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckRun {
+    /// Exit status; `None` when killed by a signal or unknown.
+    pub exit_code: Option<i32>,
+    /// Failed test count from a parsed report, when one was found.
+    pub failed_tests: Option<u64>,
+    /// Failing test names, in order, at most ten.
+    pub failing: Vec<String>,
+    /// The sorted failing names joined by newlines, or, when none parse, the first 16 hex
+    /// digits of the SHA-256 of the output's last 20 lines.
+    pub signature: String,
+}
+
+/// An image a tool returns for the model to see.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ToolImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 impl ToolOutput {
@@ -127,6 +157,9 @@ impl ToolOutput {
             is_error: false,
             plan_update: None,
             full_text: None,
+            diff: None,
+            image: None,
+            check: None,
         }
     }
 
@@ -144,6 +177,9 @@ impl ToolOutput {
             is_error: true,
             plan_update: None,
             full_text: None,
+            diff: None,
+            image: None,
+            check: None,
         }
     }
 
@@ -211,6 +247,23 @@ pub struct ExecutionContext {
     live_plan: Arc<std::sync::Mutex<crate::update_plan::PlanUpdate>>,
     /// Composite cancellation flag, checked between steps of long work.
     cancelled: Arc<AtomicBool>,
+    /// What shell commands receive beyond the minimal environment.
+    pub environment: Arc<rune_exec::EnvironmentPolicy>,
+    /// Whether sandboxed shell commands may use the network.
+    ///
+    /// Separate from `external_access`, which also lets file tools reach
+    /// outside the workspace: granting network must not grant that.
+    pub network: bool,
+    /// Tool cache directories sandboxed commands may write.
+    pub cache_roots: Vec<Utf8PathBuf>,
+    /// Whether a tool may quote file contents in an error, such as the lines
+    /// closest to a missed edit. False when reading that file would need an
+    /// approval the model has not been given.
+    pub quote_files: bool,
+    /// Whether the model can see an image a tool attaches to its result.
+    pub accepts_images: bool,
+    /// The newest output lines of a running command, for a host to show.
+    pub live_tail: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl ExecutionContext {
@@ -229,7 +282,55 @@ impl ExecutionContext {
             result_store: None,
             live_plan: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            environment: Arc::default(),
+            network: false,
+            cache_roots: Vec::new(),
+            quote_files: true,
+            accepts_images: false,
+            live_tail: None,
         }
+    }
+
+    /// Supplies where a running command's newest output lines are stored.
+    #[must_use]
+    pub fn with_live_tail(mut self, tail: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        self.live_tail = Some(tail);
+        self
+    }
+
+    /// Sets whether the model can see an image a tool attaches.
+    #[must_use]
+    pub const fn with_accepts_images(mut self, accepts: bool) -> Self {
+        self.accepts_images = accepts;
+        self
+    }
+
+    /// Sets whether a tool may quote file contents in an error.
+    #[must_use]
+    pub const fn with_quote_files(mut self, allowed: bool) -> Self {
+        self.quote_files = allowed;
+        self
+    }
+
+    /// Sets the tool cache directories sandboxed commands may write.
+    #[must_use]
+    pub fn with_cache_roots(mut self, roots: Vec<Utf8PathBuf>) -> Self {
+        self.cache_roots = roots;
+        self
+    }
+
+    /// Sets whether sandboxed shell commands may use the network.
+    #[must_use]
+    pub const fn with_network(mut self, network: bool) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Sets what shell commands receive beyond the minimal environment.
+    #[must_use]
+    pub fn with_environment(mut self, environment: Arc<rune_exec::EnvironmentPolicy>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Adds an additional root.
@@ -303,6 +404,15 @@ impl ExecutionContext {
         self
     }
 
+    /// A copy of the plan this context carries.
+    #[must_use]
+    pub fn plan_snapshot(&self) -> crate::update_plan::PlanUpdate {
+        self.live_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn live_plan(&self) -> &std::sync::Mutex<crate::update_plan::PlanUpdate> {
         &self.live_plan
     }
@@ -331,6 +441,24 @@ impl ExecutionContext {
             result_store: self.result_store.clone(),
             live_plan: Arc::clone(&self.live_plan),
             cancelled: Arc::clone(&self.cancelled),
+            environment: Arc::clone(&self.environment),
+            network: self.network,
+            cache_roots: self.cache_roots.clone(),
+            quote_files: self.quote_files,
+            accepts_images: self.accepts_images,
+            live_tail: self.live_tail.clone(),
+        }
+    }
+
+    /// Returns a copy with its own cancellation flag, not yet cancelled.
+    ///
+    /// Used at the start of a turn, so cancelling that turn reaches its tools
+    /// without leaving later turns cancelled.
+    #[must_use]
+    pub fn with_fresh_cancellation(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ..self.fork()
         }
     }
 
@@ -393,6 +521,19 @@ impl Cancellation {
     }
 }
 
+/// A command a tool keeps running between calls.
+#[derive(Clone, Debug)]
+pub struct BackgroundTask {
+    /// The id a later call names it by.
+    pub id: String,
+    /// The command it runs.
+    pub command: String,
+    /// When it started.
+    pub started: Instant,
+    /// The newest non-empty line it printed, or empty.
+    pub last_line: String,
+}
+
 /// One tool.
 ///
 /// Implementations are pure with respect to policy: they receive a context and
@@ -442,6 +583,25 @@ pub trait Tool: Send + Sync {
     /// A failure here is returned to the model as a tool error, so a malformed
     /// call teaches the model rather than ending the turn. Checks required
     /// names and closed objects; argument types are decoded by the tool.
+    /// Ends any work the tool keeps running between calls.
+    ///
+    /// Called once when the run that owns the tool stops, so nothing it
+    /// started outlives the run.
+    fn shutdown(&self) {}
+
+    /// Returns the commands this tool keeps running, oldest first.
+    ///
+    /// Reading them consumes no output a later call would return.
+    fn background(&self) -> Vec<BackgroundTask> {
+        Vec::new()
+    }
+
+    /// Returns up to `lines` of the newest output of one running command,
+    /// without consuming it.
+    fn background_tail(&self, _id: &str, _lines: usize) -> Option<String> {
+        None
+    }
+
     fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
         let schema = self.input_schema();
         validate_closed_arguments(arguments, &schema)?;
@@ -535,13 +695,88 @@ fn validate_closed_fields(
     Ok(())
 }
 
+/// Returns true when a value fits an argument schema.
+///
+/// Checks `type`, `enum`, `required`, `properties` with
+/// `additionalProperties: false`, and `items`, recursively. Other keywords,
+/// such as `oneOf`, `anyOf`, `not`, `minimum` and `maximum`, are not checked;
+/// the tool's own validation still runs.
+pub fn conforms(schema: &serde_json::Value, value: &serde_json::Value) -> bool {
+    let fits = |name: &str| match name {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    };
+    let typed = match schema.get("type") {
+        Some(serde_json::Value::String(name)) => fits(name),
+        Some(serde_json::Value::Array(names)) => {
+            names.iter().filter_map(serde_json::Value::as_str).any(fits)
+        }
+        _ => true,
+    };
+    if !typed {
+        return false;
+    }
+    if let Some(options) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !options.contains(value)
+    {
+        return false;
+    }
+    if let Some(object) = value.as_object() {
+        let mut required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str);
+        if required.any(|key| !object.contains_key(key)) {
+            return false;
+        }
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let closed = schema
+            .get("additionalProperties")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        for (key, field) in object {
+            match properties.and_then(|fields| fields.get(key)) {
+                Some(field_schema) if !conforms(field_schema, field) => return false,
+                None if closed => return false,
+                _ => {}
+            }
+        }
+    }
+    if let Some(items) = schema.get("items")
+        && let Some(array) = value.as_array()
+    {
+        return array.iter().all(|item| conforms(items, item));
+    }
+    true
+}
+
 /// Largest description a tool may advertise.
 pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
 /// Describes a tool for the model.
 #[must_use]
 pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
-    let mut description = tool.description().to_owned();
+    ToolSpec {
+        name: tool.name().to_owned(),
+        description: bounded_description(tool.description()),
+        input_schema: tool.input_schema(),
+    }
+}
+
+/// A tool description cut to [`MAX_DESCRIPTION_BYTES`].
+#[must_use]
+pub fn bounded_description(text: &str) -> String {
+    let mut description = text.to_owned();
     if description.len() > MAX_DESCRIPTION_BYTES {
         // Truncation is explicit rather than silent, because a description cut
         // mid-sentence without a marker looks like a bug in the tool.
@@ -549,11 +784,7 @@ pub fn model_spec(tool: &dyn Tool) -> ToolSpec {
         description.truncate(end);
         description.push_str("... [truncated]");
     }
-    ToolSpec {
-        name: tool.name().to_owned(),
-        description,
-        input_schema: tool.input_schema(),
-    }
+    description
 }
 
 #[cfg(test)]
@@ -924,5 +1155,75 @@ mod tests {
         let output = ToolOutput::success("abcd");
         assert_eq!(output.produced_bytes, 4);
         assert_eq!(output.render(), "abcd");
+    }
+
+    #[test]
+    fn conforms_checks_types_required_and_closed_objects() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "count": { "type": "integer", "minimum": 1 },
+                "ratio": { "type": "number" },
+                "all": { "type": "boolean" },
+                "mode": { "type": "string", "enum": ["a", "b"] },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "step": { "type": "string" } },
+                        "required": ["step"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let fits = |value: serde_json::Value| conforms(&schema, &value);
+        assert!(fits(serde_json::json!({ "path": "a" })));
+        assert!(fits(serde_json::json!({
+            "path": "a", "count": 2, "ratio": 1.5, "all": true, "mode": "b",
+            "steps": [{ "step": "one" }]
+        })));
+        // The tool's own validation checks bounds.
+        assert!(fits(serde_json::json!({ "path": "a", "count": 0 })));
+        assert!(!fits(serde_json::json!({ "count": 2 })), "missing required");
+        assert!(!fits(serde_json::json!({ "path": 1 })), "wrong type");
+        assert!(!fits(serde_json::json!({ "path": "a", "count": "2" })));
+        assert!(!fits(serde_json::json!({ "path": "a", "count": 1.5 })));
+        assert!(!fits(serde_json::json!({ "path": "a", "all": "true" })));
+        assert!(
+            !fits(serde_json::json!({ "path": "a", "mode": "c" })),
+            "enum"
+        );
+        assert!(
+            !fits(serde_json::json!({ "path": "a", "extra": 1 })),
+            "closed"
+        );
+        assert!(!fits(serde_json::json!({ "path": "a", "steps": [{}] })));
+        assert!(!fits(
+            serde_json::json!({ "path": "a", "steps": [{ "step": "x", "id": 1 }] })
+        ));
+        assert!(!fits(serde_json::json!(["path"])), "not an object");
+        let open = serde_json::json!({ "type": "object", "properties": {} });
+        assert!(conforms(&open, &serde_json::json!({ "anything": 1 })));
+    }
+
+    #[test]
+    fn a_plan_snapshot_copies_the_carried_plan() {
+        let plan = Arc::new(std::sync::Mutex::new(crate::update_plan::PlanUpdate {
+            version: 2,
+            explanation: None,
+            plan: Vec::new(),
+        }));
+        let context = ExecutionContext::new(Utf8PathBuf::from("/workspace")).with_live_plan(plan);
+        assert_eq!(context.plan_snapshot().version, 2);
+        assert_eq!(
+            ExecutionContext::new(Utf8PathBuf::from("/w"))
+                .plan_snapshot()
+                .version,
+            0
+        );
     }
 }

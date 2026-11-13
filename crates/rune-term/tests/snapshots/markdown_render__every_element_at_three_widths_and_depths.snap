@@ -1,0 +1,377 @@
+---
+source: crates/rune-term/tests/markdown_render.rs
+expression: out
+---
+truecolor width 20
+|\e[1m\e[38;2;122;162;247mRelease notes\e[0m
+|
+|A paragraph with\e[0m
+|\e[1m\e[1mstrong\e[0m, \e[3memphasis\e[0m
+|and \e[38;2;158;206;106mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[38;2;125;207;255m\e[4mthe guide\e[0m\e]8;;\e\ or\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;38;2;125;207;255m\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[38;2;125;207;255m\e[4mhttps://example.te\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;38;2;125;207;255mst/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[38;2;125;207;255m\e[4m[image: diagram]\e[0m\e]8;;\e\
+|and \e[9mstruck\e[0m text.
+|
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mA quoted line\e[0m
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mlong enough\e[0m
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mthat it wraps\e[0m
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128monto a second\e[0m
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mrow.\e[0m
+|
+|\e[38;2;107;114;128m──────────────────\e[0m
+|
+|\e[38;2;107;114;128m•\e[0m outer item
+|  \e[38;2;107;114;128m•\e[0m inner item
+|    \e[38;2;107;114;128m•\e[0m innermost
+|      item
+|[ ] open task
+|\e[38;2;107;114;128m[x]\e[0m \e[38;2;107;114;128mdone task\e[0m
+|
+|\e[38;2;107;114;128mrust\e[0m
+|\e[48;2;26;27;38m\e[38;2;187;154;247mfn\e[0m\e[48;2;26;27;38m \e[38;2;122;162;247mmain\e[0m\e[48;2;26;27;38m() {\e[K\e[0m
+|\e[48;2;26;27;38m    \e[38;2;187;154;247mlet\e[0m\e[48;2;26;27;38m total = \e[38;2;255;158;100m42\e[0m\e[48;2;26;27;38m; \e[38;2;86;95;137m// the answer\e[0m\e[48;2;26;27;38m\e[K\e[0m
+|\e[48;2;26;27;38m}\e[K\e[0m
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the
+|first program for
+|an engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw
+|html</details>
+truecolor width 40
+|\e[1m\e[38;2;122;162;247mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and\e[0m
+|\e[38;2;158;206;106m\e[38;2;158;206;106mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[38;2;125;207;255m\e[4mthe guide\e[0m\e]8;;\e\ or\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;38;2;125;207;255m\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[38;2;125;207;255m\e[4mhttps://example.test/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[38;2;125;207;255m\e[4m[image: diagram]\e[0m\e]8;;\e\ and \e[9mstruck\e[0m text.
+|
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mA quoted line long enough that it\e[0m
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mwraps onto a second row.\e[0m
+|
+|\e[38;2;107;114;128m──────────────────────────────────────\e[0m
+|
+|\e[38;2;107;114;128m•\e[0m outer item
+|  \e[38;2;107;114;128m•\e[0m inner item
+|    \e[38;2;107;114;128m•\e[0m innermost item
+|[ ] open task
+|\e[38;2;107;114;128m[x]\e[0m \e[38;2;107;114;128mdone task\e[0m
+|
+|\e[38;2;107;114;128mrust\e[0m
+|\e[48;2;26;27;38m\e[38;2;187;154;247mfn\e[0m\e[48;2;26;27;38m \e[38;2;122;162;247mmain\e[0m\e[48;2;26;27;38m() {\e[K\e[0m
+|\e[48;2;26;27;38m    \e[38;2;187;154;247mlet\e[0m\e[48;2;26;27;38m total = \e[38;2;255;158;100m42\e[0m\e[48;2;26;27;38m; \e[38;2;86;95;137m// the answer\e[0m\e[48;2;26;27;38m\e[K\e[0m
+|\e[48;2;26;27;38m}\e[K\e[0m
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the first program for an
+|engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw html</details>
+truecolor width 80
+|\e[1m\e[38;2;122;162;247mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and \e[38;2;158;206;106mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[38;2;125;207;255m\e[4mthe guide\e[0m\e]8;;\e\ or \e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[38;2;125;207;255m\e[4mhttps://example.test/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[38;2;125;207;255m\e[4m[image: diagram]\e[0m\e]8;;\e\ and \e[9mstruck\e[0m text.
+|
+|\e[38;2;107;114;128m│\e[0m \e[38;2;107;114;128mA quoted line long enough that it wraps onto a second row.\e[0m
+|
+|\e[38;2;107;114;128m────────────────────────────────────────\e[0m
+|
+|\e[38;2;107;114;128m•\e[0m outer item
+|  \e[38;2;107;114;128m•\e[0m inner item
+|    \e[38;2;107;114;128m•\e[0m innermost item
+|[ ] open task
+|\e[38;2;107;114;128m[x]\e[0m \e[38;2;107;114;128mdone task\e[0m
+|
+|\e[38;2;107;114;128mrust\e[0m
+|\e[48;2;26;27;38m\e[38;2;187;154;247mfn\e[0m\e[48;2;26;27;38m \e[38;2;122;162;247mmain\e[0m\e[48;2;26;27;38m() {\e[K\e[0m
+|\e[48;2;26;27;38m    \e[38;2;187;154;247mlet\e[0m\e[48;2;26;27;38m total = \e[38;2;255;158;100m42\e[0m\e[48;2;26;27;38m; \e[38;2;86;95;137m// the answer\e[0m\e[48;2;26;27;38m\e[K\e[0m
+|\e[48;2;26;27;38m}\e[K\e[0m
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|name │ role │ note
+|─────┼──────┼──────────────────────────────────────
+|ada  │ lead │ wrote the first program for an engine
+|bo   │ dev  │ short
+|
+|<details>raw html</details>
+ansi16 width 20
+|\e[1m\e[34mRelease notes\e[0m
+|
+|A paragraph with\e[0m
+|\e[1m\e[1mstrong\e[0m, \e[3memphasis\e[0m
+|and \e[32mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[36m\e[4mthe guide\e[0m\e]8;;\e\ or\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;36m\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[36m\e[4mhttps://example.te\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;36mst/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[36m\e[4m[image: diagram]\e[0m\e]8;;\e\
+|and \e[9mstruck\e[0m text.
+|
+|\e[90m│\e[0m \e[90mA quoted line\e[0m
+|\e[90m│\e[0m \e[90mlong enough\e[0m
+|\e[90m│\e[0m \e[90mthat it wraps\e[0m
+|\e[90m│\e[0m \e[90monto a second\e[0m
+|\e[90m│\e[0m \e[90mrow.\e[0m
+|
+|\e[90m──────────────────\e[0m
+|
+|\e[90m•\e[0m outer item
+|  \e[90m•\e[0m inner item
+|    \e[90m•\e[0m innermost
+|      item
+|[ ] open task
+|\e[90m[x]\e[0m \e[90mdone task\e[0m
+|
+|\e[90mrust\e[0m
+|\e[35mfn\e[0m \e[34mmain\e[0m() {
+|    \e[35mlet\e[0m total = \e[33m42\e[0m; \e[90m// the answer\e[0m
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the
+|first program for
+|an engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw
+|html</details>
+ansi16 width 40
+|\e[1m\e[34mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and\e[0m
+|\e[32m\e[32mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[36m\e[4mthe guide\e[0m\e]8;;\e\ or\e]8;;\e\\e[0m
+|\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[4;36m\e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[36m\e[4mhttps://example.test/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[36m\e[4m[image: diagram]\e[0m\e]8;;\e\ and \e[9mstruck\e[0m text.
+|
+|\e[90m│\e[0m \e[90mA quoted line long enough that it\e[0m
+|\e[90m│\e[0m \e[90mwraps onto a second row.\e[0m
+|
+|\e[90m──────────────────────────────────────\e[0m
+|
+|\e[90m•\e[0m outer item
+|  \e[90m•\e[0m inner item
+|    \e[90m•\e[0m innermost item
+|[ ] open task
+|\e[90m[x]\e[0m \e[90mdone task\e[0m
+|
+|\e[90mrust\e[0m
+|\e[35mfn\e[0m \e[34mmain\e[0m() {
+|    \e[35mlet\e[0m total = \e[33m42\e[0m; \e[90m// the answer\e[0m
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the first program for an
+|engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw html</details>
+ansi16 width 80
+|\e[1m\e[34mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and \e[32mcode\e[0m in it.
+|See \e]8;id=rune-246eb5558b6f8f1d;https://example.test/guide\e\\e[36m\e[4mthe guide\e[0m\e]8;;\e\ or \e]8;id=rune-3151ac33ab0583ef;https://example.test/raw\e\\e[36m\e[4mhttps://example.test/raw\e[0m\e]8;;\e\.
+|\e]8;id=rune-1f0211c550736594;https://example.test/d.png\e\\e[36m\e[4m[image: diagram]\e[0m\e]8;;\e\ and \e[9mstruck\e[0m text.
+|
+|\e[90m│\e[0m \e[90mA quoted line long enough that it wraps onto a second row.\e[0m
+|
+|\e[90m────────────────────────────────────────\e[0m
+|
+|\e[90m•\e[0m outer item
+|  \e[90m•\e[0m inner item
+|    \e[90m•\e[0m innermost item
+|[ ] open task
+|\e[90m[x]\e[0m \e[90mdone task\e[0m
+|
+|\e[90mrust\e[0m
+|\e[35mfn\e[0m \e[34mmain\e[0m() {
+|    \e[35mlet\e[0m total = \e[33m42\e[0m; \e[90m// the answer\e[0m
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|name │ role │ note
+|─────┼──────┼──────────────────────────────────────
+|ada  │ lead │ wrote the first program for an engine
+|bo   │ dev  │ short
+|
+|<details>raw html</details>
+none width 20
+|\e[1mRelease notes\e[0m
+|
+|A paragraph with\e[0m
+|\e[1m\e[1mstrong\e[0m, \e[3memphasis\e[0m
+|and code\e[0m in it.
+|See \e[4mthe guide\e[0m
+|(https://example.t
+|est/guide) or
+|https://example.te
+|st/raw.
+|\e[4m[image: diagram]\e[0m
+|(https://example.t
+|est/d.png) and\e[0m
+|\e[9m\e[9mstruck\e[0m text.
+|
+|│\e[0m A quoted line
+|│\e[0m long enough
+|│\e[0m that it wraps
+|│\e[0m onto a second
+|│\e[0m row.\e[0m
+|
+|──────────────────\e[0m
+|
+|•\e[0m outer item
+|  •\e[0m inner item
+|    •\e[0m innermost
+|      item
+|[ ] open task
+|[x]\e[0m done task\e[0m
+|
+|rust\e[0m
+|fn main() {
+|    let total = 42; // the answer
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the
+|first program for
+|an engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw
+|html</details>
+none width 40
+|\e[1mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and
+|code\e[0m in it.
+|See \e[4mthe guide\e[0m
+|(https://example.test/guide) or
+|https://example.test/raw.
+|\e[4m[image: diagram]\e[0m
+|(https://example.test/d.png) and\e[0m
+|\e[9m\e[9mstruck\e[0m text.
+|
+|│\e[0m A quoted line long enough that it
+|│\e[0m wraps onto a second row.\e[0m
+|
+|──────────────────────────────────────\e[0m
+|
+|•\e[0m outer item
+|  •\e[0m inner item
+|    •\e[0m innermost item
+|[ ] open task
+|[x]\e[0m done task\e[0m
+|
+|rust\e[0m
+|fn main() {
+|    let total = 42; // the answer
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|\e[1mname\e[0m: ada
+|\e[1mrole\e[0m: lead
+|\e[1mnote\e[0m: wrote the first program for an
+|engine
+|
+|\e[1mname\e[0m: bo
+|\e[1mrole\e[0m: dev
+|\e[1mnote\e[0m: short
+|
+|<details>raw html</details>
+none width 80
+|\e[1mRelease notes\e[0m
+|
+|A paragraph with \e[1mstrong\e[0m, \e[3memphasis\e[0m and code\e[0m in it.
+|See \e[4mthe guide\e[0m (https://example.test/guide) or https://example.test/raw.
+|\e[4m[image: diagram]\e[0m (https://example.test/d.png) and \e[9mstruck\e[0m text.
+|
+|│\e[0m A quoted line long enough that it wraps onto a second row.\e[0m
+|
+|────────────────────────────────────────\e[0m
+|
+|•\e[0m outer item
+|  •\e[0m inner item
+|    •\e[0m innermost item
+|[ ] open task
+|[x]\e[0m done task\e[0m
+|
+|rust\e[0m
+|fn main() {
+|    let total = 42; // the answer
+|}
+|
+|key │ value
+|────┼──────
+|a   │ 1
+|bb  │ 22
+|
+|name │ role │ note
+|─────┼──────┼──────────────────────────────────────
+|ada  │ lead │ wrote the first program for an engine
+|bo   │ dev  │ short
+|
+|<details>raw html</details>

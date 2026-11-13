@@ -83,20 +83,28 @@ impl Options {
     }
 
     /// Discovers every candidate file, with the widest scope first.
-    pub fn discover(&self) -> Result<Vec<InstructionFile>> {
+    ///
+    /// The user file, the ancestors and the workspace root file are sent up
+    /// front; files below the root wait until their directory is touched.
+    pub fn discover(&self) -> Result<Discovery> {
         if !self.enabled {
-            return Ok(Vec::new());
+            return Ok(Discovery::default());
         }
-        let mut files = Vec::new();
+        let mut upfront = Vec::new();
         Self::push_file(
-            &mut files,
+            &mut upfront,
             &self.config_root,
             &self.workspace,
             &self.config_root,
         );
-        self.push_ancestors(&mut files);
-        self.push_tree(&mut files);
-        Ok(files)
+        self.push_ancestors(&mut upfront);
+        let mut tree = Vec::new();
+        self.push_tree(&mut tree);
+        let (root, nested): (Vec<_>, Vec<_>) = tree
+            .into_iter()
+            .partition(|file| file.scope == self.workspace);
+        upfront.extend(root);
+        Ok(Discovery { upfront, nested })
     }
 
     /// Reads one candidate, recording it when it exists and is usable.
@@ -108,7 +116,13 @@ impl Options {
         scope: &Utf8Path,
         root: &Utf8Path,
     ) {
-        let path = directory.join(names::INSTRUCTIONS_FILE);
+        let primary = directory.join(names::INSTRUCTIONS_FILE);
+        let path = match std::fs::symlink_metadata(&primary) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                directory.join(names::FALLBACK_INSTRUCTIONS_FILE)
+            }
+            _ => primary,
+        };
         let Some((content, declared_bytes)) = read_candidate(&path, root) else {
             return;
         };
@@ -157,10 +171,63 @@ impl Options {
     }
 }
 
+/// Instruction files split by when they reach the model.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Discovery {
+    /// The user file, the ancestors and the workspace root file, sent up front.
+    pub upfront: Vec<InstructionFile>,
+    /// Files below the workspace root, sent when their directory is first touched.
+    pub nested: Vec<InstructionFile>,
+}
+
+impl Discovery {
+    /// Returns every file, the ones sent up front first.
+    #[must_use]
+    pub fn all(self) -> Vec<InstructionFile> {
+        let mut files = self.upfront;
+        files.extend(self.nested);
+        files
+    }
+}
+
 /// Discovers instructions for a workspace, using the process configuration root.
 pub fn discover(workspace: &Utf8Path, home: Option<&Utf8Path>) -> Result<Vec<InstructionFile>> {
     let config_root = Paths::from_process().config_root;
-    Options::new(workspace, home, &config_root).discover()
+    Options::new(workspace, home, &config_root)
+        .discover()
+        .map(Discovery::all)
+}
+
+/// Renders a nested file for delivery when its directory is first touched,
+/// cut at `cap` bytes as the prompt cuts a file, with paths relative to the
+/// workspace.
+#[must_use]
+pub fn scoped_rules(file: &InstructionFile, workspace: &Utf8Path, cap: usize) -> String {
+    let shown = |path: &Utf8Path| {
+        path.strip_prefix(workspace)
+            .map_or_else(|_| path.to_string(), ToString::to_string)
+    };
+    let retained = prefix(&file.content, cap);
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "<scoped-rules from=\"{}\" applies-to=\"{}/\">",
+        escape(&shown(&file.path)),
+        escape(&shown(&file.scope))
+    );
+    text.push_str(file.content.get(..retained).unwrap_or_default().trim_end());
+    text.push('\n');
+    if file.declared_bytes > retained as u64 {
+        let _ = writeln!(
+            text,
+            "<instructions-truncated limit=\"{}\" observed_bytes=\"{}\" retained_bytes=\"{}\" />",
+            LimitName::ProjectInstructionFileBytes.as_str(),
+            file.declared_bytes,
+            retained
+        );
+    }
+    text.push_str("</scoped-rules>");
+    text
 }
 
 /// Returns the files that apply to a target, widest scope first.
@@ -433,6 +500,7 @@ mod tests {
     ) -> Vec<InstructionFile> {
         Options::new(workspace, Some(home), config_root)
             .discover()
+            .map(Discovery::all)
             .expect("discover")
     }
 
@@ -558,11 +626,67 @@ mod tests {
 
         let files = Options::new(&workspace, None, &root.join("config"))
             .discover()
+            .map(Discovery::all)
             .expect("discover");
         assert_eq!(files.len(), 2);
 
         let chain = resolve_for_target(&files, &under(&workspace, "other/main.rs"));
         assert_eq!(scopes(&chain), vec![workspace.to_string()]);
+    }
+
+    #[test]
+    fn a_claude_file_is_used_only_without_an_agents_file() {
+        let (_dir, root) = tree();
+        let workspace = root.join("proj");
+        write(&under(&workspace, "a/AGENTS.md"), "agents rules\n");
+        write(&under(&workspace, "a/CLAUDE.md"), "claude rules in a\n");
+        write(&under(&workspace, "b/CLAUDE.md"), "claude rules in b\n");
+        write(&workspace.join("CLAUDE.md"), "root claude rules\n");
+
+        let found = Options::new(&workspace, None, &root.join("config"))
+            .discover()
+            .expect("discover");
+        let names: Vec<String> = found
+            .nested
+            .iter()
+            .map(|file| file.path.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                under(&workspace, "a/AGENTS.md").to_string(),
+                under(&workspace, "b/CLAUDE.md").to_string(),
+            ]
+        );
+        assert_eq!(found.upfront.len(), 1);
+        assert_eq!(found.upfront[0].path, workspace.join("CLAUDE.md"));
+        assert_eq!(found.upfront[0].content, "root claude rules\n");
+    }
+
+    #[test]
+    fn nested_files_are_not_loaded_up_front() {
+        let (_dir, root) = tree();
+        let workspace = root.join("proj");
+        write(&workspace.join("AGENTS.md"), "root rules\n");
+        write(&under(&workspace, "pkg/AGENTS.md"), "package rules\n");
+        let found = Options::new(&workspace, None, &root.join("config"))
+            .discover()
+            .expect("discover");
+        assert_eq!(found.upfront.len(), 1);
+        assert_eq!(found.upfront[0].content, "root rules\n");
+        assert_eq!(found.nested.len(), 1);
+        assert_eq!(found.nested[0].content, "package rules\n");
+
+        let file = &found.nested[0];
+        let rendered = scoped_rules(file, &workspace, 1_000);
+        let expected_from = under(Utf8Path::new("pkg"), "AGENTS.md");
+        assert!(
+            rendered.starts_with(&format!(
+                "<scoped-rules from=\"{expected_from}\" applies-to=\"pkg/\">\npackage rules\n"
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.ends_with("</scoped-rules>"));
     }
 
     #[test]
@@ -574,6 +698,7 @@ mod tests {
         let files = Options::new(&workspace, Some(&root), &root.join("config"))
             .disabled()
             .discover()
+            .map(Discovery::all)
             .expect("discover");
         assert!(files.is_empty());
         assert!(render(&[]).is_empty());

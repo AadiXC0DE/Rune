@@ -1,0 +1,16 @@
+{
+  "title": "Fix money formatting and the invoice total",
+  "kind": "bugfix",
+  "prompt": "Amounts in the invoice preview are wrong: negative values lose their sign after rounding and large numbers have no thousands separators. The totals line also disagrees with the sum of the rows.",
+  "verify": "node --experimental-strip-types --test test/*.test.ts",
+  "protected": [
+    "test",
+    "test/hidden.test.ts"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "typescript",
+  "tags": []
+}

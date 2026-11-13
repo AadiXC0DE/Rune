@@ -215,3 +215,30 @@ fn invalid_recordings_and_conflicting_actions_fail_without_partial_output_or_wri
     assert!(output.stdout.is_empty());
     assert_eq!(fixture.snapshot(), before);
 }
+
+#[test]
+fn explain_names_the_user_file_rule() {
+    let fixture = Fixture::new();
+    let config = fixture.temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[[permission.rules]]\ntool = \"shell\"\nmatch = \"rm *\"\ndecision = \"deny\"\n",
+    )
+    .expect("config");
+    let output = fixture.run(&["permissions", "--explain", "shell:rm -rf x", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(report["outcome"], "deny", "{report}");
+    assert_eq!(report["source"], "user", "{report}");
+    assert_eq!(
+        report["source_path"],
+        config.to_str().expect("utf8"),
+        "{report}"
+    );
+    let output = fixture.run(&["permissions", "--explain", "shell:rm -rf x"]);
+    let text = String::from_utf8(output.stdout).expect("text");
+    assert!(
+        text.contains(&format!("; source: user file {}", config.display())),
+        "{text}"
+    );
+}

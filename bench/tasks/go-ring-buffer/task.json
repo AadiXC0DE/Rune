@@ -1,0 +1,15 @@
+{
+  "title": "Fix the ring buffer eviction and iteration order",
+  "kind": "bugfix",
+  "prompt": "The ring buffer loses the oldest item at the wrong time when it is full, and iterating after a wrap-around returns items out of order.",
+  "verify": "go test ./...",
+  "protected": [
+    "ring/ring_test.go",
+    "ring/hidden_test.go"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "go"
+}

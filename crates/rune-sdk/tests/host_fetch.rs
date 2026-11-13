@@ -111,6 +111,8 @@ fn limits(head_ms: u64, total: Budget, attempts: u64) -> BudgetSet {
 
 fn agent(fetch: Arc<dyn HostFetch>, limits: BudgetSet) -> Agent {
     Agent::new(AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "fixture-key".to_owned(),
         model: Some("fixture-model".to_owned()),
         base_url: "https://example.invalid/v1".to_owned(),

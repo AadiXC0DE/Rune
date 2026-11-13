@@ -9,7 +9,7 @@ Accepted anywhere on the command line.
 | Flag | Value | Description |
 |---|---|---|
 | `--model` | `id` | Override the model for this process. |
-| `--provider` | `name` | Override the provider for this process. |
+| `--provider` | `name` | Override the provider for this process. Run `rune connect` to list them. |
 | `--effort` | `level` | Override the reasoning effort: auto, none, minimal, low, medium, high, xhigh, max. |
 | `--fast` | - | Request fast mode where the provider supports it. |
 | `--no-fast` | - | Disable fast mode for this process. |
@@ -17,14 +17,16 @@ Accepted anywhere on the command line.
 | `--limit` | `name=value` | Override one limit. Repeatable. Use off to disable a limit. |
 | `--add-dir` | `path` | Add a workspace directory for this process. Repeatable. |
 | `--no-additional-dirs` | - | Ignore saved additional directories for this process. |
-| `--offline` | - | Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
-| `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. |
+| `--offline` | - | Refuse provider requests except to a model server on this machine, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network. |
+| `--allow-unsandboxed` | - | Run commands where the host has no sandbox backend. Without this, such a host refuses them. Also RUNE_ALLOW_UNSANDBOXED=1. |
+| `--network` | - | Let sandboxed shell commands use the network. --offline still wins. |
 | `--json` | - | Emit machine-readable output where supported. |
 | `--accessible` | - | Use append-only labelled session output and line input for screen readers. |
 | `--ascii` | - | Use ASCII terminal decorations, preserving message text. |
 | `--theme` | `name` | Override the theme for this process. |
 | `--provider-order` | `a,b` | Prefer these upstream providers in order. |
 | `--provider-strict` | - | Restrict requests to the listed providers. |
+| `--trace` | `dir` | Write each provider request and response, redacted, to this directory. |
 | `-h, --help` | - | Print help. |
 | `-v, --version` | - | Print the version. |
 
@@ -41,9 +43,25 @@ Run one bounded turn without an interactive session
 | Flag | Description |
 |---|---|
 | `--json` | Print one JSON object instead of Markdown. |
-| `--jsonl` | Stream bounded JSONL events (takes precedence over --json). |
+| `--jsonl` | Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs. |
 | `--no-save` | Do not create a session. |
+| `--checkpoints` | Snapshot the workspace before and after the turn so it can be restored with rune session restore. |
 | `--image <path>` | Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images. |
+| `--max-steps <n>` | Stop after this many model steps; the last one answers without tools. 0 means no limit. |
+| `--timeout <seconds>` | Stop the run after this many seconds and report what it did. |
+| `--max-cost <usd>` | Stop the run once its estimated cost reaches this many dollars. |
+| `--goal <objective>` | Work toward this objective; it is added to the instructions. |
+| `--judge` | With --goal, check the result against the objective before finishing. |
+| `--context-report` | Add a context object to the JSON result: the last request's estimated tokens by part. |
+
+```text
+Exit status:
+  0    the model finished (stop_reason end_turn)
+  1    the run failed: provider_error, refused, content_filter, stalled, or an error before the first request
+  3    a limit ended the run and its output is usable: max_model_turns, max_output_tokens, time_limit, spend_limit, objective_token_budget
+  130  interrupted by SIGINT
+  143  stopped by SIGTERM or SIGHUP
+```
 ### `rune acp [--log-file <path>]`
 
 Serve the Agent Client Protocol over standard input and output
@@ -60,7 +78,7 @@ Aliases:
 - `pr`: Same as `rune review`; reviews pending workspace changes with optional context.
 - `issue`: Same as `rune review`; reviews pending workspace changes with optional context.
 
-### `rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--json]`
+### `rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--split <name>] [--jobs <n>] [--logs <dir>] [--json]`
 
 Measure the configured model and harness on coding tasks
 
@@ -68,6 +86,9 @@ Measure the configured model and harness on coding tasks
 |---|---|
 | `--only <ids>` | Run only these comma-separated task identifiers. |
 | `--trials <n>` | Run each task this many times, 1 to 20. |
+| `--split <name>` | Run only tasks of this split: dev, heldout or all. |
+| `--jobs <n>` | Run this many tasks at once, 1 to 16. |
+| `--logs <dir>` | Keep each run's stderr and JSON report in this directory. |
 | `--json` | Print one JSON object with every run and the summary. |
 ### `rune connect [<name>] [--json]`
 
@@ -85,18 +106,21 @@ Aliases:
 
 ## Sessions and local records
 
-### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]`
+### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>] | rune sessions prune --older-than <days> [--keep <n>] [--dry-run] [--json]`
 
 List sessions
 
 | Flag | Description |
 |---|---|
 | `--all` | Include sessions from every workspace. |
+| `--older-than <days>` | With prune: remove sessions last updated more than this many days ago. |
+| `--keep <n>` | With prune: never remove the n most recently updated sessions. |
+| `--dry-run` | With prune: list what would be removed and remove nothing. |
 | `--search <text>` | Match a case-insensitive literal fragment in titles or user messages. |
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |
 | `--json` | Emit JSON. |
-### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>`
+### `rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id> | rune session restore <last|id> --turn <n> [--dry-run] [--force] [--json]`
 
 Inspect, search, export, fork, migrate, or recover one session
 
@@ -106,6 +130,9 @@ Inspect, search, export, fork, migrate, or recover one session
 | `--at <seq>` | Fork through this inclusive saved event sequence. All tool calls must have results. |
 | `--search <text>` | Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions. |
 | `--allow-large` | Permit migrating an oversized session. |
+| `--turn <n>` | Restore the workspace to its state before this turn. |
+| `--dry-run` | List the files a restore would change and change nothing. |
+| `--force` | Restore even when files changed outside the session since its last checkpoint. |
 | `--record <id|all>` | Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record. |
 | `--json` | Emit JSON. Export always emits ordered JSONL event records. |
 ### `rune tree [last|id] [--json] | rune tree --id <id> [--json]`
@@ -151,16 +178,18 @@ Check provider capabilities and context provenance before a turn
 | `--require-images` | Require image content support in the dialect. |
 | `--require-tool-streaming` | Require incremental tool argument streaming. |
 | `--json` | Emit JSON. |
-### `rune models [--json]`
+### `rune models [--refresh] [--explain [<model>]] [--json]`
 
 List the models of the connected provider
 
 | Flag | Description |
 |---|---|
+| `--refresh` | Download the published model catalog now. |
+| `--explain` | Show how requests to this model are shaped, and why. |
 | `--json` | Emit JSON. |
-### `rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>`
+### `rune mcp list | check [server] | login <server> | logout <server> | import claude-desktop <file>`
 
-Manage MCP servers: mcp list, mcp check, mcp import
+Manage MCP servers: mcp list, mcp check, mcp login, mcp logout, mcp import
 
 | Flag | Description |
 |---|---|
@@ -174,9 +203,9 @@ Show the permission mode and rules
 | `--explain <target>` | Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer. |
 | `--simulate <file>` | Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes. |
 | `--json` | Emit JSON. |
-### `rune sandbox [explain] [--external-access] [--json] -- <command>`
+### `rune sandbox [explain] [--external-access] [--json] [-- <command>]`
 
-Explain command policy: sandbox [explain] -- <command>
+Explain command policy: sandbox [explain] [-- <command>]
 
 | Flag | Description |
 |---|---|
@@ -189,9 +218,10 @@ Inspect or change workspace trust
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune config [--explain] [--json]`
+| `--yes` | Approve project hooks and rules without asking. |
+### `rune config [--explain] [--json] | rune config get <key> [--json] | rune config set <key> <value> | rune config unset <key> | rune config path [--json] | rune config edit`
 
-Show the resolved configuration and where each value came from
+Show, read or change the configuration and where each value came from
 
 Aliases:
 
@@ -200,6 +230,13 @@ Aliases:
 | Flag | Description |
 |---|---|
 | `--explain` | Show the source layer of every key. |
+| `--json` | Emit JSON. |
+### `rune keys [--json]`
+
+List the key actions, their keys, and the file that rebinds them
+
+| Flag | Description |
+|---|---|
 | `--json` | Emit JSON. |
 ### `rune limits [--json]`
 
@@ -233,19 +270,21 @@ Show the resolved configuration and runtime state
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune doctor [--json]`
+### `rune doctor [--provider <name>] [--json]`
 
-Check the local setup without starting a turn
+Check the local setup, or one provider with a short round trip
 
 | Flag | Description |
 |---|---|
+| `--provider <name>` | Send one short tool round trip to this provider and report what works. |
 | `--json` | Emit JSON. |
-### `rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
+### `rune upgrade [--check] [--json] | rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
 
 Replace the installed binary with a verified artifact
 
 | Flag | Description |
 |---|---|
+| `--check` | Report whether a newer release exists and change nothing. |
 | `--from <path>` | Artifact to install. |
 | `--checksum <hex>` | Published checksum of that artifact. |
 | `--target <path>` | Binary to replace. Defaults to the running one. |
@@ -260,7 +299,7 @@ Remove the installed binary and, on request, local state
 | `--keep-state` | Leave the state directory in place. |
 | `--yes` | Confirm removal of the state directory. |
 | `--json` | Emit JSON. |
-### `rune completion bash`
+### `rune completion <bash|zsh|fish|powershell>`
 
 Generate shell completion from the command table
 
@@ -297,31 +336,31 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | Name | Default | Unit | Range | Description |
 |---|---|---|---|---|
 | `max_agent_steps` | 0 | items | 0 to 10000 | Maximum model tool-loop steps per turn; zero means unlimited. |
-| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before stopping the next duplicate. |
+| `max_consecutive_tool_failures` | 3 | items | 1 to 10000 | Consecutive identical tool failures allowed before refusing the next duplicate. |
 | `verification_reminders` | 1 | items | 0 to 8 | Times a turn that changed files without a check afterwards is asked to verify. |
 | `session_spend_cents` | off | cents | 1 to unbounded | Estimated spend at which an interactive session stops sending requests. |
-| `max_tool_result_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
+| `max_tool_result_bytes` | 32768 | bytes | 0 to unbounded | Bytes retained from one tool result before spilling. |
 | `max_turn_result_bytes` | 8388608 | bytes | 0 to unbounded | Tool-result bytes one turn retains across its steps. |
 | `skill_catalog_bytes` | 32768 | bytes | 0 to unbounded | Combined size of the skill catalog placed in the prompt. |
 | `skill_description_bytes` | 256 | bytes | 0 to unbounded | Size of one skill description in the catalog. |
 | `skill_file_bytes` | 1048576 | bytes | 0 to unbounded | Largest skill file that may be loaded. |
 | `mcp_description_bytes` | 1024 | bytes | 0 to unbounded | Size of one MCP tool description. |
-| `mcp_search_result_bytes` | 16384 | bytes | 0 to unbounded | Size of MCP tool search results. |
+| `mcp_search_result_bytes` | 1048576 | bytes | 0 to unbounded | Bytes of one MCP server's tool listing read at connection. |
 | `mcp_server_instructions_bytes` | 2048 | bytes | 0 to unbounded | Instructions accepted from one MCP server. |
 | `mcp_selected_schema_bytes` | 65536 | bytes | 0 to unbounded | Schema size for one explicitly selected MCP tool. |
 | `project_instruction_file_bytes` | 65536 | bytes | 0 to unbounded | Size of one project instruction file. |
 | `project_instructions_total_bytes` | 131072 | bytes | 0 to unbounded | Combined size of all applicable project instructions. |
 | `repository_map_bytes` | 4096 | bytes | 0 to unbounded | Rendered Rust repository symbol map bytes; zero disables it. |
 | `image_adapter_output_bytes` | 20480 | bytes | 0 to unbounded | Text produced by an image analysis adapter. |
-| `command_output_bytes` | 65536 | bytes | 0 to unbounded | Bytes retained from one command's output. |
+| `command_output_bytes` | 32768 | bytes | 0 to unbounded | Bytes retained from one command's output. |
 | `read_file_lines` | 2000 | items | 0 to unbounded | Lines returned by one file read. |
 | `read_file_line_bytes` | 2000 | bytes | 0 to unbounded | Bytes per line before truncation in a file read. |
-| `list_entries` | 1000 | bytes | 0 to unbounded | Entries returned by one listing or glob. |
+| `list_entries` | 1000 | items | 0 to unbounded | Entries returned by one listing or glob. |
 | `parallel_tool_calls` | 8 | items | 1 to 64 | Tool calls executed concurrently within one step. |
 | `subagent_children` | 256 | items | 0 to 4096 | Subagent children one parent session may register. |
 | `provider_head_timeout_ms` | 120000 | ms | 1000 to 3600000 | Time to wait for a model response head. |
 | `provider_request_timeout_ms` | 600000 | ms | 1000 to 7200000 | Total time allowed for one model request attempt. |
-| `provider_max_attempts` | 10 | bytes | 1 to 20 | Provider attempts before the turn fails. |
+| `provider_max_attempts` | 10 | items | 1 to 20 | Provider attempts before the turn fails. |
 | `acp_permission_timeout_ms` | 120000 | ms | 0 to unbounded | Time allowed for a client to answer an ACP permission request. |
 | `mcp_operation_timeout_ms` | 60000 | ms | 0 to unbounded | Time allowed for one MCP operation. |
 | `mcp_startup_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for an MCP server to start and be discovered. |
@@ -329,7 +368,9 @@ Every limit takes a count, or `off` to remove it. A hard ceiling still applies t
 | `review_context_bytes` | 8192 | bytes | 0 to unbounded | Current-turn tool output shown to the safety reviewer. |
 | `review_holds_per_turn` | 64 | items | 0 to unbounded | Safety review holds permitted in one turn. |
 | `review_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for one safety review request. |
-| `compaction_trigger_percent` | 80 | items | 10 to 99 | Compaction trigger as a percentage of usable input. |
+| `compaction_trigger_percent` | 80 | percent | 10 to 99 | Compaction trigger as a percentage of usable input. |
+| `context_cap_tokens` | 256000 | items | 0 to 100000000 | Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off. |
+| `compaction_keep_tokens` | 20000 | items | 0 to 1000000 | Newest conversation kept verbatim by compaction, in estimated tokens. |
 | `web_fetch_redirects` | 5 | items | 0 to 20 | Redirects followed by one web fetch. |
 | `web_fetch_bytes` | 1048576 | bytes | 0 to unbounded | Bytes returned by one web fetch. |
 | `web_fetch_timeout_ms` | 30000 | ms | 0 to unbounded | Time allowed for one web fetch. |

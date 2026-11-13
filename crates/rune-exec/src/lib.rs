@@ -8,8 +8,9 @@
 // Unsafe code is denied rather than forbidden, so that the one call that needs
 // it can say so where it is written. Child limits and a controlling tty are set
 // between fork and exec, which is `CommandExt::pre_exec`, and that is
-// unsafe by its own contract. Windows file moves have a separate documented
-// FFI boundary in rename.rs. Everywhere else the denial applies.
+// unsafe by its own contract. Windows file moves and job objects have separate
+// documented FFI boundaries in rename.rs and job.rs. Everywhere else the
+// denial applies.
 #![deny(unsafe_code)]
 // Tests assert by panicking. The guards that forbid panicking apply to the
 // shipped build, where a panic on user input is a defect.
@@ -19,22 +20,27 @@
 mod pty;
 
 #[cfg(windows)]
+mod job;
+#[cfg(windows)]
 mod rename;
 #[cfg(windows)]
 pub use rename::rename_no_replace;
 
 pub mod command;
+pub mod disk;
 pub mod sandbox;
 pub mod session;
 
 pub use command::{
     CommandOutcome, DEFAULT_ADDRESS_SPACE_BYTES, DEFAULT_CPU_SECONDS, DEFAULT_FILE_BYTES,
-    DEFAULT_PROCESSES, DEFAULT_SHELL, Exit, PreparedCommand, ResourceLimits, TRUNCATION_MARKER,
-    minimal_environment, own_group, prepare, prepare_shell, requires_shell, resource_limits, run,
-    run_with_limits, shell_reason, verify_unchanged,
+    DEFAULT_PROCESSES, DEFAULT_SHELL, EnvironmentPolicy, Exit, PreparedCommand, QUIET_DEFAULTS,
+    ResourceLimits, TRUNCATION_MARKER, command_environment, minimal_environment, own_group,
+    prepare, prepare_shell, requires_shell, resource_limits, run, run_with_limits, shell_reason,
+    verify_unchanged,
 };
 pub use sandbox::{
-    LinuxSandbox, MacSandbox, NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy,
-    Support, UNSANDBOXED_OVERRIDE, detect,
+    CACHE_ROOT_VARIABLES, CacheRoot, DEFAULT_CACHE_ROOTS, LinuxSandbox, MacSandbox,
+    NAMESPACE_HELPER, NullSandbox, SEATBELT_TOOL, Sandbox, SandboxPolicy, Support,
+    UNSANDBOXED_OVERRIDE, cache_roots, detect, guidance, in_container,
 };
 pub use session::{Buffer, Process, Reading};

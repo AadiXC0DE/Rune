@@ -19,7 +19,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -158,6 +158,12 @@ pub struct ServerConfig {
     pub context_window: u64,
     /// Directories every session may reach in addition to the workspace.
     pub additional_roots: Vec<Utf8PathBuf>,
+    /// What shell commands receive beyond the minimal environment.
+    pub environment: Arc<rune_tools::EnvironmentPolicy>,
+    /// Whether sandboxed shell commands may use the network.
+    pub network: bool,
+    /// Tool cache directories sandboxed commands may write.
+    pub cache_roots: Vec<Utf8PathBuf>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -181,12 +187,20 @@ impl ServerConfig {
         model: impl Into<String>,
     ) -> Result<Self> {
         let limits = BudgetSet::new();
-        let registry = rune_tools::inventory::builtin(
+        let mut registry = rune_tools::inventory::builtin(
             &FileLimits::from_budget(&limits),
             &limits,
             &Paths::from_process().managed_skills_dir(),
         )?;
         let model = model.into();
+        rune_tools::inventory::tailor(
+            &mut registry,
+            &rune_tools::inventory::Tailoring {
+                workspace: &workspace,
+                interactive: true,
+                edit_tool: rune_net::compat::edit_tool_for(&model),
+            },
+        );
         let context_window = Catalog::new("acp")
             .metadata_or_default(&model)
             .usable_context();
@@ -208,6 +222,9 @@ impl ServerConfig {
             log_file: None,
             context_window,
             additional_roots: Vec::new(),
+            environment: Arc::default(),
+            network: false,
+            cache_roots: Vec::new(),
         })
     }
 
@@ -267,6 +284,14 @@ impl ServerConfig {
             &limits,
             &Paths::from_process().managed_skills_dir(),
         )?;
+        rune_tools::inventory::tailor(
+            &mut self.registry,
+            &rune_tools::inventory::Tailoring {
+                workspace: &self.workspace,
+                interactive: true,
+                edit_tool: rune_net::compat::edit_tool_for(&self.model),
+            },
+        );
         self.limits = limits;
         Ok(self)
     }
@@ -1040,7 +1065,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
     let host = TurnHost {
         server: Arc::clone(server),
         prompt: queued.prompt,
-        prompt_seq,
+        prompt_seq: AtomicU64::new(prompt_seq),
+        prompt_from_end: AtomicUsize::new(usize::MAX),
         session: session.clone(),
         context_window: server.context_window(&snapshot.config.model),
         config: snapshot.config.clone(),
@@ -1048,7 +1074,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         context: snapshot
             .context
             .clone()
-            .with_offline(server.config.endpoint.offline),
+            .with_offline(server.config.endpoint.offline)
+            .with_environment(Arc::clone(&server.config.environment))
+            .with_network(server.config.network)
+            .with_cache_roots(server.config.cache_roots.clone()),
         cancellation: cancellation.clone(),
         steering: snapshot.steering,
         tools,
@@ -1058,7 +1087,8 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         permission_timeout: OnceLock::new(),
     };
 
-    let outcome = run_turn(&mut history, &host);
+    let outcome =
+        run_turn(&mut history, &host).and_then(rune_agent::turn::TurnOutcome::into_strict);
     // The host cancels work when an approval expires. Preserve the deadline
     // error so the prompt reports a timeout rather than a user cancellation.
     let permission_timeout = host.permission_timeout.get();
@@ -1125,7 +1155,10 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
 pub const fn stop_reason(reason: StopReason) -> &'static str {
     match reason {
         StopReason::Completed => "end_turn",
-        StopReason::StepLimit => "max_turn_requests",
+        StopReason::StepLimit
+        | StopReason::Stalled
+        | StopReason::TimeLimit
+        | StopReason::SpendLimit => "max_turn_requests",
         StopReason::OutputLimit | StopReason::ObjectiveBudget => "max_tokens",
         StopReason::Refused | StopReason::ContentFilter => "refusal",
         StopReason::Cancelled => "cancelled",
@@ -1194,7 +1227,11 @@ impl<W: Write + Send + 'static> Server<W> {
 /// The host a turn runs against.
 struct TurnHost<W: Write + Send + 'static> {
     prompt: Prompt,
-    prompt_seq: u64,
+    /// Position of this turn's prompt, which compaction renumbers.
+    prompt_seq: AtomicU64,
+    /// The prompt's distance from the end of the history while a compaction
+    /// is applied, which the retained tail preserves; `usize::MAX` otherwise.
+    prompt_from_end: AtomicUsize,
     server: Arc<Server<W>>,
     session: String,
     config: SessionConfig,
@@ -1311,18 +1348,61 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
         &self,
         history: &mut History,
         plan: &mut RequestPlan,
-        _client: &dyn rune_net::fetch::Fetch,
+        client: &dyn rune_net::fetch::Fetch,
     ) -> Result<()> {
-        self.prompt.hydrate(self.prompt_seq, history, plan);
+        // Attachments are projected first so the size estimate counts them.
+        self.prompt
+            .hydrate(self.prompt_seq.load(Ordering::Relaxed), history, plan);
+        let window = rune_agent::compaction::Window(self.context_window);
+        if rune_agent::compaction::auto_compact(history, plan, self, client, window)?.is_some() {
+            // The request was rebuilt from the compacted history, so the
+            // prompt's attachments are projected again at its new position.
+            self.prompt
+                .hydrate(self.prompt_seq.load(Ordering::Relaxed), history, plan);
+        }
         Ok(())
+    }
+
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        reason: rune_agent::turn::CompactReason,
+    ) -> Result<bool> {
+        let rune_agent::turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        rune_agent::compaction::compact_now(history, self, client, target_tokens)
+    }
+
+    fn before_compaction(&self, history: &History) {
+        let seq = self.prompt_seq.load(Ordering::Relaxed);
+        let from_end = history
+            .turns()
+            .iter()
+            .rev()
+            .position(|turn| turn.seq == seq)
+            .unwrap_or(usize::MAX);
+        self.prompt_from_end.store(from_end, Ordering::Relaxed);
+    }
+
+    fn context_replaced(&self, report: &rune_agent::compaction::CompactionReport) {
+        // Turns are numbered from one after a compaction, with the summary
+        // first. A prompt inside the retained tail keeps its distance from the
+        // end; one in the removed prefix has no position left.
+        let from_end = self.prompt_from_end.swap(usize::MAX, Ordering::Relaxed);
+        let seq = if from_end.saturating_add(1) < report.remaining_turns {
+            u64::try_from(report.remaining_turns.saturating_sub(from_end)).unwrap_or(0)
+        } else {
+            0
+        };
+        self.prompt_seq.store(seq, Ordering::Relaxed);
     }
 
     fn dialect(&self) -> &dyn Provider {
         self.server.config.dialect.provider()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.server.config.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.server.config.endpoint)
     }
 
     fn model(&self) -> String {
@@ -1424,11 +1504,15 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                 )));
             }
             Event::PlanUpdated { .. }
+            | Event::CallRepaired { .. }
+            | Event::ToolRewritten { .. }
             | Event::SteeringApplied { .. }
             | Event::VerificationRequested
+            | Event::ContextPruned { .. }
             | Event::ContextCompacted { .. }
             | Event::ProviderRetry { .. }
-            | Event::ProviderRetryFinished { .. } => {}
+            | Event::ProviderRetryFinished { .. }
+            | Event::Notice { .. } => {}
         }
     }
 
@@ -1446,6 +1530,9 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     is_error: outcome.is_error,
                     plan_update: None,
                     full_text: None,
+                    diff: None,
+                    image: None,
+                    check: None,
                 },
                 Err(err) => ToolOutput::from_error(&err),
             };

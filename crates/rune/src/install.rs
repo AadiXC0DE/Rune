@@ -145,7 +145,7 @@ pub fn digest_of(bytes: &[u8]) -> String {
 
 /// Decodes only the single-file archive formats used by release staging. No archive
 /// path is ever used as a filesystem destination.
-fn release_binary(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+pub(crate) fn release_binary(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     const MAX_TRAILER_BYTES: u64 = 20 * 512;
 
     if bytes.starts_with(b"PK") {

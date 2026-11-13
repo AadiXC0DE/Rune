@@ -14,30 +14,49 @@ mod ask;
 mod attachments;
 mod auto_review;
 mod bench;
+mod cache_warming;
 mod capabilities;
+mod checkpoint;
 mod cli;
+mod clipboard;
 mod compaction_archive;
 mod completion;
+mod config_edit;
 mod connect_flow;
+mod context_watch;
 mod diagnostics;
+mod draft;
+mod file_index;
 mod help;
+mod helper_usage;
+mod hints;
+mod hooks;
 mod install;
+mod keys_file;
 mod mcp;
+mod mcp_oauth;
+mod model_limits;
 mod path_completion;
 mod permissions;
-mod post_tool_hook;
-mod pre_tool_hook;
+mod project_trust;
 mod prompt_history;
 mod provider_setup;
 mod reference;
+mod resume_picker;
 mod sandbox;
 mod session;
 mod session_log;
+mod session_prefix;
+mod shutdown;
 mod spec;
+mod spend;
 mod subagent;
+mod terminal_setup;
+mod upgrade;
 mod version;
 mod vision_client;
 mod web_client;
+mod workspace_snapshot;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -82,6 +101,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_OK);
     }
 
+    install_crash_hook(launch.command.as_str());
     match run(&launch) {
         Ok(code) => code,
         Err(err) => {
@@ -134,6 +154,19 @@ fn handle_runtime_free(launch: &Launch) -> Option<ExitCode> {
     }
 }
 
+/// Records whether the user approved the project file's `allow` rules.
+fn apply_project_rule_approval(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    settings: &mut Settings,
+) -> Result<()> {
+    if let Some(digest) = permissions::project_allow_digest(settings) {
+        settings.project_allow_approved =
+            project_trust::load(paths)?.rules_approved(workspace, &digest);
+    }
+    Ok(())
+}
+
 /// Runs a command that needs the resolved environment.
 fn run(launch: &Launch) -> Result<ExitCode> {
     let paths = Paths::from_process().require_absolute()?;
@@ -149,14 +182,22 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         let config_override = std::env::var("RUNE_CONFIG").ok();
         let config_file = paths.config_file(config_override.as_deref());
         let env = EnvironmentOverrides::from_process();
-        config::load(
+        let mut settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&config_file),
             &env,
-        )
+        );
+        // A typo in a switch ends the run before any request.
+        settings.experiments =
+            rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
+        apply_project_rule_approval(&paths, &workspace, &mut settings)?;
+        settings
     } else {
         Settings::default()
     };
+    if requirements.config {
+        warn_about_network_environment();
+    }
 
     let saved_directory_source = settings.source_of("additional_directories");
 
@@ -177,6 +218,11 @@ fn run(launch: &Launch) -> Result<ExitCode> {
             .record("allow_unsandboxed", Layer::CommandLine);
     }
 
+    if launch.network {
+        settings.shell_network = true;
+        settings.sources.record("shell_network", Layer::CommandLine);
+    }
+
     if launch.offline {
         // Set on the settings rather than only recorded, so every endpoint a
         // command builds carries the refusal rather than just the label.
@@ -185,18 +231,22 @@ fn run(launch: &Launch) -> Result<ExitCode> {
     }
 
     match launch.command {
-        Command::Doctor => run_doctor(&settings, &paths, &workspace, &output_flags),
+        Command::Doctor => run_doctor(&settings, &paths, &workspace, launch, &output_flags),
         Command::Status => run_status(&settings, &paths, &workspace, &output_flags),
         Command::Limits => run_limits(&settings, &output_flags),
-        Command::Config => run_config(&settings, &output_flags),
+        Command::Keys => run_keys(&paths, &output_flags),
+        Command::Config => run_config(&settings, &paths, &workspace, launch, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
+        Command::Sessions if launch.args.first().map(String::as_str) == Some("prune") => {
+            run_prune(&paths, launch, &output_flags)
+        }
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
         Command::Session => run_session(&paths, launch, &workspace, &output_flags),
         Command::Usage => run_usage(&paths, launch, &output_flags),
         Command::Auth => run_auth(&settings, &paths, launch, &output_flags),
         Command::Connect => run_connect(&settings, &paths, launch, &output_flags),
-        Command::Models => run_models(&settings, &paths, &output_flags),
+        Command::Models => run_models(&settings, &paths, launch, &output_flags),
         Command::Capabilities => {
             let check = capabilities::check(&settings, &paths, launch)?;
             if output_flags.json {
@@ -212,6 +262,20 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Mcp => {
             if launch.args.first().is_some_and(|action| action == "import") {
                 println!("{}", mcp::import(&settings, launch)?);
+                return Ok(ExitCode::from(EXIT_OK));
+            }
+            if launch
+                .args
+                .first()
+                .is_some_and(|action| action == "login" || action == "logout")
+            {
+                mcp::login_command(
+                    &settings,
+                    &paths,
+                    launch,
+                    &workspace,
+                    &mut std::io::stdout(),
+                )?;
                 return Ok(ExitCode::from(EXIT_OK));
             }
             let report = mcp::run(&settings, &paths, launch, &workspace)?;
@@ -245,7 +309,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         }
         Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
         Command::Bench => run_bench(launch, &output_flags),
-        Command::Upgrade => run_upgrade(launch, &output_flags),
+        Command::Upgrade => run_upgrade(&settings, launch, &output_flags),
         Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
         Command::Help | Command::Version | Command::Completion => Ok(ExitCode::from(EXIT_OK)),
@@ -284,14 +348,57 @@ fn current_workspace() -> Result<Utf8PathBuf> {
     })
 }
 
+/// Says once why a proxy variable or `SSL_CERT_FILE` is being ignored.
+///
+/// The agents fall back silently, so this is the only place the user hears of it.
+fn warn_about_network_environment() {
+    if let Some(warning) = rune_net::transport::proxy_warning(&|name| std::env::var(name).ok()) {
+        eprintln!("rune: {warning}");
+    }
+    if let Some(warning) = rune_net::roots::Roots::from_environment().warning() {
+        eprintln!("rune: {warning}");
+    }
+}
+
 /// Runs `doctor`.
 fn run_doctor(
     settings: &Settings,
     paths: &Paths,
     workspace: &Utf8Path,
+    launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    if launch.provider.is_some() {
+        return run_doctor_provider(settings, paths, workspace, output);
+    }
     let report = diagnostics::run(settings, paths, workspace);
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else {
+        print!("{}", report.render());
+    }
+    let code = report.exit_code();
+    Ok(ExitCode::from(u8::try_from(code).unwrap_or(EXIT_FAILURE)))
+}
+
+/// Runs `doctor --provider`: says what it will send, sends it and reports.
+fn run_doctor_provider(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let estimate = diagnostics::estimate_line(settings, paths);
+    // The JSON on standard output stays one document.
+    if output.json {
+        eprintln!("{estimate}");
+    } else {
+        println!("{estimate}");
+    }
+    let report = diagnostics::provider_check(settings, paths, workspace)?;
     if output.json {
         println!(
             "{}",
@@ -315,8 +422,25 @@ fn run_ask(
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     let jsonl = launch.has_flag("--jsonl");
+    let context_report = launch.has_flag("--context-report");
+    if context_report && !jsonl && !output.json {
+        return Err(RuneError::invalid_field(
+            "--context-report",
+            "--context-report needs --json or --jsonl",
+        )
+        .with_hint("add --json or --jsonl"));
+    }
+    let checkpoints = launch.has_flag("--checkpoints");
+    if checkpoints && launch.has_flag("--no-save") {
+        return Err(RuneError::invalid_field(
+            "--checkpoints",
+            "--checkpoints needs a saved session; drop --no-save",
+        ));
+    }
+    // Chosen now so the stream's first record can name the saved session.
+    let session_id = (!launch.has_flag("--no-save")).then(rune_core::id::SessionId::generate);
     if jsonl {
-        ask::start_jsonl()?;
+        ask::start_jsonl(settings, session_id.as_ref())?;
     }
     let submitted: String = launch.args.join(" ");
     let prompt = if submitted.trim().is_empty() {
@@ -326,6 +450,7 @@ fn run_ask(
                 if jsonl {
                     ask::final_jsonl(&ask::JsonResult::failure(
                         &settings.model,
+                        settings.effort.as_str(),
                         &err,
                         i32::from(EXIT_FAILURE),
                     ))?;
@@ -341,7 +466,12 @@ fn run_ask(
         let err = RuneError::missing_field("prompt")
             .with_hint("pass the prompt as an argument, or pipe it on standard input");
         if jsonl || output.json {
-            let result = ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+            let result = ask::JsonResult::failure(
+                &settings.model,
+                settings.effort.as_str(),
+                &err,
+                i32::from(EXIT_FAILURE),
+            );
             if jsonl {
                 ask::final_jsonl(&result)?;
             } else {
@@ -351,13 +481,60 @@ fn run_ask(
         return Err(err);
     }
 
+    let goal = launch.flag("--goal").map(ToOwned::to_owned);
+    let judge = launch.has_flag("--judge");
+    if judge && goal.is_none() {
+        return Err(RuneError::invalid_field("--judge", "needs --goal")
+            .with_hint("pass --goal <objective> as well"));
+    }
+    let max_steps = match launch.flag("--max-steps") {
+        Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+            RuneError::invalid_field("--max-steps", format!("`{raw}` is not a whole number"))
+                .with_hint("pass a number of steps, or 0 for no limit")
+        })?),
+        None => None,
+    };
+    let timeout = match launch.flag("--timeout") {
+        Some(raw) => Some(std::time::Duration::from_secs(
+            raw.parse::<u64>()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    RuneError::invalid_field(
+                        "--timeout",
+                        format!("`{raw}` is not a positive number of seconds"),
+                    )
+                    .with_hint("pass a whole number of seconds, such as --timeout 600")
+                })?,
+        )),
+        None => None,
+    };
+    let max_cost_cents = match launch.flag("--max-cost") {
+        Some(raw) => Some(ask::parse_cents(raw).ok_or_else(|| {
+            RuneError::invalid_field(
+                "--max-cost",
+                format!("`{raw}` is not a dollar amount with at most two decimals"),
+            )
+            .with_hint("pass dollars, such as --max-cost 2.50")
+        })?),
+        None => None,
+    };
+
     let options = ask::Options {
         prompt,
         json: output.json,
         jsonl,
+        max_steps,
+        timeout,
+        max_cost_cents,
+        session_id,
         no_save: launch.has_flag("--no-save"),
         tool_loop: true,
         read_only: false,
+        goal,
+        judge,
+        context_report,
+        checkpoints,
         images: launch
             .flags
             .iter()
@@ -373,8 +550,12 @@ fn run_ask(
         }
         Err(err) => {
             if options.jsonl || options.json {
-                let result =
-                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let result = ask::JsonResult::failure(
+                    &settings.model,
+                    settings.effort.as_str(),
+                    &err,
+                    i32::from(EXIT_FAILURE),
+                );
                 // The returned error is reported by main, including its hint.
                 if options.jsonl {
                     ask::final_jsonl(&result)?;
@@ -438,6 +619,14 @@ fn run_review(
         no_save: false,
         tool_loop: true,
         read_only: true,
+        goal: None,
+        judge: false,
+        context_report: false,
+        checkpoints: false,
+        max_steps: None,
+        timeout: None,
+        max_cost_cents: None,
+        session_id: None,
         images: Vec::new(),
     };
 
@@ -445,8 +634,12 @@ fn run_review(
         Ok(result) => Ok(ExitCode::from(ask::report(&result, &options)?)),
         Err(err) => {
             if options.json {
-                let result =
-                    ask::JsonResult::failure(&settings.model, &err, i32::from(EXIT_FAILURE));
+                let result = ask::JsonResult::failure(
+                    &settings.model,
+                    settings.effort.as_str(),
+                    &err,
+                    i32::from(EXIT_FAILURE),
+                );
                 let _ = ask::report(&result, &options);
             }
             Err(err)
@@ -544,16 +737,26 @@ fn run_interactive(
     settings.require_valid_user_config()?;
     let mut settings = settings.clone();
     if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
-        let entry = connect_flow::choose_provider()?;
+        // A terminal gets the guided flow; a pipe the numbered prompts.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            if connect_flow::run_interactive_first(paths, &settings)?.is_none() {
+                return Ok(ExitCode::from(EXIT_OK));
+            }
+        } else {
+            let entry = connect_flow::choose_provider()?;
+            connect_flow::run(paths, &settings, entry)?;
+        }
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
         // runs on exactly what a later run would load.
-        connect_flow::run(paths, &settings, entry)?;
         settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),
             &EnvironmentOverrides::from_process(),
         );
+        settings.experiments =
+            rune_core::experiment::Experiments::from_lookup(|key| std::env::var(key).ok())?;
+        apply_project_rule_approval(paths, workspace, &mut settings)?;
         cli::apply_to_settings(launch, &mut settings);
         // The connection flow has already named what it connected, so the
         // session says only what it is doing next.
@@ -561,6 +764,12 @@ fn run_interactive(
     }
 
     let resume = match &launch.resume {
+        Some(ResumeTarget::Picker) if picker_terminal() && !launch.accessible => {
+            match pick_session(paths, workspace)? {
+                Some(id) => Some(id.parse()?),
+                None => return Ok(ExitCode::from(EXIT_OK)),
+            }
+        }
         Some(target) => Some(session_log::resolve_target(target, paths, workspace)?),
         None => None,
     };
@@ -568,8 +777,119 @@ fn run_interactive(
     config.accessible = launch.accessible;
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
-    let code = session::run(config, input, std::io::stdout())?;
+    let code = session::run(config, input, rune_term::inline::TerminalOutput)?;
+    // With `auto_upgrade = "install"`, a newer release found by the session's
+    // check is installed once the terminal is back to normal. A failure is
+    // reported and leaves the session's exit status alone.
+    if settings.auto_upgrade == config::AutoUpgrade::Install
+        && !settings.offline
+        && interactive_stdin()
+        && let Some(line) = upgrade::install_after_session(paths)
+    {
+        println!("{line}");
+    }
     Ok(ExitCode::from(code))
+}
+
+/// Returns whether both ends of the session are a terminal, so a picker can
+/// read keys and draw.
+fn picker_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Writes `<state root>/last-crash.txt` and says where it is when the process
+/// panics. The previous hook runs first, so the terminal is already restored.
+fn install_crash_hook(command: &'static str) {
+    let previous = std::panic::take_hook();
+    let written = std::sync::atomic::AtomicBool::new(false);
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        // A panic on another thread while this one runs writes nothing more.
+        if written.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned());
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        let paths = Paths::from_process();
+        match write_crash(&paths, command, &message, &location) {
+            Ok(path) => eprintln!(
+                "rune crashed: {}\ndetails are in {path}; include that file in a bug report",
+                rune_net::redact::redact(&message)
+            ),
+            Err(_) => eprintln!("rune crashed: {}", rune_net::redact::redact(&message)),
+        }
+    }));
+}
+
+/// Writes the crash record, private to the user, with secrets redacted.
+fn write_crash(
+    paths: &Paths,
+    command: &str,
+    message: &str,
+    location: &str,
+) -> std::io::Result<Utf8PathBuf> {
+    let path = paths.state_root.join("last-crash.txt");
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let time = session_log::timestamp(millis).unwrap_or_default();
+    let text = format!(
+        "{}\ntime {time}\ncommand {command}\n\n{}\nat {location}\n\nbacktrace:\n{}\n",
+        version::version_line(),
+        rune_net::redact::redact(message),
+        std::backtrace::Backtrace::force_capture()
+    );
+    std::fs::create_dir_all(&paths.state_root)?;
+    rune_core::paths::write_private(&path, &text)
+        .map_err(|err| std::io::Error::other(err.message().to_owned()))?;
+    Ok(path)
+}
+
+/// Lets the user choose a saved session before the session starts.
+///
+/// The key reader and the renderer are dropped before returning, so the
+/// session that follows starts on a restored terminal.
+fn pick_session(paths: &Paths, workspace: &Utf8Path) -> Result<Option<String>> {
+    use std::io::Write as _;
+
+    let mut reader = rune_term::input::KeyReader::new();
+    let (cols, rows) = rune_term::shell::terminal_size().unwrap_or((80, 24));
+    let mut inline = rune_term::inline::Inline::new(cols);
+    inline.set_max_rows(rows);
+    let mut out = rune_term::inline::TerminalOutput;
+    let chosen = {
+        let mut draw = |lines: &[String], caret: (u16, u16)| -> Result<()> {
+            if let Some((cols, rows)) = rune_term::shell::terminal_size() {
+                inline.set_width(cols);
+                inline.set_max_rows(rows);
+            }
+            let bytes = inline.frame(&rune_term::inline::Frame {
+                prompt: lines,
+                caret,
+                ..rune_term::inline::Frame::default()
+            });
+            out.write_all(&bytes)?;
+            out.flush()?;
+            Ok(())
+        };
+        resume_picker::pick(&mut reader, &mut draw, paths, workspace)
+    };
+    let cleared = inline.clear();
+    let _ = out.write_all(&cleared);
+    let _ = out.flush();
+    drop(reader);
+    chosen
 }
 
 /// Returns whether a person is waiting at the terminal.
@@ -642,7 +962,10 @@ fn run_connect(
     output: &OutputFlags,
 ) -> Result<ExitCode> {
     settings.require_valid_user_config()?;
-    let named = launch.args.first().map(|value| value.trim().to_owned());
+    let named = launch
+        .args
+        .first()
+        .map(|value| connect_flow::connection_name(value));
     if named.is_none() && !output.json {
         let entry = connect_flow::choose_provider()?;
         connect_flow::run(paths, settings, entry)?;
@@ -740,7 +1063,33 @@ fn run_connect(
 /// environment, or the configuration, reports the configured model without
 /// contacting anything, which is the answer a machine with no network needs
 /// rather than a failure.
-fn run_models(settings: &Settings, paths: &Paths, output: &OutputFlags) -> Result<ExitCode> {
+fn run_models(
+    settings: &Settings,
+    paths: &Paths,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if launch.has_flag("--refresh") {
+        let refreshed = provider_setup::refresh_catalog(settings, paths)?;
+        if output.json {
+            let value = serde_json::json!({
+                "refreshed": true,
+                "providers": refreshed.providers,
+                "bytes": refreshed.bytes,
+                "path": refreshed.path.as_str(),
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "catalog refreshed: {} providers, {} bytes written to {}",
+                refreshed.providers, refreshed.bytes, refreshed.path
+            );
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    if launch.has_flag("--explain") {
+        return run_models_explain(settings, launch, output);
+    }
     if settings.offline {
         let catalog = provider_setup::catalog_for(settings);
         if output.json {
@@ -756,6 +1105,59 @@ fn run_models(settings: &Settings, paths: &Paths, output: &OutputFlags) -> Resul
         println!("{}", serde_json::to_string_pretty(&catalog.to_json())?);
     } else {
         println!("{}", provider_setup::render_catalog(&catalog));
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Prints how requests to a model are shaped and the rule behind each value.
+///
+/// Read from the configuration and the built-in table alone, so it never
+/// reaches the network.
+fn run_models_explain(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let model = launch
+        .args
+        .first()
+        .map_or(settings.model.trim(), |model| model.trim())
+        .to_owned();
+    if model.is_empty() {
+        return Err(config::unconfigured_model_error());
+    }
+    let resolution = provider_setup::compat_for(settings, &model)?;
+    let endpoint = provider_setup::configured_base_url(settings);
+    if output.json {
+        let rows = |rows: &[rune_net::compat::Applied]| {
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({"field": row.field, "value": row.value, "rule": row.rule})
+                })
+                .collect::<Vec<_>>()
+        };
+        let value = serde_json::json!({
+            "provider": settings.provider.as_str(),
+            "endpoint": endpoint,
+            "model": model,
+            "compat": rows(resolution.compat_rows()),
+            "traits": rows(resolution.trait_rows()),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    println!("provider  {}", settings.provider);
+    println!("endpoint  {}", endpoint.as_deref().unwrap_or("not set"));
+    println!("model     {model}");
+    println!();
+    for (heading, rows) in [
+        ("endpoint compatibility", resolution.compat_rows()),
+        ("model traits", resolution.trait_rows()),
+    ] {
+        println!("{heading}");
+        for row in rows {
+            println!("  {:<34}  {:<22}  {}", row.field, row.value, row.rule);
+        }
     }
     Ok(ExitCode::from(EXIT_OK))
 }
@@ -934,6 +1336,7 @@ fn run_session(
         Some("recover") => return run_session_recover(paths, launch, output),
         Some("migrate") => return run_session_migrate(paths, launch, output),
         Some("fork") => return run_session_fork(paths, launch, workspace, output),
+        Some("restore") => return run_session_restore(paths, launch, workspace, output),
         _ => {}
     }
 
@@ -1038,6 +1441,141 @@ fn run_session(
         );
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Restores the workspace to its state before one turn of a session.
+fn run_session_restore(
+    paths: &Paths,
+    launch: &Launch,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    use checkpoint::{ChangeKind, Record, RestoreReport, RestoreRequest, Shadow, Timeline};
+    use rune_session::event::{RestoreDirection, SessionEvent};
+    let raw = launch.args.get(1).ok_or_else(|| {
+        RuneError::missing_field("session").with_hint("name a session, or run `rune sessions`")
+    })?;
+    let id = if raw == "last" {
+        session_log::resolve_target(&ResumeTarget::Latest, paths, workspace)?
+    } else {
+        raw.parse()?
+    };
+    let turn = launch
+        .flag("--turn")
+        .ok_or_else(|| RuneError::missing_field("turn").with_hint("pass --turn <n>"))?
+        .parse::<u64>()
+        .ok()
+        .filter(|turn| *turn > 0)
+        .ok_or_else(|| RuneError::invalid_field("turn", "expected a positive turn number"))?;
+    let dry_run = launch.has_flag("--dry-run");
+    let force = launch.has_flag("--force");
+    let log = rune_session::store::load_read_only(&paths.session_dir(&id))?;
+    let events: Vec<SessionEvent> = log.events.into_iter().map(|frame| frame.event).collect();
+    let here = trust::canonical_workspace(workspace);
+    let recorded = events.iter().find_map(|event| match event {
+        SessionEvent::WorkspaceSet { workspace } => Some(workspace.clone()),
+        _ => None,
+    });
+    if let Some(recorded) = &recorded
+        && recorded.as_str() != here.as_str()
+    {
+        return Err(RuneError::new(
+            ErrorCode::InvalidState,
+            format!("session {id} ran in {recorded}; run this command there"),
+        ));
+    }
+    let shadow = Shadow::open(paths, &here)?.ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::Unsupported,
+            "this workspace has no checkpoints (it is not a git work tree)",
+        )
+    })?;
+    let mut timeline = Timeline::from_events(&events);
+    let start = timeline.before_turn(turn).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::NotFound,
+            format!("no checkpoint for turn {turn} in session {id}"),
+        )
+    })?;
+    let request = RestoreRequest {
+        turn,
+        target: start.tree,
+        direction: RestoreDirection::Turn,
+    };
+    // The writer lock is taken before anything is written, so a session that is
+    // still open elsewhere refuses the restore.
+    let recorder = if dry_run {
+        None
+    } else {
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::Recorder::open(paths, &id)?,
+        )))
+    };
+    let record: Record = {
+        let recorder = recorder.clone();
+        std::sync::Arc::new(move |event| match &recorder {
+            Some(recorder) => recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workspace_checkpoint(event),
+            None => Ok(()),
+        })
+    };
+    let report = checkpoint::restore_to(
+        &shadow,
+        id.as_str(),
+        &mut timeline,
+        &request,
+        force,
+        dry_run,
+        &record,
+    )?;
+    let (changes, refused) = match &report {
+        RestoreReport::Done(changes) => (changes, false),
+        RestoreReport::OutsideChanges(changes) => (changes, true),
+    };
+    if output.json {
+        let listed: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|change| {
+                serde_json::json!({
+                    "path": change.path,
+                    "kind": match change.kind {
+                        ChangeKind::Added => "added",
+                        ChangeKind::Modified => "modified",
+                        ChangeKind::Deleted => "deleted",
+                    },
+                    "added": change.added,
+                    "removed": change.removed,
+                })
+            })
+            .collect();
+        let mut value = serde_json::json!({
+            "turn": turn,
+            "dry_run": dry_run,
+            "changes": listed,
+        });
+        if refused {
+            value["outside_changes"] = serde_json::Value::Bool(true);
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        let heading = if refused {
+            "these files changed outside this session since the last checkpoint:".to_owned()
+        } else if dry_run {
+            format!("undo preview: restoring to before turn {turn} would change")
+        } else {
+            format!("restored the workspace to before turn {turn}")
+        };
+        println!("{heading}");
+        for change in changes {
+            println!("{}", change.line());
+        }
+        if refused {
+            println!("run this command again with --force to restore anyway");
+        }
+    }
+    Ok(ExitCode::from(if refused { EXIT_FAILURE } else { EXIT_OK }))
 }
 
 /// Creates a separately resumable branch at an inclusive journal position.
@@ -1150,6 +1688,17 @@ fn run_projects(
     let canonical = trust::canonical_workspace(workspace);
     let mut store = trust::TrustStore::load(&paths.trust_file())?;
     let action = launch.args.first().map_or("status", String::as_str);
+    let project_hooks = project_trust::ProjectHooks::read(workspace);
+    let project = config::load(
+        Some(&workspace.join(".rune.toml")),
+        None,
+        &EnvironmentOverrides::default(),
+    );
+    if !matches!(action, "status" | "list") {
+        // Created private before any record is written, or a first write
+        // would leave a state root that every later run refuses.
+        rune_core::paths::create_dir_private(&paths.state_root)?;
+    }
 
     match action {
         "status" | "list" => {}
@@ -1159,6 +1708,8 @@ fn run_projects(
             if !output.json {
                 println!("approved {canonical}");
             }
+            approve_project_hooks(paths, &canonical, &project_hooks, launch, output)?;
+            approve_project_rules(paths, &canonical, &project, launch, output)?;
         }
         "reject" => {
             store.reject(&canonical);
@@ -1172,6 +1723,9 @@ fn run_projects(
             // path's record is cleared.
             store.reset(&canonical);
             store.save(&paths.trust_file())?;
+            let mut approvals = project_trust::load(paths)?;
+            approvals.reset(&canonical);
+            approvals.save(paths)?;
             if !output.json {
                 println!("cleared the recorded decision for {canonical}");
             }
@@ -1197,6 +1751,8 @@ fn run_projects(
             Some(t) => println!("{canonical}: {}", t.as_str()),
             None => println!("{canonical}: no decision recorded"),
         }
+        print_project_hooks(paths, &canonical, &project_hooks)?;
+        print_project_rules(paths, &canonical, &project)?;
         let known = store.entries();
         if known.is_empty() {
             println!("no workspaces have a recorded decision");
@@ -1210,11 +1766,170 @@ fn run_projects(
     Ok(ExitCode::from(EXIT_OK))
 }
 
+/// Prints whether the project hooks are approved, listing them when not.
+fn print_project_hooks(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    hooks: &project_trust::ProjectHooks,
+) -> Result<()> {
+    match hooks {
+        project_trust::ProjectHooks::None => println!("project hooks: none"),
+        project_trust::ProjectHooks::Malformed(diagnostic) => {
+            println!("project hooks: none");
+            println!("  {}", project_trust::ignored(diagnostic));
+        }
+        project_trust::ProjectHooks::Present { digest, hooks } => {
+            if project_trust::load(paths)?.hooks_approved(workspace, digest) {
+                println!("project hooks: approved");
+            } else {
+                let noun = if hooks.len() == 1 { "hook" } else { "hooks" };
+                println!("project hooks: not approved ({} {noun})", hooks.len());
+                for hook in hooks {
+                    println!("{}", project_trust::hook_line(hook));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One project `allow` rule as the user reviews it: `  allow {tool} "{match}"`.
+fn project_rule_line(rule: &config::ConfiguredRule) -> String {
+    format!("  allow {} {:?}", rule.tool.escape_debug(), rule.pattern)
+}
+
+/// Prints whether the project `allow` rules are approved, listing them when
+/// not. Prints nothing when the project file has none.
+fn print_project_rules(paths: &Paths, workspace: &Utf8Path, project: &Settings) -> Result<()> {
+    let Some(digest) = permissions::project_allow_digest(project) else {
+        return Ok(());
+    };
+    if project_trust::load(paths)?.rules_approved(workspace, &digest) {
+        println!("project allow rules: approved");
+    } else {
+        println!("project allow rules: not approved");
+        for rule in permissions::project_allow_rules(project) {
+            println!("{}", project_rule_line(rule));
+        }
+    }
+    Ok(())
+}
+
+/// Approves the project `allow` rules after the user saw them, as the hooks
+/// are approved.
+fn approve_project_rules(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    project: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    let Some(digest) = permissions::project_allow_digest(project) else {
+        return Ok(());
+    };
+    let mut approvals = project_trust::load(paths)?;
+    if approvals.rules_approved(workspace, &digest) {
+        return Ok(());
+    }
+    let yes = launch.has_flag("--yes");
+    let ask = !yes && !output.json && std::io::stdin().is_terminal();
+    if !output.json {
+        for rule in permissions::project_allow_rules(project) {
+            println!("{}", project_rule_line(rule));
+        }
+    }
+    let approved = if yes {
+        true
+    } else if ask {
+        print!("allow these actions without asking? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        let line = "project allow rules not approved: pass --yes to approve them without a prompt";
+        if output.json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        false
+    };
+    if approved {
+        approvals.approve_rules(workspace, &digest);
+        approvals.save(paths)?;
+        if !output.json {
+            println!("approved the allow rules in .rune.toml");
+        }
+    }
+    Ok(())
+}
+
+/// Approves the project hooks after the user saw the exact commands: asked on
+/// a terminal, or with `--yes` without one.
+fn approve_project_hooks(
+    paths: &Paths,
+    workspace: &Utf8Path,
+    hooks: &project_trust::ProjectHooks,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    let project_trust::ProjectHooks::Present { digest, hooks } = hooks else {
+        return Ok(());
+    };
+    let mut approvals = project_trust::load(paths)?;
+    if approvals.hooks_approved(workspace, digest) {
+        return Ok(());
+    }
+    let yes = launch.has_flag("--yes");
+    let ask = !yes && !output.json && std::io::stdin().is_terminal();
+    if !output.json {
+        for hook in hooks {
+            println!("{}", project_trust::hook_line(hook));
+        }
+    }
+    let approved = if yes {
+        true
+    } else if ask {
+        print!("run these commands as you, outside the sandbox? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        let line = "project hooks not approved: pass --yes to approve them without a prompt";
+        if output.json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        false
+    };
+    if approved {
+        approvals.approve_hooks(workspace, digest);
+        approvals.save(paths)?;
+        if !output.json {
+            println!(
+                "approved the project hooks in {}",
+                project_trust::HOOKS_FILE
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Replaces the running binary with a verified artifact.
 ///
 /// The artifact is named by the caller. Nothing here discovers a release on its
 /// own, so an upgrade never contacts a location the user did not name.
-fn run_upgrade(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_upgrade(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    if launch.flag("--from").is_none() && launch.flag("--checksum").is_none() {
+        return run_upgrade_latest(settings, launch, output);
+    }
     let Some(source) = launch.flag("--from") else {
         return Err(RuneError::missing_field("from")
             .with_hint("name the artifact to install, as `--from <path>` or `--from <url>`"));
@@ -1253,6 +1968,62 @@ fn run_upgrade(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("installed {} ({} bytes)", target, artifact.bytes.len());
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Installs, or with `--check` only reports, the latest published release.
+fn run_upgrade_latest(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if settings.offline {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "upgrade needs the network; --offline is set",
+        ));
+    }
+    let target = match launch.flag("--target") {
+        Some(raw) => Utf8PathBuf::from(raw),
+        None => install::current_binary()?,
+    };
+    let check = launch.has_flag("--check");
+    if !check && let Some(refusal) = upgrade::managed_by(&target) {
+        return Err(RuneError::new(ErrorCode::Unsupported, refusal));
+    }
+    let current = version::VERSION;
+    let release = upgrade::latest_release(std::time::Duration::from_secs(15))?;
+    let newer = upgrade::is_newer(&release.version, current);
+    if check || !newer {
+        if output.json {
+            let value = serde_json::json!({
+                "current": current,
+                "latest": release.version,
+                "newer": newer,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else if newer {
+            println!("rune {} is available (this is {current})", release.version);
+        } else {
+            println!("rune {current} is the latest release");
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    let installed = upgrade::install_release(&release, &target)?;
+    if output.json {
+        let value = serde_json::json!({
+            "previous": current,
+            "installed": installed.version,
+            "target": installed.target,
+            "path": target,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "upgraded rune {current} to {} ({})",
+            installed.version, installed.target
+        );
     }
     Ok(ExitCode::from(EXIT_OK))
 }
@@ -1296,6 +2067,23 @@ fn run_uninstall(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result
                 paths.state_root
             );
         }
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Lists the key actions with the keys they answer to.
+fn run_keys(paths: &Paths, output_flags: &OutputFlags) -> Result<ExitCode> {
+    let path = paths.keys_file();
+    let loaded = keys_file::load(&path)?;
+    let present = loaded.is_some();
+    let keymap = loaded.unwrap_or_default();
+    if output_flags.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&keys_file::json(&keymap))?
+        );
+    } else {
+        print!("{}", keys_file::render(&path, present, &keymap));
     }
     Ok(ExitCode::from(EXIT_OK))
 }
@@ -1362,12 +2150,13 @@ fn run_permissions(
     };
     if let Some((tool, target)) = action {
         if output.json {
-            let value = permissions::explain_json(&rules, settings.permission_mode, tool, target);
+            let value =
+                permissions::explain_json(&rules, settings, settings.permission_mode, tool, target);
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!(
                 "{}",
-                permissions::explain(&rules, settings.permission_mode, tool, target)
+                permissions::explain(&rules, settings, settings.permission_mode, tool, target)
             );
         }
         return Ok(ExitCode::from(EXIT_OK));
@@ -1380,6 +2169,124 @@ fn run_permissions(
         println!("{}", permissions::render(&rules, settings.permission_mode));
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Removes old sessions on request: those last updated more than
+/// `--older-than` days ago, never the `--keep` most recent, never a child of a
+/// kept session, and never one another process holds open. Nothing prunes
+/// automatically.
+fn run_prune(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let number = |name: &str| -> Result<Option<u64>> {
+        launch
+            .flag(name)
+            .map(|raw| {
+                raw.parse::<u64>().map_err(|_| {
+                    RuneError::invalid_field(
+                        name.trim_start_matches('-'),
+                        format!("`{raw}` is not a whole number"),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let Some(days) = number("--older-than")? else {
+        return Err(RuneError::new(
+            ErrorCode::MissingField,
+            "--older-than is required; nothing is pruned automatically",
+        )
+        .with_hint("rune sessions prune --older-than 30 --dry-run lists what would go"));
+    };
+    let keep = usize::try_from(number("--keep")?.unwrap_or(0)).unwrap_or(usize::MAX);
+    let dry_run = launch.has_flag("--dry-run");
+    let mut sessions = session_log::list_scoped(paths, None);
+    sessions.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms()));
+    let kept: std::collections::BTreeSet<String> = sessions
+        .iter()
+        .take(keep)
+        .map(|summary| summary.id.clone())
+        .collect();
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis()),
+    )
+    .unwrap_or(u64::MAX);
+    let cutoff = now.saturating_sub(days.saturating_mul(86_400_000));
+    let mut removed = Vec::new();
+    let mut bytes = 0_u64;
+    let mut lines = Vec::new();
+    for summary in &sessions {
+        if summary.updated_at_ms() >= cutoff
+            || kept.contains(&summary.id)
+            || summary
+                .parent
+                .as_ref()
+                .is_some_and(|parent| kept.contains(parent))
+        {
+            continue;
+        }
+        // A session another process has open is left alone.
+        match rune_session::store::SessionStore::open_with_deadline(&summary.dir, 0) {
+            Ok(store) => drop(store),
+            Err(_) => continue,
+        }
+        let size = directory_size(&summary.dir);
+        if !dry_run {
+            std::fs::remove_dir_all(&summary.dir)?;
+            if let Some(workspace) = &summary.workspace {
+                let _ = checkpoint::remove_session(paths, Utf8Path::new(workspace), &summary.id);
+            }
+        }
+        bytes = bytes.saturating_add(size);
+        lines.push(format!(
+            "{} {}  {}  {}",
+            if dry_run { "would remove" } else { "removed" },
+            summary.id,
+            summary.title.as_deref().unwrap_or("untitled"),
+            summary.updated_at.as_deref().unwrap_or("-"),
+        ));
+        removed.push(summary.id.clone());
+    }
+    if output.json {
+        println!(
+            "{}",
+            serde_json::json!({ "removed": removed, "bytes": bytes, "dry_run": dry_run })
+        );
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
+        println!("{} sessions, {}", removed.len(), readable_size(bytes));
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// The bytes the files under `dir` take.
+fn directory_size(dir: &Utf8Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => {
+                Utf8PathBuf::from_path_buf(entry.path()).map_or(0, |path| directory_size(&path))
+            }
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// A byte count in the largest whole unit: `512 B`, `3 KiB`, `12 MiB`.
+fn readable_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes;
+    let mut unit = 0_usize;
+    while value >= 1024 && unit < 3 {
+        value /= 1024;
+        unit = unit.saturating_add(1);
+    }
+    format!("{value} {}", UNITS.get(unit).copied().unwrap_or("GiB"))
 }
 
 /// Lists the sessions stored for this workspace.
@@ -1400,10 +2307,12 @@ fn run_sessions(
     // Without `--all` the listing is scoped to this workspace, so `last` means
     // the latest session here rather than the latest anywhere.
     let scope = (!launch.has_flag("--all")).then_some(workspace);
-    let page = match launch.flag("--search") {
+    let query = launch.flag("--search");
+    let page = match query {
         Some(query) => session_log::search_page(paths, scope, query, limit, cursor)?,
         None => session_log::page(paths, scope, limit, cursor)?,
     };
+    let hits = query.map(|query| session_log::search_hits(&page.rows, query));
     let rows = &page.rows;
     let entries: Vec<serde_json::Value> = rows
         .iter()
@@ -1418,9 +2327,27 @@ fn run_sessions(
         })
         .collect();
     if output.json {
-        let value = serde_json::json!({ "sessions": entries, "next": page.next });
+        let mut value = serde_json::json!({ "sessions": entries, "next": page.next });
+        if let Some((hits, _)) = &hits {
+            value["hits"] = hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "id": hit.id,
+                        "date": hit.date,
+                        "role": hit.role,
+                        "line": hit.line,
+                    })
+                })
+                .collect();
+        }
         let rendered = serde_json::to_string_pretty(&value)?;
         println!("{rendered}");
+    } else if let Some((hits, more)) = &hits {
+        println!("{}", session_log::render_hits(hits, *more));
+        if let Some(next) = &page.next {
+            println!("\nmore sessions: run again with --cursor {next}");
+        }
     } else {
         println!("{}", session_log::render_listing(rows));
         if let Some(next) = &page.next {
@@ -1452,15 +2379,23 @@ fn run_acp(
         _ => rune_acp::Dialect::ChatCompletions,
     };
 
-    let registry = rune_tools::inventory::builtin_with_vision(
+    let mut registry = rune_tools::inventory::builtin_with_vision(
         &rune_tools::workspace::FileLimits::from_budget(&settings.limits),
         &settings.limits,
         &paths.managed_skills_dir(),
         web_client::backends(settings),
         std::sync::Arc::new(rune_tools::ask_user::Unavailable),
         std::sync::Arc::new(rune_tools::skill::Empty),
-        vision_client::backend(settings, paths)?,
+        vision_client::backend(settings, paths, None)?,
     )?;
+    rune_tools::inventory::tailor(
+        &mut registry,
+        &rune_tools::inventory::Tailoring {
+            workspace,
+            interactive: true,
+            edit_tool: rune_net::compat::edit_tool(settings.edit_tool, &settings.model),
+        },
+    );
 
     let rules = rune_policy::rules::RuleSet::new();
 
@@ -1484,6 +2419,9 @@ fn run_acp(
             .context_window
             .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
         additional_roots: settings.additional_directories.clone(),
+        environment: provider_setup::command_environment(settings),
+        network: settings.shell_network,
+        cache_roots: sandbox::cache_paths(settings),
     };
 
     let server = std::sync::Arc::new(rune_acp::Server::new(config, std::io::stdout())?);
@@ -1518,6 +2456,10 @@ fn run_status(
             }
         );
         println!("permissions    {}", settings.permission_mode.label());
+        println!(
+            "sandbox        {}",
+            sandbox::status_line(settings, &sandbox::status(settings))
+        );
         println!("config root    {}", paths.config_root);
         println!("state root     {}", paths.state_root);
         println!("data root      {}", paths.data_root);
@@ -1540,7 +2482,16 @@ fn run_limits(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
 }
 
 /// Runs `config`.
-fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
+fn run_config(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if let Some(action) = launch.args.first() {
+        return run_config_action(action, settings, paths, workspace, launch, output);
+    }
     if output.json {
         let value = diagnostics::config_json(settings);
         println!(
@@ -1551,6 +2502,61 @@ fn run_config(settings: &Settings, output: &OutputFlags) -> Result<ExitCode> {
         print!("{}", diagnostics::config_text(settings));
     }
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Runs `config get`, `set`, `unset`, `path` or `edit`.
+fn run_config_action(
+    action: &str,
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let argument = |index: usize, name: &str| {
+        launch
+            .args
+            .get(index)
+            .map(String::as_str)
+            .ok_or_else(|| RuneError::missing_field(name))
+    };
+    let user = config_edit::user_file(paths);
+    let unknown = |err: &RuneError| {
+        report_error(err);
+        Ok(ExitCode::from(config_edit::EXIT_UNKNOWN_KEY))
+    };
+    match action {
+        "get" => match config_edit::get(settings, argument(1, "key")?, output.json) {
+            Ok(()) => Ok(ExitCode::from(EXIT_OK)),
+            Err(err) => unknown(&err),
+        },
+        "set" | "unset" => {
+            let key = argument(1, "key")?;
+            if !config::USER_KEYS.contains(&key) {
+                return unknown(&config_edit::unknown_setting(
+                    key,
+                    config::USER_KEYS.iter().copied(),
+                ));
+            }
+            if action == "set" {
+                let line = config_edit::set(&user, key, argument(2, "value")?)?;
+                println!("set {line} in {user}");
+            } else {
+                config_edit::unset(&user, key)?;
+                println!("unset {key} in {user}");
+            }
+            Ok(ExitCode::from(EXIT_OK))
+        }
+        "path" => {
+            config_edit::print_path(&user, workspace, output.json);
+            Ok(ExitCode::from(EXIT_OK))
+        }
+        "edit" => config_edit::edit(&user),
+        other => Err(
+            RuneError::invalid_field("config", format!("`{other}` is not a subcommand"))
+                .with_hint("use get, set, unset, path, or edit"),
+        ),
+    }
 }
 
 /// Runs `bench`: every task under the given directory, each in a fresh copy.
@@ -1578,10 +2584,16 @@ fn run_bench(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
                 .collect()
         })
         .unwrap_or_default();
+    let split = match launch.flag("--split") {
+        None => bench::SplitFilter::All,
+        Some(raw) => bench::SplitFilter::parse(raw)
+            .ok_or_else(|| RuneError::invalid_field("--split", "expected dev, heldout or all"))?,
+    };
     let mut tasks = bench::discover(Utf8Path::new(root))?;
     if !only.is_empty() {
         tasks.retain(|task| only.contains(&task.id.as_str()));
     }
+    tasks.retain(|task| split.admits(&task.task));
     if tasks.is_empty() {
         return Err(RuneError::new(
             ErrorCode::NotFound,
@@ -1593,29 +2605,47 @@ fn run_bench(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
         .ok()
         .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
         .ok_or_else(|| RuneError::new(ErrorCode::Internal, "cannot locate this binary"))?;
-    // The model and provider chosen for this process apply to every run.
-    let mut overrides = Vec::new();
-    for (flag, value) in [
-        ("--model", &launch.model),
-        ("--provider", &launch.provider),
-        ("--effort", &launch.effort),
-    ] {
-        if let Some(value) = value {
-            overrides.push(flag.to_owned());
-            overrides.push(value.clone());
-        }
-    }
+    let jobs = match launch.flag("--jobs") {
+        None => 1,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=16).contains(count))
+            .ok_or_else(|| RuneError::invalid_field("--jobs", "expected 1 to 16"))?,
+    };
+    let logs = launch.flag("--logs").map(Utf8PathBuf::from);
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .ok_or_else(|| RuneError::new(ErrorCode::Internal, "cannot read the working directory"))?;
+    // The global flags chosen for this process apply to every run.
+    let overrides = bench::overrides(
+        &bench::Forwarded {
+            model: launch.model.as_deref(),
+            provider: launch.provider.as_deref(),
+            effort: launch.effort.as_deref(),
+            limits: &launch.limit_overrides,
+            add_dirs: &launch.add_dirs,
+            allow_unsandboxed: launch.allow_unsandboxed,
+            offline: launch.offline,
+        },
+        &cwd,
+    );
 
-    let mut runs = Vec::new();
-    for trial in 1..=trials {
-        for task in &tasks {
-            let run = bench::run_task(&binary, &overrides, task, trial)?;
-            if !output.json {
-                println!("{}", bench::row(&run));
+    let json = output.json;
+    let runs = bench::run_all(
+        &binary,
+        &overrides,
+        &tasks,
+        trials,
+        jobs,
+        logs.as_deref(),
+        &|run| {
+            if !json {
+                println!("{}", bench::row(run));
             }
-            runs.push(run);
-        }
-    }
+        },
+    )?;
     let summary = bench::summarize(&runs);
     if output.json {
         let value = serde_json::json!({ "runs": runs, "summary": summary });
@@ -1644,10 +2674,22 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
     // text would hide every omission, which is the thing a reader needs to see.
     if launch.has_flag("--show") {
         let workspace = current_workspace()?;
-        let text = rune_context::prompt::instructions_for(
+        let tools = session::advertised_tools(settings, &paths, &workspace)?;
+        let text = rune_context::prompt::instructions_with(
             &workspace,
             &paths.config_root,
             &settings.limits,
+            &rune_context::prompt::PromptOptions {
+                variant: settings.experiments.prompt,
+                tools: &session::tool_names(&tools),
+                overlay: Some(
+                    provider_setup::CompatSource::from_settings(settings)
+                        .resolve(&settings.model)
+                        .1
+                        .prompt_overlay,
+                ),
+                overlay_switch: settings.experiments.overlay,
+            },
         );
         print!("{text}");
         if !text.ends_with('\n') {
@@ -1659,6 +2701,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
     let workspace = current_workspace()?;
     let tools = session::advertised_tools(settings, &paths, &workspace)?;
     let tool_bytes = advertised_tool_bytes(&tools);
+    let builtin_prompt = rune_context::prompt::system_prompt(settings.experiments.prompt);
 
     // `--tools` prints each advertised tool as one JSON line, so the schemas
     // sent with every request can be read and measured like the instructions.
@@ -1677,7 +2720,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
             "path": override_path,
             "bytes": override_text
                 .as_ref()
-                .map_or(rune_context::prompt::SYSTEM_PROMPT.len(), String::len),
+                .map_or(builtin_prompt.len(), String::len),
             "context": settings.context,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -1691,7 +2734,7 @@ fn run_prompt(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Res
         ),
         None => println!(
             "system prompt  built in, {} bytes (no override at {override_path})",
-            rune_context::prompt::SYSTEM_PROMPT.len()
+            builtin_prompt.len()
         ),
     }
     println!(
@@ -1925,6 +2968,35 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crash_hook_writes_a_private_redacted_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let paths = Paths::resolve(None, None, None, None, Some(root.join("state").as_str()));
+        let secret = "sk-abc123def456ghi789jkl012mno345pqr";
+        let path = write_crash(
+            &paths,
+            "interactive",
+            &format!("boom with {secret} inside"),
+            "src/x.rs:7",
+        )
+        .expect("written");
+        assert_eq!(path, paths.state_root.join("last-crash.txt"));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.starts_with(&version::version_line()), "{text}");
+        assert!(text.contains("\ncommand interactive\n"), "{text}");
+        assert!(text.contains("\nat src/x.rs:7\n"), "{text}");
+        assert!(text.contains("\nbacktrace:\n"), "{text}");
+        assert!(text.contains("\ntime 20"), "{text}");
+        assert!(!text.contains(secret), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn the_session_subcommands_are_dispatched_before_an_identifier_is_parsed() {

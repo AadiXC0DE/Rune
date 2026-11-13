@@ -1,0 +1,8 @@
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3.1-pro","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3.1-pro","choices":[{"index":0,"delta":{"content":"The directory is rune."},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3.1-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":40,"completion_tokens":12,"total_tokens":52}}
+
+data: [DONE]
+

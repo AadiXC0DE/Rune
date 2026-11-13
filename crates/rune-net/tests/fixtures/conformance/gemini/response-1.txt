@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"The user wants the directory.","thought":true}]},"index":0}],"modelVersion":"gemini-3.8-flash"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"current_directory","args":{}},"thoughtSignature":"CiQBconformance0gemini0signature"}]},"index":0,"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash","usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":8,"thoughtsTokenCount":4,"totalTokenCount":52}}
+

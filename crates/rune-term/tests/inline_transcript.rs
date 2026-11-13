@@ -89,7 +89,7 @@ fn indented_and_bracketed_entries_fit_twelve_columns_without_losing_text() {
         assert!(plain.lines().all(|row| rune_term::str_width(row) <= 12));
         let recovered: String = plain
             .chars()
-            .filter(|ch| !matches!(ch, ' ' | '\n' | '>' | '[' | ']'))
+            .filter(|ch| !matches!(ch, ' ' | '\n' | '>' | '\u{258c}' | '[' | ']'))
             .collect();
         assert_eq!(recovered, text.replace('\n', ""));
     }

@@ -1,0 +1,315 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        default: stable
+        required: true
+      version:
+        description: Release version (empty uses the version in source)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    # Both architectures are built here rather than one per manual dispatch: the
+    # Homebrew formula carries a checksum for each, so a release missing one
+    # leaves half of the people installing from the landing page on an old
+    # build.
+    #
+    # Signing happens when the credentials are present and is skipped loudly
+    # when they are not. A Developer ID certificate requires a paid Apple
+    # Developer Program membership, so an unsigned release has to remain
+    # possible; what must not happen is an unsigned artifact being passed off as
+    # signed, so the log says which path ran and the release body repeats it.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      # Publish this certificate SHA-1 fingerprint as a repository variable.
+      # The corresponding Developer ID private key remains in encrypted secrets.
+      RUNE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+      CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+      CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+      # An App Store Connect API key, for notarisation.
+      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Add the release target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Report whether this build will be signed
+        run: |
+          set -eu
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$CERTIFICATE_PASSWORD" ] && [ -n "$RUNE_SIGNING_IDENTITY" ]; then
+            echo "signing: yes, with $RUNE_SIGNING_IDENTITY"
+          else
+            echo "::warning::Signing credentials are absent, so this release is UNSIGNED."
+            echo "signing: no, no Developer ID certificate is configured for this repository"
+          fi
+
+      - name: Import the release signing certificate into a temporary keychain
+        if: env.CERTIFICATE_P12 != ''
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_keychain="$RUNNER_TEMP/rune-release.keychain-db"
+          test -n "$RUNE_SIGNING_IDENTITY"
+          test -n "$CERTIFICATE_P12"
+          test -n "$CERTIFICATE_PASSWORD"
+          signing_password=$(openssl rand -hex 32)
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/rune-signing.p12"
+          security create-keychain -p "$signing_password" "$signing_keychain"
+          security set-keychain-settings -lut 21600 "$signing_keychain"
+          security unlock-keychain -p "$signing_password" "$signing_keychain"
+          security import "$RUNNER_TEMP/rune-signing.p12" -k "$signing_keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$signing_password" "$signing_keychain"
+          security list-keychains -d user -s "$signing_keychain"
+          rm "$RUNNER_TEMP/rune-signing.p12"
+
+      - name: Test native certificate verification and tamper rejection
+        if: env.CERTIFICATE_P12 != ''
+        run: cargo test -p xtask --test macos_signing -- --include-ignored
+
+      - name: Package the release, signed when a certificate is configured
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # An empty version input means the single source of truth decides, and
+          # the target is always passed explicitly so one leg cannot silently
+          # build the other architecture.
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$RUNE_SIGNING_IDENTITY" ]; then
+            cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}" --sign-identity "$RUNE_SIGNING_IDENTITY"
+            cargo xtask verify-release "target/dist/rune-${{ matrix.target }}/manifest.json" "$RUNE_SIGNING_IDENTITY"
+          else
+            # Without an identity the archive is packaged unsigned; the checksum
+            # still covers the exact bytes that are published.
+            cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}"
+          fi
+
+      # Apple checks a signed binary and records a ticket that Gatekeeper fetches
+      # online; a bare binary cannot be stapled. Notarisation does not change the
+      # archive, so its checksum stands.
+      - name: Notarise the signed binary
+        if: env.CERTIFICATE_P12 != '' && env.APPLE_NOTARY_KEY_P8 != '' && env.APPLE_NOTARY_KEY_ID != '' && env.APPLE_NOTARY_ISSUER_ID != ''
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          work="$RUNNER_TEMP/notarize"; mkdir -p "$work"
+          tar -xzf "target/dist/rune-$TARGET/"rune-*.tar.gz -C "$work"
+          ditto -c -k --keepParent "$work/rune" "$RUNNER_TEMP/rune-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/rune-notarize.zip" --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --timeout 20m
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Say what was produced
+        run: |
+          set -eu
+          ls -l "target/dist/rune-${{ matrix.target }}/"
+          if [ -n "$CERTIFICATE_P12" ]; then
+            echo "produced: signed ${{ matrix.target }} archive"
+          else
+            echo "produced: UNSIGNED ${{ matrix.target }} archive"
+          fi
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-macos-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/rune-release.keychain-db" || true
+          rm -f "$RUNNER_TEMP/rune-signing.p12" "$RUNNER_TEMP/notary.p8"
+
+  # Static musl archives for Linux, each built on a runner of its own
+  # architecture and checked in Alpine and Debian before it is published.
+  linux-static:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Build the static archive
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          bash .github/scripts/build-static-linux.sh "${{ matrix.target }}" "$RELEASE_CHANNEL" "$version"
+
+      - name: Run it in Alpine and Debian
+        run: bash .github/scripts/test-static-linux.sh target/dist/rune-${{ matrix.target }}/*.tar.gz
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-linux-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
+          if-no-files-found: error
+
+  # The Windows archive, built natively and checked by extracting it and
+  # replacing a running copy, as an upgrade would.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python for the archive check
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Package the Windows archive
+        shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          cargo xtask release "$RELEASE_CHANNEL" "$version" x86_64-pc-windows-msvc
+
+      - name: Extract the archive and replace a running copy
+        shell: bash
+        run: python .github/scripts/test-windows-release.py target/dist/*/*.zip
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-windows-x86_64-pc-windows-msvc
+          path: target/dist/rune-x86_64-pc-windows-msvc/*
+          if-no-files-found: error
+
+  # Everything lands in a draft release; the owner publishes it by hand. A
+  # failed leg stops this job, so a release is never missing an archive.
+  publish:
+    needs: [macos, linux-static, windows]
+    if: inputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect the artifacts, one directory per architecture
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Gather the release files and write SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Each leg ships the same file names, so the manifest is the only file
+          # that needs the architecture in its name; archives keep the names the
+          # formula and the readme already point at.
+          for directory in dist/*/; do
+            leg=$(basename "$directory")
+            for file in "$directory"*; do
+              base=$(basename "$file")
+              if [ "$base" = "manifest.json" ]; then
+                cp "$file" "release/${leg}-manifest.json"
+              else
+                cp "$file" "release/$base"
+              fi
+            done
+          done
+          (cd release && sha256sum rune-*.tar.gz rune-*.zip > SHA256SUMS)
+          # Every sidecar must agree with the list, or one of them is not the
+          # file this run built.
+          for sidecar in release/*.sha256; do
+            expected=$(awk '{ print $1 }' "$sidecar")
+            archive=$(basename "${sidecar%.sha256}")
+            listed=$(awk -v name="$archive" '$2 == name { print $1 }' release/SHA256SUMS)
+            if [ "$expected" != "$listed" ]; then
+              echo "::error::$sidecar does not match SHA256SUMS"
+              exit 1
+            fi
+          done
+          ls -l release
+          cat release/SHA256SUMS
+
+      - name: Record where the archives were built
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/rune-*.tar.gz, release/rune-*.zip'
+
+      - name: Publish a draft release from what this run produced
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          # The tag comes from the archives themselves, so the release can only be
+          # named after something this run produced.
+          version=$(basename "$(ls release/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')
+          test -n "$version"
+
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$APPLE_NOTARY_KEY_P8" ] && [ -n "$APPLE_NOTARY_KEY_ID" ] && [ -n "$APPLE_NOTARY_ISSUER_ID" ]; then
+            note="The macOS archives are signed with this repository's Developer ID certificate and notarised by Apple."
+          elif [ -n "$CERTIFICATE_P12" ]; then
+            note="These macOS archives are signed with this repository's Developer ID certificate."
+          else
+            note="These archives are **not signed**: no Developer ID certificate is configured for this repository, which requires a paid Apple Developer Program membership. Installing through Homebrew is unaffected, because the download does not carry the quarantine flag. A tarball downloaded by hand does, and Gatekeeper will refuse an unsigned binary."
+          fi
+
+          printf '%s\n\n%s\n' "$note" \
+            "Linux archives are static musl builds for x86_64 and aarch64. The Windows archive is not signed." > notes.md
+
+          if draft=$(gh release view "v$version" --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$draft" = true ]; then
+              gh release upload "v$version" release/* --clobber
+            else
+              echo "::error::v$version is already published; bump the version before releasing again"
+              exit 1
+            fi
+          else
+            gh release create "v$version" release/* --draft --title "Rune v$version" --generate-notes --notes-file notes.md
+          fi

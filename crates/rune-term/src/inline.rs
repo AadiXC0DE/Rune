@@ -32,6 +32,11 @@ pub const HIDE_CURSOR: &str = "\u{1b}[?25l";
 /// Shows the cursor once the region is consistent.
 pub const SHOW_CURSOR: &str = "\u{1b}[?25h";
 
+/// Starts a synchronized update: the terminal shows the last frame until the end mark.
+pub const BEGIN_SYNC: &str = "\u{1b}[?2026h";
+/// Ends a synchronized update.
+pub const END_SYNC: &str = "\u{1b}[?2026l";
+
 /// Erases from the cursor to the end of the screen.
 const ERASE_BELOW: &str = "\u{1b}[J";
 
@@ -59,6 +64,8 @@ pub struct Frame<'a> {
     pub menu: &'a [String],
     /// Where the caret belongs, as a row within `prompt` and a column.
     pub caret: (u16, u16),
+    /// The style of the row that says arriving rows were left out above.
+    pub overflow_style: &'a str,
 }
 
 /// The region repainted in place at the bottom of the screen.
@@ -79,6 +86,10 @@ pub struct Inline {
     max_rows: u16,
     /// Where the cursor was left inside the region, counted from its top.
     cursor_row: u16,
+    /// The column the cursor was left at.
+    cursor_col: u16,
+    /// Whether each frame is wrapped in a synchronized update.
+    synchronized: bool,
     /// Whether the region has been drawn at least once.
     drawn: bool,
     /// Rows of the region as the terminal last received them.
@@ -88,6 +99,12 @@ pub struct Inline {
     /// whole region per delta costs every visible row each time, which is what
     /// made a long response write hundreds of times the size of the answer.
     shown: Vec<String>,
+    /// Visible width of each row of the region as last written.
+    ///
+    /// Kept apart from `shown`, which a repaint request clears while the rows
+    /// are still on screen: a later width change still needs to know how the
+    /// terminal rewrapped them.
+    shown_widths: Vec<usize>,
     /// Rows of the region that were settled into the flow when last drawn.
     shown_settled: usize,
 }
@@ -100,14 +117,55 @@ impl Inline {
             cols,
             max_rows: u16::MAX,
             cursor_row: 0,
+            cursor_col: 0,
+            synchronized: true,
             drawn: false,
             shown: Vec::new(),
+            shown_widths: Vec::new(),
             shown_settled: 0,
         }
     }
 
-    /// Changes the width, which invalidates nothing because every row is redrawn.
-    pub const fn set_width(&mut self, cols: u16) {
+    /// Turns the synchronized-update marks around each frame on or off.
+    pub const fn set_synchronized(&mut self, on: bool) {
+        self.synchronized = on;
+    }
+
+    /// Changes the width.
+    ///
+    /// A terminal that reflows its lines rewraps the region when it narrows,
+    /// so a row wider than the new width now takes more than one screen row
+    /// and the region's top is further up than the row count says. The cursor
+    /// row is moved to where the rewrapped region puts it, and the next frame
+    /// walks up to the region's top, erases it and paints it whole.
+    pub fn set_width(&mut self, cols: u16) {
+        let cols = cols.max(1);
+        if cols == self.cols {
+            return;
+        }
+        if self.drawn {
+            let wide = usize::from(cols);
+            let above = self
+                .shown_widths
+                .iter()
+                .take(usize::from(self.cursor_row))
+                .map(|width| width.div_ceil(wide).max(1))
+                .sum::<usize>()
+                // A row whose width is no longer known still takes one row.
+                .saturating_add(
+                    usize::from(self.cursor_row).saturating_sub(self.shown_widths.len()),
+                );
+            let reflowed = above.saturating_add(
+                usize::from(self.cursor_col)
+                    .checked_div(wide)
+                    .unwrap_or_default(),
+            );
+            self.cursor_row = u16::try_from(reflowed).unwrap_or(u16::MAX);
+            self.cursor_col = self.cursor_col.checked_rem(cols).unwrap_or_default();
+            self.shown.clear();
+            self.shown_widths.clear();
+            self.shown_settled = 0;
+        }
         self.cols = cols;
     }
 
@@ -127,6 +185,13 @@ impl Inline {
         // region of a different size. The region is still on screen, though, so
         // where it is stays known: the next frame walks up to its top and
         // erases it before painting, rather than leaving it above the new one.
+        self.shown.clear();
+        self.shown_settled = 0;
+    }
+
+    /// Forgets what was drawn, so the next frame repaints every row: used when
+    /// the colours change and no row on screen may keep the old ones.
+    pub fn invalidate(&mut self) {
         self.shown.clear();
         self.shown_settled = 0;
     }
@@ -169,6 +234,46 @@ impl Inline {
     /// Returns the bytes to write. Nothing here reads the terminal, so the same
     /// inputs always produce the same bytes.
     pub fn frame(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        // After a resume nothing on screen can be trusted, so repaint it all.
+        if crate::modes::take_redraw() {
+            self.invalidate();
+        }
+        let body = self.render(frame, false);
+        self.wrap(body)
+    }
+
+    /// Renders one frame, or nothing when it would change nothing on screen.
+    ///
+    /// Like [`Inline::frame`], except that an unchanged frame whose caret is
+    /// already where the last frame left it returns no bytes at all.
+    pub fn frame_if_changed(&mut self, frame: &Frame<'_>) -> Vec<u8> {
+        // After a resume nothing on screen can be trusted, so repaint it all.
+        if crate::modes::take_redraw() {
+            self.invalidate();
+        }
+        let body = self.render(frame, true);
+        self.wrap(body)
+    }
+
+    /// Puts a frame's bytes inside one synchronized update, when enabled.
+    fn wrap(&self, body: String) -> Vec<u8> {
+        if body.is_empty() || !self.synchronized {
+            return body.into_bytes();
+        }
+        let mut out = String::with_capacity(
+            body.len()
+                .saturating_add(BEGIN_SYNC.len())
+                .saturating_add(END_SYNC.len()),
+        );
+        out.push_str(BEGIN_SYNC);
+        out.push_str(&body);
+        out.push_str(END_SYNC);
+        out.into_bytes()
+    }
+
+    /// Builds the bytes of one frame; `skip_unchanged` drops a caret move that
+    /// would leave the caret where it already is.
+    fn render(&mut self, frame: &Frame<'_>, skip_unchanged: bool) -> String {
         let Frame {
             settled,
             arriving,
@@ -177,6 +282,7 @@ impl Inline {
             prompt,
             menu,
             caret,
+            overflow_style,
         } = *frame;
         // The input row is always present, even when nothing is being typed.
         // Without it the caret has no home of its own and falls back onto the
@@ -230,14 +336,23 @@ impl Inline {
         let menu_room = usize::from(self.max_rows).saturating_sub(reserved);
         let menu = &menu[..menu.len().min(menu_room)];
         let room = menu_room.saturating_sub(menu.len());
-        let visible: &[String] = if arriving.len() > room {
-            arriving
-                .get(arriving.len().saturating_sub(room)..)
-                .unwrap_or(arriving)
-        } else {
-            arriving
-        };
-        rows.extend(visible.iter().map(|row| self.clip(row)));
+        if arriving.len() > room && room > 0 {
+            // The newest rows are shown under one row that counts the rest.
+            let shown = room.saturating_sub(1);
+            let hidden = arriving.len().saturating_sub(shown);
+            let reset = if overflow_style.is_empty() {
+                ""
+            } else {
+                crate::engine::Style::RESET
+            };
+            rows.push(self.clip(&format!(
+                "{overflow_style}... {hidden} more lines above (ctrl-o shows everything){reset}"
+            )));
+            let tail = arriving.get(arriving.len().saturating_sub(shown)..);
+            rows.extend(tail.unwrap_or_default().iter().map(|row| self.clip(row)));
+        } else if arriving.len() <= room {
+            rows.extend(arriving.iter().map(|row| self.clip(row)));
+        }
 
         if let Some(activity) = activity {
             rows.push(self.clip(activity));
@@ -250,6 +365,24 @@ impl Inline {
         // A list opened by typing goes under the line being typed, which is
         // where a reader looks for it and where it does not disturb the answer.
         rows.extend(menu.iter().map(|row| self.clip(row)));
+        // A tab moves the cursor by the terminal's own stops, so a row holding
+        // one no longer occupies the columns it was measured at.
+        debug_assert!(
+            rows.iter().all(|row| !row.contains('\t')),
+            "a live row holds a tab"
+        );
+        // A row wider than the terminal or holding a line break takes more
+        // than one screen row, and every move back to the region's top would
+        // then land short of it.
+        #[cfg(debug_assertions)]
+        for (index, row) in rows.iter().enumerate() {
+            let width = str_width(row);
+            let cols = self.cols;
+            debug_assert!(
+                width <= usize::from(cols) && !row.contains(['\n', '\r']),
+                "live row {index} is {width} columns wide or holds a line break at {cols} columns: {row:?}"
+            );
+        }
         let live_rows = u16::try_from(rows.len()).unwrap_or(u16::MAX).max(1);
 
         // Where the caret sits, as an offset from the top of the region. The
@@ -272,6 +405,9 @@ impl Inline {
             && self.shown_settled == settled.len()
             && settled.is_empty();
         if unchanged {
+            if skip_unchanged && caret_row == self.cursor_row && caret.1 == self.cursor_col {
+                return String::new();
+            }
             let mut out = String::new();
             out.push_str(HIDE_CURSOR);
             // Move directly between input rows. Walking past the region and
@@ -285,7 +421,8 @@ impl Inline {
             column(&mut out, caret.1);
             out.push_str(SHOW_CURSOR);
             self.cursor_row = caret_row;
-            return out.into_bytes();
+            self.cursor_col = caret.1;
+            return out;
         }
 
         // The region only grows at the bottom while text streams in and the
@@ -321,8 +458,10 @@ impl Inline {
             }
         }
 
+        // A settled line is written whole: the terminal wraps a long one, so
+        // copying it from scrollback gives the line as it was written.
         for line in settled {
-            out.push_str(&self.clip(line));
+            out.push_str(line);
             out.push_str("\r\n");
         }
 
@@ -333,8 +472,16 @@ impl Inline {
         // to the first row that has to be written rather than rewriting them.
         // Without this step the write lands at the region's top and overwrites
         // the rows it was meant to leave alone.
+        //
+        // A first change past the rows on screen is a row the region gains. A
+        // cursor move stops at the screen's bottom, so that row is reached with
+        // a newline, which scrolls instead of landing on the last row shown.
         if first_changed > 0 {
-            down(&mut out, u16::try_from(first_changed).unwrap_or(u16::MAX));
+            let on_screen = first_changed.min(self.shown.len().saturating_sub(1));
+            down(&mut out, u16::try_from(on_screen).unwrap_or(u16::MAX));
+            for _ in on_screen..first_changed {
+                out.push_str("\r\n");
+            }
         }
 
         for (index, row) in rows.iter().enumerate().skip(first_changed) {
@@ -371,11 +518,13 @@ impl Inline {
         column(&mut out, caret.1);
         out.push_str(SHOW_CURSOR);
 
+        self.shown_widths = rows.iter().map(|row| str_width(row)).collect();
         self.shown = rows;
         self.shown_settled = settled.len();
         self.cursor_row = caret_row;
+        self.cursor_col = caret.1;
         self.drawn = true;
-        out.into_bytes()
+        out
     }
 
     /// Clears the region, for a clean exit.
@@ -395,9 +544,11 @@ impl Inline {
         out.push_str(SHOW_CURSOR);
         self.drawn = false;
         self.cursor_row = 0;
+        self.cursor_col = 0;
         self.shown.clear();
+        self.shown_widths.clear();
         self.shown_settled = 0;
-        out.into_bytes()
+        self.wrap(out)
     }
 
     /// Cuts a row to the terminal width.
@@ -429,6 +580,36 @@ fn column(out: &mut String, col: u16) {
     let _ = write!(out, "\u{1b}[{}G", col.saturating_add(1));
 }
 
+/// Writes frames to standard output, one system call per write on Unix.
+///
+/// The standard library's handle is line buffered and would split a frame at
+/// every line break, so a frame passed to `write_all` would reach the terminal
+/// in pieces.
+///
+/// On Windows the standard library writes to a console as UTF-16, so the
+/// console code page never changes what Rune's own output shows.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalOutput;
+
+impl std::io::Write for TerminalOutput {
+    #[cfg(unix)]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        rustix::io::write(rustix::stdio::stdout(), buf).map_err(std::io::Error::from)
+    }
+
+    #[cfg(not(unix))]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut out = std::io::stdout().lock();
+        out.write_all(buf)?;
+        out.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +629,7 @@ mod tests {
             prompt: &prompt,
             menu: &["choice".to_owned()],
             caret: (19, 9),
+            overflow_style: "",
         }))
         .expect("feed");
         assert_eq!(inline.shown.len(), 5);
@@ -494,6 +676,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_draft_row_added_at_screen_bottom_scrolls_rather_than_overwriting() {
+        let mut inline = Inline::new(20);
+        let mut grid = crate::Grid::new(20, 6).expect("grid");
+        grid.feed(b"\r\n\r\n\r\n\r\n\r\n").expect("bottom");
+        let footer = vec!["status".to_owned()];
+        let first = rows(&["> first"]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &first, &[], (0, 7)))
+            .expect("feed");
+        let grown = rows(&["> first", "  "]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &grown, &[], (1, 2)))
+            .expect("feed");
+        let caret = grid.cursor();
+        assert_eq!((caret.row, caret.col), (5, 2), "{}", grid.text());
+        assert_eq!(grid.row_text(4), "> first", "{}", grid.text());
+        assert_eq!(grid.row_text(3), "status", "{}", grid.text());
+        let typed = rows(&["> first", "  second"]);
+        grid.feed(&frame_with_menu(&mut inline, &footer, &typed, &[], (1, 8)))
+            .expect("feed");
+        assert_eq!(grid.row_text(4), "> first", "{}", grid.text());
+        assert_eq!(grid.row_text(5), "  second", "{}", grid.text());
+    }
+
     /// Every control sequence in a byte string, in order.
     ///
     /// Lets a test assert on the moves a frame makes without matching the text.
@@ -538,6 +743,7 @@ mod tests {
             prompt,
             menu: &[],
             caret,
+            overflow_style: "",
         })
     }
 
@@ -557,6 +763,7 @@ mod tests {
             prompt,
             menu,
             caret,
+            overflow_style: "",
         })
     }
 
@@ -582,6 +789,28 @@ mod tests {
         assert!(text.contains("first line\r\n"), "{text:?}");
         assert!(text.contains("> "), "{text:?}");
         assert!(text.contains("status"), "{text:?}");
+    }
+
+    #[test]
+    fn a_long_settled_line_is_written_whole_and_wraps_in_the_terminal() {
+        let mut inline = Inline::new(10);
+        let long = format!("{}END", "x".repeat(14));
+        let bytes = frame(
+            &mut inline,
+            &rows(&[long.as_str()]),
+            None,
+            &rows(&["status"]),
+            &rows(&["> "]),
+            &[],
+            (0, 2),
+        );
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains(&format!("{long}\r\n")), "{text:?}");
+        let mut grid = crate::Grid::new(10, 6).expect("grid");
+        grid.feed(text.as_bytes()).expect("replay");
+        assert_eq!(grid.row_text(0), "xxxxxxxxxx");
+        assert_eq!(grid.row_text(1), "xxxxEND");
+        assert_eq!(grid.row_text(2), "status");
     }
 
     #[test]
@@ -757,6 +986,100 @@ mod tests {
         let seq = escapes(&bytes);
         // A one-based column, so seven columns in is column eight.
         assert!(seq.iter().any(|s| s == "\u{1b}[8G"), "{seq:?}");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a live row holds a tab")]
+    fn debug_check_rejects_a_tab() {
+        let mut inline = Inline::new(20);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["a\tb"]);
+        let _ = inline.frame(&Frame {
+            footer: &footer,
+            prompt: &prompt,
+            ..Frame::default()
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "holds a line break at 20 columns")]
+    fn debug_check_rejects_a_row_with_a_line_break() {
+        let mut inline = Inline::new(20);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["a\nb"]);
+        let _ = inline.frame(&Frame {
+            footer: &footer,
+            prompt: &prompt,
+            ..Frame::default()
+        });
+    }
+
+    #[test]
+    fn a_width_change_repaints_the_region_whole() {
+        let mut inline = Inline::new(80);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let answer = rows(&["one", "two"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(60);
+        let bytes = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        let text = String::from_utf8(bytes.clone()).expect("utf-8");
+        assert!(text.contains(ERASE_BELOW), "{text:?}");
+        for row in ["one", "two", "status", "> "] {
+            assert!(text.contains(row), "{row} was not repainted: {text:?}");
+        }
+        let mut grid = crate::engine::Grid::new(60, 10).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        assert_eq!(grid.row_text(3), ">");
+    }
+
+    #[test]
+    fn shrinking_counts_reflowed_rows_when_walking_up() {
+        // Five rows sit above the caret's row and one of them is 70 columns
+        // wide. At 40 columns a reflowing terminal shows that one as two rows,
+        // so the region's top is six rows up, not five.
+        let mut inline = Inline::new(80);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let wide = "x".repeat(70);
+        let answer = rows(&[wide.as_str(), "a", "b", "c"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(40);
+        let bytes = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        let seq = escapes(&bytes);
+        let walk = seq
+            .iter()
+            .position(|s| s == "\u{1b}[6A")
+            .unwrap_or_else(|| panic!("no walk over the reflowed rows: {seq:?}"));
+        assert_eq!(
+            seq.get(walk.saturating_add(1)).map(String::as_str),
+            Some(ERASE_BELOW),
+            "{seq:?}"
+        );
+    }
+
+    #[test]
+    fn growing_walks_up_the_rows_that_were_drawn() {
+        // No row was wider than the old width, so nothing reflowed.
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let answer = rows(&["one", "two"]);
+        let _ = frame(&mut inline, &[], None, &footer, &prompt, &answer, (0, 2));
+        inline.set_width(100);
+        let seq = escapes(&frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &answer,
+            (0, 2),
+        ));
+        assert!(seq.iter().any(|s| s == "\u{1b}[3A"), "{seq:?}");
+        assert!(seq.iter().any(|s| s == ERASE_BELOW), "{seq:?}");
     }
 
     #[test]
@@ -1184,6 +1507,7 @@ mod tests {
             prompt: &rows(&["> /mod"]),
             menu: &[],
             caret: (0, 6),
+            overflow_style: "",
         });
         grid.feed(&without).expect("feed");
         let before = grid.text();
@@ -1197,6 +1521,7 @@ mod tests {
             prompt: &rows(&["> /mod"]),
             menu: &rows(&["  /model", "  /models"]),
             caret: (0, 6),
+            overflow_style: "",
         });
         grid.feed(&with).expect("feed");
         let after = grid.text();
@@ -1244,6 +1569,7 @@ mod tests {
             prompt: &rows(&["> "]),
             menu: &[],
             caret: (0, 2),
+            overflow_style: "",
         });
         grid.feed(&plain).expect("feed");
         assert!(grid.text().contains('>'), "{}", grid.text());
@@ -1552,6 +1878,65 @@ mod tests {
     }
 
     #[test]
+    fn arriving_rows_that_do_not_fit_are_marked_above() {
+        let mut inline = Inline::new(80);
+        inline.set_max_rows(10);
+        let mut grid = crate::engine::Grid::new(80, 12).expect("grid");
+        let arriving: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        let footer = rows(&["hints", "status"]);
+        let prompt = rows(&["> "]);
+        let bytes = inline.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            ..Frame::default()
+        });
+        grid.feed(&bytes).expect("feed");
+        assert_eq!(
+            grid.row_text(0),
+            "... 24 more lines above (ctrl-o shows everything)"
+        );
+        assert_eq!(grid.row_text(1), "line 25");
+        assert_eq!(grid.row_text(6), "line 30");
+        assert_eq!(grid.row_text(7), "hints");
+        assert_eq!(grid.row_text(9), ">");
+
+        // With a style, the marker row is drawn in it and reset after.
+        let styled = String::from_utf8_lossy(&inline.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            overflow_style: "\u{1b}[2m",
+            ..Frame::default()
+        }))
+        .into_owned();
+        assert!(
+            styled.contains("\u{1b}[2m... 24 more lines above (ctrl-o shows everything)\u{1b}[0m"),
+            "{styled:?}"
+        );
+
+        // Room for one row shows only the marker.
+        let mut tight = Inline::new(80);
+        tight.set_max_rows(4);
+        let mut grid = crate::engine::Grid::new(80, 6).expect("grid");
+        grid.feed(&tight.frame(&Frame {
+            arriving: &arriving,
+            footer: &footer,
+            prompt: &prompt,
+            caret: (0, 2),
+            ..Frame::default()
+        }))
+        .expect("feed");
+        assert_eq!(
+            grid.row_text(0),
+            "... 30 more lines above (ctrl-o shows everything)"
+        );
+        assert_eq!(grid.row_text(1), "hints");
+    }
+
+    #[test]
     fn a_shrinking_region_never_scrolls_the_screen() {
         // Erasing rows that are gone must not write a newline past the region's
         // last row: at the bottom of the screen that scrolls, which pushes the
@@ -1593,5 +1978,129 @@ mod tests {
             "erasing the region's tail scrolled the prompt off:\nbefore:\n{before}\nafter:\n{}",
             grid.text()
         );
+    }
+
+    /// Asserts a frame is one synchronized update: one begin mark first and
+    /// one end mark last.
+    fn assert_wrapped(bytes: &[u8], what: &str) {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(text.starts_with(BEGIN_SYNC), "{what}: {text:?}");
+        assert!(text.ends_with(END_SYNC), "{what}: {text:?}");
+        assert_eq!(text.matches(BEGIN_SYNC).count(), 1, "{what}: {text:?}");
+        assert_eq!(text.matches(END_SYNC).count(), 1, "{what}: {text:?}");
+    }
+
+    #[test]
+    fn every_frame_and_clear_are_wrapped_in_synchronized_output() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let first = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a"]),
+            (0, 2),
+        );
+        assert_wrapped(&first, "first frame");
+        let partial = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(!String::from_utf8_lossy(&partial).contains(ERASE_BELOW));
+        assert_wrapped(&partial, "partial repaint");
+        let caret = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(!String::from_utf8_lossy(&caret).contains("status"));
+        assert_wrapped(&caret, "caret-only frame");
+        let full = frame(
+            &mut inline,
+            &rows(&["settled"]),
+            None,
+            &footer,
+            &prompt,
+            &rows(&["a", "b"]),
+            (0, 2),
+        );
+        assert!(String::from_utf8_lossy(&full).contains(ERASE_BELOW));
+        assert_wrapped(&full, "full repaint");
+        let cleared = inline.clear();
+        assert_wrapped(&cleared, "clear");
+        assert!(inline.clear().is_empty());
+    }
+
+    #[test]
+    fn synchronized_output_can_be_turned_off() {
+        let mut inline = Inline::new(40);
+        inline.set_synchronized(false);
+        let footer = rows(&["status"]);
+        let prompt = rows(&["> "]);
+        let mut written = frame(
+            &mut inline,
+            &rows(&["settled"]),
+            None,
+            &footer,
+            &prompt,
+            &[],
+            (0, 2),
+        );
+        written.extend(frame(&mut inline, &[], None, &footer, &prompt, &[], (0, 2)));
+        written.extend(inline.clear());
+        let text = String::from_utf8_lossy(&written);
+        assert!(text.contains("status"), "{text:?}");
+        assert!(!text.contains("?2026"), "{text:?}");
+    }
+
+    #[test]
+    fn a_paced_frame_that_changes_nothing_writes_nothing() {
+        let mut inline = Inline::new(40);
+        let footer = rows(&["status"]);
+        let draw = |inline: &mut Inline, caret: (u16, u16)| {
+            inline.frame_if_changed(&Frame {
+                settled: &[],
+                arriving: &[],
+                activity: None,
+                footer: &footer,
+                prompt: &rows(&["> abc"]),
+                menu: &[],
+                caret,
+                overflow_style: "",
+            })
+        };
+        let first = draw(&mut inline, (0, 2));
+        assert!(String::from_utf8_lossy(&first).contains("status"));
+        assert_wrapped(&first, "first paced frame");
+        assert!(draw(&mut inline, (0, 2)).is_empty());
+        let moved = draw(&mut inline, (0, 4));
+        let text = String::from_utf8_lossy(&moved).into_owned();
+        assert!(!text.contains("status"), "{text:?}");
+        assert!(escapes(&moved).iter().any(|s| s == "\u{1b}[5G"), "{text:?}");
+        assert_wrapped(&moved, "caret move");
+        assert!(draw(&mut inline, (0, 4)).is_empty());
+        // The immediate path still places the caret for an unchanged frame.
+        let immediate = frame(
+            &mut inline,
+            &[],
+            None,
+            &footer,
+            &rows(&["> abc"]),
+            &[],
+            (0, 4),
+        );
+        assert!(String::from_utf8_lossy(&immediate).contains(SHOW_CURSOR));
     }
 }

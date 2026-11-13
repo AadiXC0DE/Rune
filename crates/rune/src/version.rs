@@ -6,8 +6,11 @@
 /// pipeline read it from here rather than restating it.
 pub const VERSION: &str = "0.1.17";
 
-/// The release channel this build came from.
-pub const CHANNEL: &str = "dev";
+/// The release channel this build came from, `dev` unless the release build sets one.
+pub const CHANNEL: &str = match option_env!("RUNE_CHANNEL") {
+    Some(channel) => channel,
+    None => "dev",
+};
 
 /// Commit this build was produced from, filled in by the build script.
 pub const COMMIT: &str = env!("RUNE_COMMIT");
@@ -27,6 +30,14 @@ mod tests {
         let line = version_line();
         assert!(line.starts_with("rune "), "{line}");
         assert!(line.contains(VERSION), "{line}");
+    }
+
+    #[test]
+    fn the_channel_defaults_to_dev() {
+        assert_eq!(CHANNEL, option_env!("RUNE_CHANNEL").unwrap_or("dev"));
+        if option_env!("RUNE_CHANNEL").is_none() {
+            assert!(version_line().contains("(dev, "), "{}", version_line());
+        }
     }
 
     #[test]

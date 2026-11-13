@@ -464,6 +464,19 @@ pub fn parse_project_file(text: &str, path: &Utf8Path) -> Result<Vec<ProjectServ
                 "url" | "type" | "enabled" | "required" => {
                     has_url = has_url || key == "url";
                 }
+                "tools" => {
+                    let names = value
+                        .as_array()
+                        .filter(|names| names.iter().all(serde_json::Value::is_string));
+                    if names.is_none() {
+                        return Err(RuneError::invalid_field(
+                            "mcpServers",
+                            format!(
+                                "`{name}` in {path} has a `tools` value that is not a list of names"
+                            ),
+                        ));
+                    }
+                }
                 other => {
                     return Err(RuneError::invalid_field(
                         "mcpServers",

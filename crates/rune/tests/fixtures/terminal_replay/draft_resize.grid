@@ -1,10 +1,60 @@
-narrow-draft: 32x24, caret 31,3
+narrow-draft: 32x24, caret 3,8
 00|session ************|
-01|ctrl-c cancel  /help commands  e|
-02|replay-fixture | auto | ctx ~2.7|
-03|> 234567890123456789VISIBLE-END|
-04||
-05||
+01|rune <version> · replay-fixture · …|
+02|tip: @ mentions a file; tab comp|
+03|letes it|
+04|/ commands   @ files|
+05|replay-fixture | auto|
+06|> 012345678901234567890123456789|
+07|  01234567890123456789VISIBLE-EN|
+08|  D|
+09||
+10||
+11||
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||
+grown-draft: 80x24, caret 63,6
+00|session ************|
+01|rune <version> · replay-fixture · …|
+02|tip: @ mentions a file; tab comp|
+03|letes it|
+04|/ commands   @ files   shift-tab mode   ctrl-j newline|
+05|replay-fixture | auto | ctx ~###k (request bytes)|
+06|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
+07||
+08||
+09||
+10||
+11||
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||
+shrunk-draft: 20x24, caret 9,5
+00|/ commands   @ files|
+01|replay-fixture|
+02|> 012345678901234567|
+03|  890123456789012345|
+04|  67890123456789VISI|
+05|  BLE-END|
 06||
 07||
 08||
@@ -23,61 +73,11 @@ narrow-draft: 32x24, caret 31,3
 21||
 22||
 23||
-grown-draft: 80x24, caret 63,3
-00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|replay-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
-04||
-05||
-06||
-07||
-08||
-09||
-10||
-11||
-12||
-13||
-14||
-15||
-16||
-17||
-18||
-19||
-20||
-21||
-22||
-23||
-shrunk-draft: 20x24, caret 19,3
-00|session ************|
-01|ctrl-c cancel  /help|
-02|replay-fixture | aut|
-03|> 456789VISIBLE-END|
-04||
-05||
-06||
-07||
-08||
-09||
-10||
-11||
-12||
-13||
-14||
-15||
-16||
-17||
-18||
-19||
-20||
-21||
-22||
-23||
-grown-again: 80x24, caret 63,3
-00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|replay-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
+grown-again: 80x24, caret 63,2
+00|/ commands   @ files   shift-tab mode   ctrl-j newline|
+01|replay-fixture | auto | ctx ~###k (request bytes)|
+02|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
+03||
 04||
 05||
 06||

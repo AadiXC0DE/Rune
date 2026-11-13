@@ -31,13 +31,18 @@ pub struct Limits {
     pub output: Option<u64>,
     /// Published prices, when the catalog lists them.
     pub prices: Option<Prices>,
+    /// Whether the model takes images, when the catalog lists its inputs.
+    pub vision: Option<bool>,
 }
 
 impl Limits {
     /// Returns whether nothing usable was described.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.context.is_none() && self.output.is_none() && self.prices.is_none()
+        self.context.is_none()
+            && self.output.is_none()
+            && self.prices.is_none()
+            && self.vision.is_none()
     }
 }
 
@@ -59,6 +64,50 @@ pub struct Prices {
     /// Input written to a prompt cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<u64>,
+    /// Prices outside the peak window, for a model whose price follows the
+    /// clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_peak: Option<OffPeak>,
+    /// When the peak window runs; the other fields are the peak prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<PeakSchedule>,
+}
+
+/// Prices charged outside the peak window, in the same unit as [`Prices`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OffPeak {
+    /// Uncached input.
+    pub input: u64,
+    /// Output, reasoning included.
+    pub output: u64,
+    /// Input read from a prompt cache.
+    pub cache_read: Option<u64>,
+}
+
+/// A recurring window in which the peak price applies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeakSchedule {
+    /// Monday to Friday in UTC, 01:00 to 03:59 and 06:00 to 09:59.
+    WeekdaysUtc0104And0610,
+}
+
+impl PeakSchedule {
+    /// Returns whether the peak price applies at a moment. Public holidays
+    /// are not modelled, so a holiday is priced as an ordinary day.
+    #[must_use]
+    pub fn is_peak(self, at: jiff::Timestamp) -> bool {
+        const DAY: i64 = 86_400;
+        let seconds = at.as_second();
+        // The epoch fell on a Thursday, so this counts Monday as zero.
+        let weekday = seconds.div_euclid(DAY).saturating_add(3).rem_euclid(7);
+        let hour = seconds.rem_euclid(DAY) / 3_600;
+        match self {
+            Self::WeekdaysUtc0104And0610 => {
+                weekday < 5 && ((1..4).contains(&hour) || (6..10).contains(&hour))
+            }
+        }
+    }
 }
 
 impl Prices {
@@ -87,7 +136,66 @@ impl Prices {
         let micro = total.saturating_add(500_000) / 1_000_000;
         Some(u64::try_from(micro).unwrap_or(u64::MAX))
     }
+
+    /// Returns the cost of one request's usage at a moment, which differs
+    /// from [`Prices::cost`] only outside the peak window of a scheduled
+    /// model.
+    #[must_use]
+    pub fn cost_at(&self, usage: &crate::stream::Usage, at: jiff::Timestamp) -> Option<u64> {
+        match (self.schedule, self.off_peak) {
+            (Some(schedule), Some(off_peak)) if !schedule.is_peak(at) => Self {
+                input: off_peak.input,
+                output: off_peak.output,
+                cache_read: off_peak.cache_read,
+                cache_write: None,
+                off_peak: None,
+                schedule: None,
+            }
+            .cost(usage),
+            _ => self.cost(usage),
+        }
+    }
 }
+
+/// DeepSeek's peak and off-peak prices. The catalog lists one figure per
+/// model, and that figure is the off-peak one, so it cannot stand as the list
+/// price.
+const DEEPSEEK_PRICES: [(&[&str], Prices); 2] = [
+    (
+        &[
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ],
+        Prices {
+            input: 300_000,
+            output: 1_200_000,
+            cache_read: Some(6_000),
+            cache_write: None,
+            off_peak: Some(OffPeak {
+                input: 150_000,
+                output: 600_000,
+                cache_read: Some(3_000),
+            }),
+            schedule: Some(PeakSchedule::WeekdaysUtc0104And0610),
+        },
+    ),
+    (
+        &["deepseek-v4-pro"],
+        Prices {
+            input: 1_320_000,
+            output: 3_960_000,
+            cache_read: Some(44_000),
+            cache_write: None,
+            off_peak: Some(OffPeak {
+                input: 660_000,
+                output: 1_980_000,
+                cache_read: Some(22_000),
+            }),
+            schedule: Some(PeakSchedule::WeekdaysUtc0104And0610),
+        },
+    ),
+];
 
 /// Renders millionths of a dollar as a decimal amount, such as `0.001523`.
 #[must_use]
@@ -136,25 +244,13 @@ impl ProviderLimits {
 
 /// Maps a provider name to its key in the catalog.
 ///
-/// The keys are not always the name this program uses: a compatible endpoint is
-/// unknown to the catalog, and a name that is absent yields nothing rather than
-/// a guess.
+/// The keys are not always the name this program uses, so they are read from
+/// the provider table. A compatible or local endpoint is unknown to the
+/// catalog, and a name the table does not list yields nothing rather than a
+/// guess.
 #[must_use]
 pub fn catalog_key(provider: &str) -> Option<&'static str> {
-    match provider {
-        "anthropic" => Some("anthropic"),
-        "openai" | "responses" => Some("openai"),
-        "opencode" => Some("opencode"),
-        "opencode-go" => Some("opencode-go"),
-        "google" | "gemini" => Some("google"),
-        "groq" => Some("groq"),
-        "mistral" => Some("mistral"),
-        "xai" => Some("xai"),
-        "deepseek" => Some("deepseek"),
-        // A self-hosted or unknown endpoint is not described by any published
-        // catalog, so nothing is claimed for it.
-        _ => None,
-    }
+    crate::providers::lookup(provider).and_then(|entry| entry.models_dev_key)
 }
 
 /// Reads the capacity for one provider out of a catalog document.
@@ -190,18 +286,35 @@ pub fn parse(body: &str, key: &str) -> Option<ProviderLimits> {
                 output,
                 cache_read: micro_price(cost.and_then(|c| c.get("cache_read"))),
                 cache_write: micro_price(cost.and_then(|c| c.get("cache_write"))),
+                off_peak: None,
+                schedule: None,
             }),
             _ => None,
         };
+        let vision = entry
+            .get("modalities")
+            .and_then(|m| m.get("input"))
+            .and_then(serde_json::Value::as_array)
+            .map(|inputs| inputs.iter().any(|input| input == "image"));
         let entry = Limits {
             context,
             output,
             prices,
+            vision,
         };
         if entry.is_empty() {
             continue;
         }
         limits.models.insert(id.clone(), entry);
+    }
+    if key == "deepseek" {
+        for (ids, prices) in DEEPSEEK_PRICES {
+            for id in ids {
+                if let Some(entry) = limits.models.get_mut(*id) {
+                    entry.prices = Some(prices);
+                }
+            }
+        }
     }
     Some(limits)
 }
@@ -255,6 +368,8 @@ mod tests {
                 output: 1_100_000,
                 cache_read: Some(28_000),
                 cache_write: None,
+                off_peak: None,
+                schedule: None,
             }
         );
         assert_eq!(limits.get("glm-5.3-flash").and_then(|l| l.prices), None);
@@ -267,6 +382,8 @@ mod tests {
             output: 1_100_000,
             cache_read: Some(28_000),
             cache_write: None,
+            off_peak: None,
+            schedule: None,
         };
         let usage = crate::stream::Usage {
             input_tokens: Some(10_000),
@@ -279,6 +396,109 @@ mod tests {
         assert_eq!(prices.cost(&usage), Some(1_334));
         assert_eq!(dollars(1_334), "0.001334");
         assert_eq!(prices.cost(&crate::stream::Usage::default()), None);
+    }
+
+    #[test]
+    fn a_cached_gemini_prompt_is_priced_at_the_cache_rate() {
+        let doc = r#"{"google": {"id": "google", "models": {
+            "gemini-3.8-flash": { "id": "gemini-3.8-flash",
+                                  "limit": { "context": 1048576, "output": 65536 },
+                                  "cost": { "input": 0.75, "output": 3.75, "cache_read": 0.075 } }
+        }}}"#;
+        let prices = parse(doc, "google")
+            .and_then(|limits| limits.get("gemini-3.8-flash"))
+            .and_then(|limits| limits.prices)
+            .expect("prices");
+        let usage = crate::stream::Usage {
+            input_tokens: Some(1_000),
+            cache_read_tokens: Some(800),
+            ..crate::stream::Usage::default()
+        };
+        // 200 uncached at 0.75 and 800 cached at 0.075, per million: 150 + 60
+        // millionths.
+        assert_eq!(prices.cost(&usage), Some(210));
+    }
+
+    /// The catalog's DeepSeek entries, which list the off-peak figure only.
+    const DEEPSEEK_DOC: &str = r#"{"deepseek": {"id": "deepseek", "models": {
+        "deepseek-flash": { "limit": { "context": 1000000, "output": 384000 },
+                            "cost": { "input": 0.15, "output": 0.6, "cache_read": 0.003 } },
+        "deepseek-v4-pro": { "limit": { "context": 1000000, "output": 384000 },
+                             "cost": { "input": 0.66, "output": 1.98, "cache_read": 0.022 } }
+    }}}"#;
+
+    fn at(moment: &str) -> jiff::Timestamp {
+        moment.parse().expect("timestamp")
+    }
+
+    #[test]
+    fn deepseek_prices_follow_the_peak_window() {
+        let schedule = PeakSchedule::WeekdaysUtc0104And0610;
+        assert!(schedule.is_peak(at("2026-11-09T03:59:59Z")));
+        assert!(!schedule.is_peak(at("2026-11-09T04:00:00Z")));
+        assert!(schedule.is_peak(at("2026-11-09T01:00:00Z")));
+        assert!(!schedule.is_peak(at("2026-11-09T00:59:59Z")));
+        assert!(schedule.is_peak(at("2026-11-10T09:59:59Z")));
+        assert!(!schedule.is_peak(at("2026-11-10T10:00:00Z")));
+        assert!(!schedule.is_peak(at("2026-11-14T02:00:00Z")));
+
+        let limits = parse(DEEPSEEK_DOC, "deepseek").expect("parsed");
+        let flash = limits
+            .get("deepseek-flash")
+            .and_then(|l| l.prices)
+            .expect("prices");
+        assert_eq!(flash.input, 300_000);
+        assert_eq!(flash.schedule, Some(schedule));
+        let pro = limits
+            .get("deepseek-v4-pro")
+            .and_then(|l| l.prices)
+            .expect("prices");
+        assert_eq!(pro.output, 3_960_000);
+
+        let usage = crate::stream::Usage {
+            input_tokens: Some(100_000),
+            output_tokens: Some(10_000),
+            ..crate::stream::Usage::default()
+        };
+        // 100,000 in at 0.30 and 10,000 out at 1.20 per million: 30,000 +
+        // 12,000 millionths at peak, half that off peak.
+        let peak = flash.cost_at(&usage, at("2026-11-09T02:00:00Z"));
+        let saturday = flash.cost_at(&usage, at("2026-11-14T02:00:00Z"));
+        assert_eq!(peak, Some(42_000));
+        assert_eq!(saturday, Some(21_000));
+        assert_eq!(flash.cost(&usage), peak);
+        // A model without a schedule costs the same at any hour.
+        let other = parse(DOC, "opencode-go")
+            .and_then(|l| l.get("grok-4.7"))
+            .and_then(|l| l.prices)
+            .expect("prices");
+        assert_eq!(
+            other.cost_at(&usage, at("2026-11-14T02:00:00Z")),
+            other.cost(&usage)
+        );
+    }
+
+    #[test]
+    fn cache_hits_are_priced_as_cache_reads() {
+        let flash = parse(DEEPSEEK_DOC, "deepseek")
+            .and_then(|l| l.get("deepseek-flash"))
+            .and_then(|l| l.prices)
+            .expect("prices");
+        let usage = crate::stream::Usage {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(800_000),
+            ..crate::stream::Usage::default()
+        };
+        // 200,000 uncached at 0.30 and 800,000 cached at 0.006 per million
+        // at peak; 0.15 and 0.003 off peak.
+        assert_eq!(
+            flash.cost_at(&usage, at("2026-11-09T02:00:00Z")),
+            Some(64_800)
+        );
+        assert_eq!(
+            flash.cost_at(&usage, at("2026-11-14T02:00:00Z")),
+            Some(32_400)
+        );
     }
 
     #[test]
@@ -346,5 +566,22 @@ mod tests {
         // A compatible endpoint is not described by any published catalog.
         assert_eq!(catalog_key("chat_completions"), None);
         assert_eq!(catalog_key("my-self-hosted"), None);
+    }
+
+    #[test]
+    fn image_input_is_read_from_the_modalities() {
+        let doc = r#"{ "p": { "models": {
+            "sees": { "limit": { "context": 1000 },
+                      "modalities": { "input": ["text", "image"], "output": ["text"] } },
+            "blind": { "limit": { "context": 1000 },
+                       "modalities": { "input": ["text"], "output": ["text"] } },
+            "silent": { "limit": { "context": 1000 } },
+            "only": { "modalities": { "input": ["image"] } }
+        } } }"#;
+        let limits = parse(doc, "p").expect("parsed");
+        assert_eq!(limits.get("sees").expect("sees").vision, Some(true));
+        assert_eq!(limits.get("blind").expect("blind").vision, Some(false));
+        assert_eq!(limits.get("silent").expect("silent").vision, None);
+        assert_eq!(limits.get("only").expect("only").vision, Some(true));
     }
 }

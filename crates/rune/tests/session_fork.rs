@@ -127,18 +127,23 @@ impl Fixture {
     }
 
     fn files(&self, id: &SessionId) -> Vec<(String, Vec<u8>)> {
-        let mut files: Vec<_> = std::fs::read_dir(self.paths.session_dir(id))
-            .expect("directory")
-            .map(|entry| {
-                let entry = entry.expect("entry");
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    std::fs::read(entry.path()).expect("bytes"),
-                )
-            })
-            .collect();
+        let mut files = Vec::new();
+        collect_files(self.paths.session_dir(id).as_std_path(), "", &mut files);
         files.sort();
         files
+    }
+}
+
+/// Every file under `directory`, named by its path below it.
+fn collect_files(directory: &std::path::Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
+    for entry in std::fs::read_dir(directory).expect("directory") {
+        let entry = entry.expect("entry");
+        let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+        if entry.file_type().expect("file type").is_dir() {
+            collect_files(&entry.path(), &format!("{name}/"), files);
+        } else {
+            files.push((name, std::fs::read(entry.path()).expect("bytes")));
+        }
     }
 }
 

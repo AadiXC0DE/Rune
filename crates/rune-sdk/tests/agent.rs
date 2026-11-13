@@ -98,6 +98,8 @@ impl HostFetch for SlowFetch {
 /// Builds options pointed at a mock endpoint.
 fn options(base_url: &str, fetch: Arc<dyn HostFetch>) -> AgentOptions {
     AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "sk-embedder-credential-9271".to_owned(),
         model: Some("mock-model".to_owned()),
         instructions: Some(vec!["You are a meticulous assistant.".to_owned()]),
@@ -616,7 +618,20 @@ fn prompt_step_limits_inherit_agent_limits_unless_overridden() {
         assert_eq!(fetch.hits(), expected_steps as usize);
         assert_eq!(endpoint.request_count(), expected_steps as usize);
         assert_eq!(result.calls.len(), expected_steps.min(3) as usize);
-        assert!(result.calls.iter().all(|call| call.executed));
+        // A call made on the last allowed step is answered, not run.
+        let executed = result.calls.iter().filter(|call| call.executed).count();
+        let expected_executed = if expected_stop == StopReason::StepLimit {
+            expected_steps.min(3) as usize - 1
+        } else {
+            3
+        };
+        assert_eq!(executed, expected_executed, "{budget}, {prompt_options:?}");
+        assert!(
+            result
+                .calls
+                .last()
+                .is_some_and(|call| call.executed == (expected_stop == StopReason::Completed))
+        );
     }
 }
 
@@ -983,7 +998,7 @@ fn a_429_retry_after_is_honored_once_without_consuming_another_step() {
     assert_eq!(agent.usage(), result.usage);
     assert!(
         matches!(events.iter().find(|event| matches!(event, Event::ProviderRetry { .. })),
-        Some(Event::ProviderRetry { step: 1, next_attempt: 2, max_attempts: 2, delay })
+        Some(Event::ProviderRetry { step: 1, next_attempt: 2, max_attempts: 2, delay, .. })
         if *delay == Duration::from_secs(1))
     );
     assert_eq!(
@@ -1124,7 +1139,13 @@ fn permanent_provider_failures_are_never_retried() {
 
 #[test]
 fn retrying_a_failed_stream_discards_its_partial_text_and_usage() {
-    let endpoint = MockEndpoint::start(vec![Script::truncated("discard me"), Script::text("kept")]);
+    // Text then a transient failure is sent again in full; a stream that is
+    // only cut keeps its text instead.
+    let failed = Script::Frames(vec![
+        r#"{"choices":[{"index":0,"delta":{"content":"discard me"}}]}"#.to_owned(),
+        r#"{"error":{"message":"the model is overloaded","type":"overloaded_error"}}"#.to_owned(),
+    ]);
+    let endpoint = MockEndpoint::start(vec![failed, Script::text("kept")]);
     let fetch = Arc::new(CountingFetch::new());
     let mut agent = Agent::new(options(&endpoint.base_url(), fetch.clone())).expect("agent");
     let mut turn = agent

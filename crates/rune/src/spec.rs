@@ -115,7 +115,7 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     option(
         "--provider",
         "name",
-        "Override the provider for this process.",
+        "Override the provider for this process. Run `rune connect` to list them.",
     ),
     option(
         "--effort",
@@ -148,11 +148,15 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     ),
     flag(
         "--offline",
-        "Refuse provider requests, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
+        "Refuse provider requests except to a model server on this machine, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.",
     ),
     flag(
         "--allow-unsandboxed",
-        "Run commands where the host has no sandbox backend. Without this, such a host refuses them.",
+        "Run commands where the host has no sandbox backend. Without this, such a host refuses them. Also RUNE_ALLOW_UNSANDBOXED=1.",
+    ),
+    flag(
+        "--network",
+        "Let sandboxed shell commands use the network. --offline still wins.",
     ),
     flag("--json", "Emit machine-readable output where supported."),
     flag(
@@ -172,6 +176,11 @@ pub const GLOBAL_FLAGS: &[FlagSpec] = &[
     flag(
         "--provider-strict",
         "Restrict requests to the listed providers.",
+    ),
+    option(
+        "--trace",
+        "dir",
+        "Write each provider request and response, redacted, to this directory.",
     ),
     flag("-h, --help", "Print help."),
     flag("-v, --version", "Print the version."),
@@ -197,13 +206,45 @@ pub const RUN: &[CommandSpec] = &[
             flag("--json", "Print one JSON object instead of Markdown."),
             flag(
                 "--jsonl",
-                "Stream bounded JSONL events (takes precedence over --json).",
+                "Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs.",
             ),
             flag("--no-save", "Do not create a session."),
+            flag(
+                "--checkpoints",
+                "Snapshot the workspace before and after the turn so it can be restored with rune session restore.",
+            ),
             option(
                 "--image",
                 "path",
                 "Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images.",
+            ),
+            option(
+                "--max-steps",
+                "n",
+                "Stop after this many model steps; the last one answers without tools. 0 means no limit.",
+            ),
+            option(
+                "--timeout",
+                "seconds",
+                "Stop the run after this many seconds and report what it did.",
+            ),
+            option(
+                "--max-cost",
+                "usd",
+                "Stop the run once its estimated cost reaches this many dollars.",
+            ),
+            option(
+                "--goal",
+                "objective",
+                "Work toward this objective; it is added to the instructions.",
+            ),
+            flag(
+                "--judge",
+                "With --goal, check the result against the objective before finishing.",
+            ),
+            flag(
+                "--context-report",
+                "Add a context object to the JSON result: the last request's estimated tokens by part.",
             ),
         ],
         requirements: Requirements::FULL,
@@ -244,7 +285,7 @@ pub const RUN: &[CommandSpec] = &[
         name: "bench",
         aliases: &[],
         summary: "Measure the configured model and harness on coding tasks",
-        usage: "rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--json]",
+        usage: "rune bench <tasks-dir> [--only <ids>] [--trials <n>] [--split <name>] [--jobs <n>] [--logs <dir>] [--json]",
         flags: &[
             option(
                 "--only",
@@ -252,6 +293,17 @@ pub const RUN: &[CommandSpec] = &[
                 "Run only these comma-separated task identifiers.",
             ),
             option("--trials", "n", "Run each task this many times, 1 to 20."),
+            option(
+                "--split",
+                "name",
+                "Run only tasks of this split: dev, heldout or all.",
+            ),
+            option("--jobs", "n", "Run this many tasks at once, 1 to 16."),
+            option(
+                "--logs",
+                "dir",
+                "Keep each run's stderr and JSON report in this directory.",
+            ),
             flag(
                 "--json",
                 "Print one JSON object with every run and the summary.",
@@ -290,9 +342,23 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "sessions",
         aliases: &[],
         summary: "List sessions",
-        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]",
+        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>] | rune sessions prune --older-than <days> [--keep <n>] [--dry-run] [--json]",
         flags: &[
             flag("--all", "Include sessions from every workspace."),
+            option(
+                "--older-than",
+                "days",
+                "With prune: remove sessions last updated more than this many days ago.",
+            ),
+            option(
+                "--keep",
+                "n",
+                "With prune: never remove the n most recently updated sessions.",
+            ),
+            flag(
+                "--dry-run",
+                "With prune: list what would be removed and remove nothing.",
+            ),
             option(
                 "--search",
                 "text",
@@ -309,7 +375,7 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "session",
         aliases: &[],
         summary: "Inspect, search, export, fork, migrate, or recover one session",
-        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id>",
+        usage: "rune session <last|id> [--search <text> | --record <id|all>] [--json] | rune session --id <id> [--search <text> | --record <id|all>] [--json] | rune session export <last|id> | rune session export --id <id> | rune session fork <last|id> --at <seq> [--json] | rune session fork --id <id> --at <seq> [--json] | rune session migrate <id> | rune session recover <id> | rune session restore <last|id> --turn <n> [--dry-run] [--force] [--json]",
         flags: &[
             option(
                 "--id",
@@ -327,6 +393,19 @@ pub const SESSIONS: &[CommandSpec] = &[
                 "Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.",
             ),
             flag("--allow-large", "Permit migrating an oversized session."),
+            option(
+                "--turn",
+                "n",
+                "Restore the workspace to its state before this turn.",
+            ),
+            flag(
+                "--dry-run",
+                "List the files a restore would change and change nothing.",
+            ),
+            flag(
+                "--force",
+                "Restore even when files changed outside the session since its last checkpoint.",
+            ),
             option(
                 "--record",
                 "id|all",
@@ -417,16 +496,23 @@ pub const ACCOUNT: &[CommandSpec] = &[
         name: "models",
         aliases: &[],
         summary: "List the models of the connected provider",
-        usage: "rune models [--json]",
-        flags: &[flag("--json", "Emit JSON.")],
+        usage: "rune models [--refresh] [--explain [<model>]] [--json]",
+        flags: &[
+            flag("--refresh", "Download the published model catalog now."),
+            flag(
+                "--explain",
+                "Show how requests to this model are shaped, and why.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
         requirements: Requirements::NETWORK,
         supports_json: true,
     },
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "Manage MCP servers: mcp list, mcp check, mcp import",
-        usage: "rune mcp list [--json] | rune mcp check [server] [--json] | rune mcp import claude-desktop <file>",
+        summary: "Manage MCP servers: mcp list, mcp check, mcp login, mcp logout, mcp import",
+        usage: "rune mcp list | check [server] | login <server> | logout <server> | import claude-desktop <file>",
         flags: &[flag(
             "--json",
             "Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as `.mcp.json` at the workspace root.",
@@ -458,8 +544,8 @@ pub const ACCOUNT: &[CommandSpec] = &[
     CommandSpec {
         name: "sandbox",
         aliases: &[],
-        summary: "Explain command policy: sandbox [explain] -- <command>",
-        usage: "rune sandbox [explain] [--external-access] [--json] -- <command>",
+        summary: "Explain command policy: sandbox [explain] [-- <command>]",
+        usage: "rune sandbox [explain] [--external-access] [--json] [-- <command>]",
         flags: &[
             flag(
                 "--external-access",
@@ -475,7 +561,10 @@ pub const ACCOUNT: &[CommandSpec] = &[
         aliases: &[],
         summary: "Inspect or change workspace trust",
         usage: "rune projects [status|approve|reject|reset]",
-        flags: &[flag("--json", "Emit JSON.")],
+        flags: &[
+            flag("--json", "Emit JSON."),
+            flag("--yes", "Approve project hooks and rules without asking."),
+        ],
         requirements: Requirements::NONE,
         supports_json: true,
     },
@@ -485,13 +574,22 @@ pub const ACCOUNT: &[CommandSpec] = &[
             "settings",
             "Same as `rune config`; shows resolved configuration and value sources.",
         )],
-        summary: "Show the resolved configuration and where each value came from",
-        usage: "rune config [--explain] [--json]",
+        summary: "Show, read or change the configuration and where each value came from",
+        usage: "rune config [--explain] [--json] | rune config get <key> [--json] | rune config set <key> <value> | rune config unset <key> | rune config path [--json] | rune config edit",
         flags: &[
             flag("--explain", "Show the source layer of every key."),
             flag("--json", "Emit JSON."),
         ],
         requirements: Requirements::CONFIG,
+        supports_json: true,
+    },
+    CommandSpec {
+        name: "keys",
+        aliases: &[],
+        summary: "List the key actions, their keys, and the file that rebinds them",
+        usage: "rune keys [--json]",
+        flags: &[flag("--json", "Emit JSON.")],
+        requirements: Requirements::NONE,
         supports_json: true,
     },
     CommandSpec {
@@ -543,9 +641,16 @@ pub const MAINTENANCE: &[CommandSpec] = &[
     CommandSpec {
         name: "doctor",
         aliases: &[],
-        summary: "Check the local setup without starting a turn",
-        usage: "rune doctor [--json]",
-        flags: &[flag("--json", "Emit JSON.")],
+        summary: "Check the local setup, or one provider with a short round trip",
+        usage: "rune doctor [--provider <name>] [--json]",
+        flags: &[
+            option(
+                "--provider",
+                "name",
+                "Send one short tool round trip to this provider and report what works.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
         requirements: Requirements::CONFIG,
         supports_json: true,
     },
@@ -553,8 +658,12 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         name: "upgrade",
         aliases: &[],
         summary: "Replace the installed binary with a verified artifact",
-        usage: "rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]",
+        usage: "rune upgrade [--check] [--json] | rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]",
         flags: &[
+            flag(
+                "--check",
+                "Report whether a newer release exists and change nothing.",
+            ),
             option("--from", "path", "Artifact to install."),
             option("--checksum", "hex", "Published checksum of that artifact."),
             option(
@@ -589,7 +698,7 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         name: "completion",
         aliases: &[],
         summary: "Generate shell completion from the command table",
-        usage: "rune completion bash",
+        usage: "rune completion <bash|zsh|fish|powershell>",
         flags: &[],
         requirements: Requirements::NONE,
         supports_json: false,
@@ -640,6 +749,23 @@ pub const GROUPS: &[(&str, &[CommandSpec])] = &[
 /// Every command, flattened.
 pub fn all_commands() -> impl Iterator<Item = &'static CommandSpec> {
     GROUPS.iter().flat_map(|(_, specs)| specs.iter())
+}
+
+/// Extra notes printed after a command's flags in its help and reference,
+/// or `""` for a command with none.
+#[must_use]
+pub fn notes(name: &str) -> &'static str {
+    match name {
+        "ask" => "\
+Exit status:
+  0    the model finished (stop_reason end_turn)
+  1    the run failed: provider_error, refused, content_filter, stalled, or an error before the first request
+  3    a limit ended the run and its output is usable: max_model_turns, max_output_tokens, time_limit, spend_limit, objective_token_budget
+  130  interrupted by SIGINT
+  143  stopped by SIGTERM or SIGHUP
+",
+        _ => "",
+    }
 }
 
 /// Looks up a command by name or alias.

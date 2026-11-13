@@ -3,11 +3,13 @@
 //! A session belongs to the tool instance rather than to the call that started
 //! it, so a command that outlives its call can be observed and stopped later.
 //! Every session runs in its own process group, which is what lets a stop end a
-//! whole tree rather than the one process Rune spawned.
+//! whole tree rather than the one process Rune spawned. A command given
+//! `timeout_ms` has its group killed at that deadline, whether or not a call is
+//! still waiting on it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -16,12 +18,16 @@ use rune_core::LimitName;
 use rune_core::budget::BudgetSet;
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
+use crate::contract::{
+    Activity, BackgroundTask, CheckRun, ExecutionContext, Tool, ToolOutput,
+    validate_closed_arguments,
+};
 use crate::workspace::{
-    FileLimits, bool_arg, head_and_tail, resolve, string_arg, truncate_to_bytes, usize_arg,
+    FileLimits, bool_arg, head_and_tail_split, resolve, string_arg, truncate_to_bytes, usize_arg,
 };
 use rune_exec::command::Exit;
-use rune_exec::session::{Input, POLL_INTERVAL, Process};
+use rune_exec::session::{Input, Leftovers, POLL_INTERVAL, Process, SpawnOptions, Streams};
+use sha2::{Digest as _, Sha256};
 
 /// Yield window a `run` uses when none is requested.
 pub const DEFAULT_RUN_YIELD_MS: u64 = 30_000;
@@ -32,11 +38,23 @@ pub const DEFAULT_INTERACT_MS: u64 = 5_000;
 /// Largest yield window a caller may request.
 ///
 /// Bounded so one call cannot hold a turn open indefinitely; a command that
-/// outlives its window is returned as a session instead.
+/// outlives its window is returned as a session instead. A command with
+/// `timeout_ms` is still killed at its deadline after the call has returned.
 pub const MAX_YIELD_MS: u64 = 600_000;
 
+/// Largest `timeout_ms` a caller may give.
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
+
 /// Time spent collecting the last bytes a command writes as it exits.
-const DRAIN_WINDOW: Duration = Duration::from_millis(250);
+const DRAIN_WINDOW: Duration = Duration::from_millis(200);
+
+/// Finished commands whose background processes are kept; past this, the
+/// oldest group is ended.
+const MAX_LEFTOVERS: usize = 16;
+
+/// Line added after the state of a finished command whose group still runs.
+const BACKGROUND_NOTICE: &str =
+    "[processes started by this command are still running in the background]";
 
 /// Bounds on the time an `interact` waits for a session to take its input.
 ///
@@ -62,11 +80,73 @@ pub const STOP_TARGET: &str = "stop";
 /// that command is kept where every view can read it.
 static COMMANDS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
+/// Idle interactions in a row after which each one carries [`IDLE_HINT`].
+const IDLE_POLLS_BEFORE_HINT: u32 = 4;
+/// Added to an interaction with a session that keeps producing nothing.
+const IDLE_HINT: &str =
+    "[the process has produced no new output; wait longer with a larger yield_time_ms, or stop it]";
+
 /// Sessions started in this process, counted across every instance so that no
 /// two sessions share an id.
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
+/// Background work started by any shell call in this process: sessions that
+/// outlived their call and groups left running after a command exited.
+static BACKGROUND: Mutex<Background> = Mutex::new(Background {
+    watched: Vec::new(),
+    generation: 0,
+});
+
+/// What [`BACKGROUND`] watches, and a number that changes with it.
+struct Background {
+    watched: Vec<Watched>,
+    generation: u64,
+}
+
+/// One piece of background work.
+enum Watched {
+    Session(std::sync::Weak<Session>),
+    Group(u32),
+}
+
+impl Watched {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Session(session) => session
+                .upgrade()
+                .is_some_and(|session| session.process.is_running()),
+            Self::Group(group) => rune_exec::session::group_alive(*group),
+        }
+    }
+}
+
+/// Adds background work to the watch list.
+fn watch(watched: Watched) {
+    let mut background = lock(&BACKGROUND);
+    background.watched.push(watched);
+    background.generation = background.generation.saturating_add(1);
+}
+
+/// How much background work is alive, and a number that changes whenever some
+/// starts or ends. Ending is noticed when this is called.
+///
+/// The list is shared by every conversation in the process, so background work
+/// in one also counts for the others.
+pub fn background() -> (usize, u64) {
+    let mut background = lock(&BACKGROUND);
+    let before = background.watched.len();
+    background.watched.retain(Watched::alive);
+    let ended = before.saturating_sub(background.watched.len());
+    background.generation = background
+        .generation
+        .saturating_add(u64::try_from(ended).unwrap_or(u64::MAX));
+    (background.watched.len(), background.generation)
+}
+
 /// Runs commands and holds the ones that outlive their call.
+///
+/// Background processes a finished command started, such as `server &`, keep
+/// running until the tool is dropped or the run ends.
 #[derive(Debug)]
 pub struct Shell {
     limits: FileLimits,
@@ -99,6 +179,28 @@ struct State {
     sessions: BTreeMap<String, Arc<Session>>,
     /// Commands that are starting but do not yet have a session entry.
     starting: usize,
+    /// Finished commands whose groups still have processes running, oldest
+    /// first.
+    leftovers: Vec<Leftover>,
+}
+
+/// A finished command whose group still has processes running.
+#[derive(Debug)]
+enum Leftover {
+    /// A command that finished within its `run`.
+    Run(Process),
+    /// A session that ended.
+    Session(Arc<Session>),
+}
+
+impl Leftover {
+    /// Returns the process whose group is kept.
+    fn process(&self) -> &Process {
+        match self {
+            Self::Run(process) => process,
+            Self::Session(session) => &session.process,
+        }
+    }
 }
 
 /// A slot in the session bound, held while a command starts.
@@ -182,6 +284,14 @@ struct Session {
     process: Process,
     seen: Mutex<(usize, usize)>,
     input: Input,
+    /// Whether the sandbox kept this command off the network.
+    network_denied: bool,
+    /// The deadline the command was given, in milliseconds.
+    timeout_ms: Option<u64>,
+    /// Interactions in a row that sent nothing and saw no new output.
+    idle_polls: AtomicU32,
+    /// When the command started.
+    started: Instant,
 }
 
 impl Session {
@@ -192,6 +302,7 @@ impl Session {
         process: Process,
         seen: (usize, usize),
         input: Input,
+        network_denied: bool,
     ) -> Self {
         let _ = lock(&COMMANDS).insert(id.clone(), command.clone());
         Self {
@@ -200,6 +311,29 @@ impl Session {
             process,
             seen: Mutex::new(seen),
             input,
+            network_denied,
+            timeout_ms: None,
+            idle_polls: AtomicU32::new(0),
+            started: Instant::now(),
+        }
+    }
+
+    /// Returns the state line of a session that has ended this way, or its
+    /// timeout line when its deadline killed it.
+    fn ended_state(&self, exit: Exit) -> String {
+        match self.timeout_ms {
+            Some(timeout) if self.process.timed_out() => timeout_state(timeout),
+            _ => format!("session {} ended: {}", self.id, exit.describe()),
+        }
+    }
+
+    /// Returns the exit a result is judged by: the timeout status when the
+    /// deadline killed the command.
+    fn judged_exit(&self, exit: Exit) -> Exit {
+        if self.process.timed_out() {
+            Exit::Code(TIMEOUT_STATUS)
+        } else {
+            exit
         }
     }
 }
@@ -256,6 +390,34 @@ impl Shell {
         lock(&self.state).sessions.len()
     }
 
+    /// Keeps a finished command whose group still has processes running, and
+    /// says so after the result's state line. Past the bound, the oldest kept
+    /// group is ended.
+    fn keep_leftovers(&self, leftover: Leftover, text: &mut String) {
+        if !leftover.process().group_alive() {
+            return;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(BACKGROUND_NOTICE);
+        text.push('\n');
+        watch(Watched::Group(leftover.process().id()));
+        let evicted = {
+            let mut state = lock(&self.state);
+            let evicted = if state.leftovers.len() >= MAX_LEFTOVERS {
+                Some(state.leftovers.remove(0))
+            } else {
+                None
+            };
+            state.leftovers.push(leftover);
+            evicted
+        };
+        if let Some(evicted) = evicted {
+            evicted.process().end_leftovers();
+        }
+    }
+
     /// Starts a command and returns either its finished output or a session.
     fn run(&self, arguments: &serde_json::Value, context: &ExecutionContext) -> Result<ToolOutput> {
         let command = string_arg(arguments, "command")?
@@ -264,7 +426,15 @@ impl Shell {
         if command.trim().is_empty() {
             return Err(RuneError::invalid_field("command", "the command is empty"));
         }
-        let window = yield_window(arguments, DEFAULT_RUN_YIELD_MS)?;
+        let timeout = timeout_ms(arguments)?;
+        // A command with a deadline is waited on until just past it, so its
+        // timeout is usually reported by the call that started it.
+        let window = match timeout {
+            Some(timeout) if usize_arg(arguments, "yield_time_ms")?.is_none() => {
+                Duration::from_millis(timeout.saturating_add(1_000).min(MAX_YIELD_MS))
+            }
+            _ => yield_window(arguments, DEFAULT_RUN_YIELD_MS)?,
+        };
         let cwd = match string_arg(arguments, "cwd")? {
             Some(raw) => Some(resolve(context, raw)?.path),
             None => None,
@@ -291,6 +461,16 @@ impl Shell {
             Input::Closed
         };
         let cap = self.limits.output_cap(context);
+        // Kept groups whose processes have all ended need no more holding.
+        let ended: Vec<Leftover> = {
+            let mut state = lock(&self.state);
+            let (alive, ended) = std::mem::take(&mut state.leftovers)
+                .into_iter()
+                .partition(|leftover| leftover.process().group_alive());
+            state.leftovers = alive;
+            ended
+        };
+        drop(ended);
         // The slot is reserved before the command is spawned, so two starts
         // racing for the last one cannot both win it, and a start that fails or
         // returns a finished command gives the slot back.
@@ -298,26 +478,56 @@ impl Shell {
 
         // The start happens outside the map lock, because a command that runs
         // for its whole yield window would otherwise hold every other call up.
-        let process = start(&command, cwd.as_deref(), cap, context, input)?;
-        if let Some(exit) = wait_for_exit(&process, window, context)? {
+        let (process, network_denied) = start(&command, cwd.as_deref(), cap, context, input)?;
+        if let Some(timeout) = timeout {
+            process
+                .kill_after(Duration::from_millis(timeout))
+                .map_err(RuneError::from)?;
+        }
+        let waited = wait_for_exit(&process, window, context);
+        if let Err(err) = &waited
+            && err.code() == ErrorCode::Cancelled
+        {
+            process.terminate(true);
+        }
+        if let Some(exit) = waited? {
             process.drain_output(DRAIN_WINDOW);
-            let (text, full_text) = observe(
+            let (state, exit) = match timeout {
+                Some(timeout) if process.timed_out() => {
+                    (timeout_state(timeout), Exit::Code(TIMEOUT_STATUS))
+                }
+                _ => (exit.describe(), exit),
+            };
+            let (mut text, full_text, check) = observe(
                 &process,
                 &command,
-                &exit.describe(),
+                &state,
                 &mut (0, 0),
                 cap,
                 Some(&self.runs),
             );
-            let mut output = finish(text, exit);
+            self.keep_leftovers(Leftover::Run(process), &mut text);
+            let mut output = finish(text, exit, network_denied);
             output.full_text = full_text;
+            output.check = check.map(|check| with_exit(check, exit));
             return Ok(output);
         }
 
-        let state = format!("session {id} running, {}", ended_by(process.id()));
+        // This first result is the one most easily read as a failure, so it
+        // says plainly what to do next.
+        let state = format!(
+            "still running after {} s as session {id} ({}). Do not run the command again. \
+             Use action \"interact\" with this session_id to wait for more output, or action \
+             \"stop\" to end it.",
+            seconds(u64::try_from(window.as_millis()).unwrap_or(u64::MAX)),
+            ended_by(process.id())
+        );
         let mut seen = (0, 0);
-        let (text, _) = observe(&process, &command, &state, &mut seen, cap, None);
-        let session = Arc::new(Session::new(id.clone(), command, process, seen, input));
+        let (text, _, _) = observe(&process, &command, &state, &mut seen, cap, None);
+        let mut session = Session::new(id.clone(), command, process, seen, input, network_denied);
+        session.timeout_ms = timeout;
+        let session = Arc::new(session);
+        watch(Watched::Session(Arc::downgrade(&session)));
         slot.hand_over(id, session);
         Ok(ToolOutput::success(text))
     }
@@ -397,12 +607,22 @@ impl Shell {
         if ended.is_some() {
             session.process.drain_output(DRAIN_WINDOW);
         }
+        let idle = chars.is_none() && ended.is_none() && produced(&session.process) == baseline;
+        let idle_polls = if idle {
+            session
+                .idle_polls
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        } else {
+            session.idle_polls.store(0, Ordering::Relaxed);
+            0
+        };
         let state = match ended {
-            Some(exit) => format!("session {id} ended: {}", exit.describe()),
+            Some(exit) => session.ended_state(exit),
             None => format!("session {id} running, {}", ended_by(session.process.id())),
         };
         let mut seen = lock(&session.seen);
-        let (text, _) = observe(
+        let (mut text, _, check) = observe(
             &session.process,
             &session.command,
             &state,
@@ -414,7 +634,17 @@ impl Shell {
             // A session that has ended is observed once more and then dropped,
             // so a later call cannot report output that was already returned.
             let _ = lock(&self.state).sessions.remove(&id);
-            return Ok(finish(text, exit));
+            self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
+            let exit = session.judged_exit(exit);
+            let mut output = finish(text, exit, session.network_denied);
+            output.check = check.map(|check| with_exit(check, exit));
+            return Ok(output);
+        }
+        if idle_polls >= IDLE_POLLS_BEFORE_HINT {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(IDLE_HINT);
         }
         Ok(ToolOutput::success(text))
     }
@@ -443,11 +673,11 @@ impl Shell {
         let ended = session.process.terminate(force);
         session.process.drain_output(DRAIN_WINDOW);
         let state = match session.process.exit() {
-            Some(exit) => format!("session {id} ended: {}", exit.describe()),
+            Some(exit) => session.ended_state(exit),
             None => format!("session {id} survived the grace period"),
         };
         let mut seen = lock(&session.seen);
-        let (text, _) = observe(
+        let (mut text, _, _) = observe(
             &session.process,
             &session.command,
             &state,
@@ -455,10 +685,14 @@ impl Shell {
             cap,
             None,
         );
+        if session.process.exit().is_some() {
+            self.keep_leftovers(Leftover::Session(Arc::clone(&held)), &mut text);
+        }
         // A stop that ended the group succeeded even though the command was
         // killed: the signal is how it was asked to stop, not a failure of the
-        // stop itself, and the status is stated in the result.
-        if ended {
+        // stop itself, and the status is stated in the result. A command its
+        // deadline had already killed is reported as the failure it was.
+        if ended && !session.process.timed_out() {
             Ok(ToolOutput::success(text))
         } else {
             Ok(ToolOutput::failure(text))
@@ -472,15 +706,87 @@ impl Default for Shell {
     }
 }
 
+impl Drop for Shell {
+    fn drop(&mut self) {
+        // Sessions end their groups when they are dropped; kept groups of
+        // finished commands are ended here.
+        let leftovers = std::mem::take(&mut lock(&self.state).leftovers);
+        for leftover in &leftovers {
+            leftover.process().end_leftovers();
+        }
+    }
+}
+
+/// The newest bytes a background listing reads lines from.
+const BACKGROUND_WINDOW: usize = 64 * 1024;
+
 impl Tool for Shell {
     fn name(&self) -> &'static str {
         "shell"
     }
 
+    /// Lists running sessions from their output buffers. No reader position
+    /// moves, so the next call still returns everything it would have.
+    fn background(&self) -> Vec<BackgroundTask> {
+        let sessions: Vec<Arc<Session>> = lock(&self.state).sessions.values().cloned().collect();
+        let mut tasks: Vec<BackgroundTask> = sessions
+            .iter()
+            .filter(|session| session.process.is_running())
+            .map(|session| BackgroundTask {
+                id: session.id.clone(),
+                command: session.command.clone(),
+                started: session.started,
+                last_line: session
+                    .process
+                    .stdout()
+                    .last_lines(1, BACKGROUND_WINDOW)
+                    .pop()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        tasks.sort_by_key(|task| task.started);
+        tasks
+    }
+
+    fn background_tail(&self, id: &str, lines: usize) -> Option<String> {
+        let session = lock(&self.state).sessions.get(id).cloned()?;
+        let tail = session
+            .process
+            .stdout()
+            .last_lines(lines, BACKGROUND_WINDOW);
+        Some(tail.join("\n"))
+    }
+
+    /// Stops every session this tool started, each asked to exit and killed
+    /// after the grace period. They are stopped together, so many sessions
+    /// take one grace period rather than one each.
+    fn shutdown(&self) {
+        let (sessions, leftovers): (Vec<Arc<Session>>, Vec<Leftover>) = {
+            let mut state = lock(&self.state);
+            (
+                std::mem::take(&mut state.sessions).into_values().collect(),
+                std::mem::take(&mut state.leftovers),
+            )
+        };
+        std::thread::scope(|scope| {
+            for session in &sessions {
+                scope.spawn(|| session.process.terminate(false));
+            }
+        });
+        // A leader that ended leaves its kept group behind, and so does a
+        // finished command that started background processes.
+        for session in &sessions {
+            session.process.end_leftovers();
+        }
+        for leftover in &leftovers {
+            leftover.process().end_leftovers();
+        }
+    }
+
     fn description(&self) -> &'static str {
-        "Run a shell command. `run` returns the output and exit status, or a session_id \
-         when the command is still running after yield_time_ms. `interact` reads new output \
-         and sends chars; `stop` ends a session and its processes."
+        "Run a shell command. `run` returns the output and exit status, or a session_id if \
+         it is still running after yield_time_ms; never rerun a running command. `interact` \
+         reads new output and sends chars; `stop` ends it."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -501,27 +807,25 @@ impl Tool for Shell {
                 },
                 "interactive": {
                     "type": "boolean",
-                    "description": "Keep standard input open for `interact`.",
+                    "description": "Keep standard input open.",
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Linux only: run under a terminal, with merged output.",
+                    "description": "Linux only: run under a terminal.",
                 },
                 "rows": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Terminal rows; `interact` resizes.",
                 },
                 "cols": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Terminal columns; `interact` resizes.",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "From `run`. Required by `interact` and `stop`.",
+                    "description": "From `run`.",
                 },
                 "chars": {
                     "type": "string",
@@ -533,9 +837,15 @@ impl Tool for Shell {
                     "maximum": MAX_YIELD_MS,
                     "description": "Wait before returning.",
                 },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMEOUT_MS,
+                    "description": "Kill the command after this long.",
+                },
                 "force": {
                     "type": "boolean",
-                    "description": "Kill at once instead of stopping gracefully.",
+                    "description": "Kill at once.",
                 },
             },
             "required": ["action"],
@@ -583,6 +893,12 @@ impl Tool for Shell {
         let action = Action::parse(
             string_arg(arguments, "action")?.ok_or_else(|| RuneError::missing_field("action"))?,
         )?;
+        if action != Action::Run && arguments.get("timeout_ms").is_some() {
+            return Err(RuneError::invalid_field(
+                "timeout_ms",
+                "applies only to `run`",
+            ));
+        }
         match action {
             Action::Run => self.run(arguments, context),
             Action::Interact => self.interact(arguments, context),
@@ -631,9 +947,26 @@ pub fn sandbox_policy(context: &ExecutionContext) -> rune_exec::SandboxPolicy {
     rune_exec::SandboxPolicy::new(
         context.workspace.clone(),
         context.additional_roots.clone(),
-        context.external_access && !context.offline,
+        (context.external_access || context.network) && !context.offline,
     )
+    .with_cache_roots(context.cache_roots.clone())
 }
+
+/// Added once to a failed command's output when the sandbox kept it off the
+/// network and its output looks like a failed connection.
+pub const NETWORK_NOTICE: &str =
+    "[commands in this run have no network access; the user can allow it with --network]";
+
+/// What a failed connection prints, in the tools agents run most.
+const NETWORK_FAILURES: &[&str] = &[
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "enotfound",
+    "eai_again",
+    "network is unreachable",
+    "failed to connect",
+];
 
 /// Returns the command to run, wrapped by `backend` unless the context says no
 /// sandbox applies.
@@ -670,15 +1003,17 @@ fn start(
     cap: usize,
     context: &ExecutionContext,
     input: Input,
-) -> Result<Process> {
+) -> Result<(Process, bool)> {
     let workspace = cwd.unwrap_or(&context.workspace);
     // The shell tool exists to run shell commands, so its input always goes to a
     // shell: routing a bare word to direct argv would break builtins such as
     // `exit`.
     // The environment is built here rather than inherited: this process holds
     // the provider credential, and a command that reaches the network must not
-    // be able to read it back out of its own environment.
-    let environment = rune_exec::minimal_environment();
+    // be able to read it back out of its own environment. A command without a
+    // terminal is told so, and pagers and prompts are off.
+    let environment =
+        rune_exec::command_environment(&context.environment, matches!(input, Input::Pty { .. }));
     let prepared =
         rune_exec::command::prepare_shell(command, workspace, None, environment.clone())?;
     let policy = sandbox_policy(context);
@@ -688,6 +1023,9 @@ fn start(
     // host backend, which is the path production takes.
     let backend = rune_exec::detect();
     let wrapped = confined(&prepared, &policy, context, input, &*backend)?;
+    // Only a command the sandbox actually confines without network can blame
+    // a failed connection on it; the unsandboxed fallback had network.
+    let network_denied = context.sandboxed && !policy.network && backend.support().is_full();
 
     // The working directory is the resolved workspace, which is the path the
     // sandbox rule was built from. Starting in the path as written would leave
@@ -707,12 +1045,16 @@ fn start(
         };
         RuneError::new(code, format!("`{workspace}` cannot be started in: {err}"))
     })?;
-    Process::start_argv(
+    Process::start_argv_with(
         &wrapped.argv,
         Some(start_in.as_std_path()),
         cap,
         &environment,
         input,
+        SpawnOptions {
+            streams: Streams::Merged,
+            leftovers: Leftovers::Keep,
+        },
     )
     .map_err(|err| {
         let hint = match cwd {
@@ -721,6 +1063,7 @@ fn start(
         };
         RuneError::from(err).with_hint(hint)
     })
+    .map(|process| (process, network_denied))
 }
 
 /// Returns the total bytes both streams have produced.
@@ -739,7 +1082,9 @@ fn produced(process: &Process) -> u64 {
 /// has already seen are not repeated.
 ///
 /// With `runs`, a finished test run that repeats an earlier one is shown as
-/// what changed, and the complete rendering is returned beside it.
+/// what changed, and the complete rendering is returned beside it. An ended
+/// command also yields what it reported, with the exit status the process
+/// gave; a caller that judges the exit differently replaces it.
 fn observe(
     process: &Process,
     command: &str,
@@ -747,20 +1092,19 @@ fn observe(
     seen: &mut (usize, usize),
     cap: usize,
     runs: Option<&Mutex<BTreeMap<String, String>>>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<CheckRun>) {
+    // Standard error shares the standard output pipe, so this one stream holds
+    // everything in the order the command wrote it.
     let stdout = process.stdout().since(seen.0);
-    let stderr = process.stderr().since(seen.1);
     // An ended command is observed for the last time, so the newest bytes of a
     // stream that outgrew its head follow that head, once.
-    let ended = process.exit().is_some();
+    let exit = process.exit();
     let mut body = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let mut full = None;
-    if ended {
+    let mut check = None;
+    if let Some(exit) = exit {
         push_tail(&mut body, process.stdout());
-    }
-    body.push_str(&String::from_utf8_lossy(&stderr.bytes));
-    if ended {
-        push_tail(&mut body, process.stderr());
+        check = Some(with_exit(check_run(&body), exit));
         // A finished test run leads with its verdict, which the cut below
         // always keeps, because the start of the output survives it.
         if let Some(counts) = crate::test_report::parse(&body) {
@@ -785,31 +1129,74 @@ fn observe(
         }
     }
     seen.0 = stdout.next;
-    seen.1 = stderr.next;
 
-    // A stream whose capture stopped at the cap says so, because the bytes the
-    // command printed and the bytes retained are then different numbers, and
-    // only the pair makes the shortfall visible. The comparison is the retained
-    // head against total production; what a caller has not yet read says
-    // nothing about the capture.
-    let clipped = [
-        ("standard output", process.stdout().totals()),
-        ("standard error", process.stderr().totals()),
-    ];
-    let mut note = String::new();
-    for (name, (retained, total)) in clipped {
-        if total > retained as u64 {
-            if !note.is_empty() {
-                note.push(' ');
-            }
-            let _ = write!(
-                note,
-                "[{name} capture stopped after {retained} bytes, the stream produced {total} bytes]"
-            );
-        }
+    // A capture that stopped at the cap says so, because the bytes the command
+    // printed and the bytes retained are then different numbers, and only the
+    // pair makes the shortfall visible. The comparison is the retained head
+    // against total production; what a caller has not yet read says nothing
+    // about the capture.
+    let (retained, total) = process.stdout().totals();
+    let note = if total > retained as u64 {
+        format!(
+            "[output capture stopped after {retained} bytes, the command produced {total} bytes]"
+        )
+    } else {
+        String::new()
+    };
+    let failed = process.exit().is_some_and(|exit| !exit.is_success()) || process.timed_out();
+    let full = full.map(|full| render(command, full, &note, state, usize::MAX, failed));
+    (
+        render(command, body, &note, state, cap, failed),
+        full,
+        check,
+    )
+}
+
+/// Most failing test names a check run keeps.
+const MAX_CHECK_FAILING: usize = 10;
+
+/// Lines of output a check run's signature is taken from when no failing
+/// test is named.
+const SIGNATURE_LINES: usize = 20;
+
+/// Reads what a finished command's output reports, without its exit status.
+fn check_run(body: &str) -> CheckRun {
+    let failed_tests = crate::test_report::parse(body).map(|counts| counts.failed);
+    let mut names = crate::test_report::failures(body);
+    let signature = if names.is_empty() {
+        let lines: Vec<&str> = body.lines().collect();
+        let tail = lines
+            .get(lines.len().saturating_sub(SIGNATURE_LINES)..)
+            .unwrap_or_default()
+            .join("\n");
+        let digest = Sha256::digest(tail.as_bytes());
+        digest.iter().take(8).fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    } else {
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.join("\n")
+    };
+    names.truncate(MAX_CHECK_FAILING);
+    CheckRun {
+        exit_code: None,
+        failed_tests,
+        failing: names,
+        signature,
     }
-    let full = full.map(|full| render(command, full, &note, state, usize::MAX));
-    (render(command, body, &note, state, cap), full)
+}
+
+/// Sets a check run's exit status: the code of a command that exited, else none.
+fn with_exit(check: CheckRun, exit: Exit) -> CheckRun {
+    CheckRun {
+        exit_code: match exit {
+            Exit::Code(code) => Some(code),
+            _ => None,
+        },
+        ..check
+    }
 }
 
 /// Appends a stream's newest bytes past its retained head, with the gap.
@@ -831,8 +1218,16 @@ fn push_tail(body: &mut String, stream: &rune_exec::Buffer) {
 /// retained, because a result that is merely short looks like a command that
 /// printed nothing. A cut keeps the start and the end and drops the middle:
 /// a build names its first error at the top, and a test run puts its failures
-/// and its summary at the bottom.
-fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) -> String {
+/// and its summary at the bottom. A command that failed keeps more of its end,
+/// where the error usually is.
+fn render(
+    command: &str,
+    mut body: String,
+    note: &str,
+    state: &str,
+    cap: usize,
+    failed: bool,
+) -> String {
     if cap == 0 {
         return String::new();
     }
@@ -866,20 +1261,27 @@ fn render(command: &str, mut body: String, note: &str, state: &str, cap: usize) 
         out.push_str(&body);
     } else {
         let total = body.len();
+        let share = if failed { 5 } else { 3 };
         let mut kept = room;
         // The marker states how many bytes were kept, so its own length depends
         // on the answer. Two passes settle it; the loop is a bound, not a guess.
         for _ in 0..8 {
-            let (start, end) =
-                head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+            let (start, end) = head_and_tail_split(
+                &body,
+                room.saturating_sub(marker(kept, total, cap).len()),
+                share,
+            );
             let settled = start.len().saturating_add(end.len());
             if settled == kept {
                 break;
             }
             kept = settled;
         }
-        let (start, end) =
-            head_and_tail(&body, room.saturating_sub(marker(kept, total, cap).len()));
+        let (start, end) = head_and_tail_split(
+            &body,
+            room.saturating_sub(marker(kept, total, cap).len()),
+            share,
+        );
         out.push_str(start);
         if room > kept {
             out.push_str(&marker(kept, total, cap));
@@ -918,12 +1320,25 @@ fn unknown_session(state: &State, id: &str) -> RuneError {
 }
 
 /// Marks a finished result as a failure when the command did not succeed.
-fn finish(text: String, exit: Exit) -> ToolOutput {
+/// Builds a command's result; a failure that looks like a blocked connection
+/// from a command kept off the network says how the user can allow it.
+fn finish(mut text: String, exit: Exit, network_denied: bool) -> ToolOutput {
     if exit.is_success() {
-        ToolOutput::success(text)
-    } else {
-        ToolOutput::failure(text)
+        return ToolOutput::success(text);
     }
+    let lower = text.to_ascii_lowercase();
+    if network_denied
+        && NETWORK_FAILURES
+            .iter()
+            .any(|failure| lower.contains(failure))
+        && !text.contains(NETWORK_NOTICE)
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(NETWORK_NOTICE);
+    }
+    ToolOutput::failure(text)
 }
 
 /// Resolves the yield window from the arguments.
@@ -935,6 +1350,46 @@ fn yield_window(arguments: &serde_json::Value, default: u64) -> Result<Duration>
     Ok(Duration::from_millis(bounded))
 }
 
+/// Exit status a command killed at its deadline is reported with.
+const TIMEOUT_STATUS: i32 = 124;
+
+/// Reads `timeout_ms`, refusing a value outside its bounds.
+fn timeout_ms(arguments: &serde_json::Value) -> Result<Option<u64>> {
+    let Some(raw) = usize_arg(arguments, "timeout_ms")? else {
+        return Ok(None);
+    };
+    let raw = u64::try_from(raw).unwrap_or(u64::MAX);
+    if !(1..=MAX_TIMEOUT_MS).contains(&raw) {
+        return Err(RuneError::invalid_field(
+            "timeout_ms",
+            format!("`timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"),
+        ));
+    }
+    Ok(Some(raw))
+}
+
+/// Returns the state line of a command its deadline killed.
+fn timeout_state(timeout: u64) -> String {
+    format!(
+        "killed after {} s (timeout_ms), exit status {TIMEOUT_STATUS}. The output above is \
+         partial. If it needs longer, run it with a larger timeout_ms, or without one and \
+         wait with interact.",
+        seconds(timeout)
+    )
+}
+
+/// Writes milliseconds as seconds, with no fractional part when it is whole
+/// and the fraction trimmed of trailing zeros otherwise.
+fn seconds(ms: u64) -> String {
+    let (whole, fraction) = (ms / 1_000, ms % 1_000);
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        let fraction = format!("{fraction:03}");
+        format!("{whole}.{}", fraction.trim_end_matches('0'))
+    }
+}
+
 /// Waits for a process to end, or for the window to elapse.
 fn wait_for_exit(
     process: &Process,
@@ -942,7 +1397,9 @@ fn wait_for_exit(
     context: &ExecutionContext,
 ) -> Result<Option<Exit>> {
     let deadline = Instant::now().checked_add(window);
+    let mut tail = TailWriter::default();
     loop {
+        tail.store(process, context);
         if let Some(exit) = process.exit() {
             return Ok(Some(exit));
         }
@@ -966,7 +1423,9 @@ fn wait_for_progress(
     context: &ExecutionContext,
 ) -> Result<()> {
     let deadline = Instant::now().checked_add(window);
+    let mut tail = TailWriter::default();
     loop {
+        tail.store(process, context);
         if process.exit().is_some() || produced(process) > baseline {
             return Ok(());
         }
@@ -975,6 +1434,51 @@ fn wait_for_progress(
             return Ok(());
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Shortest time between two stores of a running command's newest lines.
+const TAIL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Newest output lines kept for a host to show under a running command.
+const TAIL_LINES: usize = 3;
+
+/// Bytes read from the end of a stream to find those lines.
+const TAIL_BYTES: usize = 4096;
+
+/// Copies a running command's newest output lines into the context's tail.
+#[derive(Default)]
+struct TailWriter {
+    /// When the lines were last stored.
+    stored: Option<Instant>,
+    /// Bytes each stream had produced at that store.
+    seen: (u64, u64),
+}
+
+impl TailWriter {
+    /// Stores the newest lines of stdout, or of stderr when stdout produced
+    /// nothing new since the last store, at most every [`TAIL_INTERVAL`].
+    fn store(&mut self, process: &Process, context: &ExecutionContext) {
+        let Some(target) = &context.live_tail else {
+            return;
+        };
+        if self
+            .stored
+            .is_some_and(|stored| stored.elapsed() < TAIL_INTERVAL)
+        {
+            return;
+        }
+        let produced = (process.stdout().totals().1, process.stderr().totals().1);
+        let lines = if produced.0 > self.seen.0 {
+            process.stdout().last_lines(TAIL_LINES, TAIL_BYTES)
+        } else if produced.1 > self.seen.1 {
+            process.stderr().last_lines(TAIL_LINES, TAIL_BYTES)
+        } else {
+            return;
+        };
+        self.stored = Some(Instant::now());
+        self.seen = produced;
+        *lock(target) = lines;
     }
 }
 
@@ -1101,11 +1605,20 @@ mod tests {
     }
 
     /// Returns the session id and process group a running result reports.
+    ///
+    /// Reads both the first result of a `run` that yielded
+    /// (`still running after N s as session ID (GROUP). ...`) and the shorter
+    /// line of an `interact` (`session ID running, GROUP`).
     fn running(text: &str) -> (String, String) {
         let line = text
             .lines()
-            .find(|line| line.contains(" running, "))
+            .find(|line| line.contains("as session ") || line.contains(" running, "))
             .unwrap_or_else(|| panic!("no running session in {text}"));
+        if let Some((_, rest)) = line.split_once("as session ") {
+            let (id, rest) = rest.split_once(" (").expect("a session id and a group");
+            let group = rest.split_once(')').expect("the end of the group").0;
+            return (id.trim().to_owned(), group.trim().to_owned());
+        }
         let rest = line.split_once("session ").expect("a session id").1;
         let (id, group) = rest
             .split_once(" running, ")
@@ -1168,6 +1681,78 @@ mod tests {
         let (id, group) = running(&started);
         assert!(started.contains("ready"), "{started}");
         (id, group)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_command_stores_its_newest_lines_in_the_live_tail() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let context = context.with_live_tail(Arc::clone(&tail));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let watcher = {
+            let (tail, seen) = (Arc::clone(&tail), Arc::clone(&seen));
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    let lines = lock(&tail).clone();
+                    if lines.iter().any(|line| line == "four") {
+                        *lock(&seen) = lines;
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let output = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'one\\ntwo\\nthree\\nfour\\n'; sleep 1",
+            }),
+        );
+        watcher.join().expect("watcher");
+        assert!(output.contains("four"), "{output}");
+        assert_eq!(*lock(&seen), ["two", "three", "four"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_ends_every_session_gracefully() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // One ignores TERM and must be killed after the grace period; the
+        // other ends on TERM. They are stopped together.
+        let group = |command: &str| {
+            let (_, group) = start_ready(&tool, &context, command);
+            group
+                .strip_prefix("process group ")
+                .expect("group id")
+                .to_owned()
+        };
+        let stubborn = group("trap '' TERM; echo ready; sleep 30");
+        let polite = group("echo ready; sleep 30");
+        assert!(group_alive(&stubborn) && group_alive(&polite));
+        let started = Instant::now();
+        tool.shutdown();
+        let took = started.elapsed();
+        assert!(
+            wait_until(
+                || !group_alive(&stubborn) && !group_alive(&polite),
+                Duration::from_secs(5)
+            ),
+            "a session survived shutdown"
+        );
+        assert!(took >= rune_exec::session::GRACE_PERIOD, "{took:?}");
+        assert!(
+            took < rune_exec::session::GRACE_PERIOD
+                .saturating_mul(2)
+                .saturating_add(Duration::from_secs(1)),
+            "{took:?}"
+        );
+        assert_eq!(tool.live_sessions(), 0);
     }
 
     /// Returns true when `observed` contains `expected` as a path.
@@ -1319,6 +1904,50 @@ mod tests {
             context,
             &serde_json::json!({ "action": "stop", "session_id": id }),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_lists_live_sessions_without_consuming_output() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 1; printf 'unseen-%s\\n' line; sleep 30",
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        assert!(!started.contains("unseen-line"), "{started}");
+        let listed = wait_until(
+            || {
+                tool.background()
+                    .iter()
+                    .any(|task| task.id == id && task.last_line == "unseen-line")
+            },
+            Duration::from_secs(20),
+        );
+        assert!(listed, "{:?}", tool.background());
+        let task = tool.background().into_iter().next().expect("one task");
+        assert!(task.command.contains("sleep 30"), "{}", task.command);
+        assert_eq!(
+            tool.background_tail(&id, 20).as_deref(),
+            Some("unseen-line")
+        );
+        assert_eq!(tool.background_tail("no-such-session", 20), None);
+
+        // The listing and the tail moved no reader position.
+        let next = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "interact", "session_id": id, "yield_time_ms": 100 }),
+        );
+        assert!(next.contains("unseen-line"), "{next}");
+        let _ = stop(&tool, &context, &id);
+        assert!(tool.background().is_empty(), "{:?}", tool.background());
     }
 
     /// Exercises the public tool, not just the terminal syscall wrappers.
@@ -1643,6 +2272,15 @@ mod tests {
             "{}",
             observed.text
         );
+        // `findstr` that matches nothing exits with 1, so only `cat` has a
+        // status to pin.
+        if cfg!(unix) {
+            assert!(
+                observed.text.contains("exited with status 0"),
+                "{}",
+                observed.text
+            );
+        }
         assert_eq!(tool.live_sessions(), 0);
     }
 
@@ -1778,6 +2416,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn standard_error_appears_where_it_was_written() {
+        let (_dir, context) = workspace();
+        let output = call(
+            &Shell::default(),
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'o1\\n'; printf 'e1\\n' >&2; printf 'o2\\n'; printf 'e2\\n' >&2",
+            }),
+        );
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output.text.contains("\no1\ne1\no2\ne2\n"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_signal_that_ends_a_command_is_reported_by_name() {
         let (_dir, context) = workspace();
         let output = call(
@@ -1791,6 +2449,339 @@ mod tests {
             "{}",
             output.text
         );
+        assert!(
+            output
+                .text
+                .contains("[killed by signal 9 (SIGKILL), exit status 137]"),
+            "{}",
+            output.text
+        );
+    }
+
+    /// Runs `sleep 30 & echo $!` to completion and returns the result and the
+    /// pid of the background process.
+    #[cfg(unix)]
+    fn run_background(tool: &Shell, context: &ExecutionContext) -> (ToolOutput, String) {
+        let output = call(
+            tool,
+            context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30 & echo $!" }),
+        );
+        let pid = output
+            .text
+            .lines()
+            .find(|line| is_pid(line))
+            .unwrap_or_else(|| panic!("no pid in {}", output.text))
+            .trim()
+            .to_owned();
+        (output, pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_is_reported_and_left_running() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let (output, pid) = run_background(&tool, &context);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the call waited {:?}",
+            began.elapsed()
+        );
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output.text.contains("[exited with status 0]\n"),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.ends_with(&format!("{BACKGROUND_NOTICE}\n")),
+            "{}",
+            output.text
+        );
+        assert!(alive(&pid), "the background process was ended");
+
+        let quiet = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "echo hi" }),
+        );
+        assert!(!quiet.contains(BACKGROUND_NOTICE), "{quiet}");
+        drop(tool);
+        assert!(wait_until(|| !alive(&pid), Duration::from_secs(5)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_counts_a_live_session_and_notices_its_end() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30", "yield_time_ms": 100 }),
+        );
+        let (id, _) = running(&started);
+        let (alive, before) = background();
+        assert!(alive >= 1, "{alive}");
+        let _ = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "stop", "session_id": id }),
+        );
+        assert!(wait_until(
+            || background().1 > before,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_counts_a_leftover_group() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let (_, before) = background();
+        let (_, pid) = run_background(&tool, &context);
+        assert!(alive(&pid));
+        let (alive_now, after) = background();
+        assert!(alive_now >= 1, "{alive_now}");
+        assert!(after > before);
+        drop(tool);
+        assert!(wait_until(
+            || background().1 > after,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_tool_ends_leftover_background_processes() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let (_, pid) = run_background(&tool, &context);
+        assert!(alive(&pid));
+        drop(tool);
+        assert!(
+            wait_until(|| !alive(&pid), Duration::from_secs(2)),
+            "a background process outlived the tool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftover_groups_are_bounded() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let pids: Vec<String> = (0..=MAX_LEFTOVERS)
+            .map(|_| run_background(&tool, &context).1)
+            .collect();
+        let (oldest, rest) = pids.split_first().expect("pids");
+        assert!(
+            wait_until(|| !alive(oldest), Duration::from_secs(5)),
+            "the oldest kept group was not ended"
+        );
+        assert!(rest.iter().all(|pid| alive(pid)));
+        assert_eq!(lock(&tool.state).leftovers.len(), MAX_LEFTOVERS);
+        drop(tool);
+        assert!(wait_until(
+            || rest.iter().all(|pid| !alive(pid)),
+            Duration::from_secs(5)
+        ));
+    }
+
+    /// The state line of a command killed at a 0.5 s deadline.
+    const HALF_SECOND_TIMEOUT: &str = "[killed after 0.5 s (timeout_ms), exit status 124. The \
+        output above is partial. If it needs longer, run it with a larger timeout_ms, or \
+        without one and wait with interact.]";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_group_and_says_the_output_is_partial() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "echo start; echo $$; sleep 30",
+                "timeout_ms": 500,
+            }),
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the call waited {:?}",
+            began.elapsed()
+        );
+        assert!(output.is_error, "{}", output.text);
+        assert!(output.text.contains("\nstart\n"), "{}", output.text);
+        assert_eq!(output.text.lines().last(), Some(HALF_SECOND_TIMEOUT));
+        let group = output
+            .text
+            .lines()
+            .find(|line| is_pid(line))
+            .expect("the shell's pid")
+            .trim()
+            .to_owned();
+        assert!(
+            wait_until(|| !group_alive(&group), Duration::from_secs(5)),
+            "the group outlived its timeout"
+        );
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_still_applies_after_the_call_yields() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 30",
+                "timeout_ms": 2_000,
+                "yield_time_ms": 100,
+            }),
+        );
+        assert!(started.contains("still running after 0.1 s"), "{started}");
+        let (id, group) = running(&started);
+        let group = group.strip_prefix("process group ").expect("group id");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!group_alive(group), "the deadline did not end the group");
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "interact", "session_id": id }),
+        );
+        assert!(output.is_error, "{}", output.text);
+        assert!(
+            output.text.lines().last().is_some_and(
+                |line| line.starts_with("[killed after 2 s (timeout_ms), exit status 124.")
+            ),
+            "{}",
+            output.text
+        );
+        assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_ms_is_refused_outside_run() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": echo_input_then_sleep(),
+                "interactive": true,
+                "yield_time_ms": 0,
+            }),
+        );
+        let (id, _group) = running(&started);
+        for action in ["interact", "stop"] {
+            let err = tool
+                .call(
+                    &serde_json::json!({
+                        "action": action,
+                        "session_id": id,
+                        "chars": "hello\n",
+                        "timeout_ms": 1_000,
+                    }),
+                    &context,
+                )
+                .expect_err("timeout_ms applies only to run");
+            assert_eq!(err.code(), ErrorCode::InvalidField);
+            assert_eq!(err.field(), Some("timeout_ms"));
+        }
+        let observed = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "interact", "session_id": id, "yield_time_ms": 200,
+            }),
+        );
+        assert!(!observed.contains("got hello"), "{observed}");
+        assert_eq!(
+            tool.live_sessions(),
+            1,
+            "the refused stop ended the session"
+        );
+        let _ = stop(&tool, &context, &id);
+
+        for bound in [0, 4_000_000] {
+            let err = tool
+                .call(
+                    &serde_json::json!({
+                        "action": "run", "command": "echo hi", "timeout_ms": bound,
+                    }),
+                    &context,
+                )
+                .expect_err("out of bounds");
+            assert_eq!(err.field(), Some("timeout_ms"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_finishes_first_ignores_its_timeout() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let began = Instant::now();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "echo hi; exit 3", "timeout_ms": 10_000,
+            }),
+        );
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(output.is_error, "{}", output.text);
+        assert_eq!(output.text.lines().last(), Some("[exited with status 3]"));
+        assert!(!output.text.contains("timeout_ms"), "{}", output.text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_yielded_run_says_not_to_run_the_command_again() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run", "command": "sleep 30", "yield_time_ms": 100,
+            }),
+        );
+        let (id, group) = running(&started);
+        assert_eq!(
+            started.lines().last().map(str::to_owned),
+            Some(format!(
+                "[still running after 0.1 s as session {id} ({group}). Do not run the command \
+                 again. Use action \"interact\" with this session_id to wait for more output, \
+                 or action \"stop\" to end it.]"
+            ))
+        );
+        let _ = stop(&tool, &context, &id);
+    }
+
+    #[test]
+    fn the_description_does_not_grow() {
+        assert!(Shell::default().description().len() <= 219);
+    }
+
+    #[test]
+    fn seconds_drop_a_whole_fraction_and_trailing_zeros() {
+        assert_eq!(seconds(30_000), "30");
+        assert_eq!(seconds(1_500), "1.5");
+        assert_eq!(seconds(500), "0.5");
+        assert_eq!(seconds(1_250), "1.25");
+        assert_eq!(seconds(7), "0.007");
     }
 
     #[cfg(unix)]
@@ -1834,6 +2825,34 @@ mod tests {
         let stopped = stop(&tool, &context, &id);
         assert!(stopped.contains("ended"), "{stopped}");
         assert_eq!(tool.live_sessions(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_interacts_get_a_hint_on_the_fourth_poll() {
+        let tool = Shell::default();
+        let (_dir, context) = workspace();
+        let started = text(
+            &tool,
+            &context,
+            &serde_json::json!({ "action": "run", "command": "sleep 30", "yield_time_ms": 0 }),
+        );
+        let (id, _group) = running(&started);
+        for poll in 1..=5 {
+            let polled = text(
+                &tool,
+                &context,
+                &serde_json::json!({ "action": "interact", "session_id": id, "yield_time_ms": 10 }),
+            );
+            assert!(polled.contains(" running"), "{polled}");
+            assert_eq!(
+                polled.contains(IDLE_HINT),
+                poll >= 4,
+                "poll {poll}: {polled}"
+            );
+        }
+        let stopped = stop(&tool, &context, &id);
+        assert!(stopped.contains("ended"), "{stopped}");
     }
 
     #[cfg(unix)]
@@ -1924,7 +2943,7 @@ mod tests {
         let head = observed.find('\n').expect("the command line") + 1;
         let after = marker + observed[marker..].find("]\n").expect("marker end") + 2;
         // The end runs to the capture note or, without one, the state line.
-        let state = ["\n[standard output", "\n[exited"]
+        let state = ["\n[output capture", "\n[exited"]
             .iter()
             .filter_map(|line| observed[after..].find(line))
             .min()
@@ -1936,6 +2955,42 @@ mod tests {
         // reports what failed.
         assert!(observed[after..state].contains("2000"), "{observed}");
         assert!(observed[head..marker].contains('1'), "{observed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_command_keeps_more_of_its_tail() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        // Returns the bytes kept before and after the cut marker.
+        let sides = |code: i32| {
+            let output = call(
+                &tool,
+                &context,
+                &serde_json::json!({
+                    "action": "run",
+                    "command": format!("{}; {}", numbered_lines(2000), exit_with(code)),
+                }),
+            );
+            assert_eq!(output.is_error, code != 0, "{}", output.text);
+            let text = output.text;
+            assert!(text.contains("line 2000 padding"), "{text}");
+            let head = text.find('\n').expect("the command line") + 1;
+            let marker = text.find("\n[output truncated").expect("a marker");
+            let after = marker + text[marker..].find("]\n").expect("marker end") + 2;
+            let state = ["\n[output capture", "\n[exited"]
+                .iter()
+                .filter_map(|line| text[after..].find(line))
+                .min()
+                .map(|offset| after + offset + 1)
+                .expect("the state line");
+            (marker - head, state - after)
+        };
+        let (head, tail) = sides(1);
+        assert!(tail >= head * 3, "head {head}, tail {tail}");
+        let (head, tail) = sides(0);
+        assert!(tail < head * 3, "head {head}, tail {tail}");
+        assert!(tail > head, "head {head}, tail {tail}");
     }
 
     #[test]
@@ -1951,8 +3006,10 @@ mod tests {
                 "yield_time_ms": 2_000,
             }),
         );
-        assert!(started.contains("capture stopped after"), "{started}");
-        assert!(started.contains("standard output"), "{started}");
+        assert!(
+            started.contains("output capture stopped after"),
+            "{started}"
+        );
         let (id, _group) = running(&started);
         let _ = stop(&tool, &context, &id);
     }
@@ -1974,6 +3031,56 @@ mod tests {
         .text;
         let second = observed.lines().nth(1).unwrap_or_default();
         assert_eq!(second, "[tests: 2 passed, 1 failed]", "{observed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_run_reports_its_exit_code_and_failing_tests() {
+        let tool = shell(4, TEST_CAP);
+        let (_dir, context) = workspace();
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "printf 'test a ... FAILED\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\\n'; exit 101",
+            }),
+        );
+        let check = output.check.expect("a finished command reports its check");
+        assert_eq!(check.failing, vec!["a".to_owned()]);
+        assert_eq!(check.exit_code, Some(101));
+        assert_eq!(check.failed_tests, Some(1));
+        assert_eq!(check.signature, "a");
+
+        let plain = call(
+            &tool,
+            &context,
+            &serde_json::json!({"action": "run", "command": "echo fine"}),
+        );
+        let check = plain.check.expect("a finished command reports its check");
+        assert_eq!(check.exit_code, Some(0));
+        assert_eq!(check.failed_tests, None);
+        assert_eq!(check.signature.len(), 16);
+
+        // A command still running has reported nothing yet; its end does.
+        let started = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "sleep 0.5; exit 3",
+                "yield_time_ms": 50,
+            }),
+        );
+        assert_eq!(started.check, None, "{}", started.text);
+        let (id, _) = running(&started.text);
+        let ended = call(
+            &tool,
+            &context,
+            &serde_json::json!({"action": "interact", "session_id": id, "yield_time_ms": 10_000}),
+        );
+        let check = ended.check.expect("an ended session reports its check");
+        assert_eq!(check.exit_code, Some(3), "{}", ended.text);
     }
 
     #[cfg(unix)]
@@ -2399,6 +3506,84 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_network_grant_reaches_a_local_fixture() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let backend = rune_exec::detect();
+        if !backend.support().is_full() {
+            eprintln!("skipping live Linux sandbox test: {:?}", backend.support());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("workspace");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "printf 'SHELL_STARTED\\n'; /bin/bash -c 'printf FIXTURE_DATA > /dev/tcp/127.0.0.1/{port}'"
+            ),
+            "yield_time_ms": 2_000,
+        });
+        let tool = shell(4, TEST_CAP);
+
+        // Without the grant the sandbox keeps the command off the network.
+        let denied = call(&tool, &ExecutionContext::new(root.to_owned()), &arguments);
+        assert!(denied.is_error, "{}", denied.text);
+        let error = listener.accept().expect_err("no grant, no connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        let granted = ExecutionContext::new(root.to_owned()).with_network(true);
+        text(&tool, &granted, &arguments);
+        listener.set_nonblocking(false).expect("blocking");
+        let (mut stream, _) = listener.accept().expect("granted connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read deadline");
+        let mut received = String::new();
+        stream.read_to_string(&mut received).expect("fixture data");
+        assert_eq!(received, "FIXTURE_DATA");
+    }
+
+    #[test]
+    fn network_context_grants_the_sandbox_network() {
+        let context = ExecutionContext::new(Utf8PathBuf::from("/work"));
+        assert!(!sandbox_policy(&context).network);
+        let granted = context.clone().with_network(true);
+        assert!(sandbox_policy(&granted).network);
+        assert!(!sandbox_policy(&granted.with_offline(true)).network);
+        // The network grant does not reach outside the workspace for files.
+        assert!(!context.with_network(true).external_access);
+    }
+
+    #[test]
+    fn a_name_resolution_failure_names_the_network_flag() {
+        let text = "curl: (6) Could not resolve host: example.com".to_owned();
+        let denied = finish(text.clone(), Exit::Code(6), true);
+        assert!(denied.is_error);
+        assert!(denied.text.ends_with(NETWORK_NOTICE), "{}", denied.text);
+        assert_eq!(denied.text.matches(NETWORK_NOTICE).count(), 1);
+        assert!(
+            !finish(text.clone(), Exit::Code(6), false)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
+        assert!(
+            !finish(text, Exit::Code(0), true)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
+        assert!(
+            !finish("ordinary failure".to_owned(), Exit::Code(1), true)
+                .text
+                .contains(NETWORK_NOTICE)
+        );
+    }
+
     #[test]
     fn a_command_cannot_write_outside_the_workspace() {
         // The probe is written under the build's output directory, which no
@@ -2757,6 +3942,44 @@ mod tests {
             )
             .expect_err("the session is gone");
         assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_run_stops_its_process_group() {
+        let tool = Shell::default();
+        let (dir, context) = workspace();
+        let pid_file = dir.path().join("pid");
+        let cancellation = context.cancellation();
+        let err = std::thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                tool.call(
+                    &serde_json::json!({
+                        "action": "run",
+                        "command": "echo $$ > pid; exec sleep 30",
+                    }),
+                    &context,
+                )
+            });
+            assert!(
+                wait_until(
+                    || std::fs::read_to_string(&pid_file).is_ok_and(|pid| !pid.trim().is_empty()),
+                    Duration::from_secs(10),
+                ),
+                "the command wrote its pid"
+            );
+            cancellation.cancel();
+            call.join()
+                .expect("the call thread")
+                .expect_err("the call was cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        let pid = std::fs::read_to_string(&pid_file).expect("pid file");
+        let pid = pid.trim();
+        assert!(
+            wait_until(|| !alive(pid), Duration::from_secs(1)),
+            "process {pid} still runs after the cancelled call returned"
+        );
     }
 
     #[test]

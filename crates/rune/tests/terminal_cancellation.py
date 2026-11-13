@@ -137,7 +137,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None
@@ -153,17 +153,20 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         assert answers.count(partial) == 1, answers
         for line in partial.splitlines():
             assert sum(answer.count(line) for answer in answers) == 1, answers
-        assert all("STREAM-04" not in answer and "[cancelled]" not in answer
+        assert all("STREAM-04" not in answer and "[interrupted]" not in answer
                    for answer in answers), answers
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"slow\r")
         wait_for("STREAM-03", start)
+        # While the turn runs, the hint row names the keys that act on it.
+        wait_for("ctrl-c interrupt   enter steer", start)
         os.write(master, b"\x03")
-        wait_for("[cancelled]", start)
+        wait_for("[interrupted]", start)
+        wait_for("/ commands", start)
         release_stream.set()
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
@@ -182,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         stop()
 
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[cancelled]", start)
@@ -206,6 +209,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r024-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
+                # A session blocked writing to the terminal ends only when it is
+                # drained while it exits.
+                drain_wait(child, master, 10, bytearray())
             child.wait(timeout=10)
         if master is not None:
             os.close(master)

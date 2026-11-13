@@ -4,7 +4,12 @@
   "prompt": "Version comparison in src/lib.rs orders pre-release versions wrongly. The tests in tests/ follow the precedence rules of Semantic Versioning 2.0.0. Fix src/lib.rs so they pass. Do not modify the tests.",
   "verify": "cargo test --quiet --offline",
   "protected": [
-    "tests"
+    "tests",
+    "tests/hidden.rs"
   ],
-  "timeoutMs": 600000
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "dev",
+  "language": "rust"
 }

@@ -32,7 +32,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append(request)
-        prompt = request["messages"][-1]["content"]
+        # `ask` appends a note that the run is non-interactive; match the prompt.
+        prompt = request["messages"][-1]["content"].split("\n\n<run_context>")[0]
         answer = long_reply if prompt == "long saved prompt" else (
             "CONTINUED-REPLY" if prompt == "continue saved prompt" else reply
         )
@@ -115,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         finally:
             os.close(slave)
         transcript = bytearray()
-        wait_for("ctrl-c cancel" if cols == 80 else "resume-fixt")
+        wait_for("/ commands" if cols == 80 else "resume-fixt")
         drain()
 
     def wait_for(text, start=0):
@@ -144,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None
@@ -179,9 +180,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         os.write(master, b"continue saved prompt\r")
         wait_for("CONTINUED-REPLY", start)
         drain()
+        # The resumed conversation opens with the message the saved run sent,
+        # its run note included.
+        sent = [message for message in requests[0]["messages"] if message["role"] == "user"]
+        assert sent[0]["content"].startswith("saved prompt\n\n<run_context>"), sent
         assert [message for message in requests[-1]["messages"]
                 if message["role"] != "system"] == [
-            {"role": "user", "content": "saved prompt"},
+            sent[0],
             {"role": "assistant", "content": reply},
             {"role": "user", "content": "continue saved prompt"},
         ], requests[-1]
@@ -211,6 +216,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
+                # A session blocked writing to the terminal ends only when it is
+                # drained while it exits.
+                drain_wait(child, master, 10, bytearray())
             child.wait(timeout=10)
         if master is not None:
             os.close(master)

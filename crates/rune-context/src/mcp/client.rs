@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,11 @@ pub struct Client {
     limits: BudgetSet,
     variables: Arc<dyn Variables>,
     state: Mutex<State>,
+    /// Servers connected, recorded whenever a connection changes, so a count
+    /// can be read while a tool call holds the state.
+    connected: AtomicUsize,
+    /// Servers configured and enabled.
+    configured: AtomicUsize,
 }
 
 /// Resolves the environment values a transport's credentials come from.
@@ -156,6 +162,14 @@ pub struct Client {
 pub trait Variables: Send + Sync + std::fmt::Debug {
     /// Returns the value of an environment variable, if it is set.
     fn value(&self, name: &str) -> Option<String>;
+}
+
+/// Supplies an HTTP server's bearer token and replaces one it rejected.
+pub trait Authorizer: Send + Sync + std::fmt::Debug {
+    /// The token to send, when one is stored.
+    fn token(&self) -> Option<String>;
+    /// Obtains a new token after a rejection; false when none could be had.
+    fn refresh(&self) -> bool;
 }
 
 /// Reads variables from the process environment.
@@ -190,12 +204,32 @@ impl Variables for FixedEnvironment {
 struct State {
     servers: Vec<ServerEntry>,
     shutdown: bool,
+    /// Tool names each restricted server may expose, by server name.
+    allow: BTreeMap<String, Vec<String>>,
+    /// Servers whose tools are refused without contacting them.
+    disabled: std::collections::BTreeSet<String>,
+    /// Bearer token sources, by server name.
+    authorizers: BTreeMap<String, Arc<dyn Authorizer>>,
+}
+
+impl State {
+    /// A fresh entry with the server's allow list and token source.
+    fn entry(&self, config: ServerConfig) -> ServerEntry {
+        let mut entry = ServerEntry::new(config);
+        entry.allow = self.allow.get(&entry.config.name).cloned();
+        entry.authorizer = self.authorizers.get(&entry.config.name).cloned();
+        entry
+    }
 }
 
 /// One configured server and its live session.
 #[derive(Debug)]
 struct ServerEntry {
     config: ServerConfig,
+    /// Tool names to keep from the listing; `None` keeps every tool.
+    allow: Option<Vec<String>>,
+    /// Where an HTTP server's bearer token comes from.
+    authorizer: Option<Arc<dyn Authorizer>>,
     session: Option<Session>,
     tools: Vec<ProjectedTool>,
     warnings: Vec<String>,
@@ -219,7 +253,96 @@ impl Client {
             limits: limits.clone(),
             variables,
             state: Mutex::new(State::default()),
+            connected: AtomicUsize::new(0),
+            configured: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns the servers connected and the servers configured, without
+    /// waiting for a call in progress.
+    #[must_use]
+    pub fn server_count(&self) -> (usize, usize) {
+        (
+            self.connected.load(Ordering::Relaxed),
+            self.configured.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Records the connection counts of a state.
+    fn record_counts(&self, state: &State) {
+        let connected = state
+            .servers
+            .iter()
+            .filter(|entry| entry.session.is_some())
+            .count();
+        self.connected.store(connected, Ordering::Relaxed);
+        self.configured
+            .store(state.servers.len(), Ordering::Relaxed);
+    }
+
+    /// Limits the tools a server exposes to `tools`, applied at its next
+    /// connection. A listed name the server does not offer is a warning.
+    pub fn restrict_tools(&self, server: &str, tools: Vec<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allow.insert(server.to_owned(), tools);
+        }
+    }
+
+    /// Sends the bearer token `authorizer` supplies to an HTTP server, from its
+    /// next connection on.
+    pub fn authorize_with(&self, server: &str, authorizer: Arc<dyn Authorizer>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.authorizers.insert(server.to_owned(), authorizer);
+        }
+    }
+
+    /// Refuses every later call to one server's tools without contacting it.
+    pub fn disable(&self, server: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.disabled.insert(server.to_owned());
+        }
+    }
+
+    /// Whether calls to a server's tools are refused.
+    #[must_use]
+    pub fn is_disabled(&self, server: &str) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.disabled.contains(server))
+    }
+
+    /// Stops one server's session and connects it again, keeping its tool names.
+    pub fn reconnect(&self, server: &str) -> Result<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                "the mcp client has been shut down",
+            ));
+        }
+        let index = state
+            .servers
+            .iter()
+            .position(|entry| entry.config.name == server)
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::NotFound,
+                    format!("no MCP server named `{server}`"),
+                )
+            })?;
+        let config = state.servers.get(index).map(|entry| entry.config.clone());
+        let fresh = config.map(|config| state.entry(config));
+        let (Some(entry), Some(fresh)) = (state.servers.get_mut(index), fresh) else {
+            return Err(RuneError::new(
+                ErrorCode::NotFound,
+                format!("no MCP server named `{server}`"),
+            ));
+        };
+        entry.close();
+        *entry = fresh;
+        let result = self.open_entry(entry);
+        self.record_counts(&state);
+        result
     }
 
     /// Connects every enabled server supplied by the host, without an offline check.
@@ -229,9 +352,11 @@ impl Client {
         state.servers = servers
             .iter()
             .filter(|config| config.enabled)
-            .map(|config| ServerEntry::new(config.clone()))
+            .map(|config| state.entry(config.clone()))
             .collect();
-        self.connect_state(&mut state)
+        let report = self.connect_state(&mut state);
+        self.record_counts(&state);
+        report
     }
 
     /// Returns every tool the connected servers expose.
@@ -307,6 +432,17 @@ impl Client {
                 RuneError::new(ErrorCode::NotFound, format!("no mcp tool named `{name}`"))
                     .with_hint("list the tools again; a server may have restarted")
             })?;
+        if let Some(server) = state
+            .servers
+            .get(index)
+            .map(|entry| entry.config.name.clone())
+            .filter(|server| state.disabled.contains(server))
+        {
+            return Err(RuneError::new(
+                ErrorCode::InvalidState,
+                format!("MCP server {server} is disabled for this session"),
+            ));
+        }
         let Some(entry) = state.servers.get_mut(index) else {
             return Err(RuneError::new(
                 ErrorCode::NotFound,
@@ -327,7 +463,9 @@ impl Client {
         // The parameters are built once so a retry replays the exact call the
         // server rejected rather than one rebuilt from the same arguments.
         let params = json!({ "name": server_tool, "arguments": arguments });
-        self.call_entry(entry, &params, cancelled)
+        let outcome = self.call_entry(entry, &params, cancelled);
+        self.record_counts(&state);
+        outcome
     }
 
     /// Reconnects every configured server from scratch.
@@ -349,8 +487,13 @@ impl Client {
                 .map(|entry| entry.config.clone())
                 .collect()
         };
-        state.servers = cached.into_iter().map(ServerEntry::new).collect();
-        self.connect_state(&mut state)
+        state.servers = cached
+            .into_iter()
+            .map(|config| state.entry(config))
+            .collect();
+        let report = self.connect_state(&mut state);
+        self.record_counts(&state);
+        report
     }
 
     /// Stops every session, terminating every child process.
@@ -364,6 +507,7 @@ impl Client {
                 entry.close();
             }
             state.shutdown = true;
+            self.record_counts(&state);
         }
     }
 
@@ -490,6 +634,8 @@ impl ServerEntry {
     fn new(config: ServerConfig) -> Self {
         Self {
             config,
+            allow: None,
+            authorizer: None,
             session: None,
             tools: Vec::new(),
             warnings: Vec::new(),
@@ -537,7 +683,7 @@ impl ServerEntry {
         limits: &BudgetSet,
         variables: &Arc<dyn Variables>,
     ) -> Result<()> {
-        let mut session = Session::open(&self.config, variables)?;
+        let mut session = Session::open(&self.config, variables, self.authorizer.clone())?;
         let startup = self.config.startup_timeout();
         let (version, result) = initialize(&mut session, startup)?;
         self.protocol_version = Some(version);
@@ -551,8 +697,21 @@ impl ServerEntry {
             &self.config.name,
             self.config.operation_timeout(),
         )?;
-        self.tools = page.tools;
-        self.warnings = page.warnings;
+        let mut tools = page.tools;
+        let mut warnings = page.warnings;
+        if let Some(allow) = &self.allow {
+            for wanted in allow {
+                if !tools.iter().any(|tool| &tool.server_tool == wanted) {
+                    warnings.push(format!(
+                        "MCP server {} has no tool {wanted}",
+                        self.config.name
+                    ));
+                }
+            }
+            tools.retain(|tool| allow.contains(&tool.server_tool));
+        }
+        self.tools = tools;
+        self.warnings = warnings;
         self.session = Some(session);
         self.last_error = None;
         Ok(())
@@ -804,7 +963,11 @@ impl Session {
     /// Opens a session for a configured transport.
     // The remote transports that read `variables` are absent on wasm.
     #[cfg_attr(target_family = "wasm", allow(unused_variables))]
-    fn open(config: &ServerConfig, variables: &Arc<dyn Variables>) -> Result<Self> {
+    fn open(
+        config: &ServerConfig,
+        variables: &Arc<dyn Variables>,
+        authorizer: Option<Arc<dyn Authorizer>>,
+    ) -> Result<Self> {
         match &config.transport {
             Transport::Stdio {
                 command,
@@ -823,6 +986,7 @@ impl Session {
                 header_env,
                 variables,
                 bearer_token_env.as_deref(),
+                authorizer,
             )
             .map(Self::Http),
             // A target with no socket reaches nothing over HTTP or SSE, and
@@ -1225,6 +1389,8 @@ struct HttpSession {
     variables: Arc<dyn Variables>,
     /// Variable holding a bearer token, when one is configured.
     bearer_token_env: Option<String>,
+    /// Stored login tokens, when the server was logged in to.
+    authorizer: Option<Arc<dyn Authorizer>>,
     /// Counter behind request identifiers.
     next_id: u64,
 }
@@ -1239,6 +1405,7 @@ impl HttpSession {
         header_env: &BTreeMap<String, String>,
         variables: &Arc<dyn Variables>,
         bearer_token_env: Option<&str>,
+        authorizer: Option<Arc<dyn Authorizer>>,
     ) -> Result<Self> {
         Ok(Self {
             server: server.to_owned(),
@@ -1248,6 +1415,7 @@ impl HttpSession {
             header_env: pairs(header_env),
             variables: Arc::clone(variables),
             bearer_token_env: bearer_token_env.map(str::to_owned),
+            authorizer,
             next_id: 1,
         })
     }
@@ -1261,33 +1429,71 @@ impl HttpSession {
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let body = self.post(&encode(Some(id), method, params), timeout)?;
+        let body = self.post(
+            &encode(Some(id), method, params),
+            timeout,
+            method == INITIALIZE,
+        )?;
         protocol::response_from_body(&body, id)
     }
 
     /// Sends a notification and accepts any successful reply.
     fn notify(&mut self, method: &str, params: Option<&Value>, timeout: Duration) -> Result<()> {
-        self.post(&encode(None, method, params), timeout)
+        self.post(&encode(None, method, params), timeout, false)
             .map(|_| ())
     }
 
-    /// Posts one frame and returns the reply body.
-    fn post(&mut self, body: &str, timeout: Duration) -> Result<String> {
-        let mut request = self
+    /// Whether the endpoint answers a GET with an event stream, the sign of a
+    /// server that speaks only the legacy transport.
+    fn offers_legacy_stream(&self, timeout: Duration) -> bool {
+        let Ok(response) = self
             .agent
-            .post(&self.url)
+            .get(&self.url)
             .config()
             .timeout_global(Some(timeout))
             .build()
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream");
-        request = self.authorize(request)?;
-        let response = request
-            .send(body)
-            .map_err(|err| transport_error(&self.server, &err))?;
+            .header("accept", "text/event-stream")
+            .call()
+        else {
+            return false;
+        };
+        response.status().as_u16() == 200
+            && response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+    }
+
+    /// Posts one frame and returns the reply body.
+    fn post(&mut self, body: &str, timeout: Duration, initializing: bool) -> Result<String> {
+        let mut refreshed = false;
+        let response = loop {
+            let mut request = self
+                .agent
+                .post(&self.url)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            request = self.authorize(request)?;
+            let response = request
+                .send(body)
+                .map_err(|err| transport_error(&self.server, &err))?;
+            if response.status().as_u16() != 401 {
+                break response;
+            }
+            // One refresh per rejection, then the request is sent once more.
+            match &self.authorizer {
+                Some(authorizer) if !refreshed && authorizer.refresh() => refreshed = true,
+                Some(_) => return Err(needs_login(&self.server)),
+                None => return Err(unauthorized(&self.server)),
+            }
+        };
         let status = response.status().as_u16();
-        if status == 401 {
-            return Err(unauthorized(&self.server));
+        if initializing && matches!(status, 404 | 405) && self.offers_legacy_stream(timeout) {
+            return Err(legacy_sse(&self.server));
         }
         if status >= 400 {
             return Err(RuneError::new(
@@ -1322,6 +1528,12 @@ impl HttpSession {
                 .variables
                 .value(variable)
                 .ok_or_else(|| credential_missing(&self.server, variable))?;
+            request = request.header("authorization", format!("Bearer {token}").as_str());
+        } else if let Some(token) = self
+            .authorizer
+            .as_ref()
+            .and_then(|authorizer| authorizer.token())
+        {
             request = request.header("authorization", format!("Bearer {token}").as_str());
         }
         Ok(request)
@@ -1580,12 +1792,84 @@ fn resolve_endpoint(base: &str, endpoint: &str) -> String {
 pub(super) fn http_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .proxy(env_proxy(&|name| std::env::var(name).ok()))
+        .tls_config(extra_roots())
         .build();
     ureq::Agent::with_parts(
         config,
         super::http_transport::Connector::default(),
         ureq::unversioned::resolver::DefaultResolver::default(),
     )
+}
+
+/// The proxy named in the environment, with loopback hosts and `NO_PROXY` exempt.
+///
+/// The same rules as the model transport, which this crate does not depend
+/// on; the tests hold both to the same vectors.
+#[cfg(not(target_family = "wasm"))]
+fn env_proxy(lookup: &dyn Fn(&str) -> Option<String>) -> Option<ureq::Proxy> {
+    let value = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))?;
+    let parsed = ureq::Proxy::new(value.trim()).ok()?;
+    let mut builder = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port());
+    if let Some(username) = parsed.username() {
+        builder = builder.username(username);
+    }
+    if let Some(password) = parsed.password() {
+        builder = builder.password(password);
+    }
+    let listed = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default();
+    for host in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .chain(["localhost", "127.0.0.1", "::1", "[::1]"])
+    {
+        builder = builder.no_proxy(host);
+    }
+    builder.build().ok()
+}
+
+/// The roots MCP requests trust: `SSL_CERT_FILE` plus the system bundle, when
+/// the file holds any certificate, and the built-in roots otherwise.
+#[cfg(not(target_family = "wasm"))]
+fn extra_roots() -> ureq::tls::TlsConfig {
+    let certificates = |pem: &[u8]| -> Vec<ureq::tls::Certificate<'static>> {
+        ureq::tls::parse_pem(pem)
+            .filter_map(|item| match item {
+                Ok(ureq::tls::PemItem::Certificate(certificate)) => Some(certificate),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut roots = match rune_core::tls::extra_ca_bundle() {
+        Some(Ok(bytes)) => certificates(&bytes),
+        _ => Vec::new(),
+    };
+    let root_certs = if roots.is_empty() {
+        ureq::tls::RootCerts::WebPki
+    } else {
+        if let Some((_, system)) = rune_core::tls::system_bundle() {
+            roots.extend(certificates(&system));
+        }
+        ureq::tls::RootCerts::Specific(Arc::new(roots))
+    };
+    ureq::tls::TlsConfig::builder()
+        .root_certs(root_certs)
+        .build()
 }
 
 /// Copies a string map into request order.
@@ -1660,6 +1944,27 @@ fn unauthorized(server: &str) -> RuneError {
         format!("server `{server}` rejected the credential"),
     )
     .with_hint("check the token the configured environment variable holds")
+}
+
+/// The error used when a logged-in server rejects its tokens for good.
+#[cfg(not(target_family = "wasm"))]
+fn needs_login(server: &str) -> RuneError {
+    RuneError::new(
+        ErrorCode::AuthenticationRequired,
+        format!("MCP server {server} needs login"),
+    )
+    .with_hint(format!("run rune mcp login {server}"))
+}
+
+/// The error used for a server that speaks only the legacy SSE transport.
+#[must_use]
+pub fn legacy_sse(server: &str) -> RuneError {
+    RuneError::new(
+        ErrorCode::Unsupported,
+        format!(
+            "MCP server {server} offers only the legacy SSE transport, which is not supported; use its Streamable HTTP endpoint"
+        ),
+    )
 }
 
 /// The error used when a configured credential variable is unset.
@@ -1752,6 +2057,58 @@ impl Credential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Environment, target URL, and whether the request is proxied.
+    #[cfg(not(target_family = "wasm"))]
+    type ProxyVector = (&'static [(&'static str, &'static str)], &'static str, bool);
+
+    /// The vectors the model transport's proxy rules are checked against.
+    #[cfg(not(target_family = "wasm"))]
+    const PROXY_VECTORS: &[ProxyVector] = &[
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "http://127.0.0.1:11434/v1",
+            false,
+        ),
+        (
+            &[
+                ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+                ("NO_PROXY", "other.test, api.example.test"),
+            ],
+            "https://api.example.test/v1",
+            false,
+        ),
+        (
+            &[("HTTP_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("ALL_PROXY", "socks5://127.0.0.1:1080")],
+            "https://api.example.test/v1",
+            true,
+        ),
+    ];
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn mcp_proxy_choice_matches_the_model_transport() {
+        for (env, url, expected) in PROXY_VECTORS {
+            let lookup = |name: &str| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            };
+            let uri: ureq::http::Uri = url.parse().expect("uri");
+            let proxied = env_proxy(&lookup).is_some_and(|proxy| !proxy.is_no_proxy(&uri));
+            assert_eq!(proxied, *expected, "{env:?} {url}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1875,6 +2232,7 @@ mod tests {
         let client = Client::new(&BudgetSet::new());
         assert!(client.tools().is_empty());
         assert!(client.status().is_empty());
+        assert_eq!(client.server_count(), (0, 0));
         assert_eq!(
             client
                 .call("mcp_x_y", &json!({}))

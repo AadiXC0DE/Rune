@@ -25,8 +25,7 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Write a whole file, creating missing parent directories. Refused if the file \
-         changed since it was read."
+        "Write a whole file, creating missing parent directories."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -34,8 +33,7 @@ impl Tool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "content": {
                     "type": "string",
@@ -72,12 +70,15 @@ impl Tool for WriteFile {
         let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare(&path, content)?;
         context.check_cancelled()?;
+        let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Wrote `{}` ({})",
             applied.path(),
             mutation::detail(&applied)
-        )))
+        ));
+        output.diff = diff;
+        Ok(output)
     }
 }
 
@@ -108,6 +109,46 @@ mod tests {
             .collect();
         assert_eq!(required, ["path", "content"]);
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn a_whole_file_write_keeps_an_existing_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(&json!({ "path": "bom.txt", "content": "new\n" }), &context)
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+    }
+
+    #[test]
+    fn a_whole_file_write_does_not_double_a_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(
+                &json!({ "path": "bom.txt", "content": "\u{FEFF}new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+        // A new file is written as given.
+        WriteFile
+            .call(
+                &json!({ "path": "plain.txt", "content": "new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "plain.txt")).expect("read"),
+            b"new\n"
+        );
     }
 
     #[test]
@@ -305,6 +346,32 @@ mod tests {
         }
         assert!(!outside.path().join("new.txt").exists());
         assert!(!outside.path().join("nested").exists());
+    }
+
+    #[test]
+    fn write_file_refuses_a_parent_escape() {
+        let (dir, context) = workspace();
+        let err = WriteFile
+            .call(&json!({ "path": "../x", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        let parent = dir.path().parent().expect("parent");
+        assert!(!parent.join("x").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_a_symlink_out() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = outside.path().join("target.txt");
+        std::fs::write(&target, "outside\n").expect("target");
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.txt")).expect("symlink");
+        let err = WriteFile
+            .call(&json!({ "path": "linked.txt", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"outside\n");
     }
 
     #[test]

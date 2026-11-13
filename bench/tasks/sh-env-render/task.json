@@ -1,0 +1,18 @@
+{
+  "title": "Fix value precedence and references in the config renderer",
+  "kind": "bugfix",
+  "prompt": "Rendering the config templates gives wrong values: defaults override values from the environment file, and variables that reference other variables are left unexpanded.",
+  "verify": "sh tests/run.sh",
+  "protected": [
+    "tests",
+    "tests/run.sh"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "shell",
+  "tags": [
+    "long-debug"
+  ]
+}

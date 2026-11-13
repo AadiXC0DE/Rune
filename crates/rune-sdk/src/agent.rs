@@ -21,19 +21,19 @@ use std::time::Instant;
 
 use rune_agent::History;
 use rune_agent::compaction;
-use rune_agent::retry::{self, RetryPolicy};
-use rune_agent::steering::Cancellation;
-use rune_agent::turn::{CallResult, Event, PreparedCall, StopReason, TurnOutcome};
-use rune_core::budget::{BudgetSet, LimitDescription, LimitName};
+use rune_agent::steering::{Cancellation, SteeringQueue};
+use rune_agent::turn::{CallResult, Event, StopReason, TurnOutcome};
+use rune_core::budget::{Budget, BudgetSet, LimitDescription, LimitName};
+use rune_core::config::Layer;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::tool::ToolSpec;
-use rune_net::error::{FailureKind, NetError, parse_retry_after};
+use rune_net::error::NetError;
 use rune_net::message::{ContentPart, ImageRef, validate_tool_specs};
-use rune_net::provider::{Provider, ProviderCapabilities, RequestPlan, Routing, ToolChoice};
-use rune_net::redact;
-use rune_net::stream::{FinishReason, ProviderEvent, Usage};
+use rune_net::provider::{Provider, ProviderCapabilities, Routing};
+use rune_net::stream::Usage;
 use rune_net::transport::{AuthStyle, Endpoint, StreamOutcome};
-use rune_tools::contract::{Activity, ToolOutput};
+use rune_policy::Outcome;
+use rune_tools::contract::{Activity, ExecutionContext, ToolOutput};
 
 /// Version of the checkpoint format written by [`Agent::checkpoint`].
 pub const CHECKPOINT_VERSION: u32 = 1;
@@ -571,6 +571,10 @@ pub struct AgentOptions {
     pub dialect: Dialect,
     /// Network access. When absent, the workspace HTTP client is used.
     pub fetch: Option<Arc<dyn HostFetch>>,
+    /// Compact the conversation automatically before it outgrows the window. Off by default.
+    pub auto_compact: bool,
+    /// Context window in tokens used for that decision; the built-in default when absent.
+    pub context_window: Option<u64>,
 }
 
 impl fmt::Debug for AgentOptions {
@@ -586,6 +590,8 @@ impl fmt::Debug for AgentOptions {
                 "fetch",
                 &self.fetch.as_ref().map_or("built-in", |_| "host-supplied"),
             )
+            .field("auto_compact", &self.auto_compact)
+            .field("context_window", &self.context_window)
             .finish_non_exhaustive()
     }
 }
@@ -790,6 +796,8 @@ pub struct Agent {
     tools: Arc<Vec<HostTool>>,
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
+    /// The window automatic compaction decides against, when it is on.
+    auto_compact: Option<compaction::Window>,
     sources: AgentSources,
     conversation: Arc<Conversation>,
     /// Cancellation for the turn started last, which is the only one that can
@@ -902,6 +910,13 @@ impl Agent {
             specs: Arc::new(specs),
             tools: Arc::new(options.tools),
             limits: BudgetSet::new(),
+            auto_compact: options.auto_compact.then(|| {
+                compaction::Window(
+                    options
+                        .context_window
+                        .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
+                )
+            }),
             sources,
             conversation: Arc::new(Conversation {
                 history: Mutex::new(history),
@@ -954,7 +969,7 @@ impl Agent {
     #[must_use]
     pub fn diagnostics(&self) -> AgentDiagnostics {
         let provider = self.dialect.provider();
-        let timeouts = rune_net::transport::RequestTimeouts::from_limits(&self.limits);
+        let timeouts = rune_net::transport::RequestTimeouts::from_settings(&self.limits, None);
         let limits = self
             .limits
             .describe()
@@ -1081,7 +1096,7 @@ impl Agent {
         };
         let summary = summarizer(&compaction::render_summary_request(&history, &plan))?;
         compaction::validate_summary(&summary)?;
-        let removed = compaction::apply(&mut history, &plan, compaction::wrap_summary(&summary));
+        let removed = compaction::apply(&mut history, &plan, &summary);
         history.validate()?;
         // Check replayability before installing anything. A host may compact
         // precisely because the current checkpoint is too large.
@@ -1132,6 +1147,7 @@ impl Agent {
             tools: Arc::clone(&self.tools),
             specs: Arc::clone(&self.specs),
             limits: self.limits.clone(),
+            auto_compact: self.auto_compact,
             max_steps: if options.max_steps == 0 {
                 self.limits
                     .get(LimitName::MaxAgentSteps)
@@ -1325,6 +1341,7 @@ struct TurnContext {
     specs: Arc<Vec<ToolSpec>>,
     limits: BudgetSet,
     max_steps: u64,
+    auto_compact: Option<compaction::Window>,
 }
 
 impl TurnContext {
@@ -1359,469 +1376,306 @@ impl TurnContext {
     }
 }
 
-/// What a turn has accumulated so far.
-///
-/// Grouped rather than passed as separate arguments, because the pieces travel
-/// together through every exit from the loop and a positional list of them is
-/// easy to get wrong in a way the compiler cannot catch.
-#[derive(Default)]
-struct Accumulated {
-    /// Answer text produced so far.
-    text: String,
-    /// Reasoning produced so far, kept apart from the answer.
-    reasoning: String,
-    /// Usage summed across steps.
-    usage: Usage,
-    /// Usage of the latest request alone.
-    last_request: Usage,
-    /// Steps taken.
-    steps: u32,
-    /// Tool calls made, in order.
-    calls: Vec<CallResult>,
-    /// Images the turn produced.
-    images: Vec<HostImage>,
-}
-
-/// Runs one turn to completion.
+/// Runs one turn on the loop every surface shares.
 fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
-    let provider = context.dialect.provider();
-    let mut acc = Accumulated::default();
+    let host = SdkHost::new(context)?;
+    let outcome = {
+        // The conversation is not readable while a turn runs, so the history
+        // is held for the whole turn.
+        let mut history = lock(&context.conversation.history);
+        rune_agent::turn::run_turn(&mut history, &host).and_then(TurnOutcome::into_strict)?
+    };
+    // The SDK's answer is the text of every step, not only the last one.
+    let mut outcome = outcome;
+    outcome.text = outcome
+        .narration
+        .iter()
+        .filter_map(|entry| match entry {
+            rune_agent::turn::Narration::Text(text) => Some(text.as_str()),
+            rune_agent::turn::Narration::Call(_) => None,
+        })
+        .collect();
+    let images = std::mem::take(&mut *lock(&host.images));
+    Ok(TurnProduct { outcome, images })
+}
 
-    loop {
-        if context.cancel.is_cancelled() {
-            return Ok(settle(context, StopReason::Cancelled, acc));
-        }
+/// The embedder's tools, endpoint and fetch, presented to the shared loop.
+struct SdkHost<'a> {
+    context: &'a TurnContext,
+    provider: Box<dyn Provider>,
+    limits: BudgetSet,
+    steering: SteeringQueue,
+    /// Stop flags of the attempts in flight, set once the loop is done with
+    /// each, so a host reader blocked on its body is released.
+    attempts: Arc<Mutex<Vec<CancelFlag>>>,
+    /// Images of each executed call, in the order the calls ran, until their
+    /// results are recorded.
+    pending_images: Mutex<std::collections::VecDeque<Vec<HostImage>>>,
+    /// Every image the turn produced.
+    images: Mutex<Vec<HostImage>>,
+}
+
+impl<'a> SdkHost<'a> {
+    fn new(context: &'a TurnContext) -> Result<Self> {
+        let mut limits = context.limits.clone();
         // Zero means unlimited steps, which is the documented default.
-        if context.max_steps > 0 && u64::from(acc.steps) >= context.max_steps {
-            return Ok(settle(context, StopReason::StepLimit, acc));
-        }
-
-        acc.steps = acc.steps.saturating_add(1);
-        context.emit(Event::TurnStarted { step: acc.steps });
-
-        let plan = context.plan()?;
-        let response = match request_with_retry(context, provider.as_ref(), &plan, acc.steps) {
-            Ok(response) => response,
-            // A cancellation during the request settles the turn rather than
-            // failing it: the caller asked for it, so it is not an error.
-            Err(err) if err.code() == ErrorCode::Cancelled => {
-                return Ok(settle(context, StopReason::Cancelled, acc));
-            }
-            Err(err) => return Err(err),
+        let steps = if context.max_steps == 0 {
+            Budget::Unbounded
+        } else {
+            Budget::Bounded(context.max_steps)
         };
-        acc.usage = acc.usage.merge_sum(response.usage);
-        acc.last_request = response.usage;
-        context.store_usage(response.usage);
+        limits.set(LimitName::MaxAgentSteps, steps, Layer::CommandLine)?;
+        Ok(Self {
+            context,
+            provider: context.dialect.provider(),
+            limits,
+            // Nothing steers an embedded turn; the queue stays empty.
+            steering: SteeringQueue::new(1),
+            attempts: Arc::new(Mutex::new(Vec::new())),
+            pending_images: Mutex::new(std::collections::VecDeque::new()),
+            images: Mutex::new(Vec::new()),
+        })
+    }
+}
 
-        let mut parts: Vec<ContentPart> = Vec::new();
-        let mut pending: Vec<PreparedCall> = Vec::new();
-        // Text and reasoning were already emitted as they arrived; here they
-        // are only assembled into the turn's record.
-        for event in &response.events {
-            match event {
-                ProviderEvent::TextDelta { delta } => {
-                    acc.text.push_str(delta);
-                    parts.push(ContentPart::Text {
-                        text: delta.clone(),
-                    });
-                }
-                ProviderEvent::ReasoningDelta { delta } => {
-                    acc.reasoning.push_str(delta);
-                    parts.push(ContentPart::Reasoning {
-                        text: delta.clone(),
-                    });
-                }
-                ProviderEvent::ToolCallEnd { id, arguments } => {
-                    let name = response
-                        .events
-                        .iter()
-                        .find_map(|candidate| match candidate {
-                            ProviderEvent::ToolCallStart { id: start, name } if start == id => {
-                                Some(name.clone())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    parts.push(ContentPart::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    });
-                    pending.push(PreparedCall {
-                        id: id.to_string(),
-                        name,
-                        arguments: arguments.clone(),
-                    });
-                }
-                _ => {}
+impl rune_agent::turn::Host for SdkHost<'_> {
+    fn dialect(&self) -> &dyn Provider {
+        self.provider.as_ref()
+    }
+
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.context.endpoint)
+    }
+
+    fn model(&self) -> String {
+        self.context.model.clone()
+    }
+
+    fn instructions(&self) -> String {
+        self.context.instructions.clone()
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.context.specs.as_ref().clone()
+    }
+
+    // Host tools are opaque, so none is treated as a read the loop may skip.
+    fn tool_activity(&self, _name: &str) -> Option<Activity> {
+        Some(Activity::Execute)
+    }
+
+    fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
+        Box::new(SdkFetch {
+            fetch: Arc::clone(&self.context.fetch),
+            cancel: self.context.cancel.clone(),
+            head: rune_net::transport::RequestTimeouts::from_settings(&self.limits, None).head,
+            attempts: Arc::clone(&self.attempts),
+        })
+    }
+
+    fn attempt_finished(&self) {
+        for stop in lock(&self.attempts).drain(..) {
+            stop.cancel();
+        }
+    }
+
+    fn observe_response(&self, outcome: &StreamOutcome) {
+        self.context.store_usage(outcome.usage);
+    }
+
+    fn prepare_request(
+        &self,
+        history: &mut History,
+        plan: &mut rune_net::provider::RequestPlan,
+        client: &dyn rune_net::fetch::Fetch,
+    ) -> Result<()> {
+        match self.context.auto_compact {
+            Some(window) => {
+                compaction::auto_compact(history, plan, self, client, window).map(|_| ())
             }
-        }
-
-        if !parts.is_empty() || !pending.is_empty() {
-            lock(&context.conversation.history)
-                .push_assistant_with_replay(coalesce(parts), response.replay.clone());
-        }
-
-        let finish = response.finish.unwrap_or(FinishReason::Stop);
-        // A cancellation that arrived while the response was being read ends
-        // the turn before any tool runs, which is what a caller that closed the
-        // agent while the model was thinking expects.
-        if context.cancel.is_cancelled() {
-            return Ok(settle(context, StopReason::Cancelled, acc));
-        }
-        if pending.is_empty() {
-            return Ok(settle(context, stop_reason(finish), acc));
-        }
-
-        let (results, cancelled) = execute(context, &pending);
-        let mut result_parts = Vec::new();
-        for executed in &results {
-            result_parts.push(ContentPart::ToolResult {
-                id: rune_core::id::ToolCallId::new(executed.result.call.id.clone())?,
-                name: executed.result.call.name.clone(),
-                content: executed.result.output.text.clone(),
-                is_error: executed.result.output.is_error,
-            });
-            for image in &executed.images {
-                result_parts.push(ContentPart::Image {
-                    image: context.register_image(image),
-                });
-            }
-            acc.images.extend(executed.images.iter().cloned());
-        }
-        lock(&context.conversation.history).push_tool_results(result_parts);
-        acc.calls
-            .extend(results.into_iter().map(|executed| executed.result));
-
-        if cancelled {
-            return Ok(settle(context, StopReason::Cancelled, acc));
-        }
-        // A provider error with calls in flight still ends the turn, after their
-        // results are recorded, so nothing the model asked for is lost.
-        if finish == FinishReason::ProviderError {
-            return Ok(settle(context, StopReason::ProviderFailure, acc));
+            None => Ok(()),
         }
     }
-}
 
-impl TurnContext {
-    /// Builds the request plan for the next step.
-    fn plan(&self) -> Result<RequestPlan> {
-        let history = lock(&self.conversation.history);
-        history.validate()?;
-
-        let mut plan = RequestPlan::new(self.model.clone());
-        plan.instructions.clone_from(&self.instructions);
-        plan.messages = history.to_messages();
-        plan.tools.clone_from(self.specs.as_ref());
-        plan.tool_choice = ToolChoice::Auto;
-        // A budget that allows one call at a time is the only way an embedder
-        // asks for them to be serialized, and the endpoint reads the flag.
-        plan.parallel_tool_calls = self.limits.get_usize(LimitName::ParallelToolCalls) > 1;
-        Ok(plan)
-    }
-}
-
-/// A request failure retains the original host error and the provider taxonomy
-/// needed for retry decisions, without converting away retry metadata first.
-struct RequestFailure {
-    error: RuneError,
-    kind: FailureKind,
-    retry_after_ms: Option<u64>,
-}
-
-impl From<NetError> for RequestFailure {
-    fn from(error: NetError) -> Self {
-        Self {
-            kind: error.kind(),
-            retry_after_ms: error.retry_after_ms(),
-            error: error.to_rune_error(),
+    fn compact_now(
+        &self,
+        history: &mut History,
+        client: &dyn rune_net::fetch::Fetch,
+        reason: rune_agent::turn::CompactReason,
+    ) -> Result<bool> {
+        if self.context.auto_compact.is_none() {
+            return Ok(false);
         }
-    }
-}
-
-impl From<RuneError> for RequestFailure {
-    fn from(error: RuneError) -> Self {
-        let kind = match error.code() {
-            ErrorCode::RateLimited => FailureKind::RateLimited,
-            ErrorCode::TransportFailure => FailureKind::Network,
-            ErrorCode::Timeout => FailureKind::Timeout,
-            ErrorCode::IncompleteStream => FailureKind::IncompleteStream,
-            ErrorCode::RequestRejected => FailureKind::ProviderError,
-            // Other host failures are permanent; keep their original detail.
-            _ => FailureKind::InvalidRequest,
-        };
-        Self {
-            error,
-            kind,
-            retry_after_ms: None,
-        }
-    }
-}
-
-/// Retries one model step without recording failed attempts in the conversation.
-fn request_with_retry(
-    context: &TurnContext,
-    provider: &dyn Provider,
-    plan: &RequestPlan,
-    step: u32,
-) -> Result<StreamOutcome> {
-    let max_attempts = context
-        .limits
-        .get_usize(LimitName::ProviderMaxAttempts)
-        .max(1);
-    let policy = RetryPolicy::new(max_attempts);
-    let mut attempt = 0_usize;
-    loop {
-        context.cancel.check()?;
-        if attempt > 0 {
-            context.emit(Event::StepRestarted { step });
-        }
-        attempt = attempt.saturating_add(1);
-        match request(context, provider, plan) {
-            Ok(response) => {
-                if attempt > 1 {
-                    context.emit(Event::ProviderRetryFinished { step });
-                }
-                return Ok(response);
-            }
-            Err(failure) => {
-                context.cancel.check()?;
-                let Some(delay) = policy.delay(attempt, failure.kind, failure.retry_after_ms)
-                else {
-                    return Err(failure.error);
-                };
-                context.emit(Event::ProviderRetry {
-                    step,
-                    next_attempt: attempt.saturating_add(1),
-                    max_attempts,
-                    delay,
-                });
-                retry::wait(delay, &context.cancel)?;
-            }
-        }
-    }
-}
-
-/// Sends one request and reduces its response stream.
-fn request(
-    context: &TurnContext,
-    provider: &dyn Provider,
-    plan: &RequestPlan,
-) -> std::result::Result<StreamOutcome, RequestFailure> {
-    let started = Instant::now();
-    let mut timeouts = rune_net::transport::RequestTimeouts::from_limits(&context.limits);
-    let deadline_error = || {
-        RuneError::new(
-            ErrorCode::InvalidConfiguration,
-            "host fetch deadline is out of range",
-        )
-    };
-    let fetch_context = FetchContext {
-        signal: context.cancel.clone().into(),
-        deadline: timeouts
-            .total
-            .map(|total| started.checked_add(total).ok_or_else(deadline_error))
-            .transpose()?,
-        head_deadline: started
-            .checked_add(timeouts.head)
-            .ok_or_else(deadline_error)?,
-        stopped: CancelFlag::new(),
-    };
-    let _fetch_stop = FetchStopGuard(fetch_context.stopped.clone());
-    context.cancel.check()?;
-    provider.validate(plan)?;
-    let body = provider.build_request(plan)?;
-
-    let mut headers = vec![
-        ("content-type".to_owned(), "application/json".to_owned()),
-        ("accept".to_owned(), "text/event-stream".to_owned()),
-    ];
-    if context.endpoint.auth != AuthStyle::Anonymous {
-        headers.push((
-            context.endpoint.auth.header().to_owned(),
-            context.endpoint.auth.value(&context.endpoint.credential),
-        ));
-    }
-    for (name, value) in provider.extra_headers() {
-        headers.push((name.to_owned(), value));
+        let rune_agent::turn::CompactReason::Overflow { target_tokens, .. } = reason;
+        compaction::compact_now(history, self, client, target_tokens)
     }
 
-    let request = FetchRequest {
-        url: context.endpoint.url_for(&provider.completion_path(plan)?),
-        headers,
-        body: serde_json::to_string(&body).map_err(RuneError::from)?,
-    };
-    let (response, retry_after) = context
-        .fetch
-        .post_with_context(request, fetch_context.clone())?;
-    fetch_context.check_head()?;
-
-    if response.status >= 400 {
-        // Only enough of the body to explain the rejection; an endpoint that
-        // answers with an error page must not be able to exhaust memory here.
-        let mut raw = Vec::new();
-        let _ = response.body.take(64 * 1024).read_to_end(&mut raw);
-        fetch_context.check()?;
-        let text = String::from_utf8_lossy(&raw);
-        let sanitized = redact::redact(&text);
-        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
-            "provider `{}` rejected the request",
-            provider.name()
-        ));
-        if let Some(millis) = retry_after.as_deref().and_then(parse_retry_after) {
-            error = error.with_retry_after(millis);
-        }
-        return Err(error.into());
+    fn context_replaced(&self, report: &compaction::CompactionReport) {
+        // The summary request is billed like any other.
+        self.context.store_usage(report.usage);
     }
 
-    // Each event is handed back as it is decoded, so a host rendering the turn
-    // sees text while it is produced rather than once the response has ended.
-    let mut observe = |event: &ProviderEvent| match event {
-        ProviderEvent::TextDelta { delta } => context.emit(Event::TextDelta {
-            delta: delta.clone(),
-        }),
-        ProviderEvent::ReasoningDelta { delta } => context.emit(Event::ReasoningDelta {
-            delta: delta.clone(),
-        }),
-        _ => {}
-    };
+    fn emit(&self, event: Event) {
+        self.context.emit(event);
+    }
 
-    // HostFetch owns the blocking send. Its elapsed time still consumes the
-    // total budget available to the shared stream reader.
-    timeouts.total = timeouts
-        .total
-        .map(|total| total.saturating_sub(started.elapsed()));
-    rune_net::transport::read_stream(
-        response.body,
-        provider,
-        timeouts,
-        &|| context.cancel.is_cancelled(),
-        &mut observe,
-    )
-    .map_err(RequestFailure::from)
-}
-
-/// One executed call, with the images it produced.
-struct Executed {
-    result: CallResult,
-    images: Vec<HostImage>,
-}
-
-/// Runs the calls the model asked for, in order.
-///
-/// Every call is answered, including one that never ran, because the history
-/// must record a result for each call the model made or the next request would
-/// carry a conversation the provider rejects.
-fn execute(context: &TurnContext, calls: &[PreparedCall]) -> (Vec<Executed>, bool) {
-    let mut results: Vec<Executed> = Vec::with_capacity(calls.len());
-    let mut cancelled = false;
-
-    for call in calls {
-        if cancelled || context.cancel.is_cancelled() {
-            cancelled = true;
-            results.push(failed(
-                call,
-                "the turn was cancelled before this call ran".to_owned(),
-            ));
-            continue;
-        }
-
-        let Some(tool) = context.tools.iter().find(|tool| tool.name == call.name) else {
-            results.push(failed(
-                call,
-                format!("there is no tool named `{}`", call.name),
-            ));
-            continue;
-        };
-
-        let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
-            Ok(value) => value,
-            Err(err) => {
-                // Malformed arguments are the model's to correct, not a
-                // failure of the turn.
-                results.push(failed(
-                    call,
-                    format!(
-                        "the arguments for `{}` are not valid JSON: {err}",
-                        call.name
-                    ),
-                ));
-                continue;
-            }
-        };
-
-        context.emit(Event::ToolStarted {
-            call: call.clone(),
-            activity: Activity::Execute,
-        });
-        // A full event queue must stop a tool before invoking host code.
-        if context.cancel.is_cancelled() {
-            cancelled = true;
-            results.push(failed(
-                call,
-                "the turn was cancelled before this call ran".to_owned(),
-            ));
-            continue;
-        }
+    fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
+        // A full event queue cancels the turn, which must stop a tool before
+        // host code runs, including when the queue filled on its start event.
+        self.context.cancel.check()?;
+        let tool = self
+            .context
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| {
+                RuneError::new(ErrorCode::NotFound, format!("no tool named `{name}`"))
+            })?;
         let host_context = HostToolContext {
-            signal: context.cancel.clone().into(),
+            signal: self.context.cancel.clone().into(),
         };
+        let result = (tool.execute)(arguments, &host_context);
+        // The loop marks every call executed except one that was cancelled,
+        // and asks for attachments in the same order, so each executed call
+        // leaves exactly one entry.
+        let images = match &result {
+            Ok(result) => result.images.clone(),
+            Err(err) if err.code() == ErrorCode::Cancelled => return Err(err.clone()),
+            Err(_) => Vec::new(),
+        };
+        lock(&self.pending_images).push_back(images);
+        let result = result?;
+        let cap = self.limits.get_usize(LimitName::MaxToolResultBytes);
+        let produced = u64::try_from(result.text.len()).unwrap_or(u64::MAX);
+        Ok(ToolOutput {
+            text: bound_text(&result.text, cap.saturating_sub(TRUNCATION_MARKER.len())),
+            is_error: result.is_error,
+            produced_bytes: produced,
+            plan_update: None,
+            full_text: None,
+            diff: None,
+            image: None,
+            check: None,
+        })
+    }
 
-        let started = Instant::now();
-        match (tool.execute)(&arguments, &host_context) {
-            Ok(result) => {
-                let cap = context.limits.get_usize(LimitName::MaxToolResultBytes);
-                let produced = u64::try_from(result.text.len()).unwrap_or(u64::MAX);
-                let output = ToolOutput {
-                    text: bound_text(&result.text, cap),
-                    is_error: result.is_error,
-                    produced_bytes: produced,
-                    plan_update: None,
-                    full_text: None,
-                };
-                context.emit(Event::ToolFinished {
-                    call: call.clone(),
-                    output: output.clone(),
-                    elapsed: started.elapsed(),
-                });
-                results.push(Executed {
-                    result: CallResult {
-                        call: call.clone(),
-                        output,
-                        executed: true,
-                    },
-                    images: result.images,
-                });
-            }
-            Err(err) => {
-                context.emit(Event::ToolFinished {
-                    call: call.clone(),
-                    output: ToolOutput::from_error(&err),
-                    elapsed: started.elapsed(),
-                });
-                if err.code() == ErrorCode::Cancelled {
-                    cancelled = true;
-                }
-                results.push(failed(call, err.message().to_owned()));
-            }
+    fn tool_attachments(&self, result: &CallResult) -> Vec<ContentPart> {
+        if !result.executed {
+            return Vec::new();
         }
+        let images = lock(&self.pending_images).pop_front().unwrap_or_default();
+        let parts = images
+            .iter()
+            .map(|image| ContentPart::Image {
+                image: self.context.register_image(image),
+            })
+            .collect();
+        lock(&self.images).extend(images);
+        parts
     }
 
-    (results, cancelled)
-}
+    // The embedder chose these tools, so the loop applies no policy of its own.
+    fn decide(&self, _name: &str, _target: Option<&str>) -> (Outcome, String) {
+        (Outcome::Allow, "a host tool".to_owned())
+    }
 
-/// Builds the answer for a call that did not run.
-fn failed(call: &PreparedCall, message: String) -> Executed {
-    Executed {
-        result: CallResult {
-            call: call.clone(),
-            output: ToolOutput::failure(message),
-            executed: false,
-        },
-        images: Vec::new(),
+    fn context(&self) -> ExecutionContext {
+        ExecutionContext::new(camino::Utf8PathBuf::from("/"))
+    }
+
+    fn limits(&self) -> BudgetSet {
+        self.limits.clone()
+    }
+
+    fn cancellation(&self) -> Cancellation {
+        self.context.cancel.clone()
+    }
+
+    fn steering(&self) -> &SteeringQueue {
+        &self.steering
+    }
+
+    fn settles_cancellation(&self) -> bool {
+        true
+    }
+
+    fn retains_results(&self) -> bool {
+        false
     }
 }
+
+/// Sends the shared loop's requests through the embedder's [`HostFetch`].
+struct SdkFetch {
+    fetch: Arc<dyn HostFetch>,
+    cancel: Cancellation,
+    head: std::time::Duration,
+    attempts: Arc<Mutex<Vec<CancelFlag>>>,
+}
+
+impl rune_net::fetch::Fetch for SdkFetch {
+    fn send(
+        &self,
+        request: rune_net::fetch::FetchRequest,
+    ) -> rune_net::error::NetResult<rune_net::fetch::FetchResponse> {
+        let started = Instant::now();
+        let out_of_range = || {
+            NetError::from_rune_error(RuneError::new(
+                ErrorCode::InvalidConfiguration,
+                "host fetch deadline is out of range",
+            ))
+        };
+        let context = FetchContext {
+            signal: self.cancel.clone().into(),
+            deadline: request
+                .timeout
+                .map(|total| started.checked_add(total).ok_or_else(out_of_range))
+                .transpose()?,
+            head_deadline: started.checked_add(self.head).ok_or_else(out_of_range)?,
+            stopped: CancelFlag::new(),
+        };
+        // The attempt ends when the loop is done with it, or when the body is
+        // dropped, whichever comes first; either releases a waiting reader.
+        lock(&self.attempts).push(context.stopped.clone());
+        let stop = FetchStopGuard(context.stopped.clone());
+        let host_request = FetchRequest {
+            url: request.url,
+            headers: request.headers,
+            body: String::from_utf8_lossy(&request.body).into_owned(),
+        };
+        let (response, retry_after) = self
+            .fetch
+            .post_with_context(host_request, context.clone())
+            .map_err(NetError::from_rune_error)?;
+        context.check_head().map_err(NetError::from_rune_error)?;
+        Ok(rune_net::fetch::FetchResponse {
+            status: response.status,
+            content_type: "text/event-stream".to_owned(),
+            retry_after,
+            retry_after_ms: None,
+            should_retry: None,
+            location: None,
+            body: Box::new(StoppingBody {
+                body: response.body,
+                _stop: stop,
+            }),
+        })
+    }
+}
+
+/// A host response body that ends its attempt when dropped.
+struct StoppingBody {
+    body: Box<dyn Read + Send>,
+    _stop: FetchStopGuard,
+}
+
+impl Read for StoppingBody {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.body.read(buffer)
+    }
+}
+
+/// Appended to a host tool result cut at its byte bound.
+const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
 /// Truncates a tool result to the configured bound, keeping the marker.
 pub(crate) fn bound_text(text: &str, cap: usize) -> String {
@@ -1833,68 +1687,8 @@ pub(crate) fn bound_text(text: &str, cap: usize) -> String {
         end = end.saturating_sub(1);
     }
     let mut out = text[..end].to_owned();
-    out.push_str("\n... (truncated)");
+    out.push_str(TRUNCATION_MARKER);
     out
-}
-
-/// Merges adjacent text parts, so a delta-per-token stream does not become one
-/// history entry per token.
-fn coalesce(parts: Vec<ContentPart>) -> Vec<ContentPart> {
-    let mut out: Vec<ContentPart> = Vec::with_capacity(parts.len());
-    for part in parts {
-        match (out.last_mut(), &part) {
-            (Some(ContentPart::Text { text }), ContentPart::Text { text: next }) => {
-                text.push_str(next);
-            }
-            _ => out.push(part),
-        }
-    }
-    out
-}
-
-/// Maps a normalized finish reason onto a stop reason.
-fn stop_reason(finish: FinishReason) -> StopReason {
-    match finish {
-        FinishReason::Stop | FinishReason::ToolCalls => StopReason::Completed,
-        FinishReason::MaxTokens => StopReason::OutputLimit,
-        FinishReason::ContentFilter => StopReason::ContentFilter,
-        FinishReason::MaxModelTurns => StopReason::StepLimit,
-        FinishReason::Refused => StopReason::Refused,
-        FinishReason::Cancelled => StopReason::Cancelled,
-        FinishReason::ProviderError => StopReason::ProviderFailure,
-    }
-}
-
-/// Records the end of a turn and hands its product back.
-fn settle(context: &TurnContext, stop_reason: StopReason, acc: Accumulated) -> TurnProduct {
-    let Accumulated {
-        text,
-        reasoning,
-        usage,
-        last_request,
-        steps,
-        calls,
-        images,
-    } = acc;
-    context.emit(Event::Finished {
-        reason: stop_reason,
-        usage,
-        last_request,
-        steps,
-    });
-    TurnProduct {
-        outcome: TurnOutcome {
-            stop_reason,
-            text,
-            reasoning,
-            usage,
-            last_request,
-            steps,
-            verification: rune_agent::turn::Verification::of(&calls),
-            calls,
-        },
-        images,
-    }
 }
 
 /// Locks a mutex, ignoring poisoning.

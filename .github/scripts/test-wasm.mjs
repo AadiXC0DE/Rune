@@ -25,6 +25,7 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
     let reads = 0;
     let closed = false;
     let staged;
+    let rejected;
     let memory;
     let offset = 0;
     let takes = 0;
@@ -37,13 +38,14 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
       model: 'wasm-fixture-model',
       choices: [{ index: 0, delta, finish_reason }],
     })}\n\n`;
-    const body = Buffer.from(
-      (shell
-        ? frame({ tool_calls: [{ index: 0, id: 'shell-fixture', type: 'function',
-          function: { name: 'shell', arguments: JSON.stringify({ command: 'ls' }) } }] }, null)
-          + frame({}, 'tool_calls')
-        : frame({ content: answer }, null) + frame({}, 'stop')) + 'data: [DONE]\n\n',
-    );
+    const textBody = Buffer.from(frame({ content: answer }, null) + frame({}, 'stop') + 'data: [DONE]\n\n');
+    let body = shell
+      ? Buffer.from(frame({ tool_calls: [{ index: 0, id: 'shell-fixture', type: 'function',
+        function: { name: 'shell', arguments: JSON.stringify({ command: 'ls' }) } }] }, null)
+        + frame({}, 'tool_calls') + 'data: [DONE]\n\n')
+      : textBody;
+    // A shell call is answered on a second request, which the model ends with text.
+    const expectedRequests = shell ? 2 : 1;
     // Recreate views after allocations, since WASM may grow its memory.
     const bytes = () => new Uint8Array(memory.buffer);
     const decode = (pointer, length) => Buffer.from(bytes().subarray(pointer, pointer + length)).toString('utf8');
@@ -51,7 +53,10 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
       staged = Buffer.from(JSON.stringify(value));
       if (target === (staging.target ?? 'open') && staging.length !== undefined) {
         memoryAtStage = memory.buffer.byteLength;
-        if (staging.reject) return staging.length;
+        if (staging.reject) {
+          rejected = staged;
+          return staging.length;
+        }
         assert.ok(staged.length <= staging.length);
         // JSON whitespace pads a valid reply to exactly the configured cap.
         staged = Buffer.from(staged.toString().padEnd(staging.length, ' '));
@@ -65,7 +70,13 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
           events.push(JSON.parse(decode(pointer, length)));
         },
         open(pointer, length) {
-          assert.equal(++requests, 1, 'the fixture expects exactly one provider request');
+          assert.ok(++requests <= expectedRequests, 'the fixture expects one provider request, two with a shell call');
+          if (requests === 2) {
+            assert.equal(closed, true, 'the first response must be released before the next request');
+            closed = false;
+            offset = 0;
+            body = textBody;
+          }
           const request = JSON.parse(decode(pointer, length));
           assert.equal(request.method, 'POST');
           assert.equal(request.url, 'https://wasm-fixture.invalid/v1/chat/completions');
@@ -74,12 +85,18 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
           const payload = JSON.parse(request.body);
           assert.equal(payload.model, 'wasm-fixture-model');
           assert.equal(payload.stream, true);
-          assert.deepEqual(payload.messages.at(-1), { role: 'user', content: prompt });
+          if (requests === 1) {
+            assert.deepEqual(payload.messages.at(-1), { role: 'user', content: prompt });
+          } else {
+            assert.ok(payload.messages.some((message) => message.role === 'tool'),
+              'the second request must carry the shell result');
+          }
           return stage({ handle: 1, status: 200, content_type: 'text/event-stream' }, 'open');
         },
         take(pointer, length) {
           takes++;
           assert.ok(staged, 'a host import must stage a reply');
+          assert.notEqual(staged, rejected, 'a rejected reply must never be taken');
           assert.equal(length, staged.length);
           bytes().set(staged, pointer);
           staged = undefined;
@@ -132,17 +149,18 @@ async function fixturePrompt(readLength, expectedError, staging = {}) {
       model: 'wasm-fixture-model',
       api_key: 'wasm-fixture-key',
       workspace: '/workspace',
-      max_steps: 1,
+      max_steps: 2,
       ...(staging.cap === undefined ? {} : { max_bridge_bytes: staging.cap }),
     }))), 0, `configuration failed: ${JSON.stringify(events)}`);
     assert.equal(exports.rune_prompt(...pass(prompt)), expectedError && !shell ? 1 : 0,
       `unexpected prompt result: ${JSON.stringify(events)}`);
-    assert.equal(requests, 1);
+    assert.equal(requests, expectedRequests);
     if (staging.reject) {
       assert.equal(memory.buffer.byteLength, memoryAtStage,
         'a rejected staged length must not grow WASM memory');
-      assert.equal(takes, shell ? 1 : 0, 'a rejected reply must not reach take');
-      assert.ok(staged, 'the rejected reply must remain on the host');
+      // With a shell call, only the two provider replies are taken.
+      assert.equal(takes, shell ? 2 : 0, 'a rejected reply must not reach take');
+      assert.ok(rejected, 'the rejected reply must remain on the host');
       if (!shell) {
         assert.equal(reads, 0, 'a rejected head must not reach body reads');
         assert.equal(closed, false, 'no response handle was accepted');

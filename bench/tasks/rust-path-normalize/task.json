@@ -1,0 +1,16 @@
+{
+  "title": "Fix path normalization at the root, with repeated slashes and trailing dots",
+  "kind": "bugfix",
+  "prompt": "Path normalization returns wrong results for .. at the root, repeated slashes and trailing dots. It must never walk above the root.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests/basic.rs",
+    "tests/hidden.rs"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "rust"
+}

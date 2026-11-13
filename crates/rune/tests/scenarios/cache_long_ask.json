@@ -1,0 +1,234 @@
+{
+  "prompt": "Read the twenty fixture files one at a time.",
+  "workspace": "workspaces/cache_long_ask.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "f01.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "read_file",
+          "arguments": {
+            "path": "f02.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "read_file",
+          "arguments": {
+            "path": "f03.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_4",
+          "name": "read_file",
+          "arguments": {
+            "path": "f04.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_5",
+          "name": "read_file",
+          "arguments": {
+            "path": "f05.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_6",
+          "name": "read_file",
+          "arguments": {
+            "path": "f06.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_7",
+          "name": "read_file",
+          "arguments": {
+            "path": "f07.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_8",
+          "name": "read_file",
+          "arguments": {
+            "path": "f08.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_9",
+          "name": "read_file",
+          "arguments": {
+            "path": "f09.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_10",
+          "name": "read_file",
+          "arguments": {
+            "path": "f10.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_11",
+          "name": "read_file",
+          "arguments": {
+            "path": "f11.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_12",
+          "name": "read_file",
+          "arguments": {
+            "path": "f12.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_13",
+          "name": "read_file",
+          "arguments": {
+            "path": "f13.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_14",
+          "name": "read_file",
+          "arguments": {
+            "path": "f14.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_15",
+          "name": "read_file",
+          "arguments": {
+            "path": "f15.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_16",
+          "name": "read_file",
+          "arguments": {
+            "path": "f16.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_17",
+          "name": "read_file",
+          "arguments": {
+            "path": "f17.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_18",
+          "name": "read_file",
+          "arguments": {
+            "path": "f18.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_19",
+          "name": "read_file",
+          "arguments": {
+            "path": "f19.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_20",
+          "name": "read_file",
+          "arguments": {
+            "path": "f20.txt"
+          }
+        }
+      ]
+    },
+    {
+      "text": "All twenty files were read."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "requests": 21,
+    "prefix_breaks": 0
+  }
+}

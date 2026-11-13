@@ -327,25 +327,42 @@ pub fn truncate_to_bytes(text: &str, limit: usize) -> &str {
 
 /// Splits at most `budget` bytes of `text` into a start and an end.
 ///
-/// A third goes to the start and the rest to the end. Each cut moves to a line
-/// break when one is near, so neither side shows a broken line.
+/// A third goes to the start and the rest to the end.
 pub(crate) fn head_and_tail(text: &str, budget: usize) -> (&str, &str) {
+    head_and_tail_split(text, budget, 3)
+}
+
+/// Furthest a cut moves to reach a line break, in bytes.
+const LINE_SNAP_BYTES: usize = 256;
+
+/// Splits at most `budget` bytes of `text` into a start and an end, giving the
+/// start `budget / head_share` and the end the rest.
+///
+/// Each cut falls on a character boundary and moves to a line break only when
+/// one is within [`LINE_SNAP_BYTES`], so neither side shows a broken line
+/// without giving up much of its room to avoid one.
+pub(crate) fn head_and_tail_split(text: &str, budget: usize, head_share: usize) -> (&str, &str) {
     if text.len() <= budget {
         return (text, "");
     }
-    let head_budget = budget / 3;
+    let head_budget = budget.checked_div(head_share).unwrap_or(0);
     let mut start = truncate_to_bytes(text, head_budget);
-    if let Some(line) = start.rfind('\n').filter(|end| *end >= start.len() / 2) {
-        start = &text[..=line];
+    let window = start.len().saturating_sub(LINE_SNAP_BYTES);
+    if let Some(line) = start.as_bytes()[window..]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+    {
+        start = &text[..=window.saturating_add(line)];
     }
     let tail_budget = budget.saturating_sub(start.len());
     let mut from = text.len().saturating_sub(tail_budget);
     while from < text.len() && !text.is_char_boundary(from) {
         from = from.saturating_add(1);
     }
-    if let Some(offset) = text[from..]
-        .find('\n')
-        .filter(|offset| *offset < tail_budget / 2)
+    let reach = from.saturating_add(LINE_SNAP_BYTES).min(text.len());
+    if let Some(offset) = text.as_bytes()[from..reach]
+        .iter()
+        .position(|byte| *byte == b'\n')
     {
         from = from.saturating_add(offset).saturating_add(1);
     }
@@ -1361,5 +1378,54 @@ mod tests {
         assert_eq!(limits.output_cap(&narrow), 64);
         let wide = repo.context().with_output_cap(usize::MAX);
         assert_eq!(limits.output_cap(&wide), limits.output_bytes);
+    }
+
+    #[test]
+    fn cuts_move_to_a_line_break_only_within_256_bytes() {
+        // The head budget is 1000 bytes. A break 100 bytes before the cut is
+        // reached; one 300 bytes before it is not.
+        let near = format!("{}\n{}", "a".repeat(899), "b".repeat(10_000));
+        let (start, _) = head_and_tail_split(&near, 3000, 3);
+        assert_eq!(start.len(), 900);
+        assert!(start.ends_with('\n'));
+        let far = format!("{}\n{}", "a".repeat(699), "b".repeat(10_000));
+        let (start, _) = head_and_tail_split(&far, 3000, 3);
+        assert_eq!(start.len(), 1000);
+
+        // The tail starts 2000 bytes from the end. A break 100 bytes after
+        // that start is reached; one 300 bytes after it is not.
+        let near = format!("{}\n{}", "c".repeat(10_000), "d".repeat(1899));
+        let (_, end) = head_and_tail_split(&near, 3000, 3);
+        assert_eq!(end, "d".repeat(1899));
+        let far = format!("{}\n{}", "c".repeat(10_000), "d".repeat(1699));
+        let (_, end) = head_and_tail_split(&far, 3000, 3);
+        assert_eq!(end.len(), 2000);
+        assert!(end.starts_with('c'));
+    }
+
+    #[test]
+    fn cuts_never_split_a_character() {
+        let text = "é€😀".repeat(15_000);
+        for budget in [1000, 1001, 1002, 4096, 32_768] {
+            for share in [3, 5] {
+                let (start, end) = head_and_tail_split(&text, budget, share);
+                assert!(start.len() + end.len() <= budget);
+                assert!(text.starts_with(start));
+                assert!(text.ends_with(end));
+                assert!(!start.is_empty() && !end.is_empty());
+                assert!(!start.contains('\n') && !end.contains('\n'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_head_share_of_five_keeps_four_fifths_for_the_tail() {
+        let text = "x".repeat(100_000);
+        let (start, end) = head_and_tail_split(&text, 10_000, 5);
+        assert_eq!(start.len(), 2000);
+        assert_eq!(end.len(), 8000);
+        let (start, end) = head_and_tail(&text, 9000);
+        assert_eq!(start.len(), 3000);
+        assert_eq!(end.len(), 6000);
     }
 }

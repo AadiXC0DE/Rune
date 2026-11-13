@@ -1,0 +1,38 @@
+{
+  "prompt": "Make check.sh pass.",
+  "workspace": "workspaces/goal_check.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--goal",
+    "make check.sh pass",
+    "--judge"
+  ],
+  "turns": [
+    {
+      "text": "One."
+    },
+    {
+      "text": "{\"status\":\"continue\",\"reason\":\"no check ran.\",\"next\":\"run it\"}"
+    },
+    {
+      "text": "Two."
+    },
+    {
+      "text": "{\"status\":\"continue\",\"reason\":\"no check ran.\",\"next\":\"run it\"}"
+    },
+    {
+      "text": "Three."
+    },
+    {
+      "text": "{\"status\":\"continue\",\"reason\":\"no check ran.\",\"next\":\"run it\"}"
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "error_code": null,
+    "final_output": "Three.",
+    "stop_reason": "end_turn",
+    "requests": 6
+  }
+}

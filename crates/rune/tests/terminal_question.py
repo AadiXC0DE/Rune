@@ -173,6 +173,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
     def send(data):
         os.write(master, data)
 
+    def settle():
+        # A new question ignores keys for its first 300 ms.
+        time.sleep(0.4)
+
     def question(prompt="question"):
         start = len(transcript)
         send(prompt.encode() + b"\r")
@@ -180,10 +184,11 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         wait_for("Which choice should Rune use?", start)
         wait_for("Use the second choice", start)
         wait_for("> Alpha", start)
+        settle()
         return start
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = question()
         assert not results, "question answered before confirmation"
         send(b"\x1b[B\r")
@@ -202,6 +207,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         send(b"question-multiple\r")
         for index in range(1, 5):
             wait_for(f"answer required ({index}/4)", start)
+            settle()
             send(b"\x1b[B" * 5 + b"\r")
         wait_for_committed("QUESTION_REPLY_3", start)
         assert results[2]["content"] == "\n".join(
@@ -213,7 +219,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         for cancel in [b"\x1b", b"\x03", b"\x04"]:
             start = question()
             send(cancel)
-            wait_for("cancelled", start)
+            wait_for("[interrupted]", start)
             start = len(transcript)
             send(b"after-cancel\r")
             wait_for_committed("SESSION_STILL_USABLE", start)
@@ -222,11 +228,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         # Choice keys and pasted text preserve the correction and its caret.
         start = len(transcript)
         send(b"question-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        assert event_wait(draft_request, master, 10, transcript), "provider did not receive the draft turn"
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
         release_draft.set()
         wait_for("answer required (1/1)", start)
+        settle()
         send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[B\r")
         wait_for_committed("QUESTION_REPLY_4", start)
         assert results[3]["content"].endswith("Answer: Beta"), results
@@ -237,7 +244,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
         send(b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
 
         # Machine callers still fail promptly instead of collecting input.
         piped = subprocess.run(
@@ -257,6 +264,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r008-") as directory:
         release_draft.set()
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

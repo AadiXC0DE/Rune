@@ -1,0 +1,12 @@
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":"The user wants the directory."},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":" One call\nanswers it."},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_glm_conformance","type":"function","function":{"name":"current_directory","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"id":"chat-1","object":"chat.completion.chunk","created":1762300000,"model":"glm-5.3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":40,"completion_tokens":12,"total_tokens":52}}
+
+data: [DONE]
+

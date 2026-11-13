@@ -11,12 +11,18 @@ use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, model_spec};
 #[derive(Default)]
 pub struct Registry {
     tools: BTreeMap<String, Box<dyn Tool>>,
+    /// Whether a tool is offered, where it differs from the tool's own default.
+    advertised: BTreeMap<String, bool>,
+    /// Replacement descriptions applied to the advertised schemas.
+    text: crate::tool_text::ToolText,
 }
 
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Registry")
             .field("names", &self.tools.keys().collect::<Vec<_>>())
+            .field("advertised", &self.advertised)
+            .field("text", &self.text.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -45,10 +51,99 @@ impl Registry {
         Ok(())
     }
 
+    /// Adds a tool, or replaces the one registered under its name.
+    ///
+    /// A host uses it to swap a built-in for one built with what it knows only
+    /// after the registry exists, keeping any advertisement override.
+    pub fn replace(&mut self, tool: Box<dyn Tool>) {
+        let _ = model_spec(tool.as_ref());
+        self.tools.insert(tool.name().to_owned(), tool);
+    }
+
     /// Returns a tool by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(AsRef::as_ref)
+    }
+
+    /// Offers or hides a registered tool, overriding its own default. A hidden
+    /// tool stays registered and callable.
+    pub fn set_advertised(&mut self, name: &str, advertised: bool) {
+        self.advertised.insert(name.to_owned(), advertised);
+    }
+
+    /// Replaces advertised descriptions with `text`, after checking that every
+    /// tool and property it names exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `invalid_field` naming the first tool or property that does not.
+    pub fn set_tool_text(&mut self, text: crate::tool_text::ToolText) -> Result<()> {
+        use crate::tool_text::VARIABLE;
+        for (name, entry) in &text {
+            let Some(tool) = self.get(name) else {
+                return Err(RuneError::invalid_field(
+                    VARIABLE,
+                    format!("{VARIABLE} names `{name}`, which is not a registered tool"),
+                ));
+            };
+            let schema = tool.input_schema();
+            for property in entry.properties.keys() {
+                if schema["properties"].get(property).is_none() {
+                    return Err(RuneError::invalid_field(
+                        VARIABLE,
+                        format!(
+                            "{VARIABLE} names property `{property}` of `{name}`, which the \
+                             schema does not have"
+                        ),
+                    ));
+                }
+            }
+        }
+        self.text = text;
+        Ok(())
+    }
+
+    /// The model-facing schema of a tool, with any replacement text applied.
+    fn spec_of(&self, name: &str, tool: &dyn Tool) -> ToolSpec {
+        let mut spec = model_spec(tool);
+        let Some(entry) = self.text.get(name) else {
+            return spec;
+        };
+        if let Some(description) = &entry.description {
+            spec.description = crate::contract::bounded_description(description);
+        }
+        for (property, text) in &entry.properties {
+            if let Some(object) = spec.input_schema["properties"]
+                .get_mut(property)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if text.is_empty() {
+                    object.remove("description");
+                } else {
+                    object.insert("description".to_owned(), text.clone().into());
+                }
+            }
+        }
+        spec
+    }
+
+    /// Whether the named tool is offered to the model.
+    #[must_use]
+    pub fn is_advertised(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|tool| {
+            self.advertised
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| tool.is_advertised())
+        })
+    }
+
+    /// Ends whatever every tool keeps running between calls.
+    pub fn shutdown(&self) {
+        for tool in self.tools.values() {
+            tool.shutdown();
+        }
     }
 
     /// Returns every tool name, in a stable order.
@@ -83,9 +178,8 @@ impl Registry {
     pub fn schemas(&self, names: &[&str]) -> Vec<ToolSpec> {
         names
             .iter()
-            .filter_map(|name| self.get(name))
-            .filter(|tool| tool.is_advertised())
-            .map(model_spec)
+            .filter(|name| self.is_advertised(name))
+            .filter_map(|name| self.get(name).map(|tool| self.spec_of(name, tool)))
             .collect()
     }
 
@@ -93,9 +187,9 @@ impl Registry {
     #[must_use]
     pub fn all_schemas(&self) -> Vec<ToolSpec> {
         self.tools
-            .values()
-            .filter(|tool| tool.is_advertised())
-            .map(|tool| model_spec(tool.as_ref()))
+            .iter()
+            .filter(|(name, _)| self.is_advertised(name))
+            .map(|(name, tool)| self.spec_of(name, tool.as_ref()))
             .collect()
     }
 
@@ -203,6 +297,36 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_tool_keeps_its_name_and_advertisement_override() {
+        let mut registry = Registry::new();
+        let failing = |error: RuneError| FailingTool {
+            error,
+            fail_validation: false,
+        };
+        registry
+            .insert(Box::new(failing(RuneError::new(
+                ErrorCode::NotFound,
+                "first",
+            ))))
+            .expect("register");
+        registry.set_advertised("fixture", false);
+        registry.replace(Box::new(failing(RuneError::new(
+            ErrorCode::NotFound,
+            "second",
+        ))));
+        assert_eq!(registry.names(), ["fixture"]);
+        assert!(!registry.is_advertised("fixture"));
+        let output = registry
+            .call(
+                "fixture",
+                &serde_json::json!({}),
+                &ExecutionContext::new("/fixture".into()),
+            )
+            .expect("a tool result");
+        assert!(output.text.contains("second"), "{}", output.text);
+    }
+
+    #[test]
     fn validation_and_execution_failures_preserve_the_full_diagnostic() {
         for fail_validation in [false, true] {
             let error = if fail_validation {
@@ -264,5 +388,71 @@ mod tests {
                 .expect_err("cancellation must stop execution"),
             error
         );
+    }
+
+    fn shell_spec(registry: &Registry) -> ToolSpec {
+        registry
+            .all_schemas()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .expect("shell offered")
+    }
+
+    fn text(json: &str) -> crate::tool_text::ToolText {
+        serde_json::from_str(json).expect("tool text")
+    }
+
+    #[test]
+    fn tool_text_replaces_a_description_and_a_property() {
+        let mut registry = crate::inventory::builtin_default().expect("built");
+        registry
+            .set_tool_text(text(
+                r#"{"shell": {"description": "Run a command.", "properties": {"cwd": "Where."}}}"#,
+            ))
+            .expect("accepted");
+        let spec = shell_spec(&registry);
+        assert_eq!(spec.description, "Run a command.");
+        assert_eq!(
+            spec.input_schema["properties"]["cwd"]["description"],
+            "Where."
+        );
+        let named = registry.schemas(&["shell"]);
+        assert_eq!(named[0].description, "Run a command.");
+    }
+
+    #[test]
+    fn tool_text_naming_an_unknown_tool_or_property_is_refused() {
+        let mut registry = crate::inventory::builtin_default().expect("built");
+        let error = registry
+            .set_tool_text(text(r#"{"teleport": {"description": "x"}}"#))
+            .expect_err("unknown tool");
+        assert_eq!(
+            error.message(),
+            "RUNE_TOOL_TEXT names `teleport`, which is not a registered tool"
+        );
+        let error = registry
+            .set_tool_text(text(r#"{"shell": {"properties": {"colour": "x"}}}"#))
+            .expect_err("unknown property");
+        assert_eq!(
+            error.message(),
+            "RUNE_TOOL_TEXT names property `colour` of `shell`, which the schema does not have"
+        );
+        // A refused text changes nothing.
+        assert_ne!(shell_spec(&registry).description, "x");
+    }
+
+    #[test]
+    fn an_empty_property_text_removes_the_description() {
+        let mut registry = crate::inventory::builtin_default().expect("built");
+        registry
+            .set_tool_text(text(r#"{"shell": {"properties": {"cwd": ""}}}"#))
+            .expect("accepted");
+        let spec = shell_spec(&registry);
+        assert!(
+            spec.input_schema["properties"]["cwd"]
+                .get("description")
+                .is_none()
+        );
+        assert_eq!(spec.input_schema["properties"]["cwd"]["type"], "string");
     }
 }

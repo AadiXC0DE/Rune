@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod fixture;
 mod macos;
 mod windows;
 
@@ -16,14 +17,24 @@ const MEASUREMENT_SAMPLES: usize = 31;
 
 /// Enforced release budget ceilings, distinct from measured build results.
 mod targets {
+    /// Scripted sessions replayed for prompt cache discipline, with the prefix
+    /// breaks each is expected to show.
+    pub const CACHE_SCENARIOS: &[(&str, usize)] = &[
+        ("cache_long_ask", 0),
+        ("nested_rules", 0),
+        ("cache_skill", 0),
+        ("cache_edited_agents", 0),
+        ("cache_one_checkpoint", 1),
+    ];
+
     /// Largest accepted stripped release binary, in bytes.
     pub const MAX_BINARY_BYTES: u64 = 8 * 1024 * 1024;
 
     /// Baseline-subtracted minimum-of-31 work for `rune --version`, in milliseconds.
-    pub const MAX_VERSION_MS: f64 = 5.0;
+    pub const MAX_VERSION_MS: f64 = 2.0;
 
     /// Baseline-subtracted minimum-of-31 work for `rune --help`, in milliseconds.
-    pub const MAX_HELP_MS: f64 = 8.0;
+    pub const MAX_HELP_MS: f64 = 2.0;
 
     /// Largest accepted assembled system prompt, in bytes.
     ///
@@ -39,6 +50,33 @@ mod targets {
     /// Four is the estimator's working bytes-per-token figure, not a tokenizer:
     /// the number printed beside the byte count is an estimate at this divisor.
     pub const PROMPT_BYTES_PER_TOKEN: usize = 4;
+
+    /// Largest accepted first request of the scripted `fix_one_file` session, in bytes,
+    /// with the workspace path replaced by `<workspace>`.
+    pub const MAX_SCRIPTED_FIRST_REQUEST_BYTES: usize = 8966;
+
+    /// Largest accepted sum of every request body in that session, in bytes.
+    pub const MAX_SCRIPTED_SESSION_BYTES: usize = 38035;
+
+    /// Largest accepted number of requests in that session.
+    pub const MAX_SCRIPTED_REQUESTS: usize = 4;
+
+    /// Requests in that session whose cached share falls under one half.
+    pub const MAX_SCRIPTED_PREFIX_BREAKS: usize = 0;
+}
+
+/// Measured on macOS arm64; other hosts print their numbers without a gate.
+mod perf_baseline {
+    pub const LONG_TURN_PEAK_RSS_BYTES: u64 = 20_238_000;
+    pub const LONG_TURN_CPU_SECONDS: f64 = 2.98;
+    pub const FIRST_FRAME_MEDIAN_MS: f64 = 52.5;
+    // Rendering, median of three runs on macOS arm64 (Apple M-series), 2026-11-13.
+    pub const STREAM_CPU_SECONDS: f64 = 0.328;
+    pub const STREAM_TERMINAL_BYTES: f64 = 324_742.0;
+    pub const VIEWER_FIRST_FRAME_MS: f64 = 74.75;
+    pub const SESSION_MAX_RSS_KIB: f64 = 21_296.0;
+    /// A measurement more than this fraction above its baseline fails.
+    pub const ALLOWED_REGRESSION: f64 = 0.25;
 }
 
 fn main() -> ExitCode {
@@ -67,12 +105,14 @@ fn main() -> ExitCode {
             Ok(())
         }
         "budget" => budget(),
+        "perf" => perf(&extra),
         "gate" => gate(),
         "release" => release(&extra),
         "verify-release" => macos::verify_release(&extra),
         "benchmark" => benchmark(&extra),
         "web" => web(),
         "verify-web" => verify_web(&extra),
+        "fixture" => fixture::run(&extra),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -104,12 +144,16 @@ fn print_help() {
     println!("  lint     run clippy with warnings denied");
     println!("  test     run the workspace test suite");
     println!("  budget   build the release profile and check size and startup");
+    println!(
+        "  perf     measure long-turn memory and CPU and time to first frame against stored baselines"
+    );
     println!("  gate     format, lint, budget, and the full workspace test suite");
     println!("  release  stage a release artifact, its checksum, and a manifest");
     println!("  benchmark  print raw size and startup JSON for an existing executable");
     println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
     println!("  verify-web  fail unless site/demo/rune.wasm matches a fresh build");
+    println!("  fixture  copy one traced provider exchange into a conformance fixture");
     println!();
     println!(
         "  release takes: cargo xtask release <channel> [version] [target] [--sign-identity <certificate SHA-1>]"
@@ -118,6 +162,7 @@ fn print_help() {
         "  verify-release takes: cargo xtask verify-release <manifest-path> <certificate SHA-1>"
     );
     println!("  benchmark takes: cargo xtask benchmark <executable-path>");
+    println!("  fixture takes: cargo xtask fixture <trace-dir> <name> [--pair NNNN]");
     println!();
     print_budget_help();
 }
@@ -155,6 +200,16 @@ fn print_budget_help() {
         "  Tokens are estimated at {} bytes per token, not a tokenizer count.",
         targets::PROMPT_BYTES_PER_TOKEN
     );
+    println!(
+        "  A scripted session (fix_one_file) is replayed against the release binary: its first"
+    );
+    println!(
+        "  request, total request bytes, request count and prefix breaks are checked against ceilings."
+    );
+    println!(
+        "  Cache scenarios are replayed against the release binary; any prefix break beyond the"
+    );
+    println!("  expected count fails.");
 }
 
 /// The per-commit loop: format, lint, test.
@@ -179,6 +234,20 @@ fn format_and_lint() -> Result<(), String> {
 /// Runs cargo with the given arguments, inheriting stdio.
 fn cargo(args: &[&str]) -> Result<(), String> {
     run("cargo", args)
+}
+
+/// Runs cargo with extra environment variables, inheriting stdio.
+fn cargo_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(args)
+        .envs(env.iter().copied())
+        .status()
+        .map_err(|err| format!("could not run `cargo`: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`cargo {}` failed", args.join(" ")))
+    }
 }
 
 /// The target the landing page's harness is built for.
@@ -371,7 +440,29 @@ fn web_package_dirs(root: &Path) -> Result<Vec<String>, String> {
 ///
 /// An optional argument names the copy to check, so a caller can point at a
 /// copy outside the working tree.
+/// The scripts the site serves as byte copies of their source.
+const SITE_COPIES: &[(&str, &str)] = &[
+    ("scripts/install.sh", "site/install.sh"),
+    ("scripts/install.ps1", "site/install.ps1"),
+];
+
+/// Fails, naming the first, when a site copy differs from its source.
+fn verify_site_copies(root: &Path) -> Result<(), String> {
+    for (source, copy) in SITE_COPIES {
+        let read = |path: &str| {
+            std::fs::read(root.join(path)).map_err(|err| format!("could not read {path}: {err}"))
+        };
+        if read(source)? != read(copy)? {
+            return Err(format!(
+                "{copy} is stale; copy {source} to it and commit the result"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_web(extra: &[String]) -> Result<(), String> {
+    verify_site_copies(&workspace_root()?)?;
     let placed = match extra {
         [] => web_module_path()?,
         [path] => PathBuf::from(path),
@@ -574,6 +665,343 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Steps in the long-turn measurement.
+const LONG_TURN_STEPS: usize = 1000;
+
+/// Resources the long-turn run used, from the output of `time`.
+#[derive(Debug, PartialEq)]
+struct TimeUsage {
+    peak_rss_bytes: u64,
+    cpu_seconds: f64,
+}
+
+/// Reads peak memory and user plus system CPU from `/usr/bin/time -l` (macOS)
+/// or `/usr/bin/time -v` (Linux) output.
+fn parse_time_output(text: &str) -> Option<TimeUsage> {
+    let mut rss = None;
+    let mut user = None;
+    let mut system = None;
+    let mut mac_cpu = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_suffix("maximum resident set size") {
+            rss = rest.trim().parse::<u64>().ok();
+        } else if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
+            rss = rest
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|kib| kib.saturating_mul(1024));
+        } else if let Some(rest) = line.strip_prefix("User time (seconds):") {
+            user = rest.trim().parse::<f64>().ok();
+        } else if let Some(rest) = line.strip_prefix("System time (seconds):") {
+            system = rest.trim().parse::<f64>().ok();
+        } else if line.contains(" real ") && line.contains(" user ") && line.ends_with(" sys") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let number = |label: &str| {
+                let at = fields.iter().position(|field| *field == label)?;
+                fields.get(at.checked_sub(1)?)?.parse::<f64>().ok()
+            };
+            mac_cpu = Some(number("user")? + number("sys")?);
+        }
+    }
+    let cpu_seconds = match (user, system, mac_cpu) {
+        (Some(user), Some(system), _) => user + system,
+        (_, _, Some(cpu)) => cpu,
+        _ => return None,
+    };
+    Some(TimeUsage {
+        peak_rss_bytes: rss?,
+        cpu_seconds,
+    })
+}
+
+/// Compares measurements with the stored baselines.
+fn perf_failures(rss: u64, cpu: f64, frame: f64) -> Vec<String> {
+    let limit = 1.0 + perf_baseline::ALLOWED_REGRESSION;
+    let percent = (perf_baseline::ALLOWED_REGRESSION * 100.0).round();
+    let mut failures = Vec::new();
+    if rss as f64 > perf_baseline::LONG_TURN_PEAK_RSS_BYTES as f64 * limit {
+        failures.push(format!(
+            "long-turn peak memory {:.1} MiB is more than {percent}% above its baseline {:.1} MiB",
+            rss as f64 / 1_048_576.0,
+            perf_baseline::LONG_TURN_PEAK_RSS_BYTES as f64 / 1_048_576.0
+        ));
+    }
+    if cpu > perf_baseline::LONG_TURN_CPU_SECONDS * limit {
+        failures.push(format!(
+            "long-turn CPU time {cpu:.2} s is more than {percent}% above its baseline {:.2} s",
+            perf_baseline::LONG_TURN_CPU_SECONDS
+        ));
+    }
+    if frame > perf_baseline::FIRST_FRAME_MEDIAN_MS * limit {
+        failures.push(format!(
+            "first frame {frame:.1} ms is more than {percent}% above its baseline {:.1} ms",
+            perf_baseline::FIRST_FRAME_MEDIAN_MS
+        ));
+    }
+    failures
+}
+
+/// The scripted long run: one `read_file` call per request, then an answer.
+fn long_turn_scenario(steps: usize) -> rune_testkit::scenario::Scenario {
+    let lines: Vec<String> = (1..=steps.saturating_add(100))
+        .map(|line| format!("line {line}"))
+        .collect();
+    let workspace = std::iter::once(("data.txt".to_owned(), lines.join("\n") + "\n")).collect();
+    let mut turns: Vec<rune_testkit::scripted::Turn> = (1..=steps)
+        .map(|step| {
+            rune_testkit::scripted::Turn::call(
+                &format!("call_{step}"),
+                "read_file",
+                &format!("{{\"path\":\"data.txt\",\"start_line\":{step},\"line_count\":1}}"),
+            )
+        })
+        .collect();
+    turns.push(rune_testkit::scripted::Turn::text("Done."));
+    rune_testkit::scenario::Scenario {
+        name: "long_turn".to_owned(),
+        prompt: "Read the file one line at a time.".to_owned(),
+        workspace,
+        // No step cap: `ask` has none by default, and a cap equal to the
+        // request count would make the last request the graceful final step.
+        global_args: Vec::new(),
+        ask_args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        provider: None,
+        // A window no run here can fill, so the measurement is the turn loop
+        // and never a compaction (1,000 steps come close to 80% of 128k).
+        user_config: Some(
+            "[models.chat_completions]\nid = \"scripted\"\ncontext_window = 100000000\n".to_owned(),
+        ),
+        timeout_s: 600,
+        turns,
+        expect: rune_testkit::scenario::Expect {
+            exit_code: Some(0),
+            requests: Some(steps.saturating_add(1)),
+            ..Default::default()
+        },
+    }
+}
+
+/// Runs the long turn under `time` and returns its peak memory and CPU.
+fn measure_long_turn(binary: &Path, steps: usize) -> Result<TimeUsage, String> {
+    let time = Path::new("/usr/bin/time");
+    if !time.exists() {
+        return Err("perf needs /usr/bin/time".to_owned());
+    }
+    let flag = if cfg!(target_os = "macos") {
+        "-l"
+    } else {
+        "-v"
+    };
+    let wrapper = vec!["/usr/bin/time".to_owned(), flag.to_owned()];
+    let scenario = long_turn_scenario(steps);
+    let provider =
+        rune_testkit::scripted::ScriptedProvider::start_without_bodies(scenario.turns.clone());
+    let report = rune_testkit::scenario::run_wrapped(binary, &wrapper, &scenario, provider);
+    let failures = rune_testkit::scenario::check(&scenario, &report);
+    if !failures.is_empty() {
+        let tail: Vec<&str> = report.stderr.lines().rev().take(25).collect();
+        return Err(format!(
+            "long-turn scenario did not finish: {}\n{}",
+            failures.join("; "),
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        ));
+    }
+    parse_time_output(&report.stderr).ok_or_else(|| {
+        format!(
+            "could not read resource use from `time` output:\n{}",
+            report.stderr
+        )
+    })
+}
+
+/// Median of the samples the first-frame script prints.
+fn measure_first_frame(binary: &Path) -> Result<f64, String> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("first_frame.py"))
+        .arg(binary)
+        .output()
+        .map_err(|err| format!("could not run python3: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "first frame measurement failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|err| format!("first frame output is not JSON: {err}"))?;
+    value
+        .get("median_ms")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "first frame output has no median_ms".to_owned())
+}
+
+/// One rendering measurement: its script and the fields it reports.
+struct RenderMeasure {
+    name: &'static str,
+    script: &'static str,
+}
+
+/// The rendering measurements, each a script appended to the shared harness.
+const RENDER_MEASURES: &[RenderMeasure] = &[
+    RenderMeasure {
+        name: "stream",
+        script: include_str!("../perf/stream.py"),
+    },
+    RenderMeasure {
+        name: "viewer",
+        script: include_str!("../perf/viewer.py"),
+    },
+    RenderMeasure {
+        name: "memory",
+        script: include_str!("../perf/memory.py"),
+    },
+];
+
+/// Runs one rendering measurement and returns the JSON object it prints.
+fn measure_render(binary: &Path, measure: &RenderMeasure) -> Result<serde_json::Value, String> {
+    let program = format!("{}\n{}", include_str!("../perf/harness.py"), measure.script);
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(program)
+        .arg(binary)
+        .output()
+        .map_err(|err| format!("could not run python3: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} measurement failed: {}{}",
+            measure.name,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.lines().last().unwrap_or_default().trim())
+        .map_err(|err| format!("{} output is not JSON: {err}", measure.name))
+}
+
+/// The rendering values and their baselines, in the order they are printed.
+fn render_values(
+    results: &[(&'static str, serde_json::Value)],
+) -> Result<Vec<(&'static str, f64, f64)>, String> {
+    let field = |measure: &str, key: &str| {
+        results
+            .iter()
+            .find(|(name, _)| *name == measure)
+            .and_then(|(_, value)| value.get(key))
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("{measure} output has no {key}"))
+    };
+    Ok(vec![
+        (
+            "stream cpu_seconds",
+            field("stream", "cpu_seconds")?,
+            perf_baseline::STREAM_CPU_SECONDS,
+        ),
+        (
+            "stream terminal_bytes",
+            field("stream", "terminal_bytes")?,
+            perf_baseline::STREAM_TERMINAL_BYTES,
+        ),
+        (
+            "viewer first_frame_ms",
+            field("viewer", "first_frame_ms")?,
+            perf_baseline::VIEWER_FIRST_FRAME_MS,
+        ),
+        (
+            "memory max_rss_kib",
+            field("memory", "max_rss_kib")?,
+            perf_baseline::SESSION_MAX_RSS_KIB,
+        ),
+    ])
+}
+
+/// The rendering values more than the allowed fraction above their baselines.
+fn render_failures(values: &[(&'static str, f64, f64)]) -> Vec<String> {
+    let limit = 1.0 + perf_baseline::ALLOWED_REGRESSION;
+    let percent = (perf_baseline::ALLOWED_REGRESSION * 100.0).round();
+    values
+        .iter()
+        .filter(|(_, value, baseline)| *value > baseline * limit)
+        .map(|(name, value, baseline)| {
+            format!("{name}: {value} is more than {percent}% above the baseline {baseline}")
+        })
+        .collect()
+}
+
+/// Measures long-turn memory and CPU and the time to the first frame.
+///
+/// `--steps N` (not in the help) runs only the long turn at another length
+/// and prints its numbers, for checking how cost grows with the turn.
+fn perf(extra: &[String]) -> Result<(), String> {
+    let steps = match extra {
+        [] => None,
+        [flag, value] if flag == "--steps" => Some(
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|steps| *steps > 0)
+                .ok_or_else(|| format!("--steps needs a positive whole number, not `{value}`"))?,
+        ),
+        _ => return Err(format!("perf: unexpected arguments {extra:?}")),
+    };
+    cargo(&["build", "--release", "-p", "rune"])?;
+    let binary = release_binary_path();
+    if let Some(steps) = steps {
+        let usage = measure_long_turn(&binary, steps)?;
+        println!(
+            "long turn    {steps} steps: peak resident {:.1} MiB, cpu {:.2} s",
+            usage.peak_rss_bytes as f64 / 1_048_576.0,
+            usage.cpu_seconds
+        );
+        return Ok(());
+    }
+    let usage = measure_long_turn(&binary, LONG_TURN_STEPS)?;
+    let frame = measure_first_frame(&binary)?;
+    let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
+    println!(
+        "long turn    {LONG_TURN_STEPS} steps: peak resident {:.1} MiB (baseline {:.1} MiB), cpu {:.2} s (baseline {:.2} s)",
+        mib(usage.peak_rss_bytes),
+        mib(perf_baseline::LONG_TURN_PEAK_RSS_BYTES),
+        usage.cpu_seconds,
+        perf_baseline::LONG_TURN_CPU_SECONDS
+    );
+    println!(
+        "first frame  median of 11 {frame:.1} ms (baseline {:.1} ms)",
+        perf_baseline::FIRST_FRAME_MEDIAN_MS
+    );
+    let mut results = Vec::new();
+    for measure in RENDER_MEASURES {
+        results.push((measure.name, measure_render(&binary, measure)?));
+    }
+    let values = render_values(&results)?;
+    for (name, value, baseline) in &values {
+        println!("{name:<22} {value} (baseline {baseline})");
+    }
+    if let Some(reopen) = results
+        .iter()
+        .find(|(name, _)| *name == "viewer")
+        .and_then(|(_, value)| value.get("reopen_ms"))
+    {
+        println!("viewer reopen_ms       {reopen} (not gated)");
+    }
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        println!("no baseline for this host; numbers printed only");
+        return Ok(());
+    }
+    let mut failures = perf_failures(usage.peak_rss_bytes, usage.cpu_seconds, frame);
+    failures.extend(render_failures(&values));
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// Builds the release profile and checks size and startup.
 fn budget() -> Result<(), String> {
     cargo(&["build", "--release", "-p", "rune"])?;
@@ -595,6 +1023,8 @@ fn budget() -> Result<(), String> {
     check_startup(&binary)?;
     check_prompt(&binary)?;
     check_tools(&binary)?;
+    check_scripted_session(&binary)?;
+    check_cache_scenarios(&binary)?;
     check_duplicate_dependencies()?;
     Ok(())
 }
@@ -651,6 +1081,138 @@ fn check_tools(binary: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Replays the `fix_one_file` scenario and enforces the request-shape ceilings.
+fn check_scripted_session(binary: &Path) -> Result<(), String> {
+    let path = workspace_root()?.join("crates/rune/tests/scenarios/fix_one_file.json");
+    let scenario = rune_testkit::scenario::load(&path)?;
+    let report = rune_testkit::scenario::run(binary, &scenario);
+    let failures = rune_testkit::scenario::check(&scenario, &report);
+    if !failures.is_empty() {
+        return Err(format!(
+            "scripted session `fix_one_file` did not pass: {}",
+            failures.join("; ")
+        ));
+    }
+    let lengths: Vec<usize> = report
+        .requests
+        .iter()
+        .map(|request| normalized_len(&request.body, &[report.workspace_dir.as_str()]))
+        .collect();
+    let first = lengths.first().copied().unwrap_or(0);
+    let total: usize = lengths.iter().sum();
+    let count = lengths.len();
+    let breaks = report.prefix_breaks;
+    println!(
+        "scripted session  fix_one_file: first request {first} bytes (ceiling {}), {total} bytes over {count} requests (ceiling {}, {} requests), {breaks} prefix breaks (ceiling {})",
+        targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES,
+        targets::MAX_SCRIPTED_SESSION_BYTES,
+        targets::MAX_SCRIPTED_REQUESTS,
+        targets::MAX_SCRIPTED_PREFIX_BREAKS,
+    );
+    let failures = scripted_session_failures(first, total, count, breaks);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Replays the cache scenarios and fails on any prefix break beyond the
+/// expected count, or on a scenario that fails for another reason.
+fn check_cache_scenarios(binary: &Path) -> Result<(), String> {
+    let directory = workspace_root()?.join("crates/rune/tests/scenarios");
+    let mut results = Vec::new();
+    let mut other = Vec::new();
+    for (name, expected) in targets::CACHE_SCENARIOS {
+        let scenario = rune_testkit::scenario::load(&directory.join(format!("{name}.json")))?;
+        let report = rune_testkit::scenario::run(binary, &scenario);
+        // A wrong break count is reported by the count, not twice.
+        let failures: Vec<String> = rune_testkit::scenario::check(&scenario, &report)
+            .into_iter()
+            .filter(|failure| !failure.starts_with("prefix_breaks"))
+            .collect();
+        if !failures.is_empty() {
+            other.push(format!("cache scenario {name}: {}", failures.join("; ")));
+        }
+        results.push((*name, report.prefix_breaks, *expected));
+    }
+    let breaks: usize = results.iter().map(|(_, actual, _)| actual).sum();
+    let expected: usize = results.iter().map(|(_, _, expected)| expected).sum();
+    let unexpected: usize = results
+        .iter()
+        .map(|(_, actual, expected)| actual.abs_diff(*expected))
+        .sum();
+    println!(
+        "cache scenarios   {} run, {breaks} prefix breaks ({expected} expected), {unexpected} unexpected",
+        results.len()
+    );
+    let mut failures = cache_failures(&results);
+    failures.extend(other);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Names each scenario whose prefix breaks differ from the expected count.
+fn cache_failures(results: &[(&str, usize, usize)]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|(_, actual, expected)| actual != expected)
+        .map(|(name, actual, expected)| {
+            format!("cache scenario {name}: {actual} prefix breaks, expected {expected}")
+        })
+        .collect()
+}
+
+/// Returns the length of `body` with every path in `paths` replaced by `<workspace>`.
+///
+/// Paths are replaced as plain text: temporary directories on Unix contain no
+/// character that JSON escapes.
+fn normalized_len(body: &str, paths: &[&str]) -> usize {
+    let mut text = body.to_owned();
+    for path in paths.iter().filter(|path| !path.is_empty()) {
+        text = text.replace(path, "<workspace>");
+    }
+    text.len()
+}
+
+/// Compares the measured session against its ceilings, one message per breach.
+fn scripted_session_failures(
+    first: usize,
+    total: usize,
+    count: usize,
+    breaks: usize,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if first > targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES {
+        failures.push(format!(
+            "first scripted request is {first} bytes, ceiling {}",
+            targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES
+        ));
+    }
+    if total > targets::MAX_SCRIPTED_SESSION_BYTES {
+        failures.push(format!(
+            "scripted session sent {total} bytes, ceiling {}",
+            targets::MAX_SCRIPTED_SESSION_BYTES
+        ));
+    }
+    if count > targets::MAX_SCRIPTED_REQUESTS {
+        failures.push(format!(
+            "scripted session made {count} requests, ceiling {}",
+            targets::MAX_SCRIPTED_REQUESTS
+        ));
+    }
+    if breaks > targets::MAX_SCRIPTED_PREFIX_BREAKS {
+        failures.push(format!(
+            "scripted session had {breaks} prefix breaks, ceiling {}",
+            targets::MAX_SCRIPTED_PREFIX_BREAKS
+        ));
+    }
+    failures
 }
 
 /// Runs the binary with a throwaway home, so user configuration and user skills
@@ -722,18 +1284,26 @@ fn release(extra: &[String]) -> Result<(), String> {
         return Err("--sign-identity requires a macOS release target".to_owned());
     }
 
+    // The binary reports the channel the archive manifest records.
+    let channel_env = [("RUNE_CHANNEL", channel)];
     if target == env!("TARGET") {
-        cargo(&["build", "--release", "--locked", "-p", "rune"])?;
+        cargo_with_env(
+            &["build", "--release", "--locked", "-p", "rune"],
+            &channel_env,
+        )?;
     } else {
-        cargo(&[
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "rune",
-            "--target",
-            &target,
-        ])?;
+        cargo_with_env(
+            &[
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "rune",
+                "--target",
+                &target,
+            ],
+            &channel_env,
+        )?;
     }
 
     let binary = binary_path(&target);
@@ -1190,10 +1760,16 @@ fn startup_metrics(binary: &Path, flag: &str) -> Result<StartupMetrics, String> 
 /// Each entry is a crate that two upstream dependencies pin independently.
 /// Listing them explicitly keeps the check meaningful: anything not listed is a
 /// regression worth fixing.
-const DUPLICATE_EXCEPTIONS: &[(&str, &str)] = &[(
-    "winnow",
-    "toml 0.9 parses with winnow 0.7 and writes with toml_parser, which pins winnow 1",
-)];
+const DUPLICATE_EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "winnow",
+        "toml 0.9 parses with winnow 0.7 and writes with toml_parser, which pins winnow 1",
+    ),
+    (
+        "getrandom",
+        "xtask replays scripted sessions through rune-testkit, whose tempfile uses getrandom 0.4; the shipped binary uses 0.2",
+    ),
+];
 
 /// Fails when the release dependency graph contains two versions of one crate.
 ///
@@ -1272,9 +1848,129 @@ fn check_duplicate_dependencies() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn cache_failures_name_each_mismatch() {
+        let results = [("a", 0, 0), ("b", 2, 1), ("c", 0, 1)];
+        assert_eq!(
+            cache_failures(&results),
+            vec![
+                "cache scenario b: 2 prefix breaks, expected 1".to_owned(),
+                "cache scenario c: 0 prefix breaks, expected 1".to_owned(),
+            ]
+        );
+        assert!(cache_failures(&[("a", 1, 1)]).is_empty());
+    }
+
+    #[test]
+    fn the_perf_gate_allows_25_percent_and_fails_above() {
+        let rss = perf_baseline::LONG_TURN_PEAK_RSS_BYTES;
+        let cpu = perf_baseline::LONG_TURN_CPU_SECONDS;
+        let frame = perf_baseline::FIRST_FRAME_MEDIAN_MS;
+        assert!(perf_failures(rss, cpu, frame).is_empty());
+        assert!(perf_failures(rss * 125 / 100, cpu * 1.25, frame * 1.25).is_empty());
+        let over = perf_failures(rss * 126 / 100, cpu * 1.26, frame * 1.26);
+        assert_eq!(over.len(), 3, "{over:?}");
+        assert!(over[0].starts_with("long-turn peak memory"));
+        assert!(over[1].starts_with("long-turn CPU time"));
+        assert!(over[2].starts_with("first frame"));
+        assert_eq!(perf_failures(rss * 126 / 100, cpu, frame).len(), 1);
+        assert_eq!(perf_failures(rss, cpu * 1.26, frame).len(), 1);
+        assert_eq!(perf_failures(rss, cpu, frame * 1.26).len(), 1);
+    }
+
+    #[test]
+    fn a_stale_site_copy_is_named() {
+        let root = std::env::temp_dir().join(format!("rune-site-copies-{}", std::process::id()));
+        for (source, copy) in SITE_COPIES {
+            for path in [source, copy] {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                std::fs::write(&path, "same\n").expect("write");
+            }
+        }
+        assert_eq!(verify_site_copies(&root), Ok(()));
+        std::fs::write(root.join("site/install.ps1"), "older\n").expect("write");
+        let stale = verify_site_copies(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            stale,
+            Err(
+                "site/install.ps1 is stale; copy scripts/install.ps1 to it and commit the result"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn render_gates_fail_only_above_a_quarter_over_the_baseline() {
+        let values = [
+            ("viewer first_frame_ms", 125.0, 100.0),
+            ("stream cpu_seconds", 0.2, 0.3),
+        ];
+        assert!(render_failures(&values).is_empty());
+        let over = render_failures(&[("viewer first_frame_ms", 125.5, 100.0)]);
+        assert_eq!(
+            over,
+            ["viewer first_frame_ms: 125.5 is more than 25% above the baseline 100"]
+        );
+        let results = [
+            (
+                "stream",
+                serde_json::json!({"cpu_seconds": 0.3, "terminal_bytes": 10}),
+            ),
+            (
+                "viewer",
+                serde_json::json!({"first_frame_ms": 70.0, "reopen_ms": 9.0}),
+            ),
+            ("memory", serde_json::json!({"max_rss_kib": 20000})),
+        ];
+        let named: Vec<&str> = render_values(&results)
+            .expect("values")
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "stream cpu_seconds",
+                "stream terminal_bytes",
+                "viewer first_frame_ms",
+                "memory max_rss_kib"
+            ]
+        );
+        assert!(render_values(&results[..2]).is_err());
+    }
+
+    #[test]
+    fn time_output_is_parsed_on_both_hosts() {
+        let macos = "        2.50 real         1.20 user         0.30 sys\n\
+                     \x20          9830400  maximum resident set size\n\
+                     \x20                 0  average shared memory size\n";
+        assert_eq!(
+            parse_time_output(macos),
+            Some(TimeUsage {
+                peak_rss_bytes: 9_830_400,
+                cpu_seconds: 1.5
+            })
+        );
+        let linux = "\tCommand being timed: \"rune\"\n\
+                     \tUser time (seconds): 1.20\n\
+                     \tSystem time (seconds): 0.30\n\
+                     \tMaximum resident set size (kbytes): 9600\n";
+        assert_eq!(
+            parse_time_output(linux),
+            Some(TimeUsage {
+                peak_rss_bytes: 9_830_400,
+                cpu_seconds: 1.5
+            })
+        );
+        assert_eq!(parse_time_output("nothing useful"), None);
+    }
 
     #[test]
     fn a_module_record_round_trips_and_rejects_a_partial_file() {
@@ -1299,7 +1995,7 @@ mod tests {
         assert!(metrics.work_ms(0.5) <= targets::MAX_VERSION_MS);
         assert_eq!(
             metrics.report("--version", 0.5, targets::MAX_VERSION_MS),
-            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 5 ms)"
+            "startup --version  raw process latency: minimum-of-31 1.00 ms, median 16.00 ms, p95 30.00 ms; baseline-subtracted work 0.50 ms (budget 2 ms)"
         );
     }
 
@@ -1309,7 +2005,7 @@ mod tests {
         assert!(metrics.work_ms(2.0).abs() < f64::EPSILON);
         assert_eq!(
             metrics.report("--help", 2.0, targets::MAX_HELP_MS),
-            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 8 ms)"
+            "startup --help     raw process latency: minimum-of-31 1.00 ms, median 1.00 ms, p95 1.00 ms; baseline-subtracted work 0.00 ms (budget 2 ms)"
         );
     }
 
@@ -1366,7 +2062,7 @@ mod tests {
         );
         assert_eq!(
             metrics.report("--version", 6.0, targets::MAX_VERSION_MS),
-            "startup --version  raw process latency: minimum-of-31 7.31 ms, median 7.31 ms, p95 7.31 ms; baseline-subtracted work 1.31 ms (budget 5 ms)"
+            "startup --version  raw process latency: minimum-of-31 7.31 ms, median 7.31 ms, p95 7.31 ms; baseline-subtracted work 1.31 ms (budget 2 ms)"
         );
     }
 
@@ -1378,6 +2074,52 @@ mod tests {
         let message = prompt_ceiling_failure(targets::MAX_PROMPT_BYTES + 1)
             .expect("one byte over the ceiling was accepted");
         assert!(message.contains("assembled prompt exceeds"), "{message}");
+    }
+
+    #[test]
+    fn the_scripted_session_ceilings_fail_only_above_them() {
+        let first = targets::MAX_SCRIPTED_FIRST_REQUEST_BYTES;
+        let total = targets::MAX_SCRIPTED_SESSION_BYTES;
+        let count = targets::MAX_SCRIPTED_REQUESTS;
+        let breaks = targets::MAX_SCRIPTED_PREFIX_BREAKS;
+        assert!(scripted_session_failures(first, total, count, breaks).is_empty());
+        let cases = [
+            (
+                scripted_session_failures(first.saturating_add(1), total, count, breaks),
+                "first scripted request is",
+                first < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total.saturating_add(1), count, breaks),
+                "scripted session sent",
+                total < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total, count.saturating_add(1), breaks),
+                "scripted session made",
+                count < usize::MAX,
+            ),
+            (
+                scripted_session_failures(first, total, count, breaks + 1),
+                "scripted session had",
+                true,
+            ),
+        ];
+        for (failures, text, reachable) in cases {
+            if reachable {
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert!(failures[0].contains(text), "{failures:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_paths_are_replaced_before_measuring() {
+        let body = "cwd /tmp/ws/a and /tmp/ws/b";
+        assert_eq!(
+            normalized_len(body, &["/tmp/ws"]),
+            "cwd <workspace>/a and <workspace>/b".len()
+        );
     }
 
     /// Returns the tar header of an archive, for assertions about its fields.

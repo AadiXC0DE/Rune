@@ -10,8 +10,9 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
+use crate::compat::{CallIdShape, ClaudeThinking, shape_call_id};
 use crate::message::{ContentPart, Message, Role};
-use crate::provider::{Provider, RequestPlan, ToolChoice};
+use crate::provider::{MarkerPolicy, Provider, RequestPlan, ToolChoice};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
     stream_failure,
@@ -29,6 +30,12 @@ pub const PATH: &str = "/v1/messages";
 /// With extended thinking, the fallback also includes the thinking budget so
 /// this many tokens remain available for the reply.
 pub const DEFAULT_MAX_TOKENS: u64 = 8192;
+
+/// Output ceiling for an adaptive-thinking model when the plan names none.
+///
+/// Thinking shares the ceiling with the reply, so it needs more room than
+/// `DEFAULT_MAX_TOKENS`.
+pub const ADAPTIVE_MAX_TOKENS: u64 = 32_768;
 
 /// The dialect.
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,25 +68,69 @@ impl Provider for Anthropic {
         vec![("anthropic-version", "2023-06-01".to_owned())]
     }
 
+    fn replay_is_signed(&self, replay: &str) -> bool {
+        let Ok(serde_json::Value::Array(blocks)) = serde_json::from_str(replay) else {
+            return false;
+        };
+        blocks.iter().any(
+            |block| match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("redacted_thinking") => true,
+                Some("thinking") => block
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty()),
+                _ => false,
+            },
+        )
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
-
+        // Blocks the last plan message adds, which a shared-prefix request leaves unmarked.
+        let mut newest_blocks = 0;
         for message in &plan.messages {
             let encoded = encode_message(message, plan)?;
+            newest_blocks = encoded
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .map_or(usize::MAX, Vec::len);
             merge_adjacent(&mut messages, encoded);
         }
 
-        let requested_budget = thinking_budget(plan.effort);
-        let max_tokens = plan
-            .max_output_tokens
-            .unwrap_or(DEFAULT_MAX_TOKENS.saturating_add(requested_budget.unwrap_or_default()));
+        let adaptive = matches!(
+            plan.traits.claude_thinking,
+            ClaudeThinking::Adaptive
+                | ClaudeThinking::AdaptiveAlwaysOn
+                | ClaudeThinking::AdaptiveBetweenTools
+        );
+        let requested_budget = if adaptive {
+            None
+        } else {
+            thinking_budget(plan.effort)
+        };
+        let max_tokens = plan.max_output_tokens.unwrap_or(if adaptive {
+            ADAPTIVE_MAX_TOKENS
+        } else {
+            DEFAULT_MAX_TOKENS.saturating_add(requested_budget.unwrap_or_default())
+        });
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::json!(plan.model));
         body.insert("max_tokens".to_owned(), serde_json::json!(max_tokens));
         body.insert("stream".to_owned(), serde_json::json!(true));
         body.insert("messages".to_owned(), serde_json::Value::Array(messages));
 
-        if let Some(budget) = requested_budget {
+        if adaptive {
+            let (thinking, effort) = adaptive_controls(plan);
+            if let Some(thinking) = thinking {
+                body.insert("thinking".to_owned(), thinking);
+            }
+            if let Some(effort) = effort {
+                body.insert(
+                    "output_config".to_owned(),
+                    serde_json::json!({ "effort": effort }),
+                );
+            }
+        } else if let Some(budget) = requested_budget {
             // Manual thinking needs at least 1024 tokens and a budget strictly
             // below the total output ceiling. Keep an explicit ceiling intact.
             if max_tokens <= 1024 {
@@ -109,14 +160,18 @@ impl Provider for Anthropic {
         }
 
         if !plan.instructions.is_empty() {
-            body.insert(
-                "system".to_owned(),
-                serde_json::json!([{
-                    "type": "text",
-                    "text": plan.instructions,
-                    "cache_control": cache_control(),
-                }]),
-            );
+            let blocks = plan
+                .system_blocks()
+                .into_iter()
+                .map(|text| {
+                    let mut block = serde_json::json!({ "type": "text", "text": text });
+                    if plan.cache_markers != MarkerPolicy::None {
+                        block["cache_control"] = cache_control();
+                    }
+                    block
+                })
+                .collect();
+            body.insert("system".to_owned(), serde_json::Value::Array(blocks));
         }
 
         if plan.has_tools() {
@@ -136,7 +191,9 @@ impl Provider for Anthropic {
                 // The endpoint spells a required tool call `any`, not the
                 // `required` the OpenAI shapes use.
                 let choice = match plan.tool_choice {
-                    ToolChoice::Required => "any",
+                    ToolChoice::Required if plan.traits.forced_tool_choice => "any",
+                    // Models that refuse a forced choice get the closest one they accept.
+                    ToolChoice::Required => "auto",
                     other => other.as_str(),
                 };
                 let mut choice = serde_json::json!({ "type": choice });
@@ -147,9 +204,39 @@ impl Provider for Anthropic {
             }
         }
 
-        mark_cache_breakpoints(&mut body);
+        mark_cache_breakpoints(&mut body, plan.cache_markers, newest_blocks);
+        debug_assert!(marker_count(&body) <= 4, "at most four cache markers");
         Ok(serde_json::Value::Object(body))
     }
+}
+
+/// Returns the `thinking` and `output_config.effort` values for a model with
+/// adaptive thinking.
+fn adaptive_controls(plan: &RequestPlan) -> (Option<serde_json::Value>, Option<&'static str>) {
+    let effort = match plan.effort {
+        Effort::Auto => return (None, None),
+        Effort::None => {
+            return match plan.traits.claude_thinking {
+                // Thinking cannot be turned off, so ask for as little as possible.
+                ClaudeThinking::AdaptiveAlwaysOn => (None, Some("low")),
+                ClaudeThinking::AdaptiveBetweenTools => {
+                    (Some(serde_json::json!({ "type": "between_tools" })), None)
+                }
+                _ => (Some(serde_json::json!({ "type": "disabled" })), None),
+            };
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Xhigh if !plan.traits.efforts.contains(&Effort::Xhigh) => "high",
+        Effort::Xhigh => "xhigh",
+        Effort::Max => "max",
+    };
+    let mut thinking = serde_json::json!({ "type": "adaptive" });
+    if plan.show_reasoning {
+        thinking["display"] = serde_json::json!("summarized");
+    }
+    (Some(thinking), Some(effort))
 }
 
 /// Encodes one message into a role with content blocks.
@@ -170,7 +257,7 @@ fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::V
         // Tool results are user-role content blocks in this dialect.
         Role::Tool => Ok(serde_json::json!({
             "role": "user",
-            "content": encode_tool_blocks(message),
+            "content": encode_tool_blocks(message, plan),
         })),
     }
 }
@@ -211,11 +298,40 @@ fn encode_user_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::
     blocks
 }
 
+/// Whether a block is a thinking or a redacted thinking block.
+fn is_thinking_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
 /// Encodes assistant content blocks, including tool use and thinking.
 fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
-    // A thinking block must be replayed with the turn that produced it, so it
-    // comes first in the block list.
-    let mut blocks = replay_blocks(message);
+    let stored = replay_blocks(message);
+
+    // A replay holding the whole turn is sent back as it was produced, so the
+    // thinking blocks keep their place between the calls, as long as the
+    // message still makes the same calls in the same order.
+    if stored.iter().any(|block| !is_thinking_block(block)) {
+        let stored_ids = stored
+            .iter()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            })
+            .map(|block| block.get("id").and_then(serde_json::Value::as_str));
+        let message_ids = message.parts.iter().filter_map(|part| match part {
+            ContentPart::ToolCall { id, .. } => Some(Some(id.as_str())),
+            _ => None,
+        });
+        if stored_ids.eq(message_ids) {
+            return stored;
+        }
+    }
+
+    // Otherwise the stored thinking blocks must still be replayed with the
+    // turn that produced them, so they come first in the block list.
+    let mut blocks: Vec<serde_json::Value> = stored.into_iter().filter(is_thinking_block).collect();
 
     for part in &message.parts {
         match part {
@@ -236,7 +352,7 @@ fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
                     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
                 blocks.push(serde_json::json!({
                     "type": "tool_use",
-                    "id": id.as_str(),
+                    "id": shape_call_id(id.as_str(), CallIdShape::ClaudeSafe),
                     "name": name,
                     "input": parsed,
                 }));
@@ -245,29 +361,48 @@ fn encode_assistant_blocks(message: &Message) -> Vec<serde_json::Value> {
         }
     }
 
-    if blocks.is_empty() {
-        blocks.push(serde_json::json!({ "type": "text", "text": "" }));
-    }
     blocks
 }
 
 /// Encodes tool results as user content blocks.
-fn encode_tool_blocks(message: &Message) -> Vec<serde_json::Value> {
-    let mut blocks = Vec::new();
+///
+/// An image that follows a result joins that result's content, which then
+/// becomes a list of a text block and image blocks. An image whose data the
+/// plan does not hold is left out.
+fn encode_tool_blocks(message: &Message, plan: &RequestPlan) -> Vec<serde_json::Value> {
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
     for part in &message.parts {
-        if let ContentPart::ToolResult {
-            id,
-            content,
-            is_error,
-            ..
-        } = part
-        {
-            blocks.push(serde_json::json!({
+        match part {
+            ContentPart::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } => blocks.push(serde_json::json!({
                 "type": "tool_result",
-                "tool_use_id": id.as_str(),
+                "tool_use_id": shape_call_id(id.as_str(), CallIdShape::ClaudeSafe),
                 "content": content,
                 "is_error": is_error,
-            }));
+            })),
+            ContentPart::Image { image } => {
+                let Some(data) = plan.image_data.get(&image.id) else {
+                    continue;
+                };
+                let Some(content) = blocks.last_mut().and_then(|block| block.get_mut("content"))
+                else {
+                    continue;
+                };
+                if let serde_json::Value::String(text) = content {
+                    *content = serde_json::json!([{ "type": "text", "text": text }]);
+                }
+                if let serde_json::Value::Array(items) = content {
+                    items.push(serde_json::json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": image.media_type, "data": data.as_ref()},
+                    }));
+                }
+            }
+            _ => {}
         }
     }
     blocks
@@ -292,7 +427,22 @@ fn cache_control() -> serde_json::Value {
 /// the next request reads back before adding its own. That is three of the
 /// four markers a request may carry. A thinking block or an empty text block
 /// cannot hold one, so the newest block that can is used.
-fn mark_cache_breakpoints(body: &mut serde_json::Map<String, serde_json::Value>) {
+///
+/// Under `SharedPrefix` the conversation marker skips the `newest_blocks`
+/// blocks the last plan message added, and under `None` nothing is marked.
+fn mark_cache_breakpoints(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    policy: MarkerPolicy,
+    newest_blocks: usize,
+) {
+    if policy == MarkerPolicy::None {
+        return;
+    }
+    let skip = if policy == MarkerPolicy::SharedPrefix {
+        newest_blocks
+    } else {
+        0
+    };
     if let Some(last) = body
         .get_mut("tools")
         .and_then(serde_json::Value::as_array_mut)
@@ -301,17 +451,61 @@ fn mark_cache_breakpoints(body: &mut serde_json::Map<String, serde_json::Value>)
     {
         last.insert("cache_control".to_owned(), cache_control());
     }
-    let block = body
-        .get_mut("messages")
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
-        .and_then(|message| message.get_mut("content"))
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|blocks| blocks.iter_mut().rev().find(|block| can_hold_marker(block)))
-        .and_then(serde_json::Value::as_object_mut);
+    let block = if skip == 0 {
+        body.get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|messages| messages.last_mut())
+            .and_then(|message| message.get_mut("content"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|blocks| blocks.iter_mut().rev().find(|block| can_hold_marker(block)))
+    } else {
+        body.get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|messages| {
+                messages
+                    .iter_mut()
+                    .rev()
+                    .filter_map(|message| message.get_mut("content"))
+                    .filter_map(serde_json::Value::as_array_mut)
+                    .flat_map(|blocks| blocks.iter_mut().rev())
+                    .skip(skip)
+                    .find(|block| can_hold_marker(block))
+            })
+    }
+    .and_then(serde_json::Value::as_object_mut);
     if let Some(block) = block {
         block.insert("cache_control".to_owned(), cache_control());
     }
+}
+
+/// Counts the cache markers in a request body, wherever a marker may go.
+fn marker_count(body: &serde_json::Map<String, serde_json::Value>) -> usize {
+    let marked = |blocks: Option<&serde_json::Value>| {
+        blocks
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, |blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("cache_control").is_some())
+                    .count()
+            })
+    };
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .map(|message| marked(message.get("content")))
+                .sum()
+        });
+    [
+        marked(body.get("tools")),
+        marked(body.get("system")),
+        messages,
+    ]
+    .into_iter()
+    .sum()
 }
 
 /// Returns true for a content block the endpoint accepts a cache marker on.
@@ -373,6 +567,8 @@ struct PartialBlock {
     name: Option<String>,
     arguments: String,
     text: String,
+    signature: String,
+    raw: Option<serde_json::Value>,
     ended: bool,
 }
 
@@ -381,8 +577,11 @@ struct PartialBlock {
 pub struct Reducer {
     limits: Limit,
     blocks: std::collections::BTreeMap<u64, PartialBlock>,
-    thinking: Vec<serde_json::Value>,
+    /// Finished blocks in the order they stopped, kept for replay.
+    ordered: Vec<serde_json::Value>,
     content: String,
+    /// Bytes of thinking text and signatures, bounded with the content.
+    reasoning_bytes: usize,
     usage: Usage,
     stop_reason: Option<FinishReason>,
     finished: bool,
@@ -402,8 +601,9 @@ impl Reducer {
         Self {
             limits: Limit::default(),
             blocks: std::collections::BTreeMap::new(),
-            thinking: Vec::new(),
+            ordered: Vec::new(),
             content: String::new(),
+            reasoning_bytes: 0,
             usage: Usage::default(),
             stop_reason: None,
             finished: false,
@@ -507,17 +707,27 @@ impl Reducer {
                 }
             }
             "thinking" => {
-                // Retained verbatim for replay.
-                self.thinking.push(block.clone());
-                if let Some(text) = block
-                    .get("thinking")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
+                let field = |name: &str| {
+                    block
+                        .get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                partial.text = field("thinking");
+                partial.signature = field("signature");
+                self.add_reasoning_bytes(
+                    partial.text.len().saturating_add(partial.signature.len()),
+                )?;
+                if !partial.text.is_empty() {
                     out.push(crate::stream::ProviderEvent::ReasoningDelta {
-                        delta: text.to_owned(),
+                        delta: partial.text.clone(),
                     });
                 }
+            }
+            "redacted_thinking" => {
+                // Passed back byte for byte.
+                partial.raw = Some(block.clone());
             }
             "tool_use" => {
                 let id = block
@@ -579,10 +789,11 @@ impl Reducer {
                 {
                     block.text.push_str(text);
                     self.content.push_str(text);
-                    if self.content.len() > self.limits.max_content_bytes {
+                    let total = self.content.len().saturating_add(self.reasoning_bytes);
+                    if total > self.limits.max_content_bytes {
                         return Err(RuneError::too_large(
                             "stream.content",
-                            self.content.len(),
+                            total,
                             self.limits.max_content_bytes,
                         ));
                     }
@@ -597,9 +808,18 @@ impl Reducer {
                     .and_then(serde_json::Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
+                    block.text.push_str(text);
+                    self.add_reasoning_bytes(text.len())?;
                     out.push(crate::stream::ProviderEvent::ReasoningDelta {
                         delta: text.to_owned(),
                     });
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(serde_json::Value::as_str)
+                {
+                    block.signature.push_str(signature);
+                    self.add_reasoning_bytes(signature.len())?;
                 }
             }
             Some("input_json_delta") => {
@@ -642,22 +862,69 @@ impl Reducer {
         let Some(block) = self.blocks.get_mut(&index) else {
             return Ok(());
         };
-        if block.ended || block.kind.as_deref() != Some("tool_use") {
-            block.ended = true;
+        if block.ended {
             return Ok(());
         }
         block.ended = true;
-        let id = block
-            .id
-            .clone()
-            .ok_or_else(|| protocol_violation("a tool use block lost its identifier"))?;
-        // An empty argument string means no arguments were supplied.
-        let arguments = if block.arguments.is_empty() {
-            "{}".to_owned()
-        } else {
-            block.arguments.clone()
-        };
-        out.push(crate::stream::ProviderEvent::ToolCallEnd { id, arguments });
+        match block.kind.as_deref() {
+            Some("thinking") => {
+                // A block with neither text nor signature carries nothing to replay.
+                if !block.text.is_empty() || !block.signature.is_empty() {
+                    self.ordered.push(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": block.text,
+                        "signature": block.signature,
+                    }));
+                }
+            }
+            Some("redacted_thinking") => {
+                if let Some(raw) = block.raw.take() {
+                    self.ordered.push(raw);
+                }
+            }
+            Some("text") => {
+                if !block.text.is_empty() {
+                    self.ordered
+                        .push(serde_json::json!({ "type": "text", "text": block.text }));
+                }
+            }
+            Some("tool_use") => {
+                let id = block
+                    .id
+                    .clone()
+                    .ok_or_else(|| protocol_violation("a tool use block lost its identifier"))?;
+                // An empty argument string means no arguments were supplied.
+                let arguments = if block.arguments.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    block.arguments.clone()
+                };
+                let input: serde_json::Value =
+                    serde_json::from_str(&arguments).unwrap_or_else(|_| serde_json::json!({}));
+                self.ordered.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id.as_str(),
+                    "name": block.name.as_deref().unwrap_or_default(),
+                    "input": input,
+                }));
+                out.push(crate::stream::ProviderEvent::ToolCallEnd { id, arguments });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Counts thinking text or a signature against the content bound.
+    fn add_reasoning_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.reasoning_bytes = self.reasoning_bytes.saturating_add(bytes);
+        let total = self.content.len().saturating_add(self.reasoning_bytes);
+        if total > self.limits.max_content_bytes {
+            return Err(RuneError::too_large(
+                "stream.content",
+                total,
+                self.limits.max_content_bytes,
+            ));
+        }
         Ok(())
     }
 
@@ -705,10 +972,10 @@ impl StreamReducer for Reducer {
     }
 
     fn replay(&self) -> Option<String> {
-        if self.thinking.is_empty() {
+        if !self.ordered.iter().any(is_thinking_block) {
             return None;
         }
-        serde_json::to_string(&self.thinking).ok()
+        serde_json::to_string(&self.ordered).ok()
     }
 
     fn finish(&self) -> Result<FinishReason> {
@@ -786,8 +1053,10 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_the_instructions_and_the_newest_turn_are_marked_cacheable() {
+    fn four_markers_cover_tools_both_system_blocks_and_the_newest_turn() {
         let mut plan = plan_with_user("first");
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
         plan.messages
             .push(Message::assistant(vec![ContentPart::Text {
                 text: "answer".to_owned(),
@@ -810,7 +1079,10 @@ mod tests {
 
         assert_eq!(body["tools"][1]["cache_control"], ephemeral);
         assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["system"][0]["text"], "stable rules");
         assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        assert_eq!(body["system"][1]["text"], "workspace rules");
+        assert_eq!(body["system"][1]["cache_control"], ephemeral);
         // Only the newest message carries a marker; the endpoint reads the
         // earlier prefix back from the previous request's marker.
         assert_eq!(
@@ -824,8 +1096,110 @@ mod tests {
                     .is_none()
             );
         }
-        let markers = body.to_string().matches("cache_control").count();
-        assert!(markers <= 4, "the endpoint accepts at most four markers");
+        assert_eq!(body.to_string().matches("cache_control").count(), 4);
+        assert_eq!(marker_count(body.as_object().expect("object")), 4);
+    }
+
+    #[test]
+    fn one_system_block_when_no_split_is_given() {
+        let mut plan = plan_with_user("first");
+        plan.instructions = "all of the rules".to_owned();
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["system"].as_array().expect("blocks").len(), 1);
+        assert_eq!(body["system"][0]["text"], "all of the rules");
+
+        // A split that is not a character boundary keeps one block.
+        plan.instructions = "caf\u{e9} rules".to_owned();
+        plan.stable_instructions_len = 4;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["system"].as_array().expect("blocks").len(), 1);
+    }
+
+    #[test]
+    fn no_tools_means_three_markers() {
+        let mut plan = plan_with_user("first");
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
+    }
+
+    #[test]
+    fn a_shared_prefix_request_marks_the_previous_tail() {
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let mut plan = plan_with_user("first");
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::Text {
+                text: "answer".to_owned(),
+            }]));
+        plan.messages.push(Message::user("one-off"));
+        plan.tools = vec![ToolSpec {
+            name: "a".to_owned(),
+            description: "a tool".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.cache_markers = MarkerPolicy::SharedPrefix;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(body["tools"][0]["cache_control"], ephemeral);
+        assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert!(
+            body["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+
+        // An instruction after a tool result merges into its user message;
+        // the marker stays on the result.
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![
+            Message::user("start"),
+            Message::assistant(vec![ContentPart::ToolCall {
+                id: ToolCallId::new("toolu_1").expect("id"),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }]),
+            Message {
+                role: Role::Tool,
+                parts: vec![ContentPart::ToolResult {
+                    id: ToolCallId::new("toolu_1").expect("id"),
+                    name: "read_file".to_owned(),
+                    content: "contents".to_owned(),
+                    is_error: false,
+                }],
+                replay: None,
+                origin: None,
+            },
+            Message::user("one-off"),
+        ];
+        plan.cache_markers = MarkerPolicy::SharedPrefix;
+        let body = Anthropic.build_request(&plan).expect("build");
+        let last = &body["messages"][2]["content"];
+        assert_eq!(last[0]["type"], "tool_result");
+        assert_eq!(last[0]["cache_control"], ephemeral);
+        assert!(last[1].get("cache_control").is_none());
+        assert_eq!(body.to_string().matches("cache_control").count(), 1);
+    }
+
+    #[test]
+    fn a_request_without_markers_has_none() {
+        let mut plan = plan_with_user("first");
+        plan.tools = vec![ToolSpec {
+            name: "a".to_owned(),
+            description: "a tool".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.cache_markers = MarkerPolicy::None;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -839,7 +1213,7 @@ mod tests {
                 {"type": "text", "text": ""},
             ]}]),
         );
-        mark_cache_breakpoints(&mut body);
+        mark_cache_breakpoints(&mut body, MarkerPolicy::Full, 0);
         let blocks = &body["messages"][0]["content"];
         assert!(blocks[0].get("cache_control").is_some());
         assert!(blocks[1].get("cache_control").is_none());
@@ -1092,12 +1466,92 @@ mod tests {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         }];
         let body = Anthropic.build_request(&plan).expect("build");
         let message = &body["messages"][0];
         assert_eq!(message["role"], "user");
         assert_eq!(message["content"][0]["type"], "tool_result");
         assert_eq!(message["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+            origin: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_is_sent_inside_its_tool_result() {
+        let mut plan = tool_turn(vec![
+            result("toolu_1", "image shot.png attached"),
+            image(1),
+            result("toolu_2", "contents"),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        let body = Anthropic.build_request(&plan).expect("build");
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(
+            blocks[0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "image shot.png attached"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+            ])
+        );
+        assert_eq!(blocks[1]["content"], "contents");
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("toolu_1", "contents")]);
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "contents",
+                    "is_error": false,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let plan = tool_turn(vec![result("toolu_1", "image shot.png attached"), image(9)]);
+        let body = Anthropic.build_request(&plan).expect("build");
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["content"], "image shot.png attached");
+        assert!(!body.to_string().contains("image_ref"));
     }
 
     #[test]
@@ -1116,6 +1570,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = Anthropic.build_request(&plan).expect("build");
@@ -1182,11 +1637,25 @@ mod tests {
     }
 
     #[test]
-    fn an_assistant_message_with_no_blocks_still_encodes() {
+    fn an_assistant_message_with_no_blocks_is_not_sent_as_an_empty_text() {
         let mut plan = RequestPlan::new("m");
-        plan.messages = vec![Message::assistant(vec![])];
-        let body = Anthropic.build_request(&plan).expect("build");
-        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        plan.messages = vec![
+            Message::user("one"),
+            Message::assistant(vec![]),
+            Message::user("two"),
+        ];
+        let sent = crate::normalize::for_request(&plan, NAME);
+        let body = Anthropic.build_request(&sent).expect("build");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .all(|block| block["text"] != "")
+        );
     }
 
     #[test]
@@ -1197,6 +1666,244 @@ mod tests {
         assert_eq!(thinking_budget(Effort::Minimal), Some(1024));
         assert_eq!(thinking_budget(Effort::Max), Some(65_536));
         assert!(thinking_budget(Effort::High) > thinking_budget(Effort::Low));
+    }
+
+    /// Returns a plan for a Claude model with the traits the resolver gives it.
+    fn claude_plan(model: &str, effort: Effort) -> RequestPlan {
+        let mut plan = plan_with_user("hi");
+        plan.model = model.to_owned();
+        plan.traits = crate::compat::resolve("anthropic", None, model).1;
+        plan.effort = effort;
+        plan
+    }
+
+    fn with_tool(mut plan: RequestPlan, choice: ToolChoice) -> RequestPlan {
+        plan.tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.tool_choice = choice;
+        plan
+    }
+
+    #[test]
+    fn every_claude_row_maps_each_effort() {
+        let adaptive = serde_json::json!({"type": "adaptive"});
+        let disabled = serde_json::json!({"type": "disabled"});
+        let between = serde_json::json!({"type": "between_tools"});
+        let absent = serde_json::Value::Null;
+        let effort = |level: &str| serde_json::json!({ "effort": level });
+        // (model, effort, thinking, output_config)
+        let rows = [
+            ("claude-opus-5-5", Effort::Auto, &absent, absent.clone()),
+            ("claude-opus-5-5", Effort::None, &absent, effort("low")),
+            ("claude-opus-5-5", Effort::Minimal, &adaptive, effort("low")),
+            ("claude-opus-5-5", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-opus-5-5",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-opus-5-5", Effort::High, &adaptive, effort("high")),
+            ("claude-opus-5-5", Effort::Xhigh, &adaptive, effort("xhigh")),
+            ("claude-opus-5-5", Effort::Max, &adaptive, effort("max")),
+            ("claude-fable-5-1", Effort::None, &absent, effort("low")),
+            ("claude-sonnet-5-5", Effort::Auto, &absent, absent.clone()),
+            ("claude-sonnet-5-5", Effort::None, &between, absent.clone()),
+            (
+                "claude-sonnet-5-5",
+                Effort::Minimal,
+                &adaptive,
+                effort("low"),
+            ),
+            ("claude-sonnet-5-5", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-sonnet-5-5",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-sonnet-5-5", Effort::High, &adaptive, effort("high")),
+            (
+                "claude-sonnet-5-5",
+                Effort::Xhigh,
+                &adaptive,
+                effort("xhigh"),
+            ),
+            ("claude-sonnet-5-5", Effort::Max, &adaptive, effort("max")),
+            ("claude-opus-4-7", Effort::Auto, &absent, absent.clone()),
+            ("claude-opus-4-7", Effort::None, &disabled, absent.clone()),
+            ("claude-opus-4-7", Effort::Minimal, &adaptive, effort("low")),
+            ("claude-opus-4-7", Effort::Low, &adaptive, effort("low")),
+            (
+                "claude-opus-4-7",
+                Effort::Medium,
+                &adaptive,
+                effort("medium"),
+            ),
+            ("claude-opus-4-7", Effort::High, &adaptive, effort("high")),
+            ("claude-opus-4-7", Effort::Xhigh, &adaptive, effort("xhigh")),
+            ("claude-opus-4-7", Effort::Max, &adaptive, effort("max")),
+            ("claude-haiku-5-5", Effort::None, &disabled, absent.clone()),
+            ("claude-opus-4-6", Effort::Xhigh, &adaptive, effort("high")),
+            (
+                "claude-sonnet-4-6",
+                Effort::Xhigh,
+                &adaptive,
+                effort("high"),
+            ),
+            ("claude-sonnet-4-6", Effort::Max, &adaptive, effort("max")),
+        ];
+        for (model, level, thinking, output_config) in rows {
+            let body = Anthropic
+                .build_request(&claude_plan(model, level))
+                .expect("build");
+            assert_eq!(body["thinking"], *thinking, "{model} {level:?}");
+            assert_eq!(body["output_config"], output_config, "{model} {level:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_claude_keeps_its_thinking_budget() {
+        let body = Anthropic
+            .build_request(&claude_plan("claude-haiku-4-5", Effort::High))
+            .expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 16_384})
+        );
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + 16_384);
+        assert!(body.get("output_config").is_none());
+        let opus = Anthropic
+            .build_request(&claude_plan("claude-opus-4-5-20251101", Effort::Low))
+            .expect("build");
+        assert_eq!(opus["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn forced_tool_choice_degrades_where_refused() {
+        for model in ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::Required,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "auto"}),
+                "{model}"
+            );
+            let mut single = with_tool(claude_plan(model, Effort::High), ToolChoice::Required);
+            single.parallel_tool_calls = false;
+            let body = Anthropic.build_request(&single).expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+                "{model}"
+            );
+        }
+        for model in ["claude-opus-4-7", "claude-fable-5"] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::Required,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "any"}),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_is_sent_with_adaptive_thinking() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-7",
+            "claude-fable-5-1",
+        ] {
+            let body = Anthropic
+                .build_request(&with_tool(
+                    claude_plan(model, Effort::High),
+                    ToolChoice::None,
+                ))
+                .expect("build");
+            assert_eq!(
+                body["tool_choice"],
+                serde_json::json!({"type": "none"}),
+                "{model}"
+            );
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+        }
+    }
+
+    #[test]
+    fn a_session_asks_for_summarized_thinking() {
+        let mut plan = claude_plan("claude-opus-5-5", Effort::High);
+        plan.show_reasoning = true;
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        let quiet = Anthropic
+            .build_request(&claude_plan("claude-opus-5-5", Effort::High))
+            .expect("build");
+        assert_eq!(quiet["thinking"], serde_json::json!({"type": "adaptive"}));
+        // `between_tools` accepts no other field.
+        let mut off = claude_plan("claude-sonnet-5-5", Effort::None);
+        off.show_reasoning = true;
+        let body = Anthropic.build_request(&off).expect("build");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "between_tools"})
+        );
+    }
+
+    #[test]
+    fn no_sampling_parameter_reaches_claude() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+            "claude",
+        ] {
+            for &level in crate::provider::ALL_EFFORTS {
+                // A user temperature that reached the plan is still not sent.
+                let mut plan = claude_plan(model, level);
+                plan.sampling.temperature = Some(0.2);
+                let body = Anthropic.build_request(&plan).expect("build");
+                for field in ["temperature", "top_p", "top_k"] {
+                    assert!(body.get(field).is_none(), "{model} {level:?} {field}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_adaptive_model_without_a_known_ceiling_gets_room_to_think() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-4-7"] {
+            for &level in crate::provider::ALL_EFFORTS {
+                let body = Anthropic
+                    .build_request(&claude_plan(model, level))
+                    .expect("build");
+                assert_eq!(body["max_tokens"], ADAPTIVE_MAX_TOKENS, "{model} {level:?}");
+            }
+        }
+        let mut known = claude_plan("claude-opus-5-5", Effort::Max);
+        known.max_output_tokens = Some(4096);
+        let body = Anthropic.build_request(&known).expect("build");
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     /// Runs a reducer over frames.
@@ -1289,6 +1996,207 @@ mod tests {
         assert!(replay.contains("sig"));
     }
 
+    fn replayed(reducer: &Reducer) -> Vec<serde_json::Value> {
+        let replay = reducer.replay().expect("replay");
+        serde_json::from_str(&replay).expect("replay is a block array")
+    }
+
+    #[test]
+    fn a_signature_delivered_as_a_delta_is_replayed() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"second"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBsig"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = replayed(&reducer);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "first second");
+        assert_eq!(blocks[0]["signature"], "EqQBsig");
+    }
+
+    #[test]
+    fn thinking_text_from_deltas_is_replayed() {
+        let (events, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"both"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            // Omitted display: an empty text delta, then only the signature.
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            // Neither text nor signature: nothing to replay.
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"done"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            // Cut before its stop: stored nowhere.
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"thinking_delta","thinking":"partial"}}"#,
+        ]);
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "weigh bothpartial");
+        assert_eq!(
+            replayed(&reducer),
+            vec![
+                serde_json::json!({"type": "thinking", "thinking": "weigh both", "signature": "s1"}),
+                serde_json::json!({"type": "thinking", "thinking": "", "signature": "s2"}),
+                serde_json::json!({"type": "text", "text": "done"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redacted_block_is_kept_in_place() {
+        let redacted = r#"{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix/LafPsn4a"}"#;
+        let start =
+            format!(r#"{{"type":"content_block_start","index":1,"content_block":{redacted}}}"#);
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"a","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            &start,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"b","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = replayed(&reducer);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["thinking"], "a");
+        assert_eq!(
+            blocks[1],
+            serde_json::from_str::<serde_json::Value>(redacted).expect("redacted block")
+        );
+        assert_eq!(blocks[2]["thinking"], "b");
+
+        let mut message = Message::assistant(vec![]);
+        message.replay = reducer.replay();
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][0]["content"][1]["data"],
+            "EmwKAhgBEgy3va3pzix/LafPsn4a"
+        );
+    }
+
+    fn call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
+            id: ToolCallId::new(id).expect("call id"),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        }
+    }
+
+    #[test]
+    fn interleaved_thinking_keeps_its_order() {
+        let (_, reducer) = reduce(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"Reading the next file."}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"s2"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_2","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let stored = replayed(&reducer);
+        let kinds: Vec<&str> = stored
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect();
+        assert_eq!(kinds, ["thinking", "tool_use", "thinking", "tool_use"]);
+
+        let mut message = Message::assistant(vec![call("toolu_1"), call("toolu_2")]);
+        message.replay = reducer.replay();
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content blocks");
+        assert_eq!(content.len(), 4);
+        for (sent, kept) in content.iter().zip(&stored) {
+            let mut sent = sent.clone();
+            // The newest turn may carry a cache marker on its last block.
+            if let Some(block) = sent.as_object_mut() {
+                block.remove("cache_control");
+            }
+            assert_eq!(&sent, kept);
+        }
+    }
+
+    #[test]
+    fn an_older_thinking_only_replay_still_goes_first() {
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "outline", "signature": "s"});
+        let mut message = Message::assistant(vec![
+            ContentPart::Text {
+                text: "reading".to_owned(),
+            },
+            call("toolu_1"),
+        ]);
+        message.replay = Some(serde_json::to_string(&vec![thinking.clone()]).expect("encode"));
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0], thinking);
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content[2]["id"], "toolu_1");
+    }
+
+    #[test]
+    fn a_history_with_changed_calls_falls_back_to_thinking_first() {
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "outline", "signature": "s"});
+        let stored = vec![
+            thinking.clone(),
+            serde_json::json!({"type": "text", "text": "reading"}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}),
+        ];
+        let mut message = Message::assistant(vec![
+            ContentPart::Text {
+                text: "reading".to_owned(),
+            },
+            call("toolu_9"),
+        ]);
+        message.replay = Some(serde_json::to_string(&stored).expect("encode"));
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![message];
+        let body = Anthropic.build_request(&plan).expect("build");
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content blocks");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], thinking);
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["id"], "toolu_9");
+    }
+
     #[test]
     fn replay_is_absent_without_thinking() {
         let (_, reducer) = reduce(&[
@@ -1296,6 +2204,19 @@ mod tests {
             r#"{"type":"message_stop"}"#,
         ]);
         assert!(reducer.replay().is_none());
+    }
+
+    #[test]
+    fn replay_is_signed_for_signed_or_redacted_thinking_only() {
+        let signed =
+            r#"[{"type":"thinking","thinking":"a","signature":"s1"},{"type":"text","text":"b"}]"#;
+        let redacted = r#"[{"type":"redacted_thinking","data":"opaque"}]"#;
+        let unsigned =
+            r#"[{"type":"thinking","thinking":"a","signature":""},{"type":"text","text":"b"}]"#;
+        assert!(Anthropic.replay_is_signed(signed));
+        assert!(Anthropic.replay_is_signed(redacted));
+        assert!(!Anthropic.replay_is_signed(unsigned));
+        assert!(!Anthropic.replay_is_signed("not json"));
     }
 
     #[test]

@@ -153,8 +153,8 @@ impl Host for DeadlineHost {
         &rune_net::chat_completions::ChatCompletions
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.endpoint)
     }
 
     fn model(&self) -> String {

@@ -1,0 +1,16 @@
+{
+  "title": "Fix layered settings merging",
+  "kind": "bugfix",
+  "prompt": "Settings from the user file do not override the defaults properly: nested objects get replaced wholesale, arrays get concatenated when they should be replaced, and setting a key to null should remove it.",
+  "verify": "node --experimental-strip-types --test test/*.test.ts",
+  "protected": [
+    "test",
+    "test/hidden.test.ts"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "typescript",
+  "tags": []
+}

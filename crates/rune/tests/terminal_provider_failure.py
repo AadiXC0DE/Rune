@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import socket
 import struct
@@ -49,6 +50,18 @@ class Provider(http.server.BaseHTTPRequestHandler):
             requests.append(request)
             prompt = request["messages"][-1]["content"]
             failed = prompt == "die"
+            # Text cut off is continued in a new request; cutting that one
+            # before any output leaves nothing to continue, so the turn fails.
+            continuing = "The previous response was interrupted" in prompt
+            if continuing:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
             # Persist what Rune displays after stripping provider escape codes.
             prefix = b"".join(event("\x1b[31m" + line + "\x1b[0m\n") for line in partial.splitlines()) if failed else (
                 event("AFTER_FAILURE_OK" if prompt == "after-failure" else "AFTER_RESUME_OK")
@@ -141,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None
@@ -152,7 +165,10 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         return logs[0], [json.loads(line)["event"] for line in logs[0].read_text().splitlines()]
 
     def check_answer(request):
-        answers = [message["content"] for message in request["messages"]
+        # A reply kept from a cut stream is sent back as the provider wrote
+        # it; what was displayed and saved is the same text without escapes.
+        answers = [re.sub(r"\x1b\[[0-9;]*m", "", message["content"])
+                   for message in request["messages"]
                    if message["role"] == "assistant"]
         assert answers.count(partial) == 1, answers
         for line in partial.splitlines():
@@ -162,12 +178,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"die\r")
         wait_for("STREAM-03", start)
         cut_stream.set()
-        wait_for("[the turn failed: the response stream ended without a completion event]", start)
+        wait_for("error: the response stream ended without a completion event\r\n", start)
         log, events = saved_events()
         assert [entry for entry in events if entry["kind"] == "assistant_message"] == [
             {"kind": "assistant_message", "turn": 1, "text": partial},
@@ -192,7 +208,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         stop()
 
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[failed: incomplete_stream]", start)
@@ -234,6 +250,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r025-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
+                # A session blocked writing to the terminal ends only when it is
+                # drained while it exits.
+                drain_wait(child, master, 10, bytearray())
             child.wait(timeout=10)
         if master is not None:
             os.close(master)

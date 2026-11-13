@@ -1,0 +1,8 @@
+{
+  "description": "The v2 rules under headings, with one guidance line per offered tool.",
+  "env": {
+    "RUNE_EXPERIMENT": "prompt=v2-structured"
+  },
+  "flags": [],
+  "files": {}
+}

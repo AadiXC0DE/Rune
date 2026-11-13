@@ -1,0 +1,23 @@
+{
+  "items": {
+    "notebook": { "name": "Notebook", "unitCents": 1250 },
+    "pen": { "name": "Pen", "unitCents": 335 },
+    "stapler": { "name": "Stapler", "unitCents": 1895 }
+  },
+  "bundles": {
+    "desk-set": {
+      "name": "Desk set",
+      "percent": 15,
+      "lines": [
+        { "sku": "notebook", "qty": 2 },
+        { "sku": "pen", "qty": 3 },
+        { "sku": "stapler", "qty": 1 }
+      ]
+    },
+    "pen-pack": {
+      "name": "Pen pack",
+      "percent": 10,
+      "lines": [{ "sku": "pen", "qty": 6 }]
+    }
+  }
+}

@@ -1,0 +1,34 @@
+name: dependencies
+
+# Advisories, licences, bans and sources, checked when the dependency set can
+# have changed, and on demand.
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/dependencies.yml']
+  pull_request:
+    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/dependencies.yml']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependencies:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.9 --locked
+
+      - name: Check dependency advisories, licenses, bans, and sources
+        run: cargo deny check
+
+      - name: Test dependency policy enforcement
+        run: bash .github/scripts/test-dependency-policy.sh

@@ -7,9 +7,14 @@
 //! file is still the one that was read, and renames it into place, so a reader
 //! sees either the whole old file or the whole new one.
 //!
-//! Content is never normalized. Matching is byte exact and the postimage is
-//! written verbatim, so CRLF and lone CR endings survive a round trip.
+//! Content is never normalized. Matching tries exact bytes first and then
+//! lossless normalisations (line endings, typographic punctuation); a match
+//! found that way is mapped back to the original bytes, and every byte outside
+//! a match is written verbatim, so CRLF and lone CR endings survive. Inserted
+//! text takes the terminator of the line it lands in unless it carries `\r`
+//! itself, and a byte order mark is kept through edits and whole-file writes.
 
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Read, Write};
 use std::ops::Range;
@@ -130,9 +135,17 @@ pub struct Prepared {
     span: Option<ChangeSpan>,
     lines: LineChanges,
     replacements: usize,
+    /// Distinct non-exact tiers the hunks matched at, sorted.
+    relaxed: Vec<crate::matching::Tier>,
 }
 
 impl Prepared {
+    /// The normalisations an edit needed to match, if any.
+    #[must_use]
+    pub fn relaxed(&self) -> &[crate::matching::Tier] {
+        &self.relaxed
+    }
+
     /// Returns the resolved path the mutation targets.
     #[must_use]
     pub fn path(&self) -> &Utf8Path {
@@ -192,9 +205,17 @@ pub struct Applied {
     lines: LineChanges,
     replacements: usize,
     created: bool,
+    /// Distinct non-exact tiers the hunks matched at, sorted.
+    relaxed: Vec<crate::matching::Tier>,
 }
 
 impl Applied {
+    /// The normalisations an edit needed to match, if any.
+    #[must_use]
+    pub fn relaxed(&self) -> &[crate::matching::Tier] {
+        &self.relaxed
+    }
+
     /// Returns the resolved path that was written.
     #[must_use]
     pub fn path(&self) -> &Utf8Path {
@@ -286,6 +307,19 @@ pub fn line_changes(before: &str, after: &str) -> LineChanges {
     }
 }
 
+/// Returns a preview as the lines shown under a call's row, or nothing when
+/// the change has no textual difference. A cut preview ends with `...`.
+pub fn shown_diff(preview: &Preview) -> Option<String> {
+    if preview.text.is_empty() {
+        return None;
+    }
+    let mut shown = preview.text.clone();
+    if preview.truncated {
+        shown.push_str("\n...");
+    }
+    Some(shown)
+}
+
 /// Describes an applied mutation in one bounded phrase.
 pub(crate) fn detail(applied: &Applied) -> String {
     let lines = applied.lines();
@@ -347,6 +381,25 @@ pub fn prepare(path: &Utf8Path, desired: &str) -> Result<Prepared> {
         return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
     }
     let before = std::str::from_utf8(bytes).map_err(|_| not_text(path))?;
+    // A file that starts with a byte order mark keeps it.
+    let kept_mark;
+    let desired = if before.starts_with('\u{FEFF}') && !desired.starts_with('\u{FEFF}') {
+        kept_mark = format!("\u{FEFF}{desired}");
+        if kept_mark.len() > MAX_WRITE_BYTES {
+            return Err(RuneError::too_large(
+                "content",
+                kept_mark.len(),
+                MAX_WRITE_BYTES,
+            ));
+        }
+        let total = bytes.len().saturating_add(kept_mark.len());
+        if total > MAX_TOTAL_BYTES {
+            return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
+        }
+        kept_mark.as_str()
+    } else {
+        desired
+    };
     let region = changed_region(before, desired);
     Ok(Prepared {
         resolved: path.to_owned(),
@@ -359,6 +412,7 @@ pub fn prepare(path: &Utf8Path, desired: &str) -> Result<Prepared> {
         span: region.as_ref().map(|region| region.span),
         lines: line_changes(before, desired),
         replacements: 1,
+        relaxed: Vec::new(),
     })
 }
 
@@ -388,6 +442,18 @@ pub fn prepare_edit(
 /// succeed before the single postimage can be applied. Intermediate content
 /// obeys the same size limits as the final postimage.
 pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepared> {
+    prepare_edits_with(path, edits, true)
+}
+
+/// [`prepare_edits`], with whether a missed edit may quote the file's lines.
+///
+/// `quote` is false when reading the file would need an approval, so an
+/// error then names no file content.
+pub fn prepare_edits_with(
+    path: &Utf8Path,
+    edits: &[LiteralEdit<'_>],
+    quote: bool,
+) -> Result<Prepared> {
     if edits.is_empty() {
         return Err(RuneError::invalid_field("edits", "must not be empty"));
     }
@@ -406,12 +472,17 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
     let before = std::str::from_utf8(&snapshot.bytes).map_err(|_| not_text(path))?;
     let mut postimage = before.to_owned();
     let mut replacements = 0usize;
+    let mut relaxed = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
-        let (next, count) = replace_literal(path, &postimage, edit, before.len())
+        let (next, count, tier) = replace_literal(path, &postimage, edit, before.len(), quote)
             .map_err(|err| hunk_error(err, index, edits.len()))?;
         postimage = next;
         replacements = replacements.saturating_add(count);
+        if tier != crate::matching::Tier::Exact && !relaxed.contains(&tier) {
+            relaxed.push(tier);
+        }
     }
+    relaxed.sort();
     let region = changed_region(before, &postimage);
     let preview = preview_of(before, &postimage, region.as_ref());
     let lines = line_changes(before, &postimage);
@@ -426,6 +497,7 @@ pub fn prepare_edits(path: &Utf8Path, edits: &[LiteralEdit<'_>]) -> Result<Prepa
         span: region.as_ref().map(|region| region.span),
         lines,
         replacements,
+        relaxed,
     })
 }
 
@@ -467,35 +539,67 @@ fn replace_literal(
     before: &str,
     edit: &LiteralEdit<'_>,
     preimage_len: usize,
-) -> Result<(String, usize)> {
+    quote: bool,
+) -> Result<(String, usize, crate::matching::Tier)> {
+    use crate::matching::{Tiers, search};
     let LiteralEdit {
         old,
         new,
         occurrence,
     } = *edit;
-    let count = count_occurrences(before, old);
-    if count == 0 {
-        return Err(no_match(path));
-    }
-    let replacements = match occurrence {
+    // An edit that changes only carriage returns is about the bytes, so it
+    // must match them exactly and is written as given.
+    let endings_only = old != new && old.replace('\r', "") == new.replace('\r', "");
+    let tiers = if endings_only {
+        Tiers::Exact
+    } else if occurrence == Occurrence::Unique {
+        Tiers::Unique
+    } else {
+        Tiers::Selectable
+    };
+    let Some(matches) = search(before, old, tiers) else {
+        return Err(not_found(path, before, old, new, quote));
+    };
+    let count = matches.spans.len();
+    let chosen: Vec<Range<usize>> = match occurrence {
         Occurrence::Unique => {
             if count != 1 {
-                return Err(ambiguous(path, count));
+                return Err(ambiguous(path, before, &matches.spans, quote));
             }
-            1
+            matches.spans
         }
-        Occurrence::All => count,
+        Occurrence::All => matches.spans,
         Occurrence::Index(index) => {
             if index == 0 || index > count {
                 return Err(index_out_of_range(path, index, count));
             }
-            1
+            vec![matches.spans[index.saturating_sub(1)].clone()]
         }
     };
-    let postimage_len = before
-        .len()
-        .saturating_sub(old.len().saturating_mul(replacements))
-        .saturating_add(new.len().saturating_mul(replacements));
+    // An indentation-tier match writes the replacement at the file's
+    // indentation; one that cannot be re-indented does not match at all.
+    let replacement = match &matches.reindent {
+        Some(reindent) => crate::matching::reindented(new, reindent)
+            .ok_or_else(|| not_found(path, before, old, new, quote))?,
+        None => new.to_owned(),
+    };
+    // Text that brings no `\r` of its own takes the ending of the line it
+    // lands in, span by span.
+    let crlf = replacement.replace('\n', "\r\n");
+    let keeps_its_endings = endings_only || replacement.contains('\r');
+    let inserted: Vec<&str> = chosen
+        .iter()
+        .map(|span| {
+            if !keeps_its_endings && region_ending(before, span.start) == Ending::Crlf {
+                crlf.as_str()
+            } else {
+                replacement.as_str()
+            }
+        })
+        .collect();
+    let removed: usize = chosen.iter().map(ExactSizeIterator::len).sum();
+    let added: usize = inserted.iter().map(|text| text.len()).sum();
+    let postimage_len = before.len().saturating_sub(removed).saturating_add(added);
     if postimage_len > MAX_WRITE_BYTES {
         return Err(RuneError::too_large(
             "content",
@@ -507,13 +611,52 @@ fn replace_literal(
     if total > MAX_TOTAL_BYTES {
         return Err(RuneError::too_large("content", total, MAX_TOTAL_BYTES));
     }
-    let postimage = match occurrence {
-        Occurrence::All => before.replace(old, new),
-        Occurrence::Unique => replace_one(before, old, new, 1).ok_or_else(|| no_match(path))?,
-        Occurrence::Index(index) => replace_one(before, old, new, index)
-            .ok_or_else(|| index_out_of_range(path, index, count))?,
-    };
-    Ok((postimage, replacements))
+    Ok((
+        splice(before, &chosen, &inserted, postimage_len),
+        chosen.len(),
+        matches.tier,
+    ))
+}
+
+/// A line terminator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ending {
+    Lf,
+    Crlf,
+}
+
+/// The terminator of the line that holds byte `start`; for a last line
+/// without one, the terminator of the line before it; `Lf` when the source
+/// has no newline at all.
+fn region_ending(source: &str, start: usize) -> Ending {
+    let bytes = source.as_bytes();
+    let start = start.min(bytes.len());
+    let newline = bytes[start..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map(|at| start.saturating_add(at))
+        .or_else(|| bytes[..start].iter().rposition(|&byte| byte == b'\n'));
+    match newline {
+        Some(at) if at > 0 && bytes[at.saturating_sub(1)] == b'\r' => Ending::Crlf,
+        _ => Ending::Lf,
+    }
+}
+
+/// Builds the postimage: `source` with each range replaced by the text at the
+/// same index of `replacements`.
+///
+/// The ranges are non-overlapping and in order; everything between them is
+/// copied as it was.
+fn splice(source: &str, spans: &[Range<usize>], replacements: &[&str], capacity: usize) -> String {
+    let mut out = String::with_capacity(capacity);
+    let mut copied = 0usize;
+    for (span, replacement) in spans.iter().zip(replacements) {
+        out.push_str(&source[copied..span.start]);
+        out.push_str(replacement);
+        copied = span.end;
+    }
+    out.push_str(&source[copied..]);
+    out
 }
 
 /// Applies a prepared mutation.
@@ -532,6 +675,7 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         span,
         lines,
         replacements,
+        relaxed,
         ..
     } = prepared;
     let Some(directory) = resolved
@@ -577,7 +721,65 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         lines,
         replacements,
         created: identity.is_none(),
+        relaxed,
     })
+}
+
+/// Reads a file as text with the hash of its bytes, or `None` when it does
+/// not exist. Refuses what `prepare` refuses: symlinks, multiply-linked and
+/// oversized files, and bytes that are not UTF-8.
+///
+/// # Errors
+///
+/// Returns the refusal or the I/O failure.
+pub fn read_text(path: &Utf8Path) -> Result<Option<(String, [u8; 32])>> {
+    let Some(snapshot) = read_preimage(path)? else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(snapshot.bytes).map_err(|_| not_text(path))?;
+    Ok(Some((text, snapshot.hash)))
+}
+
+/// Checks that a prepared write starts from the state that was read:
+/// the file with `expected` hash, or no file when `expected` is `None`.
+///
+/// # Errors
+///
+/// Returns `stale` when the file changed since.
+pub fn check_preimage(prepared: &Prepared, expected: Option<&[u8; 32]>) -> Result<()> {
+    let unchanged = match expected {
+        Some(hash) => !prepared.creates_file() && prepared.preimage_hash() == hash,
+        None => prepared.creates_file(),
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(stale(prepared.path()))
+    }
+}
+
+/// Removes a file that still has the bytes hashed as `expected_hash`.
+///
+/// # Errors
+///
+/// Returns `stale` when the file changed or is gone, and refuses symlinks,
+/// directories and multiply-linked files.
+pub fn remove(path: &Utf8Path, expected_hash: &[u8; 32]) -> Result<()> {
+    match read_preimage(path)? {
+        Some(snapshot) if &snapshot.hash == expected_hash => {}
+        _ => return Err(stale(path)),
+    }
+    std::fs::remove_file(path.as_std_path()).map_err(|err| io_error(path, err))?;
+    if let Some(directory) = path.parent() {
+        sync_directory(directory);
+    }
+    Ok(())
+}
+
+/// The bounded preview of replacing `before` with `after`.
+#[must_use]
+pub fn preview_between(before: &str, after: &str) -> Preview {
+    preview_of(before, after, changed_region(before, after).as_ref())
 }
 
 /// Maps an I/O failure to a typed error that names the path involved.
@@ -975,35 +1177,6 @@ fn truncate_chars(text: &str, max: usize) -> &str {
     }
 }
 
-/// Counts non-overlapping occurrences of `needle`.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    haystack.match_indices(needle).count()
-}
-
-/// Replaces only the occurrence at the given one-based index.
-fn replace_one(haystack: &str, needle: &str, replacement: &str, index: usize) -> Option<String> {
-    let mut seen = 0usize;
-    for (offset, _) in haystack.match_indices(needle) {
-        seen = seen.saturating_add(1);
-        if seen == index {
-            let mut out = String::with_capacity(
-                haystack
-                    .len()
-                    .saturating_sub(needle.len())
-                    .saturating_add(replacement.len()),
-            );
-            out.push_str(&haystack[..offset]);
-            out.push_str(replacement);
-            out.push_str(&haystack[offset.saturating_add(needle.len())..]);
-            return Some(out);
-        }
-    }
-    None
-}
-
 /// Hashes bytes with SHA-256.
 fn hash_of(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1021,23 +1194,96 @@ fn stale(path: &Utf8Path) -> RuneError {
     .with_hint("read the file again and retry the change")
 }
 
-/// The text to replace does not appear in the target.
-fn no_match(path: &Utf8Path) -> RuneError {
-    RuneError::new(
-        ErrorCode::NotFound,
-        format!("`old_string` was not found in `{path}`"),
-    )
-    .with_hint("read the file again to see its current contents")
+/// The error for an `old_string` no tier matched.
+///
+/// The first rule that applies decides: `new_string` already in the file
+/// says the change is applied; otherwise, when quoting is allowed, the
+/// closest lines are shown numbered so the next attempt can copy them;
+/// otherwise the advice is to read the file again.
+fn not_found(path: &Utf8Path, content: &str, old: &str, new: &str, quote: bool) -> RuneError {
+    const APPLIED: &str = "if the change is already applied, do not retry this edit";
+    let missing = format!("`old_string` was not found in `{path}`");
+    if let Some((first, last)) = crate::matching::already_applied(content, new) {
+        let lines = if first == last {
+            format!("at line {first}")
+        } else {
+            format!("at lines {first}-{last}")
+        };
+        return RuneError::new(
+            ErrorCode::NotFound,
+            format!("{missing}, and `new_string` is already there {lines}"),
+        )
+        .with_hint(APPLIED);
+    }
+    if quote && let Some(closest) = crate::matching::closest_lines(content, old) {
+        let lines = if closest.first == closest.last {
+            format!("is line {}", closest.first)
+        } else {
+            format!("is lines {}-{}", closest.first, closest.last)
+        };
+        let mut message = format!("{missing}. The closest text {lines}:\n{}", closest.numbered);
+        if let Some(note) = closest.indent_note {
+            message.push('\n');
+            message.push_str(note);
+        }
+        return RuneError::new(ErrorCode::NotFound, message)
+            .with_hint(format!("copy the exact text from these lines; {APPLIED}"));
+    }
+    RuneError::new(ErrorCode::NotFound, missing).with_hint(format!(
+        "read the file again to see its current contents; {APPLIED}"
+    ))
 }
 
 /// The text to replace appears more than once and no selector was given.
-fn ambiguous(path: &Utf8Path, count: usize) -> RuneError {
-    RuneError::new(
-        ErrorCode::AmbiguousMatch,
-        format!("the requested text occurs {count} times in `{path}`"),
-    )
-    .with_observed(count.to_string())
-    .with_hint("pass `occurrence` to pick one, or `replace_all` to change every one")
+fn ambiguous(path: &Utf8Path, content: &str, spans: &[Range<usize>], quote: bool) -> RuneError {
+    const LISTED: usize = 5;
+    let count = spans.len();
+    let places: Vec<String> = spans
+        .iter()
+        .take(LISTED)
+        .map(|span| {
+            let before = &content[..span.start.min(content.len())];
+            let line = before.matches('\n').count().saturating_add(1);
+            if !quote {
+                return format!("line {line}");
+            }
+            if line == 1 {
+                return format!("line {line} (first line)");
+            }
+            // The text before the start of the match's line, without the one
+            // newline that ends the previous line.
+            let line_start = before.rfind('\n').map_or(0, |at| at.saturating_add(1));
+            let earlier = &before[..line_start];
+            let previous = earlier
+                .strip_suffix('\n')
+                .unwrap_or(earlier)
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if previous.is_empty() {
+                return format!("line {line} (after a blank line)");
+            }
+            let shown = if previous.chars().count() > 80 {
+                format!("{}...", previous.chars().take(80).collect::<String>())
+            } else {
+                previous.to_owned()
+            };
+            format!("line {line} (after `{shown}`)")
+        })
+        .collect();
+    let mut message = format!(
+        "the requested text occurs {count} times in `{path}`: {}",
+        places.join(", ")
+    );
+    if count > LISTED {
+        let _ = write!(message, ", and {} more", count.saturating_sub(LISTED));
+    }
+    RuneError::new(ErrorCode::AmbiguousMatch, message)
+        .with_observed(count.to_string())
+        .with_hint(
+            "pass `occurrence` to pick one, add more surrounding text, or pass `replace_all`",
+        )
 }
 
 /// The requested occurrence does not exist in the target.
@@ -1333,6 +1579,300 @@ mod tests {
             std::fs::read(&path).expect("read"),
             b"alpha\r\nBETA\r\ngamma\r\n"
         );
+    }
+
+    /// Seeds a file, runs one unique edit and returns the result and the tiers.
+    fn edited(body: &str, old: &str, new: &str) -> (String, Vec<crate::matching::Tier>) {
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, body).expect("seed");
+        let applied = apply(prepare_edit(&path, old, new, Occurrence::Unique).expect("prepare"))
+            .expect("apply");
+        (
+            std::fs::read_to_string(&path).expect("read"),
+            applied.relaxed().to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_crlf_file_matches_an_lf_search_at_the_line_endings_tier() {
+        let (after, relaxed) = edited("one\r\ntwo\r\nthree\r\n", "one\ntwo", "ONE\nTWO");
+        assert_eq!(after, "ONE\r\nTWO\r\nthree\r\n");
+        assert_eq!(relaxed, [crate::matching::Tier::LineEndings]);
+    }
+
+    #[test]
+    fn untouched_lines_keep_their_own_terminators_in_a_mixed_file() {
+        let (after, _) = edited("one\ntwo\r\nthree\rfour\n", "two", "TWO");
+        assert_eq!(after, "one\nTWO\r\nthree\rfour\n");
+    }
+
+    #[test]
+    fn an_lf_edit_of_a_crlf_file_writes_crlf_lines() {
+        let (after, relaxed) = edited("a\r\nb\r\nc\r\nd\r\n", "b\nc", "b\nx\nc");
+        assert_eq!(after, "a\r\nb\r\nx\r\nc\r\nd\r\n");
+        assert_eq!(relaxed, [crate::matching::Tier::LineEndings]);
+        let (after, relaxed) = edited("foo\r\nend\r\n", "foo", "foo\nbar");
+        assert_eq!(after, "foo\r\nbar\r\nend\r\n");
+        assert!(relaxed.is_empty());
+    }
+
+    #[test]
+    fn inserted_lines_take_the_terminator_of_the_first_matched_line() {
+        let body = "first\nsecond\r\n";
+        let (after, _) = edited(body, "second", "second\nmore");
+        assert_eq!(after, "first\nsecond\r\nmore\r\n");
+        let (after, _) = edited(body, "first", "first\nmore");
+        assert_eq!(after, "first\nmore\nsecond\r\n");
+        // A last line without a terminator takes the one before it.
+        let (after, _) = edited("one\r\ntail", "tail", "tail\nend");
+        assert_eq!(after, "one\r\ntail\r\nend");
+    }
+
+    #[test]
+    fn every_replaced_occurrence_takes_its_own_line_ending() {
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, "x\nx\r\n").expect("seed");
+        apply(prepare_edit(&path, "x", "y\nz", Occurrence::All).expect("prepare")).expect("apply");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "y\nz\ny\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn a_replacement_carrying_carriage_returns_is_written_verbatim() {
+        let (after, _) = edited("one\ntwo\n", "one", "one\r\nhalf");
+        assert_eq!(after, "one\r\nhalf\ntwo\n");
+        let (after, _) = edited("one\r\ntwo\r\n", "one", "one\nhalf\r\nmore");
+        assert_eq!(after, "one\nhalf\r\nmore\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn an_edit_that_changes_only_carriage_returns_applies_exactly() {
+        let (after, relaxed) = edited("x\r\na\r\nb\r\ny\r\n", "a\r\nb", "a\nb");
+        assert_eq!(after, "x\r\na\nb\r\ny\r\n");
+        assert!(relaxed.is_empty());
+        // Without an exact match it is a miss, not a line-endings match.
+        let dir = dir();
+        let path = file_in(&dir, "file.txt");
+        std::fs::write(&path, "a\r\nb\r\n").expect("seed");
+        let err =
+            prepare_edit(&path, "a\nb", "a\r\nb", Occurrence::Unique).expect_err("no exact match");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_bom_survives_an_edit_of_the_first_line() {
+        let body = "\u{FEFF}fn main() {   \n    run();\n}\n";
+        let (after, relaxed) = edited(body, "fn main() {\n    run();", "fn main() {\n    go();");
+        assert_eq!(after, "\u{FEFF}fn main() {\n    go();\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::TrailingWhitespace]);
+        let (after, relaxed) = edited(
+            body,
+            "  fn main() {\n      run();",
+            "  fn start() {\n      go();",
+        );
+        assert_eq!(after, "\u{FEFF}fn start() {\n    go();\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Indentation]);
+    }
+
+    #[test]
+    fn curly_quotes_dashes_and_no_break_spaces_match_at_the_punctuation_tier() {
+        let body = "say \u{201C}don\u{2019}t\u{201D} \u{2014} now\u{00A0}please\n";
+        let (after, relaxed) = edited(body, "\"don't\" - now please", "quiet");
+        assert_eq!(after, "say quiet\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Punctuation]);
+    }
+
+    #[test]
+    fn text_outside_a_folded_match_keeps_its_original_characters() {
+        let body = "\u{2018}a\u{2019} it\u{2019}s \u{201C}b\u{201D}";
+        let (after, _) = edited(body, "it's", "it is");
+        assert_eq!(after, "\u{2018}a\u{2019} it is \u{201C}b\u{201D}");
+    }
+
+    #[test]
+    fn the_replacement_is_written_without_folding() {
+        let (after, _) = edited("it\u{2019}s\n", "it's", "it\u{2019}s fine");
+        assert_eq!(after, "it\u{2019}s fine\n");
+    }
+
+    #[test]
+    fn replace_all_and_occurrence_use_only_the_first_three_tiers() {
+        let dir = dir();
+        let path = file_in(&dir, "quotes.txt");
+        std::fs::write(&path, "\u{201C}a\u{201D} \u{201C}b\u{201D}\n").expect("seed");
+        let applied = apply(prepare_edit(&path, "\"", "'", Occurrence::All).expect("prepare"))
+            .expect("apply");
+        assert_eq!(applied.replacements(), 4);
+        assert_eq!(applied.relaxed(), [crate::matching::Tier::Punctuation]);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "'a' 'b'\n");
+        let applied = apply(prepare_edit(&path, "b", "c", Occurrence::Index(1)).expect("prepare"))
+            .expect("apply");
+        assert!(applied.relaxed().is_empty());
+    }
+
+    #[test]
+    fn a_trailing_whitespace_match_replaces_the_spaces_on_the_line() {
+        // Without the newline the search is an exact substring of the line
+        // and matches at the exact tier; with it, only the line tier matches.
+        let (after, relaxed) = edited(
+            "fn f() {\n    let x = 1;   \n}\n",
+            "    let x = 1;\n",
+            "    let x = 2;\n",
+        );
+        assert_eq!(after, "fn f() {\n    let x = 2;\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::TrailingWhitespace]);
+    }
+
+    #[test]
+    fn tabs_in_the_file_replace_spaces_in_the_replacement() {
+        let (after, relaxed) = edited(
+            "fn f() {\n\tlet x = 1;\n}\n",
+            "    let x = 1;\n",
+            "    let x = 2;\n    let y = 3;\n",
+        );
+        assert_eq!(after, "fn f() {\n\tlet x = 2;\n\tlet y = 3;\n}\n");
+        assert_eq!(relaxed, [crate::matching::Tier::Indentation]);
+    }
+
+    #[test]
+    fn an_outdented_replacement_is_not_matched_by_indentation() {
+        let dir = dir();
+        let path = file_in(&dir, "outdent.txt");
+        std::fs::write(
+            &path,
+            "fn f() {\n        let x = 1;\n        let y = 2;\n}\n",
+        )
+        .expect("seed");
+        let err = prepare_edit(
+            &path,
+            "    let x = 1;\n    let y = 2;\n",
+            "    let x = 3;\n}\n",
+            Occurrence::Unique,
+        )
+        .expect_err("gives up");
+        assert_eq!(err.code(), ErrorCode::NotFound, "{}", err.message());
+    }
+
+    /// The error a unique edit of `body` with `old` and `new` reports.
+    fn missed(body: &str, old: &str, new: &str, quote: bool) -> RuneError {
+        let dir = dir();
+        let path = file_in(&dir, "miss.rs");
+        std::fs::write(&path, body).expect("seed");
+        prepare_edits_with(
+            &path,
+            &[LiteralEdit {
+                old,
+                new,
+                occurrence: Occurrence::Unique,
+            }],
+            quote,
+        )
+        .expect_err("a miss")
+    }
+
+    #[test]
+    fn a_miss_on_an_applied_change_says_so() {
+        let body = "fn main() {\n    let total = compute(a, b);\n}\n";
+        let err = missed(
+            body,
+            "    let sum = add(a, b);\n",
+            "    let total = compute(a, b);\n",
+            false,
+        );
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert!(
+            err.message()
+                .ends_with("and `new_string` is already there at line 2"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.hint(),
+            Some("if the change is already applied, do not retry this edit")
+        );
+    }
+
+    #[test]
+    fn a_miss_quotes_the_closest_lines() {
+        let body = "fn main() {\n    let x = compute(1);\n    println!(\"{x}\");\n}\n";
+        let err = missed(
+            body,
+            "    let x = compute(2);\n    println!(\"{x}\");\n",
+            "    let x = 3;\n",
+            true,
+        );
+        assert!(
+            err.message()
+                .contains("The closest text is lines 2-3:\n     2\t    let x = compute(1);"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.starts_with("copy the exact text"))
+        );
+    }
+
+    #[test]
+    fn a_miss_without_quote_permission_quotes_nothing() {
+        let body = "fn main() {\n    let secret = compute(1);\n    println!(\"{secret}\");\n}\n";
+        let err = missed(
+            body,
+            "    let secret = compute(2);\n    println!(\"{secret}\");\n",
+            "    let x = 3;\n",
+            false,
+        );
+        let text = format!("{} {}", err.message(), err.hint().unwrap_or(""));
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(!text.contains(line.trim()), "quoted {line:?}: {text}");
+        }
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.starts_with("read the file again"))
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_match_lists_the_first_five_lines() {
+        let mut body = String::from("x();\n");
+        for index in 0..6 {
+            let _ = write!(body, "fn f{index}() {{\nx();\n\nx();\n");
+        }
+        let err = missed(&body, "x();", "y();", true);
+        assert_eq!(err.code(), ErrorCode::AmbiguousMatch);
+        assert_eq!(err.detail().observed.as_deref(), Some("13"));
+        assert!(
+            err.message()
+                .starts_with("the requested text occurs 13 times in `"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().ends_with(
+                ": line 1 (first line), line 3 (after `fn f0() {`), line 5 (after a blank line), line 7 (after `fn f1() {`), line 9 (after a blank line), and 8 more"
+            ),
+            "{}",
+            err.message()
+        );
+        let quiet = missed(&body, "x();", "y();", false);
+        assert!(
+            quiet.message().contains(": line 1, line 3, line 5"),
+            "{}",
+            quiet.message()
+        );
+    }
+
+    #[test]
+    fn a_folded_match_found_twice_is_ambiguous() {
+        let dir = dir();
+        let path = file_in(&dir, "twice.txt");
+        std::fs::write(&path, "it\u{2019}s and it\u{2019}s\n").expect("seed");
+        let err = prepare_edit(&path, "it's", "it is", Occurrence::Unique).expect_err("ambiguous");
+        assert!(err.message().contains('2'), "{}", err.message());
     }
 
     fn literal<'a>(old: &'a str, new: &'a str) -> LiteralEdit<'a> {

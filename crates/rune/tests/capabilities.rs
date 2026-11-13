@@ -82,8 +82,11 @@ fn diagnostics_report_support_and_configured_context_without_credentials_or_a_tu
 #[test]
 fn unsupported_controls_are_reviewable_and_rejected_before_credentials_or_requests() {
     let dir = profile("provider = 'gemini'\n[models]\ngemini = 'fixture'\n");
+    let out = run(dir.path(), &["capabilities", "--json", "--effort", "high"]);
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("report");
+    assert_eq!(report["valid"], true);
     for flags in [
-        vec!["--effort", "high"],
         vec!["--fast"],
         vec!["--require-tool-streaming"],
         vec!["--provider-order", "openai"],
@@ -97,7 +100,9 @@ fn unsupported_controls_are_reviewable_and_rejected_before_credentials_or_reques
         assert!(report["selection_error"].is_string());
         assert_eq!(
             report["capabilities"]["efforts"],
-            serde_json::json!(["auto"])
+            serde_json::json!([
+                "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"
+            ])
         );
         assert_eq!(report["capabilities"]["tool_streaming"], "complete_calls");
         let stderr = String::from_utf8(out.stderr).expect("stderr");
@@ -107,14 +112,14 @@ fn unsupported_controls_are_reviewable_and_rejected_before_credentials_or_reques
     }
     // Actual entry points use the same selection check before setup or a turn.
     for args in [
-        vec!["ask", "hi", "--effort", "high", "--no-save"],
-        vec!["acp", "--effort", "high"],
-        vec!["--effort", "high"],
+        vec!["ask", "hi", "--fast", "--no-save"],
+        vec!["acp", "--fast"],
+        vec!["--fast"],
     ] {
         let out = run(dir.path(), &args);
         assert_eq!(out.status.code(), Some(1), "{out:?}");
         let stderr = String::from_utf8(out.stderr).expect("stderr");
-        assert!(stderr.contains("effort"), "{stderr}");
+        assert!(stderr.contains("fast_mode"), "{stderr}");
         assert!(!stderr.contains("credential"), "{stderr}");
         assert!(!dir.path().join("state").exists());
     }

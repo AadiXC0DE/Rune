@@ -108,7 +108,7 @@ def capture(binary, root, environment, arguments):
             transcript.extend(os.read(master, 65536))
 
     try:
-        wait_for(b"ctrl-c cancel")
+        wait_for(b"/ commands")
         wait_for(b"ascii-fixture")
         start = len(transcript)
         os.write(master, b"/mod")
@@ -128,10 +128,11 @@ def capture(binary, root, environment, arguments):
         # Tool summaries are settled after stream completion and journal writes.
         # A quiet PTY after a streamed delta is not a completion signal.
         wait_for(b"read_file")
-        wait_for(b"    > ")
+        wait_for(b"    " + b"C" * 180)
         drain()
         assert b"read_file" in transcript, "tool summary was not displayed"
-        assert b"    > " in transcript, "code continuation was not displayed"
+        # The long code row is written whole, so it copies as one line.
+        assert b"    " + b"C" * 180 in transcript, "code row was not written whole"
         start = len(transcript)
         os.write(master, b"\x12")
         wait_for(b"> fixture / second", start)
@@ -140,20 +141,21 @@ def capture(binary, root, environment, arguments):
         drain()
         start = len(transcript)
         os.write(master, b"\x0f")
-        wait_for(b"Transcript", start)
-        drain()
-        start = len(transcript)
-        os.write(master, b"\x1b[F")
+        # The viewer opens at the newest row.
+        wait_for(b"pager", start)
         wait_for(b"ASCII_REPLY_END", start)
         drain()
         assert transcript.isascii(), transcript.decode(errors="replace")
         os.write(master, b"\x1b")
         drain()
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0, transcript.decode(errors="replace")
+        assert drain_wait(child, master, 10, transcript) == 0, transcript.decode(errors="replace")
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
 

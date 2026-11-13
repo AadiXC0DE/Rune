@@ -1,0 +1,59 @@
+{
+  "prompt": "Raise max_items to 10 and make check.sh pass.",
+  "workspace": "workspaces/failed_check_note.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "edit_file",
+          "arguments": {
+            "path": "config/limits.conf",
+            "old_string": "max_items = 5",
+            "new_string": "max_items = 10"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "It still fails because X."
+    }
+  ],
+  "expect": {
+    "files": {
+      "config/limits.conf": "max_items = 10\n"
+    },
+    "exit_code": 0,
+    "error_code": null,
+    "final_output": "It still fails because X.",
+    "requests": 4,
+    "request_contains": [
+      {
+        "request": 4,
+        "text": "The last check after your changes failed: `sh check.sh` (exit 1"
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 3,
+        "text": "The last check after your changes failed"
+      }
+    ],
+    "stop_reason": "end_turn"
+  }
+}

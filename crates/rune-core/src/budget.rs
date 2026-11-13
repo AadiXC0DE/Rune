@@ -145,6 +145,8 @@ pub enum Unit {
     Count,
     /// Hundredths of a US dollar.
     Cents,
+    /// A percentage, 0 to 100.
+    Percent,
 }
 
 impl Unit {
@@ -156,6 +158,7 @@ impl Unit {
             Self::Millis => "ms",
             Self::Count => "items",
             Self::Cents => "cents",
+            Self::Percent => "percent",
         }
     }
 }
@@ -259,6 +262,10 @@ pub enum LimitName {
     ReviewTimeoutMs,
     /// Compaction trigger as a percentage of usable input capacity.
     CompactionTriggerPercent,
+    /// Largest context window used for the compaction ceiling. Zero turns the cap off.
+    ContextCapTokens,
+    /// Newest conversation kept verbatim by compaction, in estimated tokens.
+    CompactionKeepTokens,
     /// Redirects followed by one web fetch.
     WebFetchRedirects,
     /// Bytes returned by one web fetch.
@@ -316,6 +323,8 @@ impl LimitName {
             Self::ReviewHoldsPerTurn,
             Self::ReviewTimeoutMs,
             Self::CompactionTriggerPercent,
+            Self::ContextCapTokens,
+            Self::CompactionKeepTokens,
             Self::WebFetchRedirects,
             Self::WebFetchBytes,
             Self::WebFetchTimeoutMs,
@@ -365,6 +374,8 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => "review_holds_per_turn",
             Self::ReviewTimeoutMs => "review_timeout_ms",
             Self::CompactionTriggerPercent => "compaction_trigger_percent",
+            Self::ContextCapTokens => "context_cap_tokens",
+            Self::CompactionKeepTokens => "compaction_keep_tokens",
             Self::WebFetchRedirects => "web_fetch_redirects",
             Self::WebFetchBytes => "web_fetch_bytes",
             Self::WebFetchTimeoutMs => "web_fetch_timeout_ms",
@@ -385,20 +396,20 @@ impl LimitName {
             Self::MaxConsecutiveToolFailures => Budget::Bounded(3),
             Self::VerificationReminders => Budget::Bounded(1),
             Self::SessionSpendCents => Budget::Unbounded,
-            Self::MaxToolResultBytes => Budget::Bounded(64 * 1024),
+            Self::MaxToolResultBytes => Budget::Bounded(32 * 1024),
             Self::MaxTurnResultBytes => Budget::Bounded(8 * 1024 * 1024),
             Self::SkillCatalogBytes => Budget::Bounded(32768),
             Self::SkillDescriptionBytes => Budget::Bounded(256),
             Self::SkillFileBytes => Budget::Bounded(1024 * 1024),
             Self::McpDescriptionBytes => Budget::Bounded(1024),
-            Self::McpSearchResultBytes => Budget::Bounded(16 * 1024),
+            Self::McpSearchResultBytes => Budget::Bounded(1024 * 1024),
             Self::McpServerInstructionsBytes => Budget::Bounded(2 * 1024),
             Self::McpSelectedSchemaBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionFileBytes => Budget::Bounded(64 * 1024),
             Self::ProjectInstructionsTotalBytes => Budget::Bounded(128 * 1024),
             Self::RepositoryMapBytes => Budget::Bounded(4096),
             Self::ImageAdapterOutputBytes => Budget::Bounded(20 * 1024),
-            Self::CommandOutputBytes => Budget::Bounded(64 * 1024),
+            Self::CommandOutputBytes => Budget::Bounded(32 * 1024),
             Self::ReadFileLines => Budget::Bounded(2000),
             Self::ReadFileLineBytes => Budget::Bounded(2000),
             Self::ListEntries => Budget::Bounded(1000),
@@ -415,6 +426,8 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => Budget::Bounded(64),
             Self::ReviewTimeoutMs => Budget::Bounded(30_000),
             Self::CompactionTriggerPercent => Budget::Bounded(80),
+            Self::ContextCapTokens => Budget::Bounded(256_000),
+            Self::CompactionKeepTokens => Budget::Bounded(20_000),
             Self::WebFetchRedirects => Budget::Bounded(5),
             Self::WebFetchBytes => Budget::Bounded(1024 * 1024),
             Self::WebFetchTimeoutMs => Budget::Bounded(30_000),
@@ -446,6 +459,14 @@ impl LimitName {
             Self::CompactionTriggerPercent => Range {
                 min: 10,
                 max: Some(99),
+            },
+            Self::ContextCapTokens => Range {
+                min: 0,
+                max: Some(100_000_000),
+            },
+            Self::CompactionKeepTokens => Range {
+                min: 0,
+                max: Some(1_000_000),
             },
             Self::ParallelToolCalls => Range {
                 min: 1,
@@ -505,16 +526,37 @@ impl LimitName {
             | Self::SubagentChildren
             | Self::McpRestartLimit
             | Self::ReviewHoldsPerTurn
-            | Self::CompactionTriggerPercent
+            | Self::ContextCapTokens
+            | Self::CompactionKeepTokens
             | Self::WebFetchRedirects
             | Self::WebSearchResults
             | Self::VisionBatchImages
             | Self::AdditionalDirectories
             | Self::SteeringQueueDepth
-            | Self::MaxAgentSteps => Unit::Count,
-            Self::ReadFileLines => Unit::Count,
+            | Self::MaxAgentSteps
+            | Self::ReadFileLines
+            | Self::ListEntries
+            | Self::ProviderMaxAttempts => Unit::Count,
+            Self::CompactionTriggerPercent => Unit::Percent,
             Self::SessionSpendCents => Unit::Cents,
-            _ => Unit::Bytes,
+            Self::MaxToolResultBytes
+            | Self::MaxTurnResultBytes
+            | Self::SkillCatalogBytes
+            | Self::SkillDescriptionBytes
+            | Self::SkillFileBytes
+            | Self::McpDescriptionBytes
+            | Self::McpSearchResultBytes
+            | Self::McpServerInstructionsBytes
+            | Self::McpSelectedSchemaBytes
+            | Self::ProjectInstructionFileBytes
+            | Self::ProjectInstructionsTotalBytes
+            | Self::RepositoryMapBytes
+            | Self::ImageAdapterOutputBytes
+            | Self::CommandOutputBytes
+            | Self::ReadFileLineBytes
+            | Self::ReviewContextBytes
+            | Self::WebFetchBytes
+            | Self::PromptHistoryBytes => Unit::Bytes,
         }
     }
 
@@ -524,7 +566,7 @@ impl LimitName {
         match self {
             Self::MaxAgentSteps => "Maximum model tool-loop steps per turn; zero means unlimited.",
             Self::MaxConsecutiveToolFailures => {
-                "Consecutive identical tool failures allowed before stopping the next duplicate."
+                "Consecutive identical tool failures allowed before refusing the next duplicate."
             }
             Self::VerificationReminders => {
                 "Times a turn that changed files without a check afterwards is asked to verify."
@@ -538,7 +580,9 @@ impl LimitName {
             Self::SkillDescriptionBytes => "Size of one skill description in the catalog.",
             Self::SkillFileBytes => "Largest skill file that may be loaded.",
             Self::McpDescriptionBytes => "Size of one MCP tool description.",
-            Self::McpSearchResultBytes => "Size of MCP tool search results.",
+            Self::McpSearchResultBytes => {
+                "Bytes of one MCP server's tool listing read at connection."
+            }
             Self::McpServerInstructionsBytes => "Instructions accepted from one MCP server.",
             Self::McpSelectedSchemaBytes => "Schema size for one explicitly selected MCP tool.",
             Self::ProjectInstructionFileBytes => "Size of one project instruction file.",
@@ -570,6 +614,12 @@ impl LimitName {
             Self::ReviewHoldsPerTurn => "Safety review holds permitted in one turn.",
             Self::ReviewTimeoutMs => "Time allowed for one safety review request.",
             Self::CompactionTriggerPercent => "Compaction trigger as a percentage of usable input.",
+            Self::ContextCapTokens => {
+                "Largest context window used for the compaction ceiling, in tokens. Zero turns the cap off."
+            }
+            Self::CompactionKeepTokens => {
+                "Newest conversation kept verbatim by compaction, in estimated tokens."
+            }
             Self::WebFetchRedirects => "Redirects followed by one web fetch.",
             Self::WebFetchBytes => "Bytes returned by one web fetch.",
             Self::WebFetchTimeoutMs => "Time allowed for one web fetch.",
@@ -627,8 +677,9 @@ pub const PROMPT_CEILING_BYTES: usize = 6 * 1024;
 ///
 /// Counted as compact JSON of each tool's name, description, and schema, which
 /// is the part every dialect sends with every request. With the instructions it
-/// forms the fixed cost of each model call, so it is a budget like the prompt.
-pub const TOOL_SCHEMA_CEILING_BYTES: usize = 10 * 1024;
+/// forms the fixed cost of each model call, so it is a budget like the prompt;
+/// a tool that cannot help in a run is not advertised, which keeps it under.
+pub const TOOL_SCHEMA_CEILING_BYTES: usize = 8 * 1024;
 
 /// Share of a model's context window the skill catalog may occupy, as a percent.
 const SKILL_CATALOG_WINDOW_PERCENT: u64 = 2;
@@ -687,6 +738,37 @@ pub const fn skill_catalog_bytes(context_window: Option<u64>) -> u64 {
                 EMERGENCY_CEILING_BYTES
             } else {
                 share
+            }
+        }
+    }
+}
+
+/// Smallest per-result cap a context window can lower a result to.
+pub const MIN_WINDOW_RESULT_BYTES: u64 = 4 * 1024;
+
+/// Share of the context window one tool result may occupy, as a divisor.
+const WINDOW_RESULT_DIVISOR: u64 = 10;
+
+/// Per-result byte cap for a model's context window: a tenth of the window,
+/// at four bytes a token, never above `configured` and never below
+/// `MIN_WINDOW_RESULT_BYTES`. An unknown or zero window keeps `configured`.
+#[must_use]
+pub const fn window_result_bytes(configured: u64, context_window: Option<u64>) -> u64 {
+    match context_window {
+        None | Some(0) => configured,
+        Some(window) => {
+            let share = window
+                .saturating_mul(BYTES_PER_CHARACTER)
+                .saturating_div(WINDOW_RESULT_DIVISOR);
+            let floored = if share < MIN_WINDOW_RESULT_BYTES {
+                MIN_WINDOW_RESULT_BYTES
+            } else {
+                share
+            };
+            if floored < configured {
+                floored
+            } else {
+                configured
             }
         }
     }
@@ -812,6 +894,22 @@ pub struct LimitDescription {
 mod tests {
     use super::*;
     use crate::config::Layer;
+
+    #[test]
+    fn non_byte_limits_have_non_byte_units() {
+        for name in LimitName::all() {
+            let key = name.as_str();
+            let unit = name.unit();
+            if key.ends_with("_bytes") {
+                assert_eq!(unit, Unit::Bytes, "{key}");
+            } else {
+                assert_ne!(unit, Unit::Bytes, "{key}");
+            }
+            if key.ends_with("_percent") {
+                assert_eq!(unit, Unit::Percent, "{key}");
+            }
+        }
+    }
 
     #[test]
     fn every_limit_has_a_distinct_key() {
@@ -1046,5 +1144,48 @@ mod tests {
             (SKILL_CATALOG_MIN_BYTES..=EMERGENCY_CEILING_BYTES).contains(&fallback),
             "the fallback escapes the clamp: {fallback}"
         );
+    }
+
+    #[test]
+    fn result_caps_default_to_thirty_two_kib() {
+        for name in [LimitName::MaxToolResultBytes, LimitName::CommandOutputBytes] {
+            assert_eq!(name.default_value(), Budget::Bounded(32 * 1024), "{name:?}");
+        }
+        assert_eq!(
+            LimitName::ReadFileLines.default_value(),
+            Budget::Bounded(2000)
+        );
+    }
+
+    #[test]
+    fn the_window_cap_is_a_tenth_of_the_window_in_bytes() {
+        assert_eq!(window_result_bytes(32 * 1024, Some(16_000)), 6_400);
+        // A tenth of a large window is above the configured cap, which applies.
+        assert_eq!(window_result_bytes(32 * 1024, Some(128_000)), 32 * 1024);
+    }
+
+    #[test]
+    fn the_window_cap_never_drops_below_four_kib() {
+        assert_eq!(
+            window_result_bytes(32 * 1024, Some(2_000)),
+            MIN_WINDOW_RESULT_BYTES
+        );
+        assert_eq!(
+            window_result_bytes(32 * 1024, Some(1)),
+            MIN_WINDOW_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_keeps_the_configured_cap() {
+        assert_eq!(window_result_bytes(32 * 1024, None), 32 * 1024);
+        assert_eq!(window_result_bytes(32 * 1024, Some(0)), 32 * 1024);
+    }
+
+    #[test]
+    fn a_smaller_configured_cap_wins() {
+        assert_eq!(window_result_bytes(2_048, Some(16_000)), 2_048);
+        assert_eq!(window_result_bytes(2_048, Some(2_000)), 2_048);
+        assert_eq!(window_result_bytes(0, Some(16_000)), 0);
     }
 }

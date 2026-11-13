@@ -1,0 +1,17 @@
+: keep-alive
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+: keep-alive
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"content":"Still here."},"finish_reason":null}]}
+: keep-alive
+
+: keep-alive
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+: keep-alive
+
+data: [DONE]
+

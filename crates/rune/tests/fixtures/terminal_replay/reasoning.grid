@@ -1,0 +1,25 @@
+reasoning-finished: 80x24, caret 2,10
+00|session ************|
+01|rune <version> · replay-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03||
+04|▌ think|
+05||
+06|  thought for <t>|
+07|REASONED|
+08|/ commands   @ files   shift-tab mode   ctrl-j newline|
+09|replay-fixture | auto | ctx ~###k (request bytes)|
+10|>|
+11||
+12||
+13||
+14||
+15||
+16||
+17||
+18||
+19||
+20||
+21||
+22||
+23||

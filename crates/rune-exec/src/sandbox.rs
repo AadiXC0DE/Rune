@@ -145,6 +145,12 @@ pub struct SandboxPolicy {
     pub writable_roots: Vec<Utf8PathBuf>,
     /// Whether the command is granted network access.
     pub network: bool,
+    /// Tool cache directories that are writable too, such as `~/.cache`.
+    ///
+    /// Writable like the other roots, with credentials still masked inside
+    /// them, but not searched for nested repositories: a cache is not a
+    /// source tree, and walking one before every command would be slow.
+    pub cache_roots: Vec<Utf8PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -155,7 +161,29 @@ impl SandboxPolicy {
             workspace,
             writable_roots,
             network,
+            cache_roots: Vec::new(),
         }
+    }
+
+    /// Adds tool cache directories commands may write.
+    #[must_use]
+    pub fn with_cache_roots(mut self, roots: Vec<Utf8PathBuf>) -> Self {
+        self.cache_roots = roots;
+        self
+    }
+
+    /// Adds the cache roots that still resolve to `roots`, skipping any that
+    /// vanished since they were found: a missing cache is not a reason to
+    /// refuse the command.
+    fn with_caches(&self, mut roots: Vec<Utf8PathBuf>) -> Vec<Utf8PathBuf> {
+        for cache in &self.cache_roots {
+            if let Ok(resolved) = resolve(cache, "a cache directory")
+                && !roots.contains(&resolved)
+            {
+                roots.push(resolved);
+            }
+        }
+        roots
     }
 
     /// Returns every writable path, the workspace first.
@@ -169,12 +197,14 @@ impl SandboxPolicy {
     }
 
     fn paths_with(&self, credentials: &[Utf8PathBuf]) -> Result<PolicyPaths> {
-        let writable_roots = self
+        let sources = self
             .writable()
             .map(|path| resolve(path, "a writable path"))
             .collect::<Result<Vec<_>>>()?;
+        let protected_paths = protected_paths(&sources)?;
+        let writable_roots = self.with_caches(sources);
         Ok(PolicyPaths {
-            protected_paths: protected_paths(&writable_roots)?,
+            protected_paths,
             credential_paths: masked_paths(credentials, &writable_roots),
             writable_roots,
         })
@@ -183,10 +213,11 @@ impl SandboxPolicy {
     /// Returns the credential locations a command under this policy has
     /// hidden, for a caller to assert against without repeating the list.
     pub fn credential_paths(&self) -> Result<Vec<Utf8PathBuf>> {
-        let writable = self
-            .writable()
-            .map(|path| resolve(path, "a writable path"))
-            .collect::<Result<Vec<_>>>()?;
+        let writable = self.with_caches(
+            self.writable()
+                .map(|path| resolve(path, "a writable path"))
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(masked_paths(&existing_credential_paths(), &writable))
     }
 }
@@ -264,8 +295,287 @@ pub fn detect() -> Box<dyn Sandbox> {
     Box::new(NullSandbox)
 }
 
+/// Cache directories under the home directory that build tools write.
+pub const DEFAULT_CACHE_ROOTS: &[&str] = &[
+    "~/.cache",
+    "~/Library/Caches",
+    "~/.cargo/registry",
+    "~/.cargo/git",
+    "~/.npm",
+    "~/.local/share/pnpm",
+    "~/Library/pnpm",
+    "~/.yarn",
+    "~/.bun/install/cache",
+    "~/go/pkg/mod",
+    "~/.gradle",
+    "~/.m2",
+    "~/.local/share/uv",
+];
+
+/// Variables naming a cache directory, added to the default list when set.
+pub const CACHE_ROOT_VARIABLES: &[&str] = &[
+    "GOCACHE",
+    "GOMODCACHE",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+];
+
+/// Directories under home a cache root may never be, or lie inside.
+const PROTECTED_HOME_DIRECTORIES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".config",
+    ".aws",
+    ".cargo/bin",
+    ".local/bin",
+];
+
+/// One writable cache directory and the rule that added it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheRoot {
+    /// The resolved directory.
+    pub path: Utf8PathBuf,
+    /// What added it: `default ~/.cache`, a variable name, `CARGO_HOME`, or
+    /// `sandbox_cache_roots`.
+    pub rule: String,
+}
+
+/// Resolves the cache roots. `configured` replaces the default list when
+/// present; an empty list allows none.
+///
+/// Only existing directories are kept. The second vector holds the entries
+/// refused, with why: the home directory itself (its startup files live
+/// there), an ancestor of it, or a protected or credential directory.
+pub fn cache_roots(
+    configured: Option<&[String]>,
+    home: Option<&Utf8Path>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<CacheRoot>, Vec<(String, &'static str)>) {
+    let expand = |entry: &str| -> Option<Utf8PathBuf> {
+        match entry.strip_prefix("~/") {
+            Some(rest) => home.map(|home| home.join(rest)),
+            None if entry == "~" => home.map(Utf8Path::to_path_buf),
+            None => Some(Utf8PathBuf::from(entry)),
+        }
+    };
+    let mut candidates: Vec<(String, Utf8PathBuf, String)> = Vec::new();
+    if let Some(entries) = configured {
+        for entry in entries {
+            if let Some(path) = expand(entry) {
+                candidates.push((entry.clone(), path, "sandbox_cache_roots".to_owned()));
+            }
+        }
+    } else {
+        for &entry in DEFAULT_CACHE_ROOTS {
+            if let Some(path) = expand(entry) {
+                candidates.push((entry.to_owned(), path, format!("default {entry}")));
+            }
+        }
+        for &name in CACHE_ROOT_VARIABLES {
+            if let Some(value) = lookup(name).filter(|value| !value.is_empty()) {
+                candidates.push((value.clone(), Utf8PathBuf::from(value), name.to_owned()));
+            }
+        }
+        if let Some(cargo) = lookup("CARGO_HOME").filter(|value| !value.is_empty()) {
+            for sub in ["registry", "git"] {
+                let path = Utf8PathBuf::from(&cargo).join(sub);
+                candidates.push((path.to_string(), path, "CARGO_HOME".to_owned()));
+            }
+        }
+    }
+    let home = home.and_then(|home| home.canonicalize_utf8().ok());
+    let protected: Vec<Utf8PathBuf> = home.as_ref().map_or_else(Vec::new, |home| {
+        PROTECTED_HOME_DIRECTORIES
+            .iter()
+            .chain(CREDENTIAL_PATHS.iter())
+            .map(|relative| home.join(relative))
+            .collect()
+    });
+    let mut roots: Vec<CacheRoot> = Vec::new();
+    let mut refused = Vec::new();
+    for (entry, path, rule) in candidates {
+        let Ok(resolved) = path.canonicalize_utf8() else {
+            continue;
+        };
+        if !resolved.is_dir() {
+            continue;
+        }
+        if home
+            .as_ref()
+            .is_some_and(|home| home.starts_with(&resolved))
+        {
+            refused.push((entry, "not the home directory itself"));
+            continue;
+        }
+        if protected
+            .iter()
+            .any(|guarded| resolved.starts_with(guarded))
+        {
+            refused.push((entry, "a protected directory"));
+            continue;
+        }
+        if !roots.iter().any(|root| root.path == resolved) {
+            roots.push(CacheRoot {
+                path: resolved,
+                rule,
+            });
+        }
+    }
+    (roots, refused)
+}
+
+/// Returns true when this process appears to run inside a container.
+///
+/// Docker leaves `/.dockerenv`, Podman `/run/.containerenv`, and systemd-nspawn
+/// and others set `container`. A container is usually its own isolation
+/// boundary, which changes the advice for a refused command.
+#[must_use]
+pub fn in_container() -> bool {
+    in_container_with(
+        |path| std::path::Path::new(path).exists(),
+        std::env::var("container").ok(),
+    )
+}
+
+/// [`in_container`] with the file check and the variable supplied.
+fn in_container_with(exists: impl Fn(&str) -> bool, variable: Option<String>) -> bool {
+    exists("/.dockerenv")
+        || exists("/run/.containerenv")
+        || variable.is_some_and(|value| !value.is_empty())
+}
+
+/// What the namespace helper's failure output most likely means.
+fn namespace_failure(helper: &str, observed: &str) -> String {
+    const PERMISSION: &[&str] = &[
+        "no permissions to create new namespace",
+        "operation not permitted",
+        "setting up uid map",
+        "creating new namespace failed",
+    ];
+    let lower = observed.to_ascii_lowercase();
+    if PERMISSION.iter().any(|marker| lower.contains(marker)) {
+        let first = observed.lines().next().unwrap_or(observed).trim();
+        format!("unprivileged user namespaces are unavailable here ({first})")
+    } else {
+        format!("`{helper}` could not build a namespace: {observed}")
+    }
+}
+
+/// The file Ubuntu uses to restrict unprivileged user namespaces.
+const APPARMOR_USERNS: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// One sentence that tells the user how to get a working backend here, when there is one.
+#[must_use]
+pub fn guidance(support: &Support) -> Option<String> {
+    if support.is_full() {
+        return None;
+    }
+    let linux = cfg!(target_os = "linux");
+    let os_release = if linux {
+        std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let apparmor = if linux {
+        std::fs::read_to_string(APPARMOR_USERNS).ok()
+    } else {
+        None
+    };
+    guidance_with(
+        std::env::consts::OS,
+        support,
+        &os_release,
+        apparmor.as_deref(),
+        linux && in_container(),
+    )
+}
+
+/// [`guidance`] with the operating system and what was read from the host supplied.
+fn guidance_with(
+    os: &str,
+    support: &Support,
+    os_release: &str,
+    apparmor: Option<&str>,
+    container: bool,
+) -> Option<String> {
+    match (os, support) {
+        (_, Support::Full) => None,
+        ("macos", _) => Some(
+            "sandbox-exec is missing or refused to start; commands need --allow-unsandboxed or allow_unsandboxed = true"
+                .to_owned(),
+        ),
+        ("windows", _) => Some(
+            "Windows has no command sandbox in this version; commands run under the permission mode only"
+                .to_owned(),
+        ),
+        ("linux", Support::Unsupported { .. }) => Some(format!(
+            "install bubblewrap: {}",
+            install_command(os_release)
+        )),
+        ("linux", Support::Partial { .. }) => Some(if apparmor.map(str::trim) == Some("1") {
+            "Ubuntu's AppArmor blocks unprivileged user namespaces for bwrap; add the AppArmor profile from the README section \"Linux sandbox\" or run sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_owned()
+        } else if container {
+            container_hint()
+        } else {
+            "this kernel does not allow unprivileged user namespaces; enable them or set allow_unsandboxed = true".to_owned()
+        }),
+        _ => None,
+    }
+}
+
+/// The command that installs bubblewrap on the distribution `os-release` names.
+///
+/// `ID` is tried first and then each entry of `ID_LIKE`, so a derivative such as
+/// `ID=pop` gets the command of the distribution it is based on.
+fn install_command(os_release: &str) -> &'static str {
+    let value = |key: &str| {
+        os_release.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+        })
+    };
+    let names: Vec<String> = [value("ID"), value("ID_LIKE")]
+        .into_iter()
+        .flatten()
+        .flat_map(|names| {
+            names
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    names
+        .iter()
+        .find_map(|name| match name.as_str() {
+            "debian" | "ubuntu" => Some("sudo apt-get install bubblewrap"),
+            "fedora" | "rhel" | "centos" => Some("sudo dnf install bubblewrap"),
+            "arch" => Some("sudo pacman -S bubblewrap"),
+            "alpine" => Some("sudo apk add bubblewrap"),
+            "opensuse" | "suse" => Some("sudo zypper install bubblewrap"),
+            _ => None,
+        })
+        .unwrap_or("install bubblewrap (the bwrap program) with your package manager")
+}
+
+/// The advice for a refused command inside a container.
+fn container_hint() -> String {
+    format!(
+        "this looks like a container; pass {UNSANDBOXED_OVERRIDE} to run commands without Rune's sandbox"
+    )
+}
+
 /// Builds the error for a restriction that cannot be applied.
 fn unavailable(backend: &str, support: &Support) -> RuneError {
+    let error = unavailable_with(backend, support, in_container());
+    match guidance(support) {
+        Some(guidance) => error.with_hint(guidance),
+        None => error,
+    }
+}
+
+/// [`unavailable`] with whether this is a container supplied.
+fn unavailable_with(backend: &str, support: &Support, container: bool) -> RuneError {
     let reason = support.reason().unwrap_or("the backend cannot enforce it");
     let refused = match support {
         Support::Full => "the backend reported full enforcement but produced no command",
@@ -276,9 +586,11 @@ fn unavailable(backend: &str, support: &Support) -> RuneError {
         ErrorCode::Unsupported,
         format!("{backend} refused to run the command: {refused}: {reason}"),
     )
-    .with_hint(format!(
-        "pass {UNSANDBOXED_OVERRIDE} to run the command with no sandbox"
-    ))
+    .with_hint(if container {
+        container_hint()
+    } else {
+        format!("pass {UNSANDBOXED_OVERRIDE} to run the command with no sandbox")
+    })
 }
 
 /// Returns the error for a path the backend cannot express a rule about.
@@ -930,10 +1242,7 @@ fn find_on_path(program: &str) -> Option<Utf8PathBuf> {
 fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
     let Some(helper) = helper else {
         return Support::Unsupported {
-            reason: format!(
-                "the `{NAMESPACE_HELPER}` helper is not on PATH on {}",
-                std::env::consts::OS
-            ),
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
         };
     };
     match Command::new(helper.as_str())
@@ -950,10 +1259,7 @@ fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
     {
         Ok(output) if output.status.success() => Support::Full,
         Ok(output) => Support::Partial {
-            reason: format!(
-                "`{helper}` could not build a namespace: {}",
-                observed(&output)
-            ),
+            reason: namespace_failure(helper.as_str(), &observed(&output)),
         },
         Err(err) => Support::Unsupported {
             reason: format!("`{helper}` could not be run: {err}"),
@@ -965,6 +1271,359 @@ fn probe_namespaces(helper: Option<&Utf8Path>) -> Support {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A temporary home with the given directories created under it.
+    fn home_with(relative: &[&str]) -> (TempDir, Utf8PathBuf) {
+        let (dir, home) = tempdir();
+        for path in relative {
+            std::fs::create_dir_all(home.join(path)).expect("fixture directory");
+        }
+        let home = home.canonicalize_utf8().expect("canonical home");
+        (dir, home)
+    }
+
+    fn no_variables(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn cache_roots_default_list_keeps_existing_directories() {
+        let (_dir, home) = home_with(&[".cache", ".npm"]);
+        let (roots, refused) = cache_roots(None, Some(&home), &no_variables);
+        let found: Vec<(&Utf8Path, &str)> = roots
+            .iter()
+            .map(|root| (root.path.as_path(), root.rule.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (home.join(".cache").as_path(), "default ~/.cache"),
+                (home.join(".npm").as_path(), "default ~/.npm"),
+            ]
+        );
+        assert!(refused.is_empty());
+    }
+
+    #[test]
+    fn cache_roots_from_variables_and_cargo_home() {
+        let (_dir, home) = home_with(&["gocache", "cargo/registry", "cargo/git"]);
+        let gocache = home.join("gocache").to_string();
+        let cargo = home.join("cargo").to_string();
+        let lookup = move |name: &str| match name {
+            "GOCACHE" => Some(gocache.clone()),
+            "CARGO_HOME" => Some(cargo.clone()),
+            _ => None,
+        };
+        let (roots, _) = cache_roots(None, Some(&home), &lookup);
+        let rules: Vec<&str> = roots.iter().map(|root| root.rule.as_str()).collect();
+        assert_eq!(rules, ["GOCACHE", "CARGO_HOME", "CARGO_HOME"]);
+        assert_eq!(roots[1].path, home.join("cargo/registry"));
+    }
+
+    #[test]
+    fn configured_cache_roots_replace_the_defaults() {
+        let (_dir, home) = home_with(&[".cache", "mine"]);
+        let configured = vec!["~/mine".to_owned()];
+        let (roots, _) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, home.join("mine"));
+        assert_eq!(roots[0].rule, "sandbox_cache_roots");
+    }
+
+    #[test]
+    fn cache_roots_never_include_credential_paths() {
+        // Every entry exists, as a directory, so only the protection refuses it.
+        let directories: Vec<&str> = CREDENTIAL_PATHS
+            .iter()
+            .copied()
+            .chain([".ssh/keys", ".config/rune/cache", ".cache"])
+            .collect();
+        let (_dir, home) = home_with(&directories);
+        let configured: Vec<String> = CREDENTIAL_PATHS
+            .iter()
+            .map(|path| format!("~/{path}"))
+            .chain(["~/.ssh/keys".to_owned(), "~/.config/rune/cache".to_owned()])
+            .collect();
+        let variables =
+            |name: &str| (name == "UV_CACHE_DIR").then(|| home.join(".aws").to_string());
+        let (roots, _) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert!(roots.is_empty(), "{roots:?}");
+        let (defaults, _) = cache_roots(None, Some(&home), &variables);
+        assert!(
+            defaults.iter().all(|root| !CREDENTIAL_PATHS
+                .iter()
+                .any(|path| root.path.starts_with(home.join(path)))),
+            "{defaults:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_cache_root_list_allows_none() {
+        let (_dir, home) = home_with(&[".cache"]);
+        let (roots, refused) = cache_roots(Some(&[]), Some(&home), &no_variables);
+        assert!(roots.is_empty() && refused.is_empty());
+    }
+
+    #[test]
+    fn home_and_protected_directories_are_refused() {
+        let (_dir, home) = home_with(&[
+            ".cache",
+            ".ssh",
+            ".cargo/bin",
+            ".cargo/registry",
+            ".config/gcloud",
+        ]);
+        let configured: Vec<String> = [
+            "~",
+            "~/.ssh",
+            "~/.cargo/bin",
+            "~/.config/gcloud",
+            "~/.cargo/registry",
+            "~/missing",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let (roots, refused) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>(),
+            [home.join(".cargo/registry")]
+        );
+        assert_eq!(
+            refused,
+            [
+                ("~".to_owned(), "not the home directory itself"),
+                ("~/.ssh".to_owned(), "a protected directory"),
+                ("~/.cargo/bin".to_owned(), "a protected directory"),
+                ("~/.config/gcloud".to_owned(), "a protected directory"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cache_roots_are_writable_in_the_seatbelt_profile() {
+        let (_dir, dir) = tempdir();
+        let cache = dir.join("cache");
+        std::fs::create_dir(&cache).expect("cache");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let policy = SandboxPolicy::new(workspace, Vec::new(), false)
+            .with_cache_roots(vec![cache.clone(), dir.join("vanished")]);
+        let profile = MacSandbox::profile(&policy).expect("profile");
+        let resolved = cache.canonicalize_utf8().expect("canonical cache");
+        assert!(
+            profile.contains(&format!("(allow file-write* (subpath \"{resolved}\"))")),
+            "{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_escapes_quotes_in_paths() {
+        let (_dir, dir) = tempdir();
+        // A quote would end the operand early and let the rest of the path
+        // become profile text, so a profile is refused rather than written.
+        let quoted = dir.join("work\") (allow file-write* (subpath \"/");
+        std::fs::create_dir(&quoted).expect("quoted workspace");
+        let policy = SandboxPolicy::new(quoted, Vec::new(), false);
+        let error = MacSandbox::profile(&policy).expect_err("refused");
+        assert!(
+            error
+                .message()
+                .contains("holds a character a sandbox profile cannot carry"),
+            "{error}"
+        );
+        // A parenthesis stays inside the quoted operand.
+        let parens = dir.join("work (copy))");
+        std::fs::create_dir(&parens).expect("workspace");
+        let profile = MacSandbox::profile(&SandboxPolicy::new(parens.clone(), Vec::new(), false))
+            .expect("profile");
+        let resolved = parens.canonicalize_utf8().expect("canonical");
+        assert!(
+            profile.contains(&format!("(subpath \"{resolved}\")")),
+            "{profile}"
+        );
+        assert!(!profile.contains("(subpath \"/\")"), "{profile}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_roots_are_bound_writable_in_the_linux_argv() {
+        let (_dir, dir) = tempdir();
+        let cache = dir.join("cache");
+        std::fs::create_dir(&cache).expect("cache");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let sandbox = LinuxSandbox::with_helper(Utf8PathBuf::from("/usr/bin/bwrap"));
+        let policy = SandboxPolicy::new(workspace.clone(), Vec::new(), false)
+            .with_cache_roots(vec![cache.clone()]);
+        let prepared = prepare("true", &workspace, None, environment()).expect("prepare");
+        let wrapped = sandbox.wrap(&prepared, &policy, false).expect("wrap");
+        let resolved = cache
+            .canonicalize_utf8()
+            .expect("canonical cache")
+            .to_string();
+        assert!(
+            wrapped.argv.windows(3).any(|window| window[0] == "--bind"
+                && window[1] == resolved
+                && window[2] == resolved),
+            "{:?}",
+            wrapped.argv
+        );
+    }
+
+    #[test]
+    fn container_markers_are_detected() {
+        let only = |marker: &'static str| move |path: &str| path == marker;
+        assert!(in_container_with(only("/.dockerenv"), None));
+        assert!(in_container_with(only("/run/.containerenv"), None));
+        assert!(in_container_with(|_| false, Some("podman".to_owned())));
+        assert!(!in_container_with(|_| false, Some(String::new())));
+        assert!(!in_container_with(|_| false, None));
+    }
+
+    #[test]
+    fn a_namespace_permission_failure_is_named() {
+        let message = "exit status: 1: bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces";
+        let reason = namespace_failure("/usr/bin/bwrap", message);
+        assert!(
+            reason.starts_with("unprivileged user namespaces are unavailable here ("),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("No permissions to create new namespace"),
+            "{reason}"
+        );
+        let other = namespace_failure("/usr/bin/bwrap", "exit status: 1: bwrap: something else");
+        assert!(
+            other.starts_with("`/usr/bin/bwrap` could not build a namespace"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn the_container_hint_replaces_the_default_hint() {
+        let support = Support::Unsupported {
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
+        };
+        let container = unavailable_with("namespaces", &support, true);
+        assert_eq!(
+            container.hint(),
+            Some(
+                "this looks like a container; pass --allow-unsandboxed to run commands without Rune's sandbox"
+            )
+        );
+        assert!(
+            container.message().contains("bwrap) is not installed"),
+            "{container}"
+        );
+        let host = unavailable_with("namespaces", &support, false);
+        assert_eq!(
+            host.hint(),
+            Some("pass --allow-unsandboxed to run the command with no sandbox")
+        );
+    }
+
+    #[test]
+    fn install_command_follows_os_release() {
+        for (os_release, expected) in [
+            (
+                "ID=pop\nID_LIKE=\"ubuntu debian\"\n",
+                "sudo apt-get install bubblewrap",
+            ),
+            (
+                "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+                "sudo dnf install bubblewrap",
+            ),
+            ("ID=arch\n", "sudo pacman -S bubblewrap"),
+            ("ID=alpine\nVERSION_ID=3.20.0\n", "sudo apk add bubblewrap"),
+            (
+                "ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n",
+                "sudo zypper install bubblewrap",
+            ),
+            (
+                "ID=nixos\n",
+                "install bubblewrap (the bwrap program) with your package manager",
+            ),
+        ] {
+            assert_eq!(install_command(os_release), expected, "{os_release}");
+        }
+        let missing = Support::Unsupported {
+            reason: "the bubblewrap helper (bwrap) is not installed".to_owned(),
+        };
+        assert_eq!(
+            guidance_with("linux", &missing, "ID=debian\n", None, false).as_deref(),
+            Some("install bubblewrap: sudo apt-get install bubblewrap")
+        );
+        assert_eq!(
+            guidance_with("linux", &Support::Full, "", None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn apparmor_restriction_gets_its_own_guidance() {
+        let refused = Support::Partial {
+            reason: "unprivileged user namespaces are unavailable here (fixture)".to_owned(),
+        };
+        let blocked =
+            guidance_with("linux", &refused, "ID=ubuntu\n", Some("1\n"), false).expect("guidance");
+        assert_eq!(
+            blocked,
+            "Ubuntu's AppArmor blocks unprivileged user namespaces for bwrap; add the AppArmor profile from the README section \"Linux sandbox\" or run sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        );
+        assert_eq!(
+            guidance_with("linux", &refused, "ID=ubuntu\n", Some("0\n"), false).as_deref(),
+            Some(
+                "this kernel does not allow unprivileged user namespaces; enable them or set allow_unsandboxed = true"
+            )
+        );
+        assert_eq!(
+            guidance_with("linux", &refused, "", None, true).as_deref(),
+            Some(
+                "this looks like a container; pass --allow-unsandboxed to run commands without Rune's sandbox"
+            )
+        );
+        let mac = Support::Unsupported {
+            reason: "fixture".to_owned(),
+        };
+        assert_eq!(
+            guidance_with("macos", &mac, "", None, false).as_deref(),
+            Some(
+                "sandbox-exec is missing or refused to start; commands need --allow-unsandboxed or allow_unsandboxed = true"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_guidance_names_the_permission_mode() {
+        let support = NullSandbox.support();
+        let guidance = guidance_with("windows", &support, "", None, false).expect("guidance");
+        assert_eq!(
+            guidance,
+            "Windows has no command sandbox in this version; commands run under the permission mode only"
+        );
+        #[cfg(windows)]
+        {
+            let error = NullSandbox
+                .wrap(
+                    &crate::command::prepare_shell(
+                        "echo fixture",
+                        Utf8Path::new("."),
+                        None,
+                        BTreeMap::new(),
+                    )
+                    .expect("prepare"),
+                    &SandboxPolicy::new(Utf8PathBuf::from("."), vec![], false),
+                    false,
+                )
+                .expect_err("refused without allow_unsandboxed");
+            assert_eq!(error.hint(), Some(guidance.as_str()));
+        }
+    }
 
     use tempfile::TempDir;
 

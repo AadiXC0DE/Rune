@@ -30,4 +30,5 @@ sha2 = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+rune-testkit.workspace = true
 tempfile.workspace = true

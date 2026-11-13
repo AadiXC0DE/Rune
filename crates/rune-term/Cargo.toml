@@ -19,6 +19,11 @@ thiserror = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
+toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["stdio", "event", "system"] }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

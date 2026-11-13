@@ -1,0 +1,50 @@
+{
+  "prompt": "Read a.txt, b.txt, c.txt and d.txt.",
+  "workspace": "workspaces/six_files.json",
+  "ask_args": [
+    "--jsonl",
+    "--no-save"
+  ],
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "r1",
+          "name": "read_file",
+          "arguments": {
+            "path": "a.txt"
+          }
+        },
+        {
+          "id": "r2",
+          "name": "read_file",
+          "arguments": {
+            "path": "b.txt"
+          }
+        },
+        {
+          "id": "r3",
+          "name": "read_file",
+          "arguments": {
+            "path": "c.txt"
+          }
+        },
+        {
+          "id": "r4",
+          "name": "read_file",
+          "arguments": {
+            "path": "d.txt"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Read all four."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Read all four.",
+    "requests": 2
+  }
+}

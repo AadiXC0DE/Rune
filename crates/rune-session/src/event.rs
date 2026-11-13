@@ -114,6 +114,17 @@ pub enum SessionEvent {
         /// Arguments as the model produced them.
         arguments: String,
     },
+    /// A tool call sent in a near-miss form ran in a repaired form.
+    ToolCallRepaired {
+        /// Identifier of the call that was repaired.
+        call_id: String,
+        /// Tool name the model sent.
+        from: String,
+        /// Tool the call ran as.
+        to: String,
+        /// What was changed in the arguments, as short phrases.
+        repairs: Vec<String>,
+    },
     /// A tool call produced a result.
     ToolResult {
         /// Identifier of the call this answers.
@@ -129,6 +140,34 @@ pub enum SessionEvent {
         through: u64,
         /// Summary that replaces the covered range.
         summary: String,
+    },
+    /// A harness note entered the conversation at history position `at`.
+    HarnessNote {
+        /// Turns the history held when the note entered it; for a note joined
+        /// to a user turn, that turn's position minus one.
+        at: u64,
+        /// Where the note went.
+        placement: NotePlacement,
+        /// The note's text.
+        text: String,
+    },
+    /// A checkpoint replaced the first `through` history turns; `message` is its full text.
+    Checkpoint {
+        /// Turns the history held when the checkpoint was installed.
+        at: u64,
+        /// Turns the checkpoint replaced.
+        through: u64,
+        /// The checkpoint turn's text.
+        message: String,
+    },
+    /// A tool result's content was replaced in place (a receipt or a removed skill body).
+    ResultReplaced {
+        /// Turns the history held when the result was replaced.
+        at: u64,
+        /// Call whose result was replaced.
+        call_id: String,
+        /// The result's new content.
+        content: String,
     },
     /// A provider reported token usage.
     UsageRecorded {
@@ -196,6 +235,72 @@ pub enum SessionEvent {
         /// Canonical workspace path.
         workspace: String,
     },
+    /// The workspace was snapshotted at a turn boundary.
+    WorkspaceCheckpoint {
+        /// Turn the snapshot belongs to.
+        turn: u64,
+        /// `start` (before the turn changed anything) or `end`.
+        boundary: Boundary,
+        /// Git tree id in the shadow store.
+        tree: String,
+        /// Commit id that holds the tree.
+        commit: String,
+        /// Previous commit of this session, absent for the first.
+        parent: Option<String>,
+        /// Untracked files left out for size.
+        skipped: Vec<String>,
+        /// False when the snapshot did not finish before the turn changed files.
+        complete: bool,
+    },
+    /// The workspace was put back to an earlier or later checkpoint.
+    Restored {
+        /// Turn the restore refers to: undone, redone, or restored to before.
+        turn: u64,
+        /// What asked for the restore.
+        direction: RestoreDirection,
+        /// Git tree or commit id the workspace was made to match.
+        target: String,
+        /// Commit of the snapshot taken just before restoring.
+        saved: String,
+    },
+}
+
+/// What asked for a workspace restore.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreDirection {
+    /// `/undo`: back to before the newest turn that changed files.
+    Undo,
+    /// `/redo`: forward to what the newest undo replaced.
+    Redo,
+    /// A restore to before a named turn.
+    Turn,
+}
+
+/// Which side of a turn a workspace checkpoint was taken on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Boundary {
+    /// Before the turn changed anything.
+    Start,
+    /// After the turn's outcome was recorded.
+    End,
+}
+
+/// Where a harness note entered the conversation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotePlacement {
+    /// Joined before the user turn at `at`: `{text}\n\n{prompt}`.
+    PromptPrefix,
+    /// Joined after the user turn at `at`: `{prompt}\n\n{text}`.
+    PromptSuffix,
+    /// Another text part of the user turn at `at`.
+    UserPart,
+    /// Its own user turn at position `at`.
+    UserTurn,
+    /// Its own assistant turn at position `at`.
+    AssistantTurn,
 }
 
 impl SessionEvent {
@@ -214,8 +319,12 @@ impl SessionEvent {
             Self::AssistantReset { .. } => "assistant_reset",
             Self::TurnInterrupted { .. } => "turn_interrupted",
             Self::ToolCall { .. } => "tool_call",
+            Self::ToolCallRepaired { .. } => "tool_call_repaired",
             Self::ToolResult { .. } => "tool_result",
             Self::Compaction { .. } => "compaction",
+            Self::HarnessNote { .. } => "harness_note",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::ResultReplaced { .. } => "result_replaced",
             Self::UsageRecorded { .. } => "usage_recorded",
             Self::TitleSet { .. } => "title_set",
             Self::ObjectiveSet { .. } => "objective_set",
@@ -224,6 +333,8 @@ impl SessionEvent {
             Self::ConstraintPinned { .. } => "constraint_pinned",
             Self::ModelSet { .. } => "model_set",
             Self::WorkspaceSet { .. } => "workspace_set",
+            Self::WorkspaceCheckpoint { .. } => "workspace_checkpoint",
+            Self::Restored { .. } => "restored",
             Self::ChildOf { .. } => "child_of",
             Self::ForkedFrom { .. } => "forked_from",
         }
@@ -777,6 +888,12 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             },
+            SessionEvent::ToolCallRepaired {
+                call_id: "call_1".to_owned(),
+                from: "cat".to_owned(),
+                to: "read_file".to_owned(),
+                repairs: vec!["`line_count` was a string".to_owned()],
+            },
             SessionEvent::ToolResult {
                 call_id: "call_1".to_owned(),
                 ok: true,
@@ -785,6 +902,21 @@ mod tests {
             SessionEvent::Compaction {
                 through: 4,
                 summary: "summary".to_owned(),
+            },
+            SessionEvent::HarnessNote {
+                at: 2,
+                placement: NotePlacement::PromptPrefix,
+                text: "note".to_owned(),
+            },
+            SessionEvent::Checkpoint {
+                at: 6,
+                through: 4,
+                message: "<conversation-checkpoint>".to_owned(),
+            },
+            SessionEvent::ResultReplaced {
+                at: 6,
+                call_id: "call_1".to_owned(),
+                content: "receipt".to_owned(),
             },
             SessionEvent::UsageRecorded {
                 input_tokens: 10,
@@ -806,6 +938,28 @@ mod tests {
             let decoded = EventFrame::decode(&line).expect("decode");
             assert_eq!(decoded, original);
         }
+    }
+
+    #[test]
+    fn checkpoint_event_round_trips() {
+        let original = frame(
+            3,
+            SessionEvent::WorkspaceCheckpoint {
+                turn: 2,
+                boundary: Boundary::End,
+                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+                commit: "c0ffee".to_owned(),
+                parent: Some("beef".to_owned()),
+                skipped: vec!["big.bin".to_owned()],
+                complete: false,
+            },
+        );
+        let line = original.encode().expect("encode");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(value["event"]["kind"], "workspace_checkpoint");
+        assert_eq!(value["event"]["boundary"], "end");
+        assert_eq!(original.event.kind(), "workspace_checkpoint");
+        assert_eq!(EventFrame::decode(&line).expect("decode"), original);
     }
 
     #[test]

@@ -1,0 +1,96 @@
+{
+  "prompt": "Read a.txt, b.txt, c.txt, d.txt and e.txt, one at a time.",
+  "workspace": "workspaces/six_files.json",
+  "env": {
+    "RUNE_CONTEXT_WINDOW": "200000"
+  },
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "read_file",
+          "arguments": {
+            "path": "a.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c2",
+          "name": "read_file",
+          "arguments": {
+            "path": "b.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c3",
+          "name": "read_file",
+          "arguments": {
+            "path": "c.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c4",
+          "name": "read_file",
+          "arguments": {
+            "path": "d.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "c5",
+          "name": "read_file",
+          "arguments": {
+            "path": "e.txt"
+          }
+        }
+      ]
+    },
+    {
+      "http_error": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"This model's maximum context length is 8192 tokens\"}}"
+      }
+    },
+    {
+      "http_error": {
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"This model's maximum context length is 8192 tokens\"}}"
+      }
+    },
+    {
+      "match": "Write a checkpoint of the conversation above",
+      "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
+    },
+    {
+      "match": "Write one updated checkpoint that replaces it",
+      "text": "## Goal\n- read the files the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- a.txt to e.txt were all read\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- report that every file was read\n## Files that matter\n- the .txt files in the workspace\n## Facts to keep\n- none"
+    },
+    {
+      "text": "Finished after compacting twice."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Finished after compacting twice.",
+    "any_request_contains": [
+      "<conversation-checkpoint>"
+    ],
+    "requests": 10,
+    "stop_reason": "end_turn"
+  }
+}

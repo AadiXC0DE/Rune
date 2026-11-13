@@ -1,0 +1,23 @@
+{
+  "title": "Fix bundle prices in the shop without breaking billing",
+  "kind": "bugfix",
+  "prompt": "In this monorepo, the price shown by the shop package is wrong for discounted bundles. Fix it without breaking the other packages.",
+  "verify": "cd packages/shop && node --test && cd ../billing && node --test && cd ../pricing && node --test",
+  "setup": "find . -name AGENTS.task.md -exec sh -c 'mv \"$1\" \"$(dirname \"$1\")/AGENTS.md\"' _ {} \\;",
+  "protected": [
+    "packages/pricing/test",
+    "packages/shop/test",
+    "packages/billing/test",
+    "packages/pricing/test/hidden.test.js",
+    "packages/shop/test/hidden.test.js",
+    "packages/billing/test/hidden.test.js"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "javascript",
+  "tags": [
+    "nested-instructions"
+  ]
+}

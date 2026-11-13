@@ -151,7 +151,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
         state.mkdir(mode=0o700)
         history_file = state / "history.jsonl"
         history_file.write_text("".join(json.dumps({
-            "text": text, "workspace": str(workspace), "session": "fixture-history",
+            # Rune records the resolved workspace; on macOS the temporary
+            # directory sits behind the /var -> /private/var link.
+            "text": text, "workspace": os.path.realpath(workspace), "session": "fixture-history",
         }) + "\n" for text, workspace in [
             ("older needle prompt\n界", root),
             ("newer needle prompt", root),
@@ -159,8 +161,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
             ("other needle workspace", root / "other"),
         ]))
         history_file.chmod(0o600)
+    columns = 40 if sys.argv[2:] == ["wrap"] else 80
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
     child = subprocess.Popen(
         [sys.argv[1]], stdin=slave, stdout=slave, stderr=slave,
         cwd=root, env=environment, preexec_fn=controlling_terminal,
@@ -205,8 +208,9 @@ sys.exit(9 if mode == "editor-failed" else 0)
             transcript.extend(os.read(master, 65536))
         captures.append((stage, list(transcript)))
 
+    earlier = []
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         if editor_mode:
             if editor_mode == "editor-steering":
                 os.write(master, b"start\r")
@@ -306,26 +310,44 @@ sys.exit(9 if mode == "editor-failed" else 0)
             capture("undo-delete", b"\x1f", "界ae\u0301b")
             capture("undo-insert", b"\x1f", "界ab")
             submitted = "界ab"
+        elif sys.argv[2:] == ["wrap"]:
+            capture("typed", "one\x1b\rtwo 漢字\x1b\rthree".encode(), "three")
+            # Up keeps the screen column: inside a wide character it stops
+            # before it, and on a shorter row it stops at the row's end.
+            capture("up-once", b"\x1b[A", "\x1b[7G")
+            capture("up-twice", b"\x1b[A", "\x1b[6G")
+            assert not prompts, prompts
+            capture("edited", b"X", "oneX")
+            earlier = ["oneX\ntwo 漢字\nthree"]
+            os.write(master, b"\r")
+            wait_for("DRAFT_RECEIVED\r\n")
+            assert prompts == earlier, prompts
+            submitted = "word " * 20
+            capture("long", submitted.encode(), "\x1b[33G")
         else:
             draft = "a" * 160 + "TAIL-END"
             capture("end", draft.encode(), "TAIL-END")
-            capture("left", b"\x1b[D", "TAIL-END")
-            capture("edited", b"\x1b[3~Z", "TAIL-ENZ")
-            capture("home", b"\x01", "> " + "a" * 78)
-            capture("end-again", b"\x05", "TAIL-ENZ")
+            capture("left", b"\x1b[D", "\x1b[14G")
+            capture("edited", b"\x1b[3~Z", "Z")
+            capture("home", b"\x01", "\x1b[3G")
+            capture("end-again", b"\x05", "\x1b[15G")
             submitted = "a" * 160 + "TAIL-ENZ"
         os.write(master, b"\r")
         # Wait for close_turn's committed line, not its earlier streamed row,
         # so /quit is handled as a command rather than steering the old turn.
-        wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" else 0)
-        assert prompts == (["start", submitted] if editor_mode == "editor-steering" else [submitted]), prompts
+        wait_for("DRAFT_RECEIVED\r\n", len(transcript) if editor_mode == "editor-steering" or earlier else 0)
+        # The session trims a submitted prompt.
+        assert prompts == (["start", submitted] if editor_mode == "editor-steering" else earlier + [submitted.strip()]), prompts
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

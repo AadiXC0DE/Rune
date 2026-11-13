@@ -25,10 +25,10 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace exact text in a file. old_string must match once, whitespace included, \
-         unless occurrence or replace_all is set. Pass edits for several replacements in \
-         one atomic write; each sees the previous result. Refused if the file changed since \
-         it was read."
+        "Replace exact text in a file. old_string must match once unless occurrence or \
+         replace_all is set; a unique match differing only in whitespace or quotes is \
+         accepted. Pass edits for several replacements in one atomic write; each sees the \
+         previous result."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -36,8 +36,7 @@ impl Tool for EditFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "old_string": {
                     "type": "string",
@@ -73,23 +72,6 @@ impl Tool for EditFile {
                 }
             },
             "required": ["path"],
-            "oneOf": [
-                {
-                    "required": ["old_string", "new_string"],
-                    "not": { "required": ["edits"] }
-                },
-                {
-                    "required": ["edits"],
-                    "not": {
-                        "anyOf": [
-                            { "required": ["old_string"] },
-                            { "required": ["new_string"] },
-                            { "required": ["occurrence"] },
-                            { "required": ["replace_all"] }
-                        ]
-                    }
-                }
-            ],
             "additionalProperties": false
         })
     }
@@ -123,15 +105,29 @@ impl Tool for EditFile {
         let raw = mutation::required_string(tool, arguments, "path")?;
         let edits = literal_edits(tool, arguments)?;
         let path = resolve(context, raw)?.path;
-        let prepared = mutation::prepare_edits(&path, &edits)?;
+        let prepared = mutation::prepare_edits_with(&path, &edits, context.quote_files)?;
         context.check_cancelled()?;
+        let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
-        Ok(ToolOutput::success(format!(
-            "Edited `{}` ({}, {})",
+        // A match that needed a normalisation is named, so the model checks
+        // the result rather than trusting a near miss.
+        let relaxed = if applied.relaxed().is_empty() {
+            String::new()
+        } else {
+            let clauses: Vec<&str> = applied.relaxed().iter().map(|tier| tier.clause()).collect();
+            format!(
+                "; matched after normalising {}, check the result",
+                clauses.join(" and ")
+            )
+        };
+        let mut output = ToolOutput::success(format!(
+            "Edited `{}` ({}, {}{relaxed})",
             applied.path(),
             count_phrase(applied.replacements()),
             mutation::detail(&applied)
-        )))
+        ));
+        output.diff = diff;
+        Ok(output)
     }
 }
 
@@ -265,11 +261,23 @@ mod tests {
             .filter_map(serde_json::Value::as_str)
             .collect();
         assert_eq!(required, ["path"]);
-        assert_eq!(
-            schema["oneOf"][0]["required"],
-            json!(["old_string", "new_string"])
-        );
-        assert_eq!(schema["oneOf"][1]["required"], json!(["edits"]));
+        // The forms are told apart by the decoder, whose errors say what is
+        // missing or mixed, not by the schema.
+        assert!(schema.get("oneOf").is_none());
+        for (arguments, field) in [
+            (json!({ "path": "a", "old_string": "x" }), "new_string"),
+            (
+                json!({ "path": "a", "old_string": "x", "new_string": "y", "edits": [] }),
+                "edits",
+            ),
+        ] {
+            let error = EditFile.validate(&arguments).expect_err("refused");
+            assert!(
+                error.to_string().contains(field)
+                    || error.field().is_some_and(|name| name.contains(field)),
+                "{error}"
+            );
+        }
         let batch = &schema["properties"]["edits"];
         assert_eq!(batch["minItems"], 1);
         assert_eq!(batch["maxItems"], mutation::MAX_EDIT_HUNKS);
@@ -644,6 +652,106 @@ mod tests {
     }
 
     #[test]
+    fn the_result_names_the_normalisation_that_matched() {
+        let (dir, context) = workspace();
+        seed(&dir, "quote.txt", "say \u{201C}hi\u{201D}\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "quote.txt", "old_string": "\"hi\"", "new_string": "\"bye\"" }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .ends_with("; matched after normalising punctuation, check the result)"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn the_indentation_clause_is_reported() {
+        let (dir, context) = workspace();
+        let path = seed(&dir, "deep.rs", "fn f() {\n        call();\n}\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "deep.rs", "old_string": "call();\n", "new_string": "call(1);\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            "fn f() {\n        call(1);\n}\n"
+        );
+        assert!(output.text.contains("(1 occurrence"), "{}", output.text);
+        let _ = output;
+        let path = seed(
+            &dir,
+            "deeper.rs",
+            "fn g() {\n        a();\n        b();\n}\n",
+        );
+        let output = EditFile
+            .call(
+                &json!({ "path": "deeper.rs", "old_string": "    a();\n    b();\n", "new_string": "    c();\n" }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .contains("matched after normalising indentation, check the result"),
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            "fn g() {\n        c();\n}\n"
+        );
+    }
+
+    #[test]
+    fn an_exact_match_adds_no_normalisation_clause() {
+        let (dir, context) = workspace();
+        seed(&dir, "plain.txt", "alpha\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "plain.txt", "old_string": "alpha", "new_string": "beta" }),
+                &context,
+            )
+            .expect("call");
+        assert!(!output.text.contains("normalising"), "{}", output.text);
+    }
+
+    #[test]
+    fn each_hunk_is_tiered_against_the_running_content() {
+        let (dir, context) = workspace();
+        let path = seed(&dir, "two.txt", "first\nit\u{2019}s second\n");
+        let output = EditFile
+            .call(
+                &json!({ "path": "two.txt", "edits": [
+                    { "old_string": "first", "new_string": "one" },
+                    { "old_string": "it's second", "new_string": "two" },
+                ] }),
+                &context,
+            )
+            .expect("call");
+        assert!(
+            output
+                .text
+                .contains("matched after normalising punctuation,"),
+            "{}",
+            output.text
+        );
+        assert_eq!(std::fs::read_to_string(path).expect("read"), "one\ntwo\n");
+    }
+
+    #[test]
+    fn the_description_stays_within_its_old_length() {
+        assert!(EditFile.description().len() <= 254);
+    }
+
+    #[test]
     fn a_crlf_file_is_edited_without_normalization() {
         let (dir, context) = workspace();
         let path = seed(&dir, "dos.txt", "alpha\r\nbeta\r\ngamma\r\n");
@@ -694,6 +802,27 @@ mod tests {
             .call(
                 &json!({
                     "path": target.to_str().expect("utf8"),
+                    "old_string": "alpha",
+                    "new_string": "beta"
+                }),
+                &context,
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"alpha\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_refuses_a_symlinked_parent() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = seed(&outside, "config.txt", "alpha\n");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).expect("symlink");
+        let err = EditFile
+            .call(
+                &json!({
+                    "path": "linked/config.txt",
                     "old_string": "alpha",
                     "new_string": "beta"
                 }),

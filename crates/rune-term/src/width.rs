@@ -5,10 +5,38 @@
 //! escape-aware: an escape sequence is copied whole, never split, and never
 //! counted toward a column.
 
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::engine::Style;
+
+/// Whether East Asian ambiguous characters count as two columns.
+static AMBIGUOUS_WIDE: AtomicBool = AtomicBool::new(false);
+
+/// Columns between tab stops.
+const TAB_STOP: usize = 8;
+
+/// Sets how many columns an East Asian ambiguous character occupies.
+///
+/// `2` makes them wide, matching a terminal set to draw them that way; any
+/// other value makes them one column. Set once, before anything is drawn.
+pub fn set_ambiguous_width(columns: u8) {
+    AMBIGUOUS_WIDE.store(columns == 2, Ordering::Relaxed);
+}
+
+/// Returns true when ambiguous characters are measured as two columns.
+fn ambiguous_wide() -> bool {
+    // Tests share one process, so only the thread that asked for the setting
+    // sees it and the others keep measuring the default.
+    #[cfg(test)]
+    if !tests::SEES_AMBIGUOUS_WIDTH.with(std::cell::Cell::get) {
+        return false;
+    }
+    AMBIGUOUS_WIDE.load(Ordering::Relaxed)
+}
 
 /// Returns the number of columns a character occupies.
 ///
@@ -20,7 +48,12 @@ pub fn char_width(c: char) -> u8 {
     if c.is_control() {
         return 0;
     }
-    match UnicodeWidthChar::width(c) {
+    let width = if ambiguous_wide() {
+        UnicodeWidthChar::width_cjk(c)
+    } else {
+        UnicodeWidthChar::width(c)
+    };
+    match width {
         Some(width) => u8::try_from(width).unwrap_or(u8::MAX),
         None => 0,
     }
@@ -42,7 +75,11 @@ pub fn str_width(s: &str) -> usize {
 /// reporting zero would place the following text one column too early.
 #[must_use]
 pub fn grapheme_width(grapheme: &str) -> usize {
-    let width = UnicodeWidthStr::width(grapheme);
+    let width = if ambiguous_wide() {
+        UnicodeWidthStr::width_cjk(grapheme)
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    };
     if width > 0 {
         return width;
     }
@@ -195,34 +232,162 @@ pub fn wrap_styled(s: &str, width: usize) -> Vec<WrappedLine> {
                     }
                     continue;
                 }
-                let cluster = grapheme_width(text);
-                if line_width > 0 && line_width.saturating_add(cluster) > width {
-                    // Break on the last space that fits, so a word is moved to
-                    // the next line rather than cut in half. A run longer than
-                    // the width has no space to break on and is split, which is
-                    // the only option that keeps it inside the terminal.
-                    if let Some(at) = last_break(&line, width) {
-                        let carried = line.split_off(at);
-                        let carried = carried.trim_start_matches(' ');
-                        let carried_width = str_width(carried);
-                        out.push(open.close(&mut line, line_width));
-                        line_width = 0;
-                        open.reopen(&mut line);
-                        line.push_str(carried);
-                        line_width = line_width.saturating_add(carried_width);
-                    } else {
-                        out.push(open.close(&mut line, line_width));
-                        line_width = 0;
-                        open.reopen(&mut line);
+                // A tab becomes the spaces up to the next stop, so it is
+                // measured and broken on like any other space and never
+                // reaches the terminal, which would move the cursor itself.
+                let (text, repeat) = if text == "\t" {
+                    (" ", tab_columns(line_width))
+                } else {
+                    (text, 1)
+                };
+                for _ in 0..repeat {
+                    let cluster = grapheme_width(text);
+                    if line_width > 0 && line_width.saturating_add(cluster) > width {
+                        // Break on the last space that fits, so a word is moved
+                        // to the next line rather than cut in half. A run
+                        // longer than the width has no space to break on and is
+                        // split, which is the only option that keeps it inside
+                        // the terminal.
+                        if let Some(at) = last_break(&line, width) {
+                            let carried = line.split_off(at);
+                            let carried = carried.trim_start_matches(' ');
+                            let carried_width = str_width(carried);
+                            out.push(open.close(&mut line, line_width));
+                            line_width = 0;
+                            open.reopen(&mut line);
+                            line.push_str(carried);
+                            line_width = line_width.saturating_add(carried_width);
+                        } else {
+                            out.push(open.close(&mut line, line_width));
+                            line_width = 0;
+                            open.reopen(&mut line);
+                        }
                     }
+                    line.push_str(text);
+                    line_width = line_width.saturating_add(cluster);
                 }
-                line.push_str(text);
-                line_width = line_width.saturating_add(cluster);
             }
         }
     }
     out.push(open.close(&mut line, line_width));
     out
+}
+
+/// Returns the spaces a tab at `column` expands to: up to the next stop, and
+/// at least one.
+const fn tab_columns(column: usize) -> usize {
+    TAB_STOP.saturating_sub(column % TAB_STOP)
+}
+
+/// Replaces every tab with the spaces up to the next eight column stop.
+///
+/// Escape sequences occupy no columns, and a line break returns the column to
+/// zero, so the result lines up the way a terminal would draw the tabs.
+#[must_use]
+pub fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0usize;
+    for piece in pieces(text) {
+        match piece {
+            Piece::Escape(escape) => out.push_str(escape),
+            Piece::Text("\t") => {
+                let spaces = tab_columns(column);
+                out.extend(std::iter::repeat_n(' ', spaces));
+                column = column.saturating_add(spaces);
+            }
+            Piece::Text(text) if text.contains(['\r', '\n']) => {
+                out.push_str(text);
+                column = 0;
+            }
+            Piece::Text(text) => {
+                out.push_str(text);
+                column = column.saturating_add(grapheme_width(text));
+            }
+        }
+    }
+    out
+}
+
+/// Longest URI written as a hyperlink; a longer one is shown as text only.
+const MAX_LINK_URI: usize = 2_000;
+
+/// This machine's host name, read once.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Hyperlinks made by this process, for their identifiers.
+static LINKS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a hyperlink identifier unique to this process: `rune-{pid}-{n}`.
+#[must_use]
+pub fn link_id() -> String {
+    let n = LINKS.fetch_add(1, Ordering::Relaxed);
+    format!("rune-{}-{n}", std::process::id())
+}
+
+/// Returns `text` as an OSC 8 hyperlink to `uri` with the identifier `id`.
+///
+/// URI bytes outside 33 to 126 are written as `%XX`. A URI longer than
+/// 2,000 bytes is not linked, so `text` is returned alone.
+#[must_use]
+pub fn hyperlink(uri: &str, text: &str, id: &str) -> String {
+    let mut encoded = String::with_capacity(uri.len());
+    for byte in uri.bytes() {
+        if (33..=126).contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    if encoded.len() > MAX_LINK_URI {
+        return text.to_owned();
+    }
+    format!(
+        "\u{1b}]8;id={id};{encoded}\u{1b}\\{text}{}",
+        Style::HYPERLINK_CLOSE
+    )
+}
+
+/// Returns the `file://` URI of an absolute path on this host.
+///
+/// The host is the node name on Unix and `COMPUTERNAME` on Windows, and is
+/// left empty when it cannot be read.
+#[must_use]
+pub fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    format!("file://{}{path}", host())
+}
+
+/// Returns this machine's host name as `file://` links name it.
+#[must_use]
+pub fn host() -> &'static str {
+    HOST.get_or_init(host_name)
+}
+
+/// Returns this machine's host name, empty when unknown.
+fn host_name() -> String {
+    #[cfg(unix)]
+    {
+        rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::new()
+    }
 }
 
 /// Returns the byte offset to break a line at, keeping the word whole.
@@ -234,15 +399,22 @@ pub fn wrap_styled(s: &str, width: usize) -> Vec<WrappedLine> {
 fn last_break(line: &str, width: usize) -> Option<usize> {
     let mut best: Option<usize> = None;
     let mut consumed = 0usize;
-    for (offset, ch) in line.char_indices() {
-        let next = consumed.saturating_add(char_width(ch).into());
-        if next > width {
-            break;
+    let mut offset = 0usize;
+    for piece in pieces(line) {
+        if let Piece::Text(text) = piece {
+            let next = consumed.saturating_add(grapheme_width(text));
+            if next > width {
+                break;
+            }
+            if text == " " && offset > 0 {
+                best = Some(offset);
+            }
+            consumed = next;
         }
-        if ch == ' ' && offset > 0 {
-            best = Some(offset);
-        }
-        consumed = next;
+        let len = match piece {
+            Piece::Escape(escape) | Piece::Text(escape) => escape.len(),
+        };
+        offset = offset.saturating_add(len);
     }
     best
 }
@@ -253,6 +425,8 @@ struct Open {
     style: Style,
     /// The hyperlink target, owned so a break can reopen it without a rescan.
     link: Option<String>,
+    /// The parameters the link was opened with, such as its `id`.
+    link_params: String,
 }
 
 impl Open {
@@ -265,12 +439,18 @@ impl Open {
         match escape_link(escape) {
             // Text inside one link repeats no open sequence, so the target is
             // copied only when it actually changes.
-            Some(Link::Open(target)) => {
+            Some(Link::Open { params, target }) => {
                 if self.link.as_deref() != Some(target) {
                     self.link = target.to_owned().into();
                 }
+                if self.link_params != params {
+                    params.clone_into(&mut self.link_params);
+                }
             }
-            Some(Link::Close) => self.link = None,
+            Some(Link::Close) => {
+                self.link = None;
+                self.link_params.clear();
+            }
             None => {}
         }
     }
@@ -297,7 +477,9 @@ impl Open {
     /// Reopens the style a wrapped or broken line continues in.
     fn reopen(&self, line: &mut String) {
         if let Some(target) = &self.link {
-            line.push_str("\u{1b}]8;;");
+            line.push_str("\u{1b}]8;");
+            line.push_str(&self.link_params);
+            line.push(';');
             line.push_str(target);
             line.push_str("\u{1b}\\");
         }
@@ -309,8 +491,8 @@ impl Open {
 
 /// An OSC 8 hyperlink operation.
 enum Link<'a> {
-    /// Opens a link to a target.
-    Open(&'a str),
+    /// Opens a link to a target, with the parameters it was opened with.
+    Open { params: &'a str, target: &'a str },
     /// Closes the open link.
     Close,
 }
@@ -328,11 +510,11 @@ fn escape_sgr(escape: &str) -> Option<&str> {
 /// Returns the hyperlink operation of an escape sequence, when it is one.
 fn escape_link(escape: &str) -> Option<Link<'_>> {
     let data = osc8_payload(escape)?;
-    let target = data.split_once(';').map_or("", |(_, target)| target);
+    let (params, target) = data.split_once(';').unwrap_or((data, ""));
     if target.is_empty() {
         return Some(Link::Close);
     }
-    Some(Link::Open(target))
+    Some(Link::Open { params, target })
 }
 
 /// Returns the payload of an OSC 8 escape sequence.
@@ -509,7 +691,7 @@ mod tests {
         // Each line is self-contained: the first closes the style it opened,
         // the second reopens it in canonical form.
         assert_eq!(lines[0], "\u{1b}[1;31mabc\u{1b}[0m");
-        assert_eq!(lines[1], "\u{1b}[1;38;5;1mdef\u{1b}[0m");
+        assert_eq!(lines[1], "\u{1b}[1;31mdef\u{1b}[0m");
         // Replaying both lines in order ends with the style cleared, which is
         // what a reader sees when it prints one after the other.
         let mut replay = Open::default();
@@ -531,8 +713,32 @@ mod tests {
         // the second reopens it rather than leaving either half styled.
         assert_eq!(
             lines,
-            vec!["ab\u{1b}[31m\u{1b}[0m", "\u{1b}[38;5;1mcd\u{1b}[0m"]
+            vec!["ab\u{1b}[31m\u{1b}[0m", "\u{1b}[31mcd\u{1b}[0m"]
         );
+    }
+
+    #[test]
+    fn a_wrapped_link_keeps_its_id_at_the_break() {
+        let lines = wrap("\u{1b}]8;id=rune-1-0;file:///a\u{1b}\\abcdef", 3);
+        assert_eq!(
+            lines[1],
+            "\u{1b}]8;id=rune-1-0;file:///a\u{1b}\\def\u{1b}]8;;\u{1b}\\"
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_escapes_its_uri_and_skips_long_ones() {
+        let link = hyperlink("file:///a b/\u{e9}", "a b", "rune-1-2");
+        assert_eq!(
+            link,
+            "\u{1b}]8;id=rune-1-2;file:///a%20b/%C3%A9\u{1b}\\a b\u{1b}]8;;\u{1b}\\"
+        );
+        assert_eq!(str_width(&link), 3, "the link adds no columns");
+        let long = format!("file:///{}", "a".repeat(2_000));
+        assert_eq!(hyperlink(&long, "a", "rune-1-3"), "a");
+        assert!(file_uri("/x/y").starts_with("file://"));
+        assert!(file_uri("/x/y").ends_with("/x/y"));
+        assert_ne!(link_id(), link_id());
     }
 
     #[test]
@@ -583,6 +789,207 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "中");
         assert_eq!(lines[1], "文");
+    }
+
+    /// Removes every escape sequence, leaving only the visible text.
+    fn visible(line: &str) -> String {
+        pieces(line)
+            .filter_map(|piece| match piece {
+                Piece::Text(text) => Some(text),
+                Piece::Escape(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_styled_line_breaks_where_the_plain_line_does() {
+        let plain = wrap("hello world foo", 11);
+        let styled = wrap("\u{1b}[1mhello\u{1b}[0m world foo", 11);
+        let shown: Vec<String> = styled.iter().map(|line| visible(line)).collect();
+        assert_eq!(shown, plain);
+        assert_eq!(shown[0], "hello");
+
+        // The break offset is the space itself, even with an escape right
+        // before it.
+        let line = "\u{1b}[1mhello\u{1b}[0m world";
+        assert_eq!(last_break(line, 11), line.find(' '));
+        let line = "\u{1b}]8;;https://a.test\u{1b}\\hello\u{1b}]8;;\u{1b}\\ world";
+        assert_eq!(last_break(line, 11), line.find(' '));
+
+        // A colour opened just before the breaking space is reopened, and
+        // only it, on the next row.
+        let lines = wrap("hello\u{1b}[31m world foo", 11);
+        assert_eq!(lines[0], "hello\u{1b}[31m\u{1b}[0m");
+        assert_eq!(lines[1], "\u{1b}[31mworld foo\u{1b}[0m");
+
+        // A style that spans the break reopens unchanged.
+        let lines = wrap("\u{1b}[1mhello world foo\u{1b}[0m", 11);
+        assert_eq!(lines[0], "\u{1b}[1mhello\u{1b}[0m");
+        assert_eq!(lines[1], "\u{1b}[1mworld foo\u{1b}[0m");
+
+        // A link that spans the break reopens on the next row.
+        let lines = wrap("\u{1b}]8;;https://a.test\u{1b}\\hello world foo", 11);
+        let shown: Vec<String> = lines.iter().map(|line| visible(line)).collect();
+        assert_eq!(shown, plain);
+        assert!(lines[1].starts_with("\u{1b}]8;;https://a.test\u{1b}\\world"));
+
+        // Long SGR parameters no longer push the break earlier.
+        let plain = wrap("a bb ccc dddd", 9);
+        let styled = wrap("\u{1b}[38;2;10;20;30ma bb\u{1b}[0m ccc dddd", 9);
+        let shown: Vec<String> = styled.iter().map(|line| visible(line)).collect();
+        assert_eq!(shown, plain);
+        assert_eq!(plain, vec!["a bb ccc", "dddd"]);
+    }
+
+    #[test]
+    fn a_line_of_escapes_and_one_word_has_no_break() {
+        let line = "\u{1b}[1m\u{1b}]8;;https://a.test\u{1b}\\abcdefgh";
+        assert_eq!(last_break(line, 4), None);
+        let lines = wrap("\u{1b}[1mabcdefgh\u{1b}[0m", 4);
+        let shown: Vec<String> = lines.iter().map(|line| visible(line)).collect();
+        assert_eq!(shown, vec!["abcd", "efgh"]);
+        // A space at the very start is never a break.
+        assert_eq!(last_break(" abc", 4), None);
+        assert_eq!(last_break("\u{1b}[1m abc", 4), Some(4));
+    }
+
+    #[test]
+    fn grapheme_widths_match_the_table() {
+        let table: &[(&str, &str, usize)] = &[
+            ("family", "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", 2),
+            ("flag", "\u{1F1EF}\u{1F1F5}", 2),
+            ("skin tone", "\u{1F44D}\u{1F3FD}", 2),
+            ("emoji presentation", "\u{2764}\u{FE0F}", 2),
+            ("text presentation", "\u{231A}\u{FE0E}", 1),
+            ("combining", "e\u{301}", 1),
+            ("cjk", "漢字", 4),
+            ("fullwidth", "\u{FF21}", 2),
+            ("ambiguous", "\u{25CB}", 1),
+            ("box drawing", "\u{2500}", 1),
+        ];
+        for (name, text, columns) in table {
+            assert_eq!(str_width(text), *columns, "{name}");
+            let sum: usize = graphemes(text).map(grapheme_width).sum();
+            assert_eq!(sum, *columns, "{name} by cluster");
+            // Escapes around a sequence add nothing to it.
+            let styled = format!("\u{1b}[1m{text}\u{1b}]8;;https://a.test\u{1b}\\\u{1b}[0m");
+            assert_eq!(str_width(&styled), *columns, "{name} styled");
+        }
+        for text in table
+            .iter()
+            .map(|(_, text, _)| text)
+            .filter(|text| **text != "漢字")
+        {
+            assert_eq!(graphemes(text).count(), 1, "{text} is one cluster");
+        }
+        // A lone regional indicator is a cluster of its own, and three make a
+        // flag and a leftover.
+        assert_eq!(graphemes("\u{1F1EF}\u{1F1F5}\u{1F1EF}").count(), 2);
+        // Wrapping never splits a sequence.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let lines = wrap(&format!("a{family}{family}"), 3);
+        assert_eq!(lines, vec![format!("a{family}"), family.to_owned()]);
+    }
+
+    thread_local! {
+        /// Whether this test thread measures with the shared setting.
+        pub(super) static SEES_AMBIGUOUS_WIDTH: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Restores the default ambiguous width when dropped.
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_ambiguous_width(1);
+            SEES_AMBIGUOUS_WIDTH.with(|sees| sees.set(false));
+        }
+    }
+
+    #[test]
+    fn ambiguous_characters_widen_when_asked() {
+        SEES_AMBIGUOUS_WIDTH.with(|sees| sees.set(true));
+        let _reset = Reset;
+        set_ambiguous_width(1);
+        assert_eq!(str_width("\u{25CB}"), 1);
+        assert_eq!(char_width('\u{25CB}'), 1);
+
+        set_ambiguous_width(2);
+        assert_eq!(str_width("\u{25CB}"), 2);
+        assert_eq!(char_width('\u{25CB}'), 2);
+        assert_eq!(str_width("\u{2500}"), 2);
+        for glyph in ["\u{258C}", "\u{2500}", "\u{2026}", "\u{2022}"] {
+            assert_eq!(str_width(glyph), 2, "{glyph}");
+        }
+        // Clipping and wrapping still keep wide chrome inside the line.
+        let (cut, used) = truncate_to_width("\u{2500}\u{2500}\u{2500}", 5);
+        assert_eq!((cut, used), ("\u{2500}\u{2500}", 4));
+        let lines = wrap_styled("\u{2022} \u{2026}\u{2026}\u{2026}", 5);
+        assert!(lines.iter().all(|line| line.width <= 5), "{lines:?}");
+        // Wide and narrow characters are not ambiguous and do not change.
+        assert_eq!(str_width("漢"), 2);
+        assert_eq!(str_width("a"), 1);
+
+        // Any value other than two is the default.
+        set_ambiguous_width(3);
+        assert_eq!(str_width("\u{25CB}"), 1);
+        set_ambiguous_width(0);
+        assert_eq!(str_width("\u{25CB}"), 1);
+    }
+
+    #[test]
+    fn tabs_expand_to_eight_column_stops_when_wrapping() {
+        for column in 0..=17 {
+            let text = format!("{}\t|", "a".repeat(column));
+            let lines = wrap(&text, 40);
+            assert_eq!(lines.len(), 1, "{column}");
+            assert!(!lines[0].contains('\t'), "{column}");
+            let stop = (column / 8 + 1) * 8;
+            assert_eq!(lines[0].find('|'), Some(stop), "{column}");
+            assert_eq!(str_width(&lines[0]), stop + 1, "{column}");
+        }
+        assert_eq!(wrap("abcdefg\tx", 20), vec!["abcdefg x"]);
+        assert_eq!(wrap("abcdefgh\tx", 20), vec!["abcdefgh        x"]);
+        // Escapes before a tab take no columns.
+        assert_eq!(
+            visible(&wrap("\u{1b}[1mab\u{1b}[0m\tc", 20)[0]),
+            "ab      c"
+        );
+        // Wide characters count both columns.
+        assert_eq!(wrap("漢\tx", 20), vec!["漢      x"]);
+        // The spaces are columns and a place to break.
+        let lines = wrap_styled("abc\tdefghij", 12);
+        assert_eq!(lines[1].text, "defghij");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.width <= 12 && !line.text.contains('\t'))
+        );
+        // A tab after a newline counts from the start of the new row.
+        assert_eq!(wrap("abc\n\tx", 20), vec!["abc", "        x"]);
+        // A tab past the edge never overflows the row.
+        let lines = wrap_styled("abcdef\tx", 7);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.width <= 7 && !line.text.contains('\t'))
+        );
+    }
+
+    #[test]
+    fn expand_tabs_resets_after_a_newline() {
+        assert_eq!(expand_tabs("ab\tc\n\td"), "ab      c\n        d");
+        assert_eq!(expand_tabs("ab\tc\r\n\td"), "ab      c\r\n        d");
+        assert_eq!(expand_tabs("abcdefg\t."), "abcdefg .");
+        assert_eq!(expand_tabs("abcdefgh\t."), "abcdefgh        .");
+        assert_eq!(expand_tabs("\t\t."), format!("{}.", " ".repeat(16)));
+        assert_eq!(
+            expand_tabs("\u{1b}[31mab\u{1b}[0m\tc"),
+            "\u{1b}[31mab\u{1b}[0m      c"
+        );
+        assert_eq!(expand_tabs("e\u{301}\t."), "e\u{301}       .");
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
     }
 
     #[test]

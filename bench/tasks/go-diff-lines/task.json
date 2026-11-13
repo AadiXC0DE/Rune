@@ -1,0 +1,18 @@
+{
+  "title": "Fix hunk headers and edge line numbers in the diff tool",
+  "kind": "bugfix",
+  "prompt": "The diff tool prints wrong hunk headers, and the line numbers are off whenever a change is at the very start or end of a file.",
+  "verify": "go test ./...",
+  "protected": [
+    "diff/hunk_test.go",
+    "diff/hidden_test.go"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "go",
+  "tags": [
+    "fix-breaks-other-test"
+  ]
+}

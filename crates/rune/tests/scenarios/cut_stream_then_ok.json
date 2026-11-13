@@ -1,0 +1,26 @@
+{
+  "prompt": "Say done.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "text": "This answer is cut off before it ends.",
+      "cut_stream": {
+        "after_bytes": 156
+      }
+    },
+    {
+      "text": "Done."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "This answer is cut off before it ends.Done.",
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "The previous response was interrupted"
+      }
+    ]
+  }
+}

@@ -19,19 +19,56 @@ use rune_net::transport::Endpoint;
 use rune_policy::Outcome;
 use rune_tools::{Activity, ExecutionContext, Registry, Tool, ToolOutput};
 
+/// Settings and paths a child resolves its limits from when it runs another model.
+pub type LimitInputs = (rune_core::config::Settings, rune_core::paths::Paths);
+
+/// Steps a child may take when its parent is not capped lower.
+pub const CHILD_STEPS: u64 = 64;
+
+/// Registers the `subagent` tool over the tools already in `registry`, and
+/// returns the bridge that runs its children.
+pub fn register(
+    registry: &mut Registry,
+    settings: &rune_core::config::Settings,
+    paths: &rune_core::paths::Paths,
+    workspace: &camino::Utf8Path,
+    rules: &rune_policy::RuleSet,
+) -> Result<Arc<Bridge>> {
+    let mut tools: Vec<String> = registry.names().into_iter().map(str::to_owned).collect();
+    tools.push("subagent".to_owned());
+    let bridge = Bridge::new(
+        Authority {
+            mode: settings.permission_mode,
+            rules: rules.clone(),
+            workspace: workspace.to_owned(),
+            roots: std::iter::once(workspace.to_owned())
+                .chain(settings.additional_directories.iter().cloned())
+                .collect(),
+            tools,
+            mcp_view: None,
+            generation: 0,
+        },
+        Some((settings.clone(), paths.clone())),
+    );
+    registry.insert(bridge.registered())?;
+    Ok(bridge)
+}
+
 /// Shared tool state. Execution borrows the live host rather than caching policy.
 pub struct Bridge {
     tool: Subagent,
     children: AtomicU64,
+    limit_inputs: Option<LimitInputs>,
 }
 
 impl Bridge {
-    pub fn new(authority: Authority) -> Arc<Self> {
+    pub fn new(authority: Authority, limit_inputs: Option<LimitInputs>) -> Arc<Self> {
         Arc::new(Self {
             // Direct registry callers have no parent host. SessionHost supplies
             // its live delegate through call_with_delegate below.
             tool: Subagent::unsupported(authority),
             children: AtomicU64::new(0),
+            limit_inputs,
         })
     }
 
@@ -53,6 +90,7 @@ impl Bridge {
                 parent,
                 registry,
                 children: &self.children,
+                limit_inputs: self.limit_inputs.as_ref(),
             },
         )
     }
@@ -96,6 +134,28 @@ struct Runner<'a> {
     parent: &'a (dyn Host + Sync),
     registry: &'a Registry,
     children: &'a AtomicU64,
+    limit_inputs: Option<&'a LimitInputs>,
+}
+
+/// Returns the context window and output ceiling a child runs `model` with.
+///
+/// The parent's model keeps the parent's resolved limits; another model is
+/// resolved for itself, because the parent's window says nothing about it.
+fn child_limits(
+    parent: &dyn Host,
+    model: &str,
+    limit_inputs: Option<&LimitInputs>,
+) -> (Option<u64>, Option<u64>) {
+    if model == parent.model() {
+        return (
+            parent.context_window().filter(|window| *window > 0),
+            parent.max_output_tokens(),
+        );
+    }
+    limit_inputs.map_or((None, None), |(settings, paths)| {
+        let resolved = crate::model_limits::resolve(settings, paths, model, None);
+        (resolved.context_window, resolved.max_output)
+    })
 }
 
 impl Runner<'_> {
@@ -135,12 +195,15 @@ impl Delegate for Runner<'_> {
             })
             .map_err(|_| RuneError::new(ErrorCode::LimitExceeded, "subagent child limit reached"))?
             .saturating_add(1);
-        let steps = limits
+        let parent_cap = limits
             .get(LimitName::MaxAgentSteps)
             .value()
-            .filter(|cap| *cap > 0)
-            .unwrap_or(16)
-            .min(16);
+            .filter(|cap| *cap > 0);
+        let steps = match (self.parent.remaining_steps(), parent_cap) {
+            (Some(remaining), _) => remaining.clamp(1, CHILD_STEPS),
+            (None, Some(cap)) => cap.min(CHILD_STEPS),
+            (None, None) => CHILD_STEPS,
+        };
         limits.set(
             LimitName::MaxAgentSteps,
             Budget::Bounded(steps),
@@ -157,10 +220,14 @@ impl Delegate for Runner<'_> {
         }
         instructions.push_str("\n\n");
         instructions.push_str(brief);
+        let model = request.model.clone().unwrap_or_else(|| self.parent.model());
+        let (context_window, max_output) = child_limits(self.parent, &model, self.limit_inputs);
         let child = ChildHost {
             parent: self.parent,
             tools,
-            model: request.model.clone().unwrap_or_else(|| self.parent.model()),
+            model,
+            context_window,
+            max_output,
             effort: request.effort.unwrap_or_else(|| self.parent.effort()),
             instructions,
             context: self.parent.context(),
@@ -174,8 +241,12 @@ impl Delegate for Runner<'_> {
                 .clone()
                 .ok_or_else(|| RuneError::missing_field("task"))?,
         );
-        let outcome = turn::run_turn(&mut history, &child)?;
-        if outcome.stop_reason != StopReason::Completed {
+        let outcome =
+            turn::run_turn(&mut history, &child).and_then(turn::TurnOutcome::into_strict)?;
+        // A child at its step limit returns what it found so far; any other
+        // stop short of completion is a failure.
+        let capped = outcome.stop_reason == StopReason::StepLimit;
+        if outcome.stop_reason != StopReason::Completed && !capped {
             return Err(RuneError::new(
                 ErrorCode::LimitExceeded,
                 format!("child stopped: {}", outcome.stop_reason.as_str()),
@@ -190,8 +261,21 @@ impl Delegate for Runner<'_> {
             label: format!("child-{seq}"),
             // A role is reusable; it is not the name of a persistent child.
             name: None,
-            summary: outcome.text,
+            summary: if capped {
+                partial_findings(&outcome.text)
+            } else {
+                outcome.text
+            },
         })
+    }
+}
+
+/// The result of a child stopped at its step limit.
+fn partial_findings(text: &str) -> String {
+    if text.trim().is_empty() {
+        "child stopped at its step limit; findings so far: none".to_owned()
+    } else {
+        format!("child stopped at its step limit; findings so far:\n{text}")
     }
 }
 
@@ -199,6 +283,8 @@ struct ChildHost<'a> {
     parent: &'a (dyn Host + Sync),
     tools: Vec<ToolSpec>,
     model: String,
+    context_window: Option<u64>,
+    max_output: Option<u64>,
     effort: Effort,
     instructions: String,
     context: ExecutionContext,
@@ -217,7 +303,7 @@ impl Host for ChildHost<'_> {
     fn dialect(&self) -> &dyn Provider {
         self.parent.dialect()
     }
-    fn endpoint(&self) -> &Endpoint {
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
         self.parent.endpoint()
     }
     fn fetch(&self) -> Box<dyn rune_net::fetch::Fetch> {
@@ -232,6 +318,12 @@ impl Host for ChildHost<'_> {
     fn effort(&self) -> Effort {
         self.effort
     }
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output
+    }
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
     fn instructions(&self) -> String {
         self.instructions.clone()
     }
@@ -241,11 +333,26 @@ impl Host for ChildHost<'_> {
     fn fast_mode(&self) -> bool {
         self.parent.fast_mode()
     }
+    fn cache_key(&self) -> Option<String> {
+        self.parent.cache_key()
+    }
+    fn temperature(&self) -> Option<f64> {
+        self.parent.temperature()
+    }
     fn provider_order(&self) -> Vec<String> {
         self.parent.provider_order()
     }
     fn provider_strict(&self) -> bool {
         self.parent.provider_strict()
+    }
+    fn compat(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        self.parent.compat(model)
     }
     // Child deltas and finish events belong to the child, not the parent's UI
     // or recorder. The parent displays and records the returned tool result.
@@ -265,12 +372,23 @@ impl Host for ChildHost<'_> {
         }
         self.parent.decide(name, target)
     }
-    fn pre_tool(&self, call: &turn::PreparedCall) -> Result<Option<turn::HookVeto>> {
-        self.parent.pre_tool(call)
+    fn decide_with_arguments(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        arguments: &serde_json::Value,
+    ) -> (Outcome, String) {
+        if !self.allowed(name) {
+            return self.decide(name, target);
+        }
+        self.parent.decide_with_arguments(name, target, arguments)
+    }
+    fn pre_tool_outcome(&self, call: &turn::PreparedCall) -> Result<turn::PreToolOutcome> {
+        self.parent.pre_tool_outcome(call)
     }
 
-    fn post_tool(&self, result: &turn::CallResult) {
-        self.parent.post_tool(result);
+    fn post_tool_effect(&self, result: &turn::CallResult) -> Option<turn::PostToolEffect> {
+        self.parent.post_tool_effect(result)
     }
 
     fn execute(&self, name: &str, arguments: &serde_json::Value) -> Result<ToolOutput> {
@@ -335,11 +453,17 @@ mod tests {
         fn dialect(&self) -> &dyn Provider {
             &rune_net::chat_completions::ChatCompletions
         }
-        fn endpoint(&self) -> &Endpoint {
-            &self.endpoint
+        fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+            std::borrow::Cow::Borrowed(&self.endpoint)
         }
         fn model(&self) -> String {
             "fixture".to_owned()
+        }
+        fn context_window(&self) -> Option<u64> {
+            Some(50_000)
+        }
+        fn max_output_tokens(&self) -> Option<u64> {
+            Some(5_000)
         }
         fn instructions(&self) -> String {
             String::new()
@@ -402,6 +526,128 @@ mod tests {
         }
     }
 
+    fn read_authority(parent: &Parent) -> Authority {
+        Authority {
+            mode: PermissionMode::Auto,
+            rules: RuleSet::new(),
+            workspace: parent.context.workspace.clone(),
+            roots: vec![parent.context.workspace.clone()],
+            tools: vec!["read_file".to_owned()],
+            mcp_view: None,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn a_child_at_its_step_limit_returns_its_findings() {
+        // Every step but the last calls a tool; the last one, told it is the
+        // last, answers.
+        let mut turns: Vec<rune_testkit::scripted::Turn> = (1..CHILD_STEPS)
+            .map(|index| {
+                rune_testkit::scripted::Turn::call(
+                    &format!("call_{index}"),
+                    "read_file",
+                    &format!(r#"{{"path":"f{index}.rs"}}"#),
+                )
+            })
+            .collect();
+        turns.push(rune_testkit::scripted::Turn::text(
+            "the parser is in lex.rs",
+        ));
+        let provider = rune_testkit::scripted::ScriptedProvider::start(turns);
+        let mut parent = parent();
+        parent.endpoint = Endpoint::new(provider.base_url(), "fixture");
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("read");
+        let children = AtomicU64::new(0);
+        let runner = Runner {
+            parent: &parent,
+            registry: &registry,
+            children: &children,
+            limit_inputs: None,
+        };
+        let request = SubagentRequest::decode(&serde_json::json!({
+            "action": "run",
+            "task": "find the parser",
+        }))
+        .expect("request");
+        let outcome = runner
+            .delegate(&request, &Admission::capture(&read_authority(&parent)))
+            .expect("partial findings");
+        assert!(
+            outcome
+                .summary
+                .starts_with("child stopped at its step limit; findings so far:\n"),
+            "{}",
+            outcome.summary
+        );
+        assert!(outcome.summary.contains("lex.rs"), "{}", outcome.summary);
+        assert_eq!(
+            u64::try_from(provider.request_count()).expect("count"),
+            CHILD_STEPS
+        );
+        assert_eq!(
+            partial_findings("  "),
+            "child stopped at its step limit; findings so far: none"
+        );
+    }
+
+    #[test]
+    fn a_child_offers_only_read_only_tools() {
+        let parent = parent();
+        let mut registry = Registry::new();
+        registry
+            .insert(Box::new(rune_tools::ReadFile::new()))
+            .expect("read");
+        registry
+            .insert(Box::new(rune_tools::WriteFile::new()))
+            .expect("write");
+        *parent.tools.lock().expect("tools") = registry.all_schemas();
+        let mut authority = read_authority(&parent);
+        authority.tools.push("write_file".to_owned());
+        let children = AtomicU64::new(0);
+        let runner = Runner {
+            parent: &parent,
+            registry: &registry,
+            children: &children,
+            limit_inputs: None,
+        };
+        let names: Vec<String> = runner
+            .tools(&Admission::capture(&authority), None)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(names, ["read_file"]);
+    }
+
+    #[test]
+    fn a_child_inherits_limits_for_the_same_model_and_resolves_another() {
+        let parent = parent();
+        assert_eq!(
+            child_limits(&parent, "fixture", None),
+            (Some(50_000), Some(5_000))
+        );
+        // Another model without anything to resolve from is unknown, not the
+        // parent's window.
+        assert_eq!(child_limits(&parent, "other", None), (None, None));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("utf8");
+        let inputs: LimitInputs = (
+            rune_core::config::Settings {
+                context_window_override: Some(64_000),
+                max_output_override: Some(6_400),
+                ..rune_core::config::Settings::default()
+            },
+            rune_core::paths::Paths::resolve(Some(root), None, None, None, Some(root)),
+        );
+        assert_eq!(
+            child_limits(&parent, "other", Some(&inputs)),
+            (Some(64_000), Some(6_400))
+        );
+    }
+
     #[test]
     fn a_child_charges_the_parent_objective_and_cannot_continue_after_exhaustion() {
         let parent = parent();
@@ -410,6 +656,8 @@ mod tests {
             parent: &parent,
             tools: parent.tools(),
             model: parent.model(),
+            context_window: None,
+            max_output: None,
             effort: Effort::Auto,
             instructions: String::new(),
             context: parent.context(),
@@ -444,6 +692,8 @@ mod tests {
             parent: &parent,
             tools: parent.tools(),
             model: parent.model(),
+            context_window: None,
+            max_output: None,
             effort: Effort::Auto,
             instructions: String::new(),
             context: parent.context(),
@@ -506,6 +756,7 @@ mod tests {
             parent: &parent,
             registry: &registry,
             children: &children,
+            limit_inputs: None,
         };
         *parent.tools.lock().expect("tools") = registry.all_schemas();
         let offered = runner.tools(&Admission::capture(&authority), None);
@@ -573,6 +824,7 @@ mod tests {
             parent: &parent,
             registry: &registry,
             children: &children,
+            limit_inputs: None,
         };
         let admission = Admission::capture(&authority);
         let tools = runner.tools(&admission, Some(&role));
@@ -587,6 +839,8 @@ mod tests {
             parent: &parent,
             tools,
             model: parent.model(),
+            context_window: None,
+            max_output: None,
             effort: Effort::Auto,
             instructions: role.instructions.clone(),
             context: parent.context(),
@@ -630,15 +884,18 @@ mod tests {
                 Layer::CommandLine,
             )
             .expect("zero children");
-        let bridge = Bridge::new(Authority {
-            mode: PermissionMode::Auto,
-            rules: RuleSet::new(),
-            workspace: parent.context.workspace.clone(),
-            roots: vec![parent.context.workspace.clone()],
-            tools: vec!["subagent".to_owned(), "read_file".to_owned()],
-            mcp_view: None,
-            generation: 0,
-        });
+        let bridge = Bridge::new(
+            Authority {
+                mode: PermissionMode::Auto,
+                rules: RuleSet::new(),
+                workspace: parent.context.workspace.clone(),
+                roots: vec![parent.context.workspace.clone()],
+                tools: vec!["subagent".to_owned(), "read_file".to_owned()],
+                mcp_view: None,
+                generation: 0,
+            },
+            None,
+        );
         let arguments = serde_json::json!({"action": "run", "task": "read"});
         let output = bridge
             .call(&parent, &Registry::new(), &arguments, &parent.context)

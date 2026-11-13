@@ -8,8 +8,11 @@ use rune_core::config::Effort;
 use rune_core::error::{Result, RuneError};
 use rune_core::id::ToolCallId;
 
+use crate::compat::{
+    CacheMarkers, EmptyContent, Family, ReasoningReplay, SchemaRules, ThinkingFormat, shape_call_id,
+};
 use crate::message::{ContentPart, Message, Role};
-use crate::provider::{Provider, RequestPlan};
+use crate::provider::{MarkerPolicy, Provider, RequestPlan};
 use crate::stream::{
     FinishReason, Limit, StreamReducer, Usage, incomplete_stream, protocol_violation,
     stream_failure,
@@ -70,24 +73,40 @@ impl Provider for ChatCompletions {
         Box::new(Reducer::new())
     }
 
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        Box::new(Reducer::new().with_done_marker(plan.compat.needs_done_marker))
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
+        let compat = &plan.compat;
         let mut messages: Vec<serde_json::Value> = Vec::new();
 
         // The system lane is emitted first and separately, because the
         // conversation model keeps it out of the message list.
         if !plan.instructions.is_empty() {
             messages.push(serde_json::json!({
-                "role": "system",
+                "role": compat.system_role.as_str(),
                 "content": plan.instructions,
             }));
         }
 
-        for message in &plan.messages {
+        // Wire messages before the last plan message's, for a shared-prefix request.
+        let mut shared = 0;
+        for (index, message) in plan.messages.iter().enumerate() {
+            shared = messages.len();
             if message.role == Role::Tool {
                 // One tool message can carry a whole batch of results, because
                 // the history groups them, so it expands to one wire message per
                 // result rather than being collapsed to its first.
-                messages.extend(encode_tool_messages(message));
+                messages.extend(encode_tool_messages(message, plan));
+                if compat.assistant_after_tool_result
+                    && plan
+                        .messages
+                        .get(index.saturating_add(1))
+                        .is_some_and(|next| next.role == Role::User)
+                {
+                    messages.push(serde_json::json!({ "role": "assistant", "content": "Done." }));
+                }
                 continue;
             }
             messages.push(encode_message(message, plan)?);
@@ -96,7 +115,7 @@ impl Provider for ChatCompletions {
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::json!(plan.model));
         body.insert("stream".to_owned(), serde_json::json!(true));
-        if Self::INCLUDE_USAGE {
+        if Self::INCLUDE_USAGE && compat.stream_usage {
             body.insert(
                 "stream_options".to_owned(),
                 serde_json::json!({ "include_usage": true }),
@@ -109,13 +128,23 @@ impl Provider for ChatCompletions {
                 .tools
                 .iter()
                 .map(|tool| {
+                    let mut function = serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": crate::schema::sanitize(
+                            &tool.input_schema,
+                            compat.schema_rules,
+                            compat.strict_schema,
+                        ),
+                    });
+                    if compat.strict_schema
+                        && let Some(function) = function.as_object_mut()
+                    {
+                        function.insert("strict".to_owned(), serde_json::json!(true));
+                    }
                     Ok(serde_json::json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
-                        }
+                        "function": function,
                     }))
                 })
                 .collect();
@@ -124,27 +153,140 @@ impl Provider for ChatCompletions {
                 "tool_choice".to_owned(),
                 serde_json::json!(plan.tool_choice.as_str()),
             );
-            body.insert(
-                "parallel_tool_calls".to_owned(),
-                serde_json::json!(plan.parallel_tool_calls),
-            );
+            if compat.parallel_tool_calls_field {
+                body.insert(
+                    "parallel_tool_calls".to_owned(),
+                    serde_json::json!(plan.parallel_tool_calls),
+                );
+            }
+        } else if compat.tools_with_tool_history
+            && plan.messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::ToolCall { .. }))
+            })
+        {
+            body.insert("tools".to_owned(), serde_json::json!([]));
         }
 
-        if let Some(effort) = effort_wire(plan.effort) {
-            body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
+        insert_thinking(&mut body, plan);
+        let sampling = plan.sampling;
+        if let Some(temperature) = sampling.temperature {
+            body.insert("temperature".to_owned(), serde_json::json!(temperature));
+        }
+        if let Some(top_p) = sampling.top_p {
+            body.insert("top_p".to_owned(), serde_json::json!(top_p));
+        }
+        // Only the families that serve `top_k` on compatible routes get it.
+        if let Some(top_k) = sampling.top_k
+            && matches!(plan.traits.family, Family::Gemini | Family::Qwen)
+        {
+            body.insert("top_k".to_owned(), serde_json::json!(top_k));
         }
 
         if let Some(max) = plan.max_output_tokens {
-            // `max_tokens` rather than `max_completion_tokens`, because the
-            // compatible-server ecosystem understands the former.
-            body.insert("max_tokens".to_owned(), serde_json::json!(max));
+            body.insert(
+                compat.max_tokens_field.as_str().to_owned(),
+                serde_json::json!(max),
+            );
         }
 
         if let Some(options) = crate::provider::provider_options(plan) {
             body.insert("provider".to_owned(), options);
         }
 
+        if compat.prompt_cache_key {
+            body.insert(
+                "prompt_cache_key".to_owned(),
+                serde_json::json!(plan.cache_key.clone().unwrap_or_else(|| {
+                    crate::provider::prefix_cache_key(&plan.instructions, &plan.tools)
+                })),
+            );
+        }
+
+        if compat.cache_control == CacheMarkers::Anthropic
+            && plan.cache_markers != MarkerPolicy::None
+            && let Some(messages) = body
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            let marked = if plan.cache_markers == MarkerPolicy::SharedPrefix {
+                &mut messages[..shared]
+            } else {
+                &mut messages[..]
+            };
+            mark_cache_breakpoints(marked, !plan.instructions.is_empty());
+            if let [stable, rest] = plan.system_blocks()[..] {
+                let marker = serde_json::json!({ "type": "ephemeral" });
+                messages[0]["content"] = serde_json::json!([
+                    { "type": "text", "text": stable, "cache_control": marker },
+                    { "type": "text", "text": rest, "cache_control": marker },
+                ]);
+            }
+        }
+
         Ok(serde_json::Value::Object(body))
+    }
+}
+
+/// Marks the system message and the newest user or assistant message that has
+/// text as prompt cache breakpoints. Tool messages are never marked.
+fn mark_cache_breakpoints(messages: &mut [serde_json::Value], has_system: bool) {
+    let is_text = |part: &serde_json::Value| {
+        part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+    };
+    let has_text = |message: &serde_json::Value| match message.get("content") {
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(serde_json::Value::Array(parts)) => parts.iter().any(|part| {
+            is_text(part)
+                && part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
+    };
+    let newest = messages
+        .iter()
+        .enumerate()
+        .skip(usize::from(has_system))
+        .rev()
+        .find(|(_, message)| {
+            matches!(
+                message.get("role").and_then(serde_json::Value::as_str),
+                Some("user" | "assistant")
+            ) && has_text(message)
+        })
+        .map(|(index, _)| index);
+    for index in has_system.then_some(0).into_iter().chain(newest) {
+        let Some(content) = messages
+            .get_mut(index)
+            .and_then(|message| message.get_mut("content"))
+        else {
+            continue;
+        };
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        match content {
+            serde_json::Value::String(text) => {
+                *content = serde_json::json!([{
+                    "type": "text",
+                    "text": std::mem::take(text),
+                    "cache_control": marker,
+                }]);
+            }
+            serde_json::Value::Array(parts) => {
+                if let Some(part) = parts
+                    .iter_mut()
+                    .rev()
+                    .find(|part| is_text(part))
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    part.insert("cache_control".to_owned(), marker);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -156,7 +298,7 @@ fn encode_message(message: &Message, plan: &RequestPlan) -> Result<serde_json::V
             "system content must be supplied as instructions, not as a message",
         )),
         Role::User => Ok(encode_user(message, plan)),
-        Role::Assistant => Ok(encode_assistant(message)),
+        Role::Assistant => Ok(encode_assistant(message, plan)),
         // Tool results are expanded before this point, because one message can
         // carry several of them and this returns a single message.
         Role::Tool => Err(RuneError::invariant(
@@ -199,8 +341,10 @@ fn encode_user(message: &Message, plan: &RequestPlan) -> serde_json::Value {
     serde_json::json!({ "role": "user", "content": parts })
 }
 
-/// Encodes an assistant message, including any tool calls.
-fn encode_assistant(message: &Message) -> serde_json::Value {
+/// Encodes an assistant message, including any tool calls and the reasoning
+/// the endpoint wants sent back.
+fn encode_assistant(message: &Message, plan: &RequestPlan) -> serde_json::Value {
+    let compat = &plan.compat;
     let calls: Vec<serde_json::Value> = message
         .parts
         .iter()
@@ -210,7 +354,7 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
                 name,
                 arguments,
             } => Some(serde_json::json!({
-                "id": id.as_str(),
+                "id": shape_call_id(id.as_str(), compat.tool_call_id),
                 "type": "function",
                 "function": { "name": name, "arguments": arguments },
             })),
@@ -225,20 +369,162 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
     if calls.is_empty() {
         value.insert("content".to_owned(), serde_json::json!(text));
     } else {
-        // A message carrying tool calls sends a null content field, which is
-        // what the reference implementation does.
+        // A message carrying only tool calls sends a null content field, which
+        // is what the reference implementation does, unless the endpoint
+        // refuses one.
         value.insert(
             "content".to_owned(),
-            if text.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!(text)
+            match (text.is_empty(), compat.assistant_content_when_only_calls) {
+                (true, EmptyContent::Null) => serde_json::Value::Null,
+                (true, EmptyContent::EmptyString) => serde_json::json!(""),
+                (false, _) => serde_json::json!(text),
             },
         );
         value.insert("tool_calls".to_owned(), serde_json::Value::Array(calls));
     }
 
+    encode_reasoning(&mut value, message, plan);
     serde_json::Value::Object(value)
+}
+
+/// Reasoning stored with an assistant message.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StoredReasoning {
+    /// The field it arrived in, when known.
+    #[serde(default)]
+    field: Option<String>,
+    /// The reasoning text, exactly as streamed.
+    #[serde(default)]
+    text: String,
+    /// The `reasoning_details` entries, verbatim.
+    #[serde(default)]
+    details: Vec<serde_json::Value>,
+}
+
+/// Returns the reasoning stored with a message.
+///
+/// A message whose replay state carries none, including one recorded before
+/// that state held reasoning, falls back to its reasoning parts. A malformed
+/// state counts as absent.
+fn reasoning_of(message: &Message) -> Option<StoredReasoning> {
+    let stored = message
+        .replay
+        .as_deref()
+        .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok())
+        .and_then(|mut blob| blob.get_mut("reasoning").map(serde_json::Value::take))
+        .and_then(|reasoning| serde_json::from_value::<StoredReasoning>(reasoning).ok());
+    if stored.is_some() {
+        return stored;
+    }
+    let text: String = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Reasoning { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then_some(StoredReasoning {
+        field: None,
+        text,
+        details: Vec::new(),
+    })
+}
+
+/// Adds earlier reasoning to an assistant message in the field the endpoint
+/// reads it from.
+fn encode_reasoning(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    message: &Message,
+    plan: &RequestPlan,
+) {
+    let compat = &plan.compat;
+    if compat.reasoning_replay == ReasoningReplay::None {
+        return;
+    }
+    let stored = reasoning_of(message).unwrap_or_default();
+    let observed = stored.field.as_deref();
+    let merged = plan.traits.family == Family::Kimi
+        && compat.reasoning_replay != ReasoningReplay::ReasoningDetails
+        && !stored.details.is_empty();
+    let details = !merged
+        && match compat.reasoning_replay {
+            ReasoningReplay::ReasoningDetails => true,
+            ReasoningReplay::AsObserved => observed == Some("reasoning_details"),
+            _ => false,
+        };
+    let text_field = match compat.reasoning_replay {
+        ReasoningReplay::ReasoningContent => "reasoning_content",
+        ReasoningReplay::AsObserved if !details => REASONING_FIELDS
+            .into_iter()
+            .find(|field| Some(*field) == observed)
+            .unwrap_or("reasoning_content"),
+        _ => "reasoning",
+    };
+    if merged {
+        value.insert(
+            "reasoning_details".to_owned(),
+            serde_json::Value::Array(merge_details(&stored.details)),
+        );
+    }
+    if details && !stored.details.is_empty() {
+        value.insert(
+            "reasoning_details".to_owned(),
+            serde_json::Value::Array(stored.details),
+        );
+    } else if !stored.text.is_empty() {
+        value.insert(text_field.to_owned(), serde_json::json!(stored.text));
+        return;
+    }
+    // Some endpoints refuse a tool conversation in which any assistant
+    // message lacks the field, even an empty one.
+    if compat.reasoning_always && plan.has_tools() && !value.contains_key(text_field) {
+        value.insert(text_field.to_owned(), serde_json::json!(stored.text));
+    }
+}
+
+/// Joins streamed `reasoning_details` fragments into whole entries.
+///
+/// Entries sharing an `index` form one entry at the place of the first: its
+/// `summary`, `text` and `data` strings are joined in arrival order and its
+/// other fields come from the first fragment. An entry with no `index` stands
+/// alone. The `index` key is not kept.
+fn merge_details(details: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut groups: Vec<(serde_json::Value, usize)> = Vec::new();
+    for entry in details {
+        let Some(fields) = entry.as_object() else {
+            merged.push(entry.clone());
+            continue;
+        };
+        let mut fields = fields.clone();
+        let index = fields.remove("index").filter(|index| !index.is_null());
+        let group = index.as_ref().and_then(|index| {
+            groups
+                .iter()
+                .find(|(known, _)| known == index)
+                .map(|(_, position)| *position)
+        });
+        let target = group.and_then(|position| merged.get_mut(position));
+        let Some(target) = target.and_then(serde_json::Value::as_object_mut) else {
+            if let Some(index) = index {
+                groups.push((index, merged.len()));
+            }
+            merged.push(serde_json::Value::Object(fields));
+            continue;
+        };
+        for key in ["summary", "text", "data"] {
+            let Some(addition) = fields.get(key).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let joined = match target.get(key).and_then(serde_json::Value::as_str) {
+                Some(existing) => format!("{existing}{addition}"),
+                None => addition.to_owned(),
+            };
+            target.insert(key.to_owned(), serde_json::json!(joined));
+        }
+    }
+    merged
 }
 
 /// Encodes one tool result message.
@@ -247,28 +533,50 @@ fn encode_assistant(message: &Message) -> serde_json::Value {
 /// calls were made. A message holding several results is the shape a batch
 /// produces, and emitting only the first leaves the other calls unanswered,
 /// which an endpoint rejects as a malformed conversation.
-fn encode_tool_messages(message: &Message) -> Vec<serde_json::Value> {
-    message
+///
+/// A tool message carries text only in this dialect, so images attached to
+/// the results follow them in one user message.
+fn encode_tool_messages(message: &Message, plan: &RequestPlan) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = message
         .parts
         .iter()
         .filter_map(|part| match part {
             ContentPart::ToolResult {
                 id,
+                name,
                 content,
                 is_error,
-                ..
-            } => Some(serde_json::json!({
-                "role": "tool",
-                "content": content,
-                "tool_call_id": id.as_str(),
-                // The compatible-server ecosystem reads a failure from this
-                // field rather than from the text, and the text is still sent
-                // so a server that ignores the field loses nothing.
-                "is_error": is_error,
-            })),
+            } => {
+                let mut result = serde_json::json!({
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": shape_call_id(id.as_str(), plan.compat.tool_call_id),
+                    // The compatible-server ecosystem reads a failure from this
+                    // field rather than from the text, and the text is still
+                    // sent so a server that ignores the field loses nothing.
+                    "is_error": is_error,
+                });
+                if plan.compat.tool_result_name
+                    && let Some(result) = result.as_object_mut()
+                {
+                    result.insert("name".to_owned(), serde_json::json!(name));
+                }
+                Some(result)
+            }
             _ => None,
         })
-        .collect()
+        .collect();
+    if let Some((text, images)) = crate::provider::tool_turn_images(message, plan) {
+        let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
+        content.extend(images.into_iter().map(|(media_type, data)| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{media_type};base64,{data}") },
+            })
+        }));
+        messages.push(serde_json::json!({ "role": "user", "content": content }));
+    }
+    messages
 }
 
 /// Maps a reasoning effort onto the dialect's spelling.
@@ -285,6 +593,125 @@ pub fn effort_wire(effort: Effort) -> Option<&'static str> {
         Effort::Max => Some("max"),
     }
 }
+
+/// Writes the reasoning controls of the endpoint's thinking format.
+fn insert_thinking(body: &mut serde_json::Map<String, serde_json::Value>, plan: &RequestPlan) {
+    let compat = &plan.compat;
+    let effort = plan.effort;
+    let id = plan.model.to_ascii_lowercase();
+    match compat.thinking_format {
+        ThinkingFormat::None => {}
+        ThinkingFormat::DeepSeek => insert_deepseek_thinking(body, effort),
+        ThinkingFormat::ReasoningEffort
+            if plan.traits.family == Family::Kimi
+                && compat.schema_rules == SchemaRules::Moonshot =>
+        {
+            insert_kimi_thinking(body, effort, &id);
+        }
+        ThinkingFormat::ReasoningEffort => {
+            if let Some(level) = effort_wire(effort) {
+                body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+            }
+        }
+        ThinkingFormat::OpenRouter => {
+            if let Some(level) = effort_wire(effort) {
+                body.insert(
+                    "reasoning".to_owned(),
+                    serde_json::json!({ "effort": level }),
+                );
+            }
+        }
+        ThinkingFormat::Zai => {
+            // GLM-5.3 cannot turn thinking off, so it stays enabled there.
+            let thinking = if effort == Effort::None && !id.contains("glm-5.3") {
+                serde_json::json!({ "type": "disabled" })
+            } else {
+                serde_json::json!({ "type": "enabled", "clear_thinking": false })
+            };
+            body.insert("thinking".to_owned(), thinking);
+        }
+        ThinkingFormat::MiniMax => {
+            body.insert("reasoning_split".to_owned(), serde_json::json!(true));
+            let level = match effort {
+                Effort::Auto | Effort::None => None,
+                Effort::Minimal => Some("low"),
+                other => effort_wire(other),
+            };
+            if let Some(level) = level.filter(|_| id.contains("m3.1-flash")) {
+                body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+            }
+        }
+        ThinkingFormat::QwenEnable => {
+            if effort != Effort::Auto {
+                body.insert(
+                    "enable_thinking".to_owned(),
+                    serde_json::json!(effort != Effort::None),
+                );
+            }
+        }
+        ThinkingFormat::ChatTemplate => {
+            if effort != Effort::Auto {
+                body.insert(
+                    "chat_template_kwargs".to_owned(),
+                    serde_json::json!({ "enable_thinking": effort != Effort::None }),
+                );
+            }
+        }
+    }
+}
+
+/// Writes Kimi's controls: `reasoning_effort` in three levels, except the
+/// K2 models, of which only K2.6 can switch thinking off.
+fn insert_kimi_thinking(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    effort: Effort,
+    id: &str,
+) {
+    let level = match effort {
+        Effort::Auto => return,
+        Effort::None => {
+            if id.contains("k2.6") {
+                body.insert(
+                    "thinking".to_owned(),
+                    serde_json::json!({ "type": "disabled" }),
+                );
+            }
+            return;
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium | Effort::High | Effort::Xhigh => "high",
+        Effort::Max => "max",
+    };
+    if !id.contains("k2.6") && !id.contains("k2.7") {
+        body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+    }
+}
+
+/// Writes DeepSeek's thinking switch and its three effort levels. `Auto`
+/// sends nothing, which leaves the server default of thinking at high effort.
+fn insert_deepseek_thinking(body: &mut serde_json::Map<String, serde_json::Value>, effort: Effort) {
+    let level = match effort {
+        Effort::Auto => return,
+        Effort::None => {
+            body.insert(
+                "thinking".to_owned(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+            return;
+        }
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium | Effort::High | Effort::Xhigh => "high",
+        Effort::Max => "max",
+    };
+    body.insert(
+        "thinking".to_owned(),
+        serde_json::json!({ "type": "enabled" }),
+    );
+    body.insert("reasoning_effort".to_owned(), serde_json::json!(level));
+}
+
+/// The text fields reasoning arrives in, in the order they are read.
+const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 /// Accumulates one tool call across streamed deltas.
 #[derive(Debug, Default)]
@@ -307,8 +734,19 @@ pub struct Reducer {
     finish_reason: Option<FinishReason>,
     saw_terminal: bool,
     saw_done: bool,
+    /// Whether the endpoint must end the stream with `[DONE]`.
+    needs_done_marker: bool,
+    /// Whether the stream ended without `[DONE]` in a state taken as complete.
+    ended_without_marker: bool,
     saw_role: bool,
     event_count: usize,
+    /// Every reasoning delta emitted, in order.
+    reasoning: String,
+    /// Every `reasoning_details` entry, verbatim, because some endpoints need
+    /// them sent back exactly.
+    reasoning_details: Vec<serde_json::Value>,
+    /// The field reasoning first arrived in.
+    observed_field: Option<&'static str>,
 }
 
 impl Default for Reducer {
@@ -329,8 +767,13 @@ impl Reducer {
             finish_reason: None,
             saw_terminal: false,
             saw_done: false,
+            needs_done_marker: false,
+            ended_without_marker: false,
             saw_role: false,
             event_count: 0,
+            reasoning: String::new(),
+            reasoning_details: Vec::new(),
+            observed_field: None,
         }
     }
 
@@ -338,6 +781,13 @@ impl Reducer {
     #[must_use]
     pub fn with_limits(mut self, limits: Limit) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Sets whether a stream that ends without `[DONE]` is incomplete.
+    #[must_use]
+    pub fn with_done_marker(mut self, needs_done_marker: bool) -> Self {
+        self.needs_done_marker = needs_done_marker;
         self
     }
 
@@ -419,7 +869,10 @@ impl Reducer {
 
         // Functions and audio are deliberately unsupported; accepting them
         // silently would let an unimplemented feature appear to work.
-        if delta.get("function_call").is_some() {
+        if delta
+            .get("function_call")
+            .is_some_and(|call| !is_empty_function_call(call))
+        {
             return Err(protocol_violation(
                 "the stream used the deprecated function_call field",
             ));
@@ -438,15 +891,41 @@ impl Reducer {
             });
         }
 
-        for field in ["reasoning", "reasoning_content"] {
-            if let Some(text) = delta
+        // Servers name the reasoning field differently and some send it under
+        // two names at once, so the first that carries text is the only one read.
+        let text_field = REASONING_FIELDS.into_iter().find_map(|field| {
+            delta
                 .get(field)
                 .and_then(serde_json::Value::as_str)
                 .filter(|text| !text.is_empty())
-            {
-                out.push(crate::stream::ProviderEvent::ReasoningDelta {
-                    delta: text.to_owned(),
-                });
+                .map(|text| (field, text))
+        });
+        if let Some((field, text)) = text_field {
+            self.observed_field.get_or_insert(field);
+            self.push_reasoning(text, out)?;
+        }
+        if let Some(details) = delta
+            .get("reasoning_details")
+            .and_then(serde_json::Value::as_array)
+            .filter(|details| !details.is_empty())
+        {
+            self.observed_field.get_or_insert("reasoning_details");
+            for entry in details {
+                let key = match entry.get("type").and_then(serde_json::Value::as_str) {
+                    Some("reasoning.text") => Some("text"),
+                    Some("reasoning.summary") => Some("summary"),
+                    _ => None,
+                };
+                let text = key
+                    .and_then(|key| entry.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty());
+                if text_field.is_none()
+                    && let Some(text) = text
+                {
+                    self.push_reasoning(text, out)?;
+                }
+                self.reasoning_details.push(entry.clone());
             }
         }
 
@@ -480,17 +959,51 @@ impl Reducer {
         Ok(())
     }
 
+    /// Records and emits one reasoning delta.
+    fn push_reasoning(
+        &mut self,
+        text: &str,
+        out: &mut Vec<crate::stream::ProviderEvent>,
+    ) -> Result<()> {
+        self.reasoning.push_str(text);
+        if self.reasoning.len() > self.limits.max_content_bytes {
+            return Err(RuneError::too_large(
+                "stream.reasoning",
+                self.reasoning.len(),
+                self.limits.max_content_bytes,
+            ));
+        }
+        out.push(crate::stream::ProviderEvent::ReasoningDelta {
+            delta: text.to_owned(),
+        });
+        Ok(())
+    }
+
     /// Applies one tool-call delta.
     fn apply_tool_call(
         &mut self,
         call: &serde_json::Value,
         out: &mut Vec<crate::stream::ProviderEvent>,
     ) -> Result<()> {
-        let index = call
-            .get("index")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| protocol_violation("a tool call delta carried no index"))?;
+        let index = match call.get("index").filter(|index| !index.is_null()) {
+            Some(index) => index
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| protocol_violation("a tool call delta carried no index"))?,
+            // Some servers omit the index; a repeated identifier then names the
+            // call, and anything else starts a new one.
+            None => call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| {
+                    self.calls.iter().position(|slot| {
+                        slot.id
+                            .as_ref()
+                            .is_some_and(|existing| existing.as_str() == id)
+                    })
+                })
+                .unwrap_or(self.calls.len()),
+        };
 
         if index >= self.limits.max_tool_calls {
             return Err(RuneError::too_large(
@@ -605,6 +1118,59 @@ impl Reducer {
         }
         Ok(())
     }
+
+    /// Closes every open call at the end of a turn that has a finish reason.
+    ///
+    /// Several compatible servers end a tool turn with `stop`, so every call
+    /// that started is closed whatever the reason, and a turn that made calls
+    /// is reported as one.
+    fn close_turn(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) -> Result<()> {
+        self.close_tool_calls(out)?;
+        if self.finish_reason == Some(FinishReason::Stop) && self.has_started_calls() {
+            self.finish_reason = Some(FinishReason::ToolCalls);
+        }
+        Ok(())
+    }
+
+    fn has_started_calls(&self) -> bool {
+        self.calls.iter().any(|call| call.started)
+    }
+
+    /// Decides whether a stream that ended without `[DONE]` is complete.
+    ///
+    /// It is when a finish reason arrived, or when it made calls whose
+    /// arguments are all whole JSON values. Anything else may have been cut.
+    fn end_without_marker(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) -> Result<()> {
+        if self.finish_reason.is_none() {
+            let calls_complete =
+                self.has_started_calls()
+                    && self.calls.iter().filter(|call| call.started).all(|call| {
+                        serde_json::from_str::<serde_json::Value>(&call.arguments).is_ok()
+                    });
+            if !calls_complete {
+                return Ok(());
+            }
+            self.finish_reason = Some(FinishReason::ToolCalls);
+        }
+        self.close_turn(out)?;
+        self.ended_without_marker = true;
+        Ok(())
+    }
+}
+
+/// Whether a legacy `function_call` value carries nothing.
+///
+/// Some servers send an empty one beside `tool_calls`; one that names a
+/// function or carries arguments is still refused.
+fn is_empty_function_call(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => ["name", "arguments"].into_iter().all(|key| {
+            map.get(key)
+                .is_none_or(|field| field.is_null() || field.as_str() == Some(""))
+        }),
+        _ => false,
+    }
 }
 
 impl StreamReducer for Reducer {
@@ -616,26 +1182,26 @@ impl StreamReducer for Reducer {
         let Some(payload) = payload else {
             // End of transport. A stream that never reported a terminal reason
             // is incomplete, which the caller surfaces as a retryable failure.
+            if !self.saw_done && !self.needs_done_marker {
+                self.end_without_marker(out)?;
+            }
             return Ok(());
         };
 
         if payload.trim() == "[DONE]" {
             self.saw_done = true;
             if self.finish_reason.is_none() {
-                return Err(protocol_violation(
-                    "the stream ended without a finish reason",
-                ));
+                if self.has_started_calls() {
+                    self.finish_reason = Some(FinishReason::ToolCalls);
+                } else if !self.content.is_empty() {
+                    self.finish_reason = Some(FinishReason::Stop);
+                } else {
+                    return Err(protocol_violation(
+                        "the stream ended without a finish reason",
+                    ));
+                }
             }
-            // Several compatible servers end a tool turn with `stop`, so every
-            // call that started is closed whatever the reason, and a turn that
-            // made calls is reported as one.
-            self.close_tool_calls(out)?;
-            if self.finish_reason == Some(FinishReason::Stop)
-                && self.calls.iter().any(|call| call.started)
-            {
-                self.finish_reason = Some(FinishReason::ToolCalls);
-            }
-            return Ok(());
+            return self.close_turn(out);
         }
 
         self.event_count = self.event_count.saturating_add(1);
@@ -644,7 +1210,7 @@ impl StreamReducer for Reducer {
     }
 
     fn is_finished(&self) -> bool {
-        self.saw_done
+        self.saw_done || self.ended_without_marker
     }
 
     fn usage(&self) -> Usage {
@@ -652,22 +1218,57 @@ impl StreamReducer for Reducer {
     }
 
     fn replay(&self) -> Option<String> {
-        // The dialect has no signed reasoning to replay, but the identifiers
-        // are recorded so a filtered history can drop a call and its result
-        // together.
+        // The identifiers are recorded so a filtered history can drop a call
+        // and its result together, and the reasoning so it can be sent back in
+        // the field the endpoint reads.
         let ids: Vec<&str> = self
             .calls
             .iter()
             .filter_map(|call| call.id.as_ref().map(ToolCallId::as_str))
             .collect();
-        if ids.is_empty() {
+        if ids.is_empty() && self.observed_field.is_none() {
             return None;
         }
-        serde_json::to_string(&serde_json::json!({ "_tool_call_ids": ids })).ok()
+        let mut replay = serde_json::Map::new();
+        replay.insert("_tool_call_ids".to_owned(), serde_json::json!(ids));
+        if let Some(field) = self.observed_field {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("field".to_owned(), serde_json::json!(field));
+            reasoning.insert("text".to_owned(), serde_json::json!(self.reasoning));
+            if !self.reasoning_details.is_empty() {
+                reasoning.insert(
+                    "details".to_owned(),
+                    serde_json::Value::Array(self.reasoning_details.clone()),
+                );
+            }
+            replay.insert("reasoning".to_owned(), serde_json::Value::Object(reasoning));
+        }
+        serde_json::to_string(&replay).ok()
+    }
+
+    fn salvage(&mut self, out: &mut Vec<crate::stream::ProviderEvent>) {
+        for slot in &mut self.calls {
+            if !slot.started || slot.ended {
+                continue;
+            }
+            let Some(id) = slot.id.clone() else {
+                continue;
+            };
+            let whole = serde_json::from_str::<serde_json::Value>(&slot.arguments)
+                .is_ok_and(|value| value.is_object());
+            if !whole {
+                continue;
+            }
+            out.push(crate::stream::ProviderEvent::ToolCallEnd {
+                id,
+                arguments: slot.arguments.clone(),
+            });
+            slot.ended = true;
+        }
     }
 
     fn finish(&self) -> Result<FinishReason> {
-        if !self.saw_done {
+        if !self.saw_done && !self.ended_without_marker {
             return Err(incomplete_stream());
         }
         if let Some(reason) = self.finish_reason {
@@ -702,10 +1303,13 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
     Usage {
         input_tokens: field("prompt_tokens"),
         output_tokens: field("completion_tokens"),
+        // DeepSeek reports hits at the top level; its `prompt_tokens` already
+        // counts them.
         cache_read_tokens: value
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
-            .and_then(serde_json::Value::as_u64),
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| field("prompt_cache_hit_tokens")),
         cache_write_tokens: value
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cache_write_tokens"))
@@ -749,6 +1353,60 @@ mod tests {
         plan.instructions = "be helpful".to_owned();
         plan.messages = vec![Message::user(text)];
         plan
+    }
+
+    /// A plan for `model` on a generic endpoint, sampled as the loop samples it.
+    fn sampled_plan(model: &str) -> RequestPlan {
+        let mut plan = plan_with_user("hi");
+        plan.model = model.to_owned();
+        (plan.compat, plan.traits) = crate::compat::resolve("chat_completions", None, model);
+        plan.sampling = plan.traits.sampling;
+        plan
+    }
+
+    #[test]
+    fn family_sampling_defaults_are_sent() {
+        let sampled = |model: &str| {
+            let body = ChatCompletions
+                .build_request(&sampled_plan(model))
+                .expect("build");
+            ["temperature", "top_p", "top_k"].map(|field| body.get(field).cloned())
+        };
+        let json = |value: serde_json::Value| Some(value);
+        assert_eq!(
+            sampled("qwen3-coder"),
+            [json(serde_json::json!(0.55)), None, None]
+        );
+        assert_eq!(
+            sampled("gemini-3.8-flash"),
+            [
+                json(serde_json::json!(1.0)),
+                json(serde_json::json!(0.95)),
+                json(serde_json::json!(64))
+            ]
+        );
+        assert_eq!(
+            sampled("glm-4.7"),
+            [json(serde_json::json!(1.0)), None, None]
+        );
+        assert_eq!(
+            sampled("minimax-m3"),
+            [
+                json(serde_json::json!(1.0)),
+                json(serde_json::json!(0.95)),
+                None
+            ]
+        );
+        assert_eq!(sampled("test/model"), [None, None, None]);
+    }
+
+    #[test]
+    fn a_user_temperature_overrides_the_default() {
+        let mut plan = sampled_plan("gemini-3.8-flash");
+        plan.sampling.temperature = Some(0.2);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["top_p"], 0.95);
     }
 
     #[test]
@@ -843,6 +1501,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = ChatCompletions.build_request(&plan).expect("build");
@@ -898,6 +1557,7 @@ mod tests {
                     },
                 ],
                 replay: None,
+                origin: None,
             },
         ];
         let body = ChatCompletions.build_request(&plan).expect("build");
@@ -927,6 +1587,7 @@ mod tests {
                 is_error: false,
             }],
             replay: None,
+            origin: None,
         }];
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert_eq!(body["messages"].as_array().expect("array").len(), 1);
@@ -941,9 +1602,110 @@ mod tests {
             role: Role::Tool,
             parts: Vec::new(),
             replay: None,
+            origin: None,
         }];
         let body = ChatCompletions.build_request(&plan).expect("build");
         assert!(body["messages"].as_array().expect("array").is_empty());
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+            origin: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_follows_the_tool_messages_as_a_user_message() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "image b.png attached"),
+            image(2),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        plan.image_data.insert(2, "REVG".into());
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["content"], "image a.png attached");
+        assert_eq!(messages[1]["tool_call_id"], "call_2");
+        assert_eq!(
+            messages[2],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Images from the tool results above."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,REVG"}},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("call_1", "contents")]);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{
+                "role": "tool",
+                "content": "contents",
+                "tool_call_id": "call_1",
+                "is_error": false,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "image b.png attached"),
+            image(2),
+        ]);
+        plan.image_data.insert(2, "REVG".into());
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let content = body["messages"][2]["content"].as_array().expect("parts");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,REVG");
+
+        let plan = tool_turn(vec![result("call_1", "image a.png attached"), image(1)]);
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "Images from the tool results above are no longer available.",
+            }])
+        );
+        assert!(!body.to_string().contains("image-ref"));
     }
 
     #[test]
@@ -1054,6 +1816,31 @@ mod tests {
     }
 
     #[test]
+    fn salvage_closes_only_calls_with_complete_arguments() {
+        let (mut events, mut reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"read_file","arguments":"[1]"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"c3","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+        ]);
+        reducer.salvage(&mut events);
+        let ended: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallEnd { id, arguments } => {
+                    Some((id.to_string(), arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [("c1".to_owned(), r#"{"path":"a"}"#.to_owned())]);
+
+        // A closed call is not closed twice.
+        let mut again = Vec::new();
+        reducer.salvage(&mut again);
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
     fn text_deltas_are_emitted_in_order() {
         let (events, reducer) = reduce(&[
             r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
@@ -1073,20 +1860,109 @@ mod tests {
         assert_eq!(text, "Hello world");
     }
 
-    #[test]
-    fn reasoning_deltas_use_both_known_field_names() {
-        let (events, _) = reduce(&[
-            r#"{"choices":[{"index":0,"delta":{"reasoning":"step one"}}]}"#,
-            r#"{"choices":[{"index":0,"delta":{"reasoning_content":" step two"}}]}"#,
-        ]);
-        let text: String = events
+    fn reasoning_text(events: &[ProviderEvent]) -> String {
+        events
             .iter()
             .filter_map(|event| match event {
                 ProviderEvent::ReasoningDelta { delta } => Some(delta.as_str()),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Reduces a recorded stream file, one `data:` line per frame.
+    fn reduce_recorded(recorded: &str) -> (Vec<ProviderEvent>, Reducer) {
+        let frames: Vec<&str> = recorded
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
             .collect();
-        assert_eq!(text, "step one step two");
+        reduce(&frames)
+    }
+
+    #[test]
+    fn reasoning_is_read_under_every_field_name() {
+        for (recorded, text, field) in [
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_content/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning_content",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_text/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning_text",
+            ),
+            (
+                include_str!("../tests/fixtures/chat_completions/reasoning_details/response.txt"),
+                "Check the file first. Then answer.",
+                "reasoning",
+            ),
+        ] {
+            let (events, reducer) = reduce_recorded(recorded);
+            reducer.finish().expect("finished");
+            assert_eq!(reasoning_text(&events), text, "{field}");
+            assert_eq!(reducer.reasoning, text, "{field}");
+            assert_eq!(reducer.observed_field, Some(field));
+        }
+
+        let (_, reducer) = reduce_recorded(include_str!(
+            "../tests/fixtures/chat_completions/reasoning_details/response.txt"
+        ));
+        assert_eq!(reducer.reasoning_details.len(), 3);
+        assert_eq!(
+            reducer.reasoning_details[2]["type"], "reasoning.encrypted",
+            "{:?}",
+            reducer.reasoning_details
+        );
+    }
+
+    #[test]
+    fn a_reasoning_field_and_its_alias_are_not_doubled() {
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"step one","reasoning_content":"step one"}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "step one");
+        assert_eq!(reducer.observed_field, Some("reasoning_content"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"","reasoning_content":"x"}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "x");
+        assert_eq!(reducer.observed_field, Some("reasoning_content"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque","id":"r1","format":"openai-responses-v1","index":0}]}}]}"#,
+        ]);
+        assert!(reasoning_text(&events).is_empty(), "{events:?}");
+        assert_eq!(reducer.reasoning_details.len(), 1);
+        assert_eq!(reducer.observed_field, Some("reasoning_details"));
+
+        let (events, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"plan"},{"type":"reasoning.text","text":" and act"}]}}]}"#,
+        ]);
+        assert_eq!(reasoning_text(&events), "plan and act");
+        assert_eq!(reducer.observed_field, Some("reasoning_details"));
+    }
+
+    #[test]
+    fn reasoning_past_the_content_bound_is_rejected() {
+        let mut reducer = Reducer::new().with_limits(Limit {
+            max_content_bytes: 4,
+            ..Limit::default()
+        });
+        let mut events = Vec::new();
+        let err = reducer
+            .apply(
+                Some(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"far too long"}}]}"#),
+                &mut events,
+            )
+            .expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::TooLarge);
     }
 
     #[test]
@@ -1255,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_done_without_a_finish_reason_is_rejected() {
+    fn a_done_without_a_finish_reason_or_content_is_rejected() {
         let mut reducer = Reducer::new();
         let mut events = Vec::new();
         let err = reducer
@@ -1502,6 +2378,100 @@ mod tests {
         assert!(reducer.replay().is_none());
     }
 
+    fn assistant_after(reasoning: Option<&str>) -> RequestPlan {
+        let mut plan = default_body_plan();
+        plan.compat.reasoning_replay = ReasoningReplay::ReasoningContent;
+        plan.compat.reasoning_always = true;
+        if let Some(text) = reasoning {
+            plan.messages[1].parts.insert(
+                0,
+                ContentPart::Reasoning {
+                    text: text.to_owned(),
+                },
+            );
+        }
+        plan
+    }
+
+    #[test]
+    fn reasoning_is_always_sent_with_tools_when_required() {
+        let body = ChatCompletions
+            .build_request(&assistant_after(None))
+            .expect("build");
+        assert_eq!(body["messages"][2]["role"], "assistant");
+        assert_eq!(body["messages"][2]["reasoning_content"], "");
+
+        let mut plan = assistant_after(None);
+        plan.compat.reasoning_always = false;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+
+        let body = ChatCompletions
+            .build_request(&assistant_after(Some("think")))
+            .expect("build");
+        assert_eq!(body["messages"][2]["reasoning_content"], "think");
+    }
+
+    #[test]
+    fn reasoning_is_omitted_without_tools() {
+        let mut plan = assistant_after(None);
+        plan.tools.clear();
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let assistant = body["messages"][2].as_object().expect("assistant");
+        assert!(
+            !assistant.contains_key("reasoning_content"),
+            "{assistant:?}"
+        );
+        assert!(!assistant.contains_key("reasoning"), "{assistant:?}");
+    }
+
+    #[test]
+    fn an_old_history_replays_reasoning_from_its_parts() {
+        for blob in [
+            Some(r#"{"_tool_call_ids":["call_1"]}"#),
+            Some("not json"),
+            None,
+        ] {
+            let mut plan = assistant_after(Some("from the parts"));
+            plan.compat.reasoning_always = false;
+            plan.messages[1].replay = blob.map(str::to_owned);
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(
+                body["messages"][2]["reasoning_content"], "from the parts",
+                "{blob:?}"
+            );
+        }
+
+        let mut plan = assistant_after(Some("from the parts"));
+        plan.messages[1].replay = Some(
+            r#"{"_tool_call_ids":["call_1"],"reasoning":{"field":"reasoning","text":"stored"}}"#
+                .to_owned(),
+        );
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(body["messages"][2]["reasoning_content"], "stored");
+
+        plan.compat.reasoning_replay = ReasoningReplay::None;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn replay_stores_the_reasoning_and_its_field() {
+        let (_, reducer) = reduce(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"a"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"b"}}]}"#,
+        ]);
+        let replay: serde_json::Value =
+            serde_json::from_str(&reducer.replay().expect("replay")).expect("json");
+        assert_eq!(
+            replay,
+            serde_json::json!({
+                "_tool_call_ids": [],
+                "reasoning": { "field": "reasoning_content", "text": "ab" },
+            })
+        );
+    }
+
     #[test]
     fn an_empty_answer_still_finishes() {
         let (_, reducer) = reduce(&[
@@ -1509,5 +2479,508 @@ mod tests {
             "[DONE]",
         ]);
         assert_eq!(reducer.finish().expect("finished"), FinishReason::Stop);
+    }
+
+    fn default_body_plan() -> RequestPlan {
+        let mut plan = plan_with_user("start");
+        plan.tools = vec![ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+        }];
+        plan.tool_choice = ToolChoice::Auto;
+        plan.effort = Effort::High;
+        plan.max_output_tokens = Some(1024);
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::ToolCall {
+                id: ToolCallId::new("call_1").expect("id"),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a\"}".to_owned(),
+            }]));
+        plan.messages.push(Message {
+            role: Role::Tool,
+            parts: vec![result("call_1", "contents")],
+            replay: None,
+            origin: None,
+        });
+        plan.messages.push(Message::user("thanks"));
+        plan
+    }
+
+    /// The body a default plan produced before the endpoint table shaped it.
+    const TODAYS_BODY: &str = r#"{"model":"test/model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"start"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]},{"role":"tool","content":"contents","tool_call_id":"call_1","is_error":false},{"role":"user","content":"thanks"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"tool_choice":"auto","parallel_tool_calls":true,"reasoning_effort":"high","max_tokens":1024}"#;
+
+    fn shaped(change: impl FnOnce(&mut crate::compat::EndpointCompat)) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        change(&mut plan.compat);
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    fn without_tools(change: impl FnOnce(&mut crate::compat::EndpointCompat)) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        plan.tools.clear();
+        change(&mut plan.compat);
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    #[test]
+    fn a_default_compat_sends_todays_body() {
+        let body = ChatCompletions
+            .build_request(&default_body_plan())
+            .expect("build");
+        assert_eq!(serde_json::to_string(&body).expect("json"), TODAYS_BODY);
+    }
+
+    #[test]
+    fn the_developer_role_carries_the_instructions() {
+        let body = shaped(|compat| compat.system_role = crate::compat::SystemRole::Developer);
+        assert_eq!(body["messages"][0]["role"], "developer");
+        assert_eq!(body["messages"][0]["content"], "be helpful");
+    }
+
+    #[test]
+    fn usage_is_not_requested_when_the_endpoint_refuses_it() {
+        let body = shaped(|compat| compat.stream_usage = false);
+        assert!(body.get("stream_options").is_none(), "{body}");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn the_ceiling_uses_the_configured_field_name() {
+        let body = shaped(|compat| {
+            compat.max_tokens_field = crate::compat::MaxTokensField::MaxCompletionTokens;
+        });
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn a_call_only_message_can_send_an_empty_string() {
+        let body = shaped(|compat| {
+            compat.assistant_content_when_only_calls = EmptyContent::EmptyString;
+        });
+        assert_eq!(body["messages"][2]["content"], "");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn a_tool_result_can_carry_its_tool_name() {
+        let body = shaped(|compat| compat.tool_result_name = true);
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][3]["name"], "read_file");
+        let default = shaped(|_| {});
+        assert!(default["messages"][3].get("name").is_none());
+    }
+
+    #[test]
+    fn history_with_calls_and_no_tools_sends_an_empty_tool_list() {
+        let body = without_tools(|compat| compat.tools_with_tool_history = true);
+        assert_eq!(body["tools"], serde_json::json!([]));
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        assert!(body.get("parallel_tool_calls").is_none(), "{body}");
+
+        let plain = without_tools(|_| {});
+        assert!(plain.get("tools").is_none(), "{plain}");
+
+        let mut no_calls = plan_with_user("hi");
+        no_calls.compat.tools_with_tool_history = true;
+        let body = ChatCompletions.build_request(&no_calls).expect("build");
+        assert!(body.get("tools").is_none(), "{body}");
+
+        let with_tools = shaped(|compat| compat.tools_with_tool_history = true);
+        assert_eq!(with_tools, shaped(|_| {}));
+    }
+
+    #[test]
+    fn an_assistant_turn_separates_a_tool_result_from_a_user_message() {
+        let body = shaped(|compat| compat.assistant_after_tool_result = true);
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(
+            messages[4],
+            serde_json::json!({ "role": "assistant", "content": "Done." })
+        );
+        assert_eq!(messages[5]["content"], "thanks");
+
+        // Followed by an assistant message, or ending the list: nothing added.
+        let mut plan = default_body_plan();
+        plan.compat.assistant_after_tool_result = true;
+        plan.messages.pop();
+        let ends = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(ends["messages"].as_array().expect("array").len(), 4);
+        plan.messages
+            .push(Message::assistant(vec![ContentPart::Text {
+                text: "read it".to_owned(),
+            }]));
+        let answered = ChatCompletions.build_request(&plan).expect("build");
+        let messages = answered["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[4]["content"], "read it");
+    }
+
+    #[test]
+    fn the_parallel_flag_can_be_left_out() {
+        let body = shaped(|compat| compat.parallel_tool_calls_field = false);
+        assert!(body.get("parallel_tool_calls").is_none(), "{body}");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn call_ids_are_shaped_the_same_on_call_and_result() {
+        let mut plan = default_body_plan();
+        let long = "call_with.a:long/identifier-that-goes-past-forty-bytes";
+        plan.messages[1] = Message::assistant(vec![ContentPart::ToolCall {
+            id: ToolCallId::new(long).expect("id"),
+            name: "read_file".to_owned(),
+            arguments: "{}".to_owned(),
+        }]);
+        plan.messages[2] = Message {
+            role: Role::Tool,
+            parts: vec![result(long, "contents")],
+            replay: None,
+            origin: None,
+        };
+        for shape in [
+            crate::compat::CallIdShape::ClaudeSafe,
+            crate::compat::CallIdShape::Max40,
+            crate::compat::CallIdShape::Alnum9,
+        ] {
+            plan.compat.tool_call_id = shape;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            let call = body["messages"][2]["tool_calls"][0]["id"]
+                .as_str()
+                .expect("call id");
+            assert_eq!(call, shape_call_id(long, shape));
+            assert_ne!(call, long, "{shape:?}");
+            assert_eq!(body["messages"][3]["tool_call_id"], call, "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn anthropic_markers_split_the_system_message() {
+        let mut plan = default_body_plan();
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        plan.compat.cache_control = CacheMarkers::Anthropic;
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "stable rules", "cache_control": marker },
+                { "type": "text", "text": "workspace rules", "cache_control": marker },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_plain_endpoint_gets_one_system_string() {
+        let mut plan = default_body_plan();
+        plan.instructions = "stable rules\n\nworkspace rules".to_owned();
+        plan.stable_instructions_len = "stable rules".len();
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "stable rules\n\nworkspace rules"
+        );
+    }
+
+    #[test]
+    fn cache_markers_go_on_the_system_and_newest_message() {
+        let body = shaped(|compat| compat.cache_control = CacheMarkers::Anthropic);
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(
+            messages[0]["content"],
+            serde_json::json!([{ "type": "text", "text": "be helpful", "cache_control": marker }])
+        );
+        assert_eq!(messages[1]["content"], "start");
+        assert!(messages[2]["content"].is_null());
+        assert_eq!(messages[3]["content"], "contents");
+        assert_eq!(
+            messages[4]["content"],
+            serde_json::json!([{ "type": "text", "text": "thanks", "cache_control": marker }])
+        );
+
+        // An array body is marked on its last text part.
+        let mut plan = default_body_plan();
+        plan.compat.cache_control = CacheMarkers::Anthropic;
+        plan.messages.push(Message::user_parts(vec![
+            ContentPart::Text {
+                text: "first".to_owned(),
+            },
+            image(7),
+            ContentPart::Text {
+                text: "second".to_owned(),
+            },
+        ]));
+        let body = ChatCompletions.build_request(&plan).expect("build");
+        let parts = body["messages"][5]["content"].as_array().expect("parts");
+        assert!(parts[0].get("cache_control").is_none());
+        assert_eq!(parts[2]["text"], "second");
+        assert_eq!(parts[2]["cache_control"], marker);
+        assert_eq!(body["messages"][4]["content"], "thanks");
+    }
+
+    #[test]
+    fn a_cache_key_is_sent_when_enabled() {
+        let body = shaped(|compat| compat.prompt_cache_key = true);
+        let plan = default_body_plan();
+        assert_eq!(
+            body["prompt_cache_key"],
+            crate::provider::prefix_cache_key(&plan.instructions, &plan.tools)
+        );
+        let mut keyed = default_body_plan();
+        keyed.compat.prompt_cache_key = true;
+        keyed.cache_key = Some("session-key".to_owned());
+        let body = ChatCompletions.build_request(&keyed).expect("build");
+        assert_eq!(body["prompt_cache_key"], "session-key");
+        assert!(shaped(|_| {}).get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn strict_schemas_and_no_thinking_format_shape_the_body() {
+        let strict = shaped(|compat| compat.strict_schema = true);
+        assert_eq!(strict["tools"][0]["function"]["strict"], true);
+        let silent = shaped(|compat| compat.thinking_format = ThinkingFormat::None);
+        assert!(silent.get("reasoning_effort").is_none(), "{silent}");
+        let other = shaped(|compat| compat.thinking_format = ThinkingFormat::DeepSeek);
+        assert_eq!(other["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn deepseek_effort_maps_onto_thinking_and_effort() {
+        let enabled = Some(serde_json::json!({ "type": "enabled" }));
+        for (effort, thinking, level) in [
+            (Effort::Auto, None, None),
+            (
+                Effort::None,
+                Some(serde_json::json!({ "type": "disabled" })),
+                None,
+            ),
+            (Effort::Minimal, enabled.clone(), Some("low")),
+            (Effort::Low, enabled.clone(), Some("low")),
+            (Effort::Medium, enabled.clone(), Some("high")),
+            (Effort::High, enabled.clone(), Some("high")),
+            (Effort::Xhigh, enabled.clone(), Some("high")),
+            (Effort::Max, enabled.clone(), Some("max")),
+        ] {
+            let mut plan = default_body_plan();
+            plan.compat.thinking_format = ThinkingFormat::DeepSeek;
+            plan.effort = effort;
+            let body = ChatCompletions.build_request(&plan).expect("build");
+            assert_eq!(body.get("thinking").cloned(), thinking, "{effort}");
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{effort}"
+            );
+        }
+    }
+
+    /// The request body for a model on a resolved provider at an effort.
+    fn thinking_body(
+        provider: &str,
+        base: Option<&str>,
+        model: &str,
+        effort: Effort,
+    ) -> serde_json::Value {
+        let mut plan = default_body_plan();
+        (plan.compat, plan.traits) = crate::compat::resolve(provider, base, model);
+        plan.model = model.to_owned();
+        plan.effort = effort;
+        ChatCompletions.build_request(&plan).expect("build")
+    }
+
+    const ABOVE_NONE: [Effort; 6] = [
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+
+    #[test]
+    fn glm_keeps_its_thinking_across_turns() {
+        let kept = serde_json::json!({ "type": "enabled", "clear_thinking": false });
+        for effort in [Effort::Auto].into_iter().chain(ABOVE_NONE) {
+            let body = thinking_body("zai", None, "glm-5", effort);
+            assert_eq!(body["thinking"], kept, "{effort}");
+            assert!(body.get("reasoning_effort").is_none(), "{effort}");
+        }
+        let off = thinking_body("zai", None, "glm-5", Effort::None);
+        assert_eq!(off["thinking"], serde_json::json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn glm_5_3_cannot_turn_thinking_off() {
+        let kept = serde_json::json!({ "type": "enabled", "clear_thinking": false });
+        for model in ["glm-5.3", "GLM-5.3-Flash"] {
+            let body = thinking_body("zai", None, model, Effort::None);
+            assert_eq!(body["thinking"], kept, "{model}");
+        }
+    }
+
+    #[test]
+    fn openrouter_effort_uses_the_reasoning_object() {
+        let model = "deepseek/deepseek-flash";
+        for (effort, level) in [
+            (Effort::None, "none"),
+            (Effort::Minimal, "minimal"),
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let body = thinking_body("openrouter", None, model, effort);
+            assert_eq!(
+                body["reasoning"],
+                serde_json::json!({ "effort": level }),
+                "{effort}"
+            );
+            assert!(body.get("reasoning_effort").is_none(), "{effort}");
+            assert!(body.get("usage").is_none(), "{effort}");
+        }
+        let auto = thinking_body("openrouter", None, model, Effort::Auto);
+        assert!(auto.get("reasoning").is_none(), "{auto}");
+    }
+
+    #[test]
+    fn minimax_asks_for_split_reasoning() {
+        for (model, effort, level) in [
+            ("MiniMax-M3", Effort::Auto, None),
+            ("MiniMax-M3", Effort::None, None),
+            ("MiniMax-M3", Effort::High, None),
+            ("MiniMax-M3.1-Flash", Effort::Auto, None),
+            ("MiniMax-M3.1-Flash", Effort::None, None),
+            ("MiniMax-M3.1-Flash", Effort::Minimal, Some("low")),
+            ("MiniMax-M3.1-Flash", Effort::Low, Some("low")),
+            ("MiniMax-M3.1-Flash", Effort::Medium, Some("medium")),
+            ("MiniMax-M3.1-Flash", Effort::High, Some("high")),
+            ("MiniMax-M3.1-Flash", Effort::Xhigh, Some("xhigh")),
+            ("MiniMax-M3.1-Flash", Effort::Max, Some("max")),
+        ] {
+            let body = thinking_body("minimax", None, model, effort);
+            assert_eq!(body["reasoning_split"], true, "{model} {effort}");
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{model} {effort}"
+            );
+            assert!(body.get("thinking").is_none(), "{model} {effort}");
+        }
+    }
+
+    #[test]
+    fn qwen_on_dashscope_enables_thinking() {
+        let base = Some("https://dashscope.aliyuncs.com/compatible-mode/v1");
+        let body = |effort| thinking_body("chat_completions", base, "qwen3-coder", effort);
+        assert!(body(Effort::Auto).get("enable_thinking").is_none());
+        assert_eq!(body(Effort::None)["enable_thinking"], false);
+        for effort in ABOVE_NONE {
+            assert_eq!(body(effort)["enable_thinking"], true, "{effort}");
+            assert!(body(effort).get("reasoning_effort").is_none(), "{effort}");
+        }
+    }
+
+    #[test]
+    fn a_chat_template_server_enables_thinking() {
+        let body = |effort| thinking_body("llamacpp", None, "qwen3-coder", effort);
+        assert!(body(Effort::Auto).get("chat_template_kwargs").is_none());
+        assert_eq!(
+            body(Effort::None)["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": false })
+        );
+        for effort in ABOVE_NONE {
+            assert_eq!(
+                body(effort)["chat_template_kwargs"],
+                serde_json::json!({ "enable_thinking": true }),
+                "{effort}"
+            );
+            assert!(body(effort).get("reasoning_effort").is_none(), "{effort}");
+        }
+    }
+
+    #[test]
+    fn kimi_effort_uses_three_levels() {
+        let disabled = serde_json::json!({ "type": "disabled" });
+        for (model, effort, level, thinking) in [
+            ("kimi-k3", Effort::Auto, None, None),
+            ("kimi-k3", Effort::None, None, None),
+            ("kimi-k3", Effort::Minimal, Some("low"), None),
+            ("kimi-k3", Effort::Low, Some("low"), None),
+            ("kimi-k3", Effort::Medium, Some("high"), None),
+            ("kimi-k3", Effort::High, Some("high"), None),
+            ("kimi-k3", Effort::Xhigh, Some("high"), None),
+            ("kimi-k3.1-pro", Effort::Max, Some("max"), None),
+            ("kimi-k2.6", Effort::None, None, Some(disabled.clone())),
+            ("kimi-k2.6", Effort::High, None, None),
+            ("kimi-k2.7-code", Effort::None, None, None),
+            ("kimi-k2.7-code", Effort::Max, None, None),
+        ] {
+            let body = thinking_body("moonshot", None, model, effort);
+            assert_eq!(
+                body.get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                level,
+                "{model} {effort}"
+            );
+            assert_eq!(body.get("thinking").cloned(), thinking, "{model} {effort}");
+        }
+    }
+
+    #[test]
+    fn a_kimi_model_on_an_unknown_endpoint_keeps_the_passthrough() {
+        let base = Some("https://gateway.example/v1");
+        let body = thinking_body("chat_completions", base, "kimi-k3", Effort::Medium);
+        assert_eq!(body["reasoning_effort"], "medium", "{body}");
+    }
+
+    #[test]
+    fn kimi_details_merge_by_index() {
+        let merged = merge_details(&[
+            serde_json::json!({ "type": "reasoning.summary", "summary": "Read ", "id": "a", "index": 0 }),
+            serde_json::json!({ "type": "reasoning.encrypted", "data": "x" }),
+            serde_json::json!({ "type": "reasoning.summary", "summary": "first", "id": "b", "index": 0 }),
+            serde_json::json!({ "type": "reasoning.text", "text": "one", "index": 1 }),
+            serde_json::json!({ "type": "reasoning.encrypted", "data": "y" }),
+            serde_json::json!({ "type": "reasoning.text", "text": " two", "index": 1 }),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                serde_json::json!({ "type": "reasoning.summary", "summary": "Read first", "id": "a" }),
+                serde_json::json!({ "type": "reasoning.encrypted", "data": "x" }),
+                serde_json::json!({ "type": "reasoning.text", "text": "one two" }),
+                serde_json::json!({ "type": "reasoning.encrypted", "data": "y" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek_cache_hits_count_as_cached_input() {
+        let usage = parse_usage(&serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_cache_hit_tokens": 70,
+            "prompt_cache_miss_tokens": 30,
+        }));
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_tokens, Some(70));
+        let both = parse_usage(&serde_json::json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": { "cached_tokens": 60 },
+            "prompt_cache_hit_tokens": 70,
+        }));
+        assert_eq!(both.cache_read_tokens, Some(60));
     }
 }

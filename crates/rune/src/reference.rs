@@ -77,12 +77,17 @@ fn render_command(command: &CommandSpec, out: &mut String) {
         }
         out.push('\n');
     }
-    if command.flags.is_empty() {
-        return;
+    if !command.flags.is_empty() {
+        out.push_str("| Flag | Description |\n|---|---|\n");
+        for flag in command.flags {
+            render_flag(flag, out);
+        }
     }
-    out.push_str("| Flag | Description |\n|---|---|\n");
-    for flag in command.flags {
-        render_flag(flag, out);
+    let notes = spec::notes(command.name);
+    if !notes.is_empty() {
+        out.push_str("\n```text\n");
+        out.push_str(notes);
+        out.push_str("```\n");
     }
 }
 

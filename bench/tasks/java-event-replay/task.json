@@ -1,0 +1,19 @@
+{
+  "title": "Make rebuilt account state match the live balance when a snapshot is used",
+  "kind": "bugfix",
+  "prompt": "Rebuilding account state from the event log gives a different balance than the live system when a snapshot is involved.",
+  "verify": "rm -rf out && javac -d out $(find src test -name '*.java') && java -ea -cp out HiddenTests",
+  "protected": [
+    "test/VisibleTests.java",
+    "test/HiddenTests.java"
+  ],
+  "timeoutMs": 900000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "heldout",
+  "language": "java",
+  "tags": [
+    "fix-breaks-other-test"
+  ]
+}

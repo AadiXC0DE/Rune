@@ -65,13 +65,13 @@ impl Tool for UpdatePlan {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "explanation": {"type": "string", "maxLength": MAX_EXPLANATION_BYTES},
+                "explanation": {"type": "string"},
                 "plan": {
-                    "type": "array", "maxItems": MAX_STEPS,
+                    "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "step": {"type": "string", "minLength": 1, "maxLength": MAX_STEP_BYTES},
+                            "step": {"type": "string", "minLength": 1},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
                         },
                         "required": ["step", "status"], "additionalProperties": false

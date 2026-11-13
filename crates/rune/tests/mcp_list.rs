@@ -219,9 +219,11 @@ fn empty_listing_and_help_work_without_a_provider() {
     assert_eq!(text.stdout, b"no MCP servers configured\n");
     let help = workspace.run(&["mcp", "--help"]);
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("rune mcp list [--json]"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains(
+        "rune mcp list | check [server] | login <server> | logout <server> | import claude-desktop <file>"
+    ));
     assert!(workspace.run(&["mcp", "check"]).status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("rune mcp check [server] [--json]"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--json"));
     for args in [
         &["mcp"][..],
         &["mcp", "check", "unknown"],
@@ -342,9 +344,15 @@ fn startup_timeout_is_reported_in_text_and_json_and_untrusted_commands_do_not_ru
     let output = workspace.run(&["mcp", "list", "--limit", "mcp_startup_timeout_ms=50"]);
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).expect("text");
-    assert!(text.contains("hang  stdio  approved  failed"), "{text}");
+    assert!(
+        text.contains("hang  project  stdio  approved  failed"),
+        "{text}"
+    );
     assert!(text.contains("timeout:"), "{text}");
-    assert!(text.contains("pending  stdio  pending  blocked"), "{text}");
+    assert!(
+        text.contains("pending  project  stdio  pending  blocked"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -471,7 +479,10 @@ fn check_reports_protocol_and_all_tools_without_model_requests_or_sessions() {
             assert_eq!(server["check"]["startup_timeout_ms"], 30_000);
             assert_eq!(server["check"]["operation_timeout_ms"], 60_000);
         } else {
-            assert!(text.contains("local  http  approved  connected"), "{text}");
+            assert!(
+                text.contains("local  project  http  approved  connected"),
+                "{text}"
+            );
             assert!(text.contains("protocol: 2025-11-25; tools: 2"), "{text}");
             assert!(text.contains("first (mcp_local_first)"), "{text}");
             assert!(text.contains("second (mcp_local_second)"), "{text}");
@@ -530,12 +541,15 @@ fn check_reports_startup_and_discovery_timeouts_and_checks_later_servers() {
                 assert_eq!(report["servers"][1]["status"], "connected");
                 assert_eq!(report["servers"][1]["check"]["timed_out"], false);
             } else {
-                assert!(text.contains("a_slow  http  approved  failed"), "{text}");
+                assert!(
+                    text.contains("a_slow  project  http  approved  failed"),
+                    "{text}"
+                );
                 assert!(text.contains("timeout:"), "{text}");
                 assert!(text.contains("timed_out=true"), "{text}");
                 assert!(text.contains("startup=200 ms; operation=200 ms"), "{text}");
                 assert!(
-                    text.contains("b_healthy  http  approved  connected"),
+                    text.contains("b_healthy  project  http  approved  connected"),
                     "{text}"
                 );
             }

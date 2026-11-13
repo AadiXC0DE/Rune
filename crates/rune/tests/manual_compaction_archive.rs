@@ -151,9 +151,18 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                 )
             } else {
                 let request: Value = serde_json::from_slice(&bytes).expect("JSON");
-                assert_eq!(
-                    request["messages"][0]["content"],
-                    rune_agent::compaction::SUMMARY_INSTRUCTIONS
+                assert!(
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .and_then(
+                            |text| text.strip_prefix(rune_agent::compaction::STANDALONE_PREFIX)
+                        )
+                        .is_some_and(|text| {
+                            let text = text.trim_start();
+                            text.starts_with(rune_agent::compaction::CHECKPOINT_OPENING)
+                                || text
+                                    .starts_with(rune_agent::compaction::CHECKPOINT_UPDATE_OPENING)
+                        })
                 );
                 summaries.push(request);
                 (
@@ -161,7 +170,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
                     format!(
                         "data: {}\n\ndata: [DONE]\n\n",
                         json!({
-                            "choices": [{"delta": {"content": "The earlier fixture established the task. Continue using the retained tool results."}, "finish_reason": "stop"}]
+                            "choices": [{"delta": {"content": "## Goal\n- finish the fixture task\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the earlier fixture established the task\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue using the retained tool results\n## Files that matter\n- fixture.txt\n## Facts to keep\n- none"}, "finish_reason": "stop"}]
                         })
                     ),
                 )
@@ -172,7 +181,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
     });
     let config = root.join("fixture.toml");
     std::fs::write(&config, format!(
-        "provider = \"chat_completions\"\nbase_url = \"http://{address}/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\nmax_tool_result_bytes = 32768\nprovider_request_timeout_ms = 5000\n"
+        "provider = \"chat_completions\"\nbase_url = \"http://{address}/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\ncompaction_keep_tokens = 0\nmax_tool_result_bytes = 32768\nprovider_request_timeout_ms = 5000\n"
     )).expect("config");
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rune"));
@@ -209,9 +218,25 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         stdout.contains("compacted 1 earlier turn(s); 5 turn(s) remain"),
         "{stdout}"
     );
+    // Each checkpoint is journaled after what was there, so a resume rebuilds it.
+    let compacted = std::fs::read(&log).expect("journal after compaction");
+    assert!(compacted.starts_with(&before));
+    let appended = String::from_utf8(compacted[before.len()..].to_vec()).expect("utf8");
+    assert_eq!(
+        appended.matches("\"kind\":\"checkpoint\"").count(),
+        2,
+        "{appended}"
+    );
+    // The removed prefix is gone; only the user's own words are carried.
+    let second = requests[1].to_string();
     assert!(
-        !requests[1].to_string().contains("question 1"),
+        !second.contains("original result 1/"),
         "original prefix was removed"
+    );
+    assert_eq!(second.matches("question 1").count(), 1, "{second}");
+    assert!(
+        second.contains(r"<message>\nquestion 1\nCafé\n</message>"),
+        "{second}"
     );
 
     let run = |args: &[&str]| -> Output { command().args(args).output().expect("restarted CLI") };
@@ -244,7 +269,7 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         records[12]["message"]["parts"][0]["text"]
             .as_str()
             .expect("summary")
-            .contains("<context_handoff>")
+            .contains("<conversation-checkpoint>")
     );
     for selector in ["0", "-1", "invalid", "18446744073709551616", "14"] {
         let output = run(&["session", id.as_str(), "--record", selector, "--json"]);
@@ -259,5 +284,5 @@ fn compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch() 
         "question",
     ]);
     assert!(!conflict.status.success(), "{conflict:?}");
-    assert_eq!(std::fs::read(log).expect("journal after"), before);
+    assert_eq!(std::fs::read(log).expect("journal after"), compacted);
 }

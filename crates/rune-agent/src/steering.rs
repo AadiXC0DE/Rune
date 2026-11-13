@@ -173,6 +173,13 @@ impl SteeringQueue {
         drained
     }
 
+    /// Removes and returns the newest message not yet drained, so it can be
+    /// edited instead of sent.
+    #[must_use]
+    pub fn take_newest(&self) -> Option<String> {
+        self.lock().ok()?.pop().map(|message| message.text)
+    }
+
     /// Returns a copy of the queued messages without removing them.
     #[must_use]
     pub fn peek(&self) -> Vec<Steering> {
@@ -350,6 +357,20 @@ mod tests {
             )
             .unwrap_or(64)
         );
+    }
+
+    #[test]
+    fn take_newest_removes_only_the_last_pending() {
+        let queue = SteeringQueue::new(4);
+        assert_eq!(queue.take_newest(), None);
+        queue.submit("first").expect("accepted");
+        queue.submit("second").expect("accepted");
+        assert_eq!(queue.take_newest().as_deref(), Some("second"));
+        assert_eq!(queue.len(), 1);
+        let drained = queue.drain(Boundary::Model);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].text, "first");
+        assert_eq!(queue.take_newest(), None);
     }
 
     #[test]

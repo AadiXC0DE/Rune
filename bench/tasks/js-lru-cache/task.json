@@ -4,7 +4,12 @@
   "prompt": "Implement the LRUCache class in src/lru.js so that the tests in test/ pass. Do not modify the tests.",
   "verify": "node --test",
   "protected": [
-    "test"
+    "test",
+    "test/hidden.test.js"
   ],
-  "timeoutMs": 600000
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "dev",
+  "language": "javascript"
 }

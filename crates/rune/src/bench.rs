@@ -8,9 +8,10 @@
 //! the same tasks measure each of them.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::Read as _;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -20,8 +21,11 @@ use serde::{Deserialize, Serialize};
 /// Agent time allowed for a task that declares none.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Time the verify command is allowed.
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Time the verify command is allowed when a task declares none.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Time the setup command is allowed.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Largest number of trials per task.
 pub const MAX_TRIALS: u32 = 20;
@@ -40,6 +44,65 @@ pub struct Task {
     /// Agent time limit in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Directory inside the task whose contents are copied into the workspace just before
+    /// verifying; never visible to the agent.
+    #[serde(default)]
+    pub tests: Option<String>,
+    /// Shell command run in the workspace before the agent starts.
+    #[serde(default)]
+    pub setup: Option<String>,
+    /// Verify time limit in milliseconds.
+    #[serde(default)]
+    pub verify_timeout_ms: Option<u64>,
+    /// Difficulty: 1 one file, 2 several files, 3 long or tricky.
+    #[serde(default)]
+    pub tier: Option<u8>,
+    /// `dev` or `heldout`; absent means `dev`.
+    #[serde(default)]
+    pub split: Option<String>,
+    /// Main language of the task; read by report tooling, not by the runner.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub language: Option<String>,
+    /// Free-form labels; read by report tooling, not by the runner.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tags: Vec<String>,
+}
+
+/// Which tasks a run admits by split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitFilter {
+    /// Development tasks, including those without a split.
+    Dev,
+    /// Held-out tasks.
+    Heldout,
+    /// Every task.
+    All,
+}
+
+impl SplitFilter {
+    /// Reads `dev`, `heldout` or `all`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "dev" => Some(Self::Dev),
+            "heldout" => Some(Self::Heldout),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// Whether the filter lets `task` through.
+    #[must_use]
+    pub fn admits(self, task: &Task) -> bool {
+        let heldout = task.split.as_deref() == Some("heldout");
+        match self {
+            Self::Dev => !heldout,
+            Self::Heldout => heldout,
+            Self::All => true,
+        }
+    }
 }
 
 /// One task found on disk.
@@ -109,6 +172,26 @@ pub fn discover(root: &Utf8Path) -> Result<Vec<Found>> {
         let task: Task = serde_json::from_str(&text).map_err(|err| {
             RuneError::invalid_field("task.json", format!("`{spec}` is not a task: {err}"))
         })?;
+        let problem = if task
+            .split
+            .as_deref()
+            .is_some_and(|split| !matches!(split, "dev" | "heldout"))
+        {
+            Some("split must be dev or heldout".to_owned())
+        } else if task.tier.is_some_and(|tier| !(1..=3).contains(&tier)) {
+            Some("tier must be 1, 2 or 3".to_owned())
+        } else {
+            task.tests
+                .as_deref()
+                .filter(|name| !dir.join(name).is_dir())
+                .map(|name| format!("tests directory `{name}` does not exist"))
+        };
+        if let Some(problem) = problem {
+            return Err(RuneError::invalid_field(
+                "task.json",
+                format!("`{spec}`: {problem}"),
+            ));
+        }
         let id = dir.file_name().unwrap_or_default().to_owned();
         found.push(Found { id, dir, task });
     }
@@ -117,18 +200,40 @@ pub fn discover(root: &Utf8Path) -> Result<Vec<Found>> {
 }
 
 /// Runs one trial of a task and reports what happened.
-pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u32) -> Result<Run> {
+pub fn run_task(
+    binary: &Utf8Path,
+    overrides: &[String],
+    found: &Found,
+    trial: u32,
+    logs: Option<&Utf8Path>,
+) -> Result<Run> {
     let scratch = tempdir()?;
     let workspace = scratch.join("workspace");
     let pristine = found.dir.join("repo");
     copy_tree(&pristine, &workspace)?;
-    initialize_repository(&workspace);
 
     let mut run = Run {
         task: found.id.clone(),
         trial,
         ..Run::default()
     };
+    if let Some(setup) = &found.task.setup {
+        let mut command = shell(setup);
+        command.current_dir(&workspace);
+        let finished = run_with_timeout(&mut command, SETUP_TIMEOUT)?;
+        if finished.timed_out || !finished.success {
+            run.error = Some(if finished.timed_out {
+                "setup timed out".to_owned()
+            } else {
+                format!("setup failed with exit {}", finished.code.unwrap_or(-1))
+            });
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Ok(run);
+        }
+    }
+    // The starting commit comes after setup, so setup's changes are part of the
+    // starting state and never counted as the agent's work.
+    initialize_repository(&workspace);
     let timeout = found
         .task
         .timeout_ms
@@ -151,6 +256,14 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
     run.seconds = started.elapsed().as_secs_f64();
     run.timed_out = finished.timed_out;
     read_report(&finished.stdout, &mut run);
+    if let Some(logs) = logs {
+        std::fs::create_dir_all(logs).map_err(|err| io_error(&err))?;
+        let stem = format!("{}-t{trial}", found.id);
+        std::fs::write(logs.join(format!("{stem}.stderr.txt")), &finished.stderr)
+            .map_err(|err| io_error(&err))?;
+        std::fs::write(logs.join(format!("{stem}.json")), &finished.stdout)
+            .map_err(|err| io_error(&err))?;
+    }
 
     for path in &found.task.protected {
         let original = pristine.join(path);
@@ -164,12 +277,156 @@ pub fn run_task(binary: &Utf8Path, overrides: &[String], found: &Found, trial: u
         }
     }
 
+    if let Some(tests) = &found.task.tests {
+        let hidden = found.dir.join(tests);
+        if let Ok(entries) = std::fs::read_dir(&hidden) {
+            for entry in entries.flatten() {
+                if let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) {
+                    let name = path.file_name().unwrap_or_default();
+                    copy_tree(&path, &workspace.join(name))?;
+                }
+            }
+        }
+    }
+
     let mut verify = shell(&found.task.verify);
     verify.current_dir(&workspace);
-    run.passed = run_with_timeout(&mut verify, VERIFY_TIMEOUT)
+    let verify_timeout = found
+        .task
+        .verify_timeout_ms
+        .map_or(VERIFY_TIMEOUT, Duration::from_millis);
+    run.passed = run_with_timeout(&mut verify, verify_timeout)
         .is_ok_and(|verified| !verified.timed_out && verified.success);
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(run)
+}
+
+/// Global flags of the parent run that every child run receives.
+pub struct Forwarded<'a> {
+    /// Model override.
+    pub model: Option<&'a str>,
+    /// Provider override.
+    pub provider: Option<&'a str>,
+    /// Reasoning effort override.
+    pub effort: Option<&'a str>,
+    /// Limit overrides as `name`, `value` pairs.
+    pub limits: &'a [(String, String)],
+    /// Additional directories.
+    pub add_dirs: &'a [String],
+    /// Whether commands may run where the host has no sandbox.
+    pub allow_unsandboxed: bool,
+    /// Whether every outbound request is refused.
+    pub offline: bool,
+}
+
+/// Builds the child's leading arguments. Relative `--add-dir` paths are made
+/// absolute against `cwd`, because children run in their own workspace.
+#[must_use]
+pub fn overrides(forwarded: &Forwarded<'_>, cwd: &Utf8Path) -> Vec<String> {
+    let mut args = Vec::new();
+    for (flag, value) in [
+        ("--model", forwarded.model),
+        ("--provider", forwarded.provider),
+        ("--effort", forwarded.effort),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.to_owned());
+            args.push(value.to_owned());
+        }
+    }
+    for (name, value) in forwarded.limits {
+        args.push("--limit".to_owned());
+        args.push(format!("{name}={value}"));
+    }
+    for dir in forwarded.add_dirs {
+        args.push("--add-dir".to_owned());
+        args.push(absolute(cwd, dir).into_string());
+    }
+    if forwarded.allow_unsandboxed {
+        args.push("--allow-unsandboxed".to_owned());
+    }
+    if forwarded.offline {
+        args.push("--offline".to_owned());
+    }
+    args
+}
+
+/// Joins `path` onto `cwd` and resolves `.` and `..` without touching the disk.
+fn absolute(cwd: &Utf8Path, path: &str) -> Utf8PathBuf {
+    use camino::Utf8Component;
+    let path = Utf8Path::new(path);
+    let mut out = if path.is_absolute() {
+        Utf8PathBuf::new()
+    } else {
+        cwd.to_owned()
+    };
+    for part in path.components() {
+        match part {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_str()),
+        }
+    }
+    out
+}
+
+/// Runs every (trial, task) pair, `jobs` at a time, and returns the runs
+/// sorted by trial and task. `on_run` sees each run as it finishes. The first
+/// error stops scheduling and is returned once running workers finish.
+pub fn run_all(
+    binary: &Utf8Path,
+    overrides: &[String],
+    tasks: &[Found],
+    trials: u32,
+    jobs: usize,
+    logs: Option<&Utf8Path>,
+    on_run: &(dyn Fn(&Run) + Sync),
+) -> Result<Vec<Run>> {
+    let queue: Mutex<VecDeque<(u32, &Found)>> = Mutex::new(
+        (1..=trials)
+            .flat_map(|trial| tasks.iter().map(move |task| (trial, task)))
+            .collect(),
+    );
+    let done: Mutex<Vec<Run>> = Mutex::new(Vec::new());
+    let failure: Mutex<Option<RuneError>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1) {
+            scope.spawn(|| {
+                loop {
+                    if failure.lock().is_ok_and(|failure| failure.is_some()) {
+                        return;
+                    }
+                    let Some((trial, task)) =
+                        queue.lock().ok().and_then(|mut jobs| jobs.pop_front())
+                    else {
+                        return;
+                    };
+                    match run_task(binary, overrides, task, trial, logs) {
+                        Ok(run) => {
+                            on_run(&run);
+                            if let Ok(mut done) = done.lock() {
+                                done.push(run);
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut failure) = failure.lock() {
+                                failure.get_or_insert(err);
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(err) = failure.into_inner().ok().flatten() {
+        return Err(err);
+    }
+    let mut runs = done.into_inner().unwrap_or_default();
+    runs.sort_by(|left, right| (left.trial, &left.task).cmp(&(right.trial, &right.task)));
+    Ok(runs)
 }
 
 /// Copies what `rune ask --json` reported into a run.
@@ -201,26 +458,39 @@ fn read_report(stdout: &str, run: &mut Run) {
 /// A finished child process.
 struct Finished {
     success: bool,
+    code: Option<i32>,
     timed_out: bool,
     stdout: String,
+    stderr: String,
 }
 
-/// Runs a command, killing it if it outlives `timeout`.
+/// Time a child gets to exit after the termination signal before it is killed.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// Reads a pipe to its end on a thread of its own.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// Runs a command in a process group of its own, ending the whole group if it
+/// outlives `timeout` and after it exits, so no stray process keeps a pipe open.
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Finished> {
+    rune_exec::command::own_group(command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| RuneError::new(ErrorCode::Internal, format!("could not start: {err}")))?;
-    let mut pipe = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(pipe) = pipe.as_mut() {
-            let _ = pipe.read_to_string(&mut text);
-        }
-        text
-    });
+    let group = child.id();
+    let stdout_reader = drain(child.stdout.take());
+    let stderr_reader = drain(child.stderr.take());
     let deadline = Instant::now().checked_add(timeout);
     let mut timed_out = false;
     let status = loop {
@@ -229,16 +499,32 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Finished
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             timed_out = true;
-            let _ = child.kill();
-            break child.wait().ok();
+            rune_exec::command::signal_group(group, "TERM");
+            let grace = Instant::now();
+            let mut exited = None;
+            while grace.elapsed() < TERM_GRACE {
+                exited = child.try_wait().map_err(|err| io_error(&err))?;
+                if exited.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if exited.is_none() && !rune_exec::command::signal_group(group, "KILL") {
+                let _ = child.kill();
+            }
+            break exited.or_else(|| child.wait().ok());
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let stdout = reader.join().unwrap_or_default();
+    rune_exec::command::signal_group(group, "KILL");
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
     Ok(Finished {
         success: status.is_some_and(|status| status.success()),
+        code: status.and_then(|status| status.code()),
         timed_out,
         stdout,
+        stderr,
     })
 }
 
@@ -444,6 +730,10 @@ pub fn row(run: &Run) -> String {
             run.verification.as_deref() == Some("unverified"),
             "unverified",
         ),
+        (
+            run.verification.as_deref() == Some("failed"),
+            "check failed",
+        ),
     ] {
         if flag {
             let _ = write!(out, "  [{label}]");
@@ -557,5 +847,336 @@ mod tests {
         assert_eq!(tree_digest(&original), tree_digest(&copy.join("test")));
         std::fs::write(copy.join("test/a.js"), "assert(true)").expect("tamper");
         assert_ne!(tree_digest(&original), tree_digest(&copy.join("test")));
+    }
+
+    fn write_task(root: &Utf8Path, id: &str, json: &str) -> Utf8PathBuf {
+        let task = root.join(id);
+        std::fs::create_dir_all(task.join("repo")).expect("repo");
+        std::fs::write(task.join("task.json"), json).expect("task");
+        task
+    }
+
+    fn temp_root() -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        (dir, root)
+    }
+
+    #[test]
+    fn a_v1_task_loads_with_v2_defaults() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "old",
+            r#"{"title":"T","kind":"fix","prompt":"fix","verify":"true","protected":["test"],"timeoutMs":1000}"#,
+        );
+        let task = &discover(&root).expect("discovered")[0].task;
+        assert_eq!(task.timeout_ms, Some(1000));
+        assert_eq!(task.protected, ["test"]);
+        assert!(task.tests.is_none() && task.setup.is_none());
+        assert!(task.verify_timeout_ms.is_none() && task.tier.is_none());
+        assert!(task.split.is_none() && task.language.is_none() && task.tags.is_empty());
+    }
+
+    #[test]
+    fn v2_fields_are_read_and_bad_values_are_refused() {
+        let (_dir, root) = temp_root();
+        let task = write_task(
+            &root,
+            "new",
+            r#"{"prompt":"p","verify":"true","tests":"tests","setup":"true","verifyTimeoutMs":500,"tier":2,"split":"heldout","language":"go","tags":["a","b"]}"#,
+        );
+        std::fs::create_dir_all(task.join("tests")).expect("tests");
+        let found = discover(&root).expect("discovered");
+        let read = &found[0].task;
+        assert_eq!(read.tests.as_deref(), Some("tests"));
+        assert_eq!(read.setup.as_deref(), Some("true"));
+        assert_eq!((read.verify_timeout_ms, read.tier), (Some(500), Some(2)));
+        assert_eq!(read.split.as_deref(), Some("heldout"));
+        assert_eq!(read.language.as_deref(), Some("go"));
+        assert_eq!(read.tags, ["a", "b"]);
+
+        for (json, problem) in [
+            (
+                r#"{"prompt":"p","verify":"true","split":"test"}"#,
+                "split must be dev or heldout",
+            ),
+            (
+                r#"{"prompt":"p","verify":"true","tier":4}"#,
+                "tier must be 1, 2 or 3",
+            ),
+            (
+                r#"{"prompt":"p","verify":"true","tests":"missing"}"#,
+                "tests directory `missing` does not exist",
+            ),
+        ] {
+            let (_dir, root) = temp_root();
+            write_task(&root, "bad", json);
+            let err = discover(&root).expect_err("refused").to_string();
+            assert!(err.contains(problem), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_split_filter_treats_an_absent_split_as_dev() {
+        let task = |split: Option<&str>| Task {
+            prompt: String::new(),
+            verify: String::new(),
+            protected: Vec::new(),
+            timeout_ms: None,
+            tests: None,
+            setup: None,
+            verify_timeout_ms: None,
+            tier: None,
+            split: split.map(str::to_owned),
+            language: None,
+            tags: Vec::new(),
+        };
+        let (absent, dev, held) = (task(None), task(Some("dev")), task(Some("heldout")));
+        assert_eq!(SplitFilter::parse("heldout"), Some(SplitFilter::Heldout));
+        assert_eq!(SplitFilter::parse("other"), None);
+        assert!(SplitFilter::Dev.admits(&absent) && SplitFilter::Dev.admits(&dev));
+        assert!(!SplitFilter::Dev.admits(&held));
+        assert!(SplitFilter::Heldout.admits(&held) && !SplitFilter::Heldout.admits(&absent));
+        assert!(SplitFilter::All.admits(&absent) && SplitFilter::All.admits(&held));
+    }
+
+    #[cfg(unix)]
+    fn fake_agent(root: &Utf8Path, body: &str) -> Utf8PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = root.join("agent.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("agent");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_tests_reach_verify_but_not_the_agent() {
+        let (_dir, root) = temp_root();
+        let task = write_task(
+            &root,
+            "hidden",
+            r#"{"prompt":"p","verify":"sh check.sh","tests":"tests"}"#,
+        );
+        std::fs::create_dir_all(task.join("tests")).expect("tests");
+        std::fs::write(task.join("tests/check.sh"), "exit 0").expect("check");
+        let agent = fake_agent(
+            &root,
+            r#"printf '{"steps":1,"error":"%s"}\n' "$(ls -A | tr '\n' ' ')""#,
+        );
+        let found = discover(&root).expect("discovered");
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(run.passed, "{run:?}");
+        let seen = run.error.unwrap_or_default();
+        assert!(!seen.contains("check.sh"), "{seen}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_runs_before_the_agent_and_its_failure_stops_the_run() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "a-ok",
+            r#"{"prompt":"p","verify":"test \"$(cat value.txt)\" = 2","setup":"printf 2 > value.txt"}"#,
+        );
+        write_task(
+            &root,
+            "b-bad",
+            r#"{"prompt":"p","verify":"true","setup":"exit 3"}"#,
+        );
+        let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
+        let found = discover(&root).expect("discovered");
+        let ok = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(ok.passed, "{ok:?}");
+        let bad = run_task(&agent, &[], &found[1], 1, None).expect("run");
+        assert!(!bad.passed);
+        assert_eq!(bad.error.as_deref(), Some("setup failed with exit 3"));
+        assert_eq!(bad.steps, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_timeout_ms_bounds_the_verify_command() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "slow",
+            r#"{"prompt":"p","verify":"sleep 5","verifyTimeoutMs":200}"#,
+        );
+        let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
+        let found = discover(&root).expect("discovered");
+        let started = Instant::now();
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(!run.passed);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_verify_timeout_ends_a_forked_child() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "slow",
+            r#"{"prompt":"p","verify":"sleep 5; true","verifyTimeoutMs":200}"#,
+        );
+        let agent = fake_agent(&root, r#"echo '{"steps":1}'"#);
+        let found = discover(&root).expect("discovered");
+        let started = Instant::now();
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(!run.passed);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn overrides_forward_the_global_flags_in_order() {
+        let limits = [("steps".to_owned(), "9".to_owned())];
+        let dirs = ["../shared".to_owned(), "/abs/dir".to_owned()];
+        // A rooted path is rebuilt from its components, so it comes back with
+        // the platform's separator.
+        let rooted = if cfg!(windows) {
+            "\\abs\\dir"
+        } else {
+            "/abs/dir"
+        };
+        let args = overrides(
+            &Forwarded {
+                model: Some("m"),
+                provider: Some("p"),
+                effort: Some("high"),
+                limits: &limits,
+                add_dirs: &dirs,
+                allow_unsandboxed: true,
+                offline: true,
+            },
+            Utf8Path::new("/work"),
+        );
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "m",
+                "--provider",
+                "p",
+                "--effort",
+                "high",
+                "--limit",
+                "steps=9",
+                "--add-dir",
+                "/shared",
+                "--add-dir",
+                rooted,
+                "--allow-unsandboxed",
+                "--offline",
+            ]
+        );
+        let none = overrides(
+            &Forwarded {
+                model: None,
+                provider: None,
+                effort: None,
+                limits: &[],
+                add_dirs: &[],
+                allow_unsandboxed: false,
+                offline: false,
+            },
+            Utf8Path::new("/work"),
+        );
+        assert!(none.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_ends_the_agents_process_group() {
+        let (_dir, root) = temp_root();
+        write_task(
+            &root,
+            "hang",
+            // Long enough for a loaded machine to start the shell and write the
+            // pid before the timeout fires.
+            r#"{"prompt":"p","verify":"true","timeoutMs":5000}"#,
+        );
+        let pidfile = root.join("child.pid");
+        let agent = fake_agent(&root, &format!("sleep 30 & echo $! > {pidfile}; wait"));
+        let found = discover(&root).expect("discovered");
+        let run = run_task(&agent, &[], &found[0], 1, None).expect("run");
+        assert!(run.timed_out);
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("pid file")
+            .trim()
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "process {pid} is still running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_keep_each_runs_stderr_and_report() {
+        let (_dir, root) = temp_root();
+        write_task(&root, "noisy", r#"{"prompt":"p","verify":"true"}"#);
+        let agent = fake_agent(&root, "echo 'agent diagnostics' >&2\necho '{\"steps\":2}'");
+        let found = discover(&root).expect("discovered");
+        let logs = root.join("logs/nested");
+        run_task(&agent, &[], &found[0], 2, Some(&logs)).expect("run");
+        let stderr = std::fs::read_to_string(logs.join("noisy-t2.stderr.txt")).expect("stderr");
+        assert_eq!(stderr.trim(), "agent diagnostics");
+        let report = std::fs::read_to_string(logs.join("noisy-t2.json")).expect("report");
+        assert_eq!(report.trim(), r#"{"steps":2}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jobs_run_tasks_at_the_same_time() {
+        let (_dir, root) = temp_root();
+        write_task(&root, "b", r#"{"prompt":"p","verify":"true"}"#);
+        write_task(&root, "a", r#"{"prompt":"p","verify":"true"}"#);
+        // Each run marks that it started, then waits for the other to start.
+        // Run one after the other, the first would give up and report no steps.
+        let agent = fake_agent(
+            &root,
+            &format!(
+                "touch {root}/started.$$\n\
+                 i=0\n\
+                 while [ $i -lt 200 ]; do\n\
+                 set -- {root}/started.*\n\
+                 if [ $# -ge 2 ]; then echo '{{\"steps\":1}}'; exit 0; fi\n\
+                 sleep 0.05; i=$((i+1))\n\
+                 done\n\
+                 echo '{{\"steps\":0}}'"
+            ),
+        );
+        let found = discover(&root).expect("discovered");
+        let runs = run_all(&agent, &[], &found, 1, 2, None, &|_| {}).expect("runs");
+        let ids: Vec<&str> = runs.iter().map(|run| run.task.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert!(
+            runs.iter().all(|run| run.steps == 1),
+            "the runs did not overlap"
+        );
+    }
+
+    #[test]
+    fn a_failed_report_keeps_its_usage() {
+        let mut parsed = Run::default();
+        read_report(
+            r#"{"steps":3,"usage":{"input_tokens":900,"output_tokens":40},"error":"boom"}"#,
+            &mut parsed,
+        );
+        assert_eq!(parsed.steps, 3);
+        assert_eq!((parsed.input_tokens, parsed.output_tokens), (900, 40));
+        assert_eq!(parsed.error.as_deref(), Some("boom"));
     }
 }

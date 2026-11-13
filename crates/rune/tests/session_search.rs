@@ -153,21 +153,29 @@ fn title_and_later_prompt_fragments_preserve_workspace_and_child_exclusions() {
     let dir = fixture.paths.session_dir(&local_id);
     let before = std::fs::read(dir.join("events.jsonl")).expect("original log");
     for query in ["CAFÉ", "lexer [x].*", "here\nand keep"] {
+        // Assistant text matches too, so the reply that mentions the word is
+        // found alongside the prompts.
+        let reply = query == "CAFÉ";
+        let mut local = vec!["searchlocal1"];
+        let mut everywhere = vec!["searchlegacy", "searchother1", "searchlocal1"];
+        if reply {
+            local.insert(0, "searchreply1");
+            everywhere.insert(0, "searchreply1");
+        }
         assert_eq!(
             ids(&fixture.json(&["--search", query])),
-            ["searchlocal1"],
+            local,
             "query: {query}"
         );
         let all = fixture.json(&["--search", query, "--all"]);
-        assert_eq!(ids(&all), ["searchlegacy", "searchother1", "searchlocal1"]);
+        assert_eq!(ids(&all), everywhere);
         assert!(all["next"].is_null());
     }
-    for query in [
-        "assistant-only",
-        "tool-only",
-        "obsolete title",
-        "no such prompt",
-    ] {
+    assert_eq!(
+        ids(&fixture.json(&["--search", "assistant-only", "--all"])),
+        ["searchreply1"]
+    );
+    for query in ["tool-only", "obsolete title", "no such prompt"] {
         assert!(ids(&fixture.json(&["--search", query, "--all"])).is_empty());
     }
     assert_eq!(
@@ -254,4 +262,101 @@ fn missing_or_empty_search_text_and_cursors_outside_the_results_fail() {
         assert!(out.stdout.is_empty(), "{out:?}");
         assert!(!out.stderr.is_empty(), "{out:?}");
     }
+}
+
+/// 2026-01-02T00:00:00Z in milliseconds.
+const JAN_2: u64 = 1_767_312_000_000;
+
+/// One day in milliseconds.
+const DAY: u64 = 86_400_000;
+
+#[test]
+fn search_prints_matching_lines_newest_first() {
+    let fixture = Fixture::new();
+    let long = format!("needle {}", "x".repeat(200));
+    fixture.session(
+        "searcholder1",
+        Some(&fixture.root),
+        vec![
+            title("older work"),
+            prompt("first needle line\nno match here"),
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                text: "reply without\nNEEDLE in reply".into(),
+            },
+            prompt(&long),
+        ],
+        JAN_2,
+    );
+    fixture.session(
+        "searchnewer1",
+        Some(&fixture.root),
+        vec![title("needle title"), prompt("unrelated prompt")],
+        JAN_2 + DAY,
+    );
+    fixture.session(
+        "searchother1",
+        Some(&fixture.root.join("elsewhere")),
+        vec![prompt("needle elsewhere")],
+        JAN_2 + 2 * DAY,
+    );
+
+    let out = fixture.run(&["--search", "needle"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).expect("text");
+    let cut: String = long.chars().take(100).collect();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "searchnewer1  2026-01-03  needle title".to_owned(),
+            "searcholder1  2026-01-02  first needle line".to_owned(),
+            "searcholder1  2026-01-02  NEEDLE in reply".to_owned(),
+            format!("searcholder1  2026-01-02  {cut}"),
+        ]
+    );
+
+    let value = fixture.json(&["--search", "needle"]);
+    assert_eq!(ids(&value), ["searchnewer1", "searcholder1"]);
+    let hits = value["hits"].as_array().expect("hits");
+    let roles: Vec<&str> = hits
+        .iter()
+        .map(|hit| hit["role"].as_str().expect("role"))
+        .collect();
+    assert_eq!(roles, ["title", "user", "assistant", "user"]);
+    assert_eq!(hits[1]["id"], "searcholder1");
+    assert_eq!(hits[1]["date"], "2026-01-02");
+    assert_eq!(hits[1]["line"], "first needle line");
+
+    let everywhere = fixture.run(&["--search", "needle", "--all"]);
+    let text = String::from_utf8(everywhere.stdout).expect("text");
+    assert_eq!(
+        text.lines().next(),
+        Some("searchother1  2026-01-04  needle elsewhere")
+    );
+    // Listing without a search keeps the session rows.
+    let plain = String::from_utf8(fixture.run(&[]).stdout).expect("text");
+    assert!(plain.contains("older work"), "{plain}");
+}
+
+#[test]
+fn search_caps_hits_at_fifty() {
+    let fixture = Fixture::new();
+    let messages = (0..60).map(|index| prompt(&format!("needle {index:02}")));
+    fixture.session(
+        "searchmany01",
+        Some(&fixture.root),
+        messages.collect(),
+        JAN_2,
+    );
+    let out = fixture.run(&["--search", "needle"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).expect("text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 51, "{text}");
+    assert_eq!(lines[0], "searchmany01  2026-01-02  needle 00");
+    assert_eq!(lines[49], "searchmany01  2026-01-02  needle 49");
+    assert_eq!(lines[50], "more matches: narrow the search");
+
+    let value = fixture.json(&["--search", "needle"]);
+    assert_eq!(value["hits"].as_array().expect("hits").len(), 50);
 }

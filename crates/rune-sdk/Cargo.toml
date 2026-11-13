@@ -17,6 +17,8 @@ rune-core = { workspace = true }
 rune-exec = { workspace = true }
 rune-agent = { workspace = true }
 rune-net = { workspace = true }
+rune-policy = { workspace = true }
+camino = { workspace = true }
 rune-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

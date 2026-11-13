@@ -165,6 +165,60 @@ impl fmt::Display for Effort {
     }
 }
 
+/// Which file-edit tool a model is offered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditTool {
+    /// `edit_file`: exact text replacement.
+    Replace,
+    /// `apply_patch`: the file patch format.
+    Patch,
+}
+
+/// The `edit_tool` setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditToolSetting {
+    /// The tool the model family is trained on.
+    #[default]
+    Auto,
+    /// Always `edit_file`.
+    Replace,
+    /// Always `apply_patch`.
+    Patch,
+}
+
+impl EditToolSetting {
+    /// Returns the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Replace => "replace",
+            Self::Patch => "patch",
+        }
+    }
+}
+
+/// How the tools of connected MCP servers reach the model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTools {
+    /// Eager while the combined schemas are small, deferred otherwise.
+    #[default]
+    Auto,
+    /// Every tool is advertised with its schema.
+    Eager,
+    /// Tools are found with `capability_search` and called through `mcp_call`.
+    Deferred,
+}
+
+impl fmt::Display for EditToolSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Provider identity.
 ///
 /// A fresh install has no provider. Every command that needs one fails with
@@ -267,6 +321,61 @@ pub struct ProjectConfig {
     /// Limit overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, Budget>>,
+    /// Permission rules; `allow` rules apply only after the user approves them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<PermissionTable>,
+}
+
+/// The permission table of a configuration file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionTable {
+    /// Rules in file order.
+    #[serde(default)]
+    pub rules: Vec<ConfiguredRule>,
+}
+
+/// One rule as written in a file.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredRule {
+    /// Tool name, `shell` for commands, or `*`.
+    pub tool: String,
+    /// Command pattern for `shell`, path glob for file tools, `*` for any.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// What the rule decides.
+    pub decision: RuleDecision,
+    /// Only in this workspace, when set (canonical path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Utf8PathBuf>,
+    /// Date the rule was saved from an approval prompt, `YYYY-MM-DD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<String>,
+}
+
+/// What a configured rule decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDecision {
+    /// Run without asking.
+    Allow,
+    /// Ask first.
+    Ask,
+    /// Refuse.
+    Deny,
+}
+
+impl RuleDecision {
+    /// Returns the name used in files.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// Input capacity assumed when a model does not declare one.
@@ -320,6 +429,32 @@ impl ModelEntry {
             Self::Detailed(settings) => settings.max_output_tokens,
         }
     }
+
+    /// Returns the declared prices, when they are stated.
+    #[must_use]
+    pub fn prices(&self) -> Option<ModelPrices> {
+        match self {
+            Self::Id(_) => None,
+            Self::Detailed(settings) => settings.prices,
+        }
+    }
+}
+
+/// Prices of one model in millionths of a dollar per million tokens, the unit
+/// of the models.dev catalog: $0.28 per million tokens is 280,000.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrices {
+    /// Uncached input.
+    pub input: u64,
+    /// Output, reasoning included.
+    pub output: u64,
+    /// Input read from a prompt cache; the input price when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Input written to a prompt cache; the input price when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
 }
 
 /// What a model accepts, as declared in a configuration file.
@@ -339,6 +474,9 @@ pub struct ModelSettings {
     /// Largest answer the model will produce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Prices in millionths of a dollar per million tokens, for endpoints the catalog does not price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prices: Option<ModelPrices>,
 }
 
 /// A user-authorized command that may veto an otherwise allowed tool call.
@@ -371,6 +509,151 @@ const fn default_hook_timeout() -> u64 {
     5_000
 }
 
+/// The points of a session a hook can run at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// After the session is built, before the first prompt.
+    SessionStart,
+    /// Before a prompt is sent.
+    UserPrompt,
+    /// Before a tool call runs.
+    PreTool,
+    /// After a tool call completed.
+    PostTool,
+    /// When the model ends a turn.
+    TurnEnd,
+    /// Before history is compacted.
+    PreCompact,
+    /// When the session wants the user's attention.
+    Notification,
+    /// On the way out of a session.
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// The snake case name used in configuration and payloads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::UserPrompt => "user_prompt",
+            Self::PreTool => "pre_tool",
+            Self::PostTool => "post_tool",
+            Self::TurnEnd => "turn_end",
+            Self::PreCompact => "pre_compact",
+            Self::Notification => "notification",
+            Self::SessionEnd => "session_end",
+        }
+    }
+}
+
+/// What a failing hook means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    /// The guarded action is refused.
+    Deny,
+    /// The hook has no effect.
+    Allow,
+}
+
+/// One configured hook.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    /// Point of the session the hook runs at.
+    pub event: HookEvent,
+    /// Name reported with a decision or failure.
+    pub name: String,
+    /// Explicit program and arguments, without implicit shell interpretation.
+    pub argv: Vec<String>,
+    /// Deadline in milliseconds, from 1 to 60,000.
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_ms: u64,
+    /// What a failure means; see `Hook::on_error`.
+    #[serde(default)]
+    pub on_error: Option<OnError>,
+    /// Tool names this hook applies to (pre_tool and post_tool only); absent means all.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Set for hooks read from a project file.
+    #[serde(skip)]
+    pub project: bool,
+    /// Set for hooks converted from `pre_tool_hook` or `post_tool_hook`.
+    #[serde(skip)]
+    pub legacy: bool,
+}
+
+impl Hook {
+    /// The configured failure meaning, else deny for `pre_tool` and `user_prompt`.
+    #[must_use]
+    pub fn on_error(&self) -> OnError {
+        self.on_error.unwrap_or(match self.event {
+            HookEvent::PreTool | HookEvent::UserPrompt => OnError::Deny,
+            _ => OnError::Allow,
+        })
+    }
+
+    /// Whether the hook applies to a call of `tool`.
+    #[must_use]
+    pub fn applies_to(&self, tool: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|name| name == tool))
+    }
+
+    fn validation_error(&self) -> Option<&'static str> {
+        if self.name.trim().is_empty() {
+            Some("a hook needs a nonempty `name`")
+        } else if self
+            .argv
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
+            Some("a hook needs a nonempty `argv` program")
+        } else if !(1..=60_000).contains(&self.timeout_ms) {
+            Some("`timeout_ms` must be from 1 to 60000")
+        } else if self.tools.is_some()
+            && !matches!(self.event, HookEvent::PreTool | HookEvent::PostTool)
+        {
+            Some("`tools` applies only to pre_tool and post_tool hooks")
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&PreToolHook> for Hook {
+    fn from(hook: &PreToolHook) -> Self {
+        Self {
+            event: HookEvent::PreTool,
+            name: hook.name.clone(),
+            argv: hook.argv.clone(),
+            timeout_ms: hook.timeout_ms,
+            on_error: Some(OnError::Deny),
+            tools: None,
+            project: false,
+            legacy: true,
+        }
+    }
+}
+
+impl From<&PostToolHook> for Hook {
+    fn from(hook: &PostToolHook) -> Self {
+        Self {
+            event: HookEvent::PostTool,
+            name: hook.name.clone(),
+            argv: hook.argv.clone(),
+            timeout_ms: hook.timeout_ms,
+            on_error: Some(OnError::Allow),
+            tools: None,
+            project: false,
+            legacy: true,
+        }
+    }
+}
+
 /// A user configuration file as parsed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -381,6 +664,9 @@ pub struct UserConfig {
     /// Post-tool result command. Only the user configuration may set this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_tool_hook: Option<PostToolHook>,
+    /// Programs run at points of a session; see the hooks section of the README.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Vec<Hook>>,
 
     /// Active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,9 +686,42 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
 
+    /// Which file-edit tool models are offered: `auto` (the one the model
+    /// family is trained on), `replace` (`edit_file`) or `patch`
+    /// (`apply_patch`). An interactive session keeps the choice made at its
+    /// start, also after `/model`, so the request prefix stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_tool: Option<EditToolSetting>,
+
+    /// How MCP tools are offered: `auto` (advertised while their combined
+    /// schemas are small, otherwise found by search), `eager` or `deferred`.
+    /// Decided once when a session starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<McpTools>,
+
+    /// MCP servers connected in every workspace, keyed by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<BTreeMap<String, UserMcpServer>>,
+
+    /// Whether sandboxed shell commands may use the network. Off by default; offline mode overrules it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_network: Option<bool>,
+
+    /// Directories commands may write besides the workspace, replacing the default cache list; an empty list allows none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cache_roots: Option<Vec<String>>,
+
+    /// Run commands without a sandbox when no sandbox backend works on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unsandboxed: Option<bool>,
+
     /// Model per provider, either a bare identifier or a table describing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelEntry>>,
+
+    /// Per-provider settings, keyed by provider name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<BTreeMap<String, ProviderEntry>>,
 
     /// Endpoint for the active provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +743,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
 
+    /// Sampling temperature, 0 to 2, sent to models that accept one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
     /// Whether fast mode is requested where supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_mode: Option<bool>,
@@ -432,21 +755,61 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
 
+    /// Color depth: `auto`, `truecolor`, `256`, `16`, or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+
+    /// Spinner motion: `full` or `reduced`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<String>,
+
+    /// How reasoning is shown: `collapsed`, `tail` or `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Whether file targets are written as terminal hyperlinks: `auto`, `on`, or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlinks: Option<String>,
+    /// How the user is told a turn ended or input is needed while the
+    /// terminal is unfocused: `auto`, `bell`, or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+
+    /// Whether the window title shows the session and its state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_title: Option<bool>,
+
+    /// Status row fields to show, highest priority first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline: Option<Vec<String>>,
+
     /// Whether terminal decorations use only ASCII.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ascii: Option<bool>,
 
-    /// Whether automatic update checks run.
+    /// Whether a newer release is looked for, and installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_upgrade: Option<bool>,
+    pub auto_upgrade: Option<AutoUpgrade>,
 
     /// Whether tool call groups are collapsed in the transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_tool_calls: Option<bool>,
 
+    /// Whether a session opens with the version line and a tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<bool>,
+
+    /// Columns an East Asian ambiguous character occupies, 1 or 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguous_width: Option<i64>,
+
     /// Whether session titles are generated from the first prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_titles: Option<bool>,
+
+    /// Whether each turn snapshots the workspace so changes, including those made by
+    /// commands, can be undone. Interactive sessions only; rune ask takes --checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<bool>,
 
     /// Whether project context is loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,7 +825,7 @@ pub struct UserConfig {
 
     /// Permission rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission: Option<toml::Value>,
+    pub permission: Option<PermissionTable>,
 
     /// Image analysis model on the active provider and endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,6 +834,13 @@ pub struct UserConfig {
     /// Model used for automatic permission review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_model: Option<String>,
+    /// Model that summarizes a conversation too large for its own model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<String>,
+    /// Keep Claude's prompt cache warm while idle (up to 27 minutes; costs a
+    /// cache read each 4.5 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_warming: Option<bool>,
 
     /// Preferred upstream providers, in order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +849,96 @@ pub struct UserConfig {
     /// Whether to restrict requests to the listed providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_strict: Option<bool>,
+
+    /// Extra variables passed to shell commands: exact names, PREFIX_* patterns, or * for the whole environment. Names containing KEY, TOKEN, SECRET, PASSWORD, PASSWD or CREDENTIAL pass only when listed exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<Vec<String>>,
+}
+
+/// Longest MCP server name, in bytes.
+pub const MAX_MCP_SERVER_NAME_BYTES: usize = 32;
+
+/// One MCP server declared in the user configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserMcpServer {
+    /// Program and arguments of a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Endpoint of a Streamable HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Variables for a stdio server; values may use `${VAR}` and `${VAR:-default}`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Headers for an HTTP server; values may use `${VAR}` and `${VAR:-default}`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    /// Tool names to expose; absent exposes every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scope: Option<String>,
+}
+
+const fn yes() -> bool {
+    true
+}
+
+impl UserMcpServer {
+    /// Why the declaration named `name` cannot be used, if it cannot.
+    #[must_use]
+    pub fn validation_error(&self, name: &str) -> Option<String> {
+        if self.command.is_some() == self.url.is_some() {
+            return Some(format!("mcp server {name}: set command or url, not both"));
+        }
+        if name.is_empty()
+            || name.len() > MAX_MCP_SERVER_NAME_BYTES
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Some(format!(
+                "mcp server {name}: a name has 1 to {MAX_MCP_SERVER_NAME_BYTES} letters, digits, `_` or `-`"
+            ));
+        }
+        None
+    }
+}
+
+/// One `[providers.<name>]` table as written.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEntry {
+    /// Request shape settings that replace the built-in ones for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<BTreeMap<String, toml::Value>>,
+    /// Time to wait for the first byte of a reply, in milliseconds, over the
+    /// `provider_head_timeout_ms` limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_timeout_ms: Option<u64>,
+    /// Headers added to every request to this provider, after the ones it requires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+}
+
+/// The resolved settings of one provider.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ProviderSettings {
+    /// Request shape settings by name, each value as written.
+    pub compat: BTreeMap<String, String>,
+    /// Time to wait for the first byte of a reply, in milliseconds.
+    pub head_timeout_ms: Option<u64>,
+    /// Headers added to every request, in name order.
+    pub headers: Vec<(String, String)>,
 }
 
 /// A diagnostic produced while loading configuration.
@@ -556,20 +1016,40 @@ pub struct Settings {
     pub pre_tool_hook: Option<PreToolHook>,
     /// User-authorized post-tool result command, absent by default.
     pub post_tool_hook: Option<PostToolHook>,
+    /// Every valid hook: the legacy pre-tool and post-tool hooks first, then `[[hooks]]`.
+    pub hooks: Vec<Hook>,
     /// Active provider.
     pub provider: Provider,
     /// Effective model identifier for the active provider.
     pub model: String,
     /// User-configured models retained for environment and command-line provider selection.
     pub configured_models: BTreeMap<String, ModelEntry>,
+    /// Per-provider settings from the user configuration, keyed by provider name.
+    pub providers: BTreeMap<String, ProviderSettings>,
     /// Whether the web tools may reach the network.
     pub web_tools: bool,
+    /// Which file-edit tool models are offered.
+    pub edit_tool: EditToolSetting,
+    /// How MCP tools are offered.
+    pub mcp_tools: McpTools,
+    /// Valid MCP servers from the user configuration.
+    pub mcp_servers: BTreeMap<String, UserMcpServer>,
+    /// Switches for behaviour under measurement, from `RUNE_EXPERIMENT`.
+    pub experiments: crate::experiment::Experiments,
+    /// Whether sandboxed shell commands may use the network.
+    pub shell_network: bool,
+    /// The configured cache directory list, replacing the defaults when set.
+    pub sandbox_cache_roots: Option<Vec<String>>,
     /// Input capacity the configured model accepts, when one is declared.
     ///
     /// Held here rather than looked up at the point it is needed, because the
     /// only place that knows it is the configuration file, and the session that
     /// budgets against it has no access to the raw file.
     pub context_window: Option<u64>,
+    /// `RUNE_CONTEXT_WINDOW`: a window that wins over every other source.
+    pub context_window_override: Option<u64>,
+    /// `RUNE_MAX_OUTPUT_TOKENS`: an output ceiling that wins over every other source.
+    pub max_output_override: Option<u64>,
     /// Endpoint base URL.
     pub base_url: Option<String>,
     /// Environment variable holding the credential.
@@ -580,28 +1060,52 @@ pub struct Settings {
     pub permission_mode: PermissionMode,
     /// Whether a command may run without a sandbox.
     ///
-    /// Off by default. A host with no usable backend refuses commands rather
-    /// than running them unrestricted, so turning this off removes the only way
-    /// to run anything on such a host.
+    /// Off by default, except on Windows, which has no backend: there commands
+    /// run under the permission mode alone unless the user file turns it off. A
+    /// host with no usable backend refuses commands rather than running them
+    /// unrestricted, so turning this off removes the only way to run anything
+    /// on such a host.
     pub allow_unsandboxed: bool,
     /// Reasoning effort.
     pub effort: Effort,
+    /// Sampling temperature chosen by the user, over the model's default.
+    pub temperature: Option<f64>,
     /// Whether fast mode is requested.
     pub fast_mode: bool,
     /// Theme selection.
     pub theme: Option<String>,
+    /// Color depth, `auto` to detect it from the terminal.
+    pub color: String,
+    /// Spinner motion, `full` or `reduced`.
+    pub motion: String,
+    /// How reasoning is shown, `collapsed`, `tail` or `full`.
+    pub reasoning: String,
+    /// Terminal hyperlinks, `auto`, `on`, or `off`.
+    pub hyperlinks: String,
+    /// Notifications while unfocused, `auto`, `bell`, or `off`.
+    pub notify: String,
+    /// Whether the window title shows the session and its state.
+    pub terminal_title: bool,
+    /// Status row fields to show, highest priority first.
+    pub statusline: Vec<String>,
     /// Whether terminal decorations use only ASCII.
     pub ascii: bool,
-    /// Whether automatic update checks run.
-    pub auto_upgrade: bool,
+    /// Whether a newer release is looked for, and installed.
+    pub auto_upgrade: AutoUpgrade,
     /// Whether provider requests are refused, web backends disabled, remote MCP
     /// checks skipped and sandboxed shell networking denied. This is not a
     /// process-wide network filter; hosts must enforce each path's policy.
     pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,
+    /// Whether a session opens with the version line and a tip.
+    pub banner: bool,
+    /// Columns an East Asian ambiguous character occupies, 1 or 2.
+    pub ambiguous_width: u8,
     /// Whether session titles are generated.
     pub session_titles: bool,
+    /// Whether each turn snapshots the workspace.
+    pub checkpoints: bool,
     /// Whether project context is loaded.
     pub context: bool,
     /// Additional workspace roots.
@@ -612,10 +1116,28 @@ pub struct Settings {
     pub provider_order: Vec<String>,
     /// Whether to restrict requests to the listed providers.
     pub provider_strict: bool,
+    /// Extra variables passed to shell commands, by name or pattern.
+    pub shell_env: Vec<String>,
     /// Image analysis model on the active provider and endpoint.
     pub vision_model: Option<String>,
     /// Model used for automatic permission review.
     pub review_model: Option<String>,
+    /// Model that summarizes a conversation too large for its own model.
+    pub compaction_model: Option<String>,
+    /// Whether an idle Claude session keeps its prompt cache warm.
+    pub cache_warming: bool,
+    /// Directory provider requests and responses are traced to, when set.
+    pub trace_dir: Option<Utf8PathBuf>,
+    /// Permission rules from the user file, in file order.
+    pub user_rules: Vec<ConfiguredRule>,
+    /// Permission rules from the project file, in file order.
+    pub project_rules: Vec<ConfiguredRule>,
+    /// The file the user layer was read from.
+    pub user_config_path: Option<Utf8PathBuf>,
+    /// The canonical workspace the project file belongs to.
+    pub workspace: Option<Utf8PathBuf>,
+    /// Whether the user approved the project file's `allow` rules.
+    pub project_allow_approved: bool,
     /// Where each value came from.
     pub sources: MergeReport,
     /// Diagnostics produced while loading.
@@ -628,30 +1150,60 @@ impl Default for Settings {
             provider: Provider::default(),
             model: String::new(),
             configured_models: BTreeMap::new(),
+            providers: BTreeMap::new(),
             pre_tool_hook: None,
             post_tool_hook: None,
+            hooks: Vec::new(),
             web_tools: false,
+            edit_tool: EditToolSetting::Auto,
+            mcp_tools: McpTools::Auto,
+            mcp_servers: BTreeMap::new(),
+            experiments: crate::experiment::Experiments::default(),
+            shell_network: false,
+            sandbox_cache_roots: None,
             context_window: None,
+            context_window_override: None,
+            max_output_override: None,
             base_url: None,
             api_key_env: None,
             anonymous: false,
             permission_mode: PermissionMode::default(),
-            allow_unsandboxed: false,
+            allow_unsandboxed: cfg!(windows),
             effort: Effort::default(),
+            temperature: None,
             fast_mode: false,
             theme: None,
+            color: COLOR_VALUES[0].to_owned(),
+            motion: MOTION_VALUES[0].to_owned(),
+            reasoning: REASONING_VALUES[0].to_owned(),
+            hyperlinks: HYPERLINK_VALUES[0].to_owned(),
+            notify: NOTIFY_VALUES[0].to_owned(),
+            terminal_title: true,
+            statusline: STATUSLINE_FIELDS.map(str::to_owned).to_vec(),
             ascii: false,
-            auto_upgrade: true,
+            auto_upgrade: AutoUpgrade::Notify,
             offline: false,
-            collapse_tool_calls: false,
+            collapse_tool_calls: true,
+            banner: true,
+            ambiguous_width: 1,
             session_titles: true,
+            checkpoints: true,
             context: true,
             additional_directories: Vec::new(),
             limits: BudgetSet::new(),
             provider_order: Vec::new(),
             provider_strict: false,
+            shell_env: Vec::new(),
             vision_model: None,
             review_model: None,
+            compaction_model: None,
+            cache_warming: false,
+            trace_dir: None,
+            user_rules: Vec::new(),
+            project_rules: Vec::new(),
+            user_config_path: None,
+            workspace: None,
+            project_allow_approved: false,
             sources: MergeReport::default(),
             diagnostics: Vec::new(),
         }
@@ -666,6 +1218,28 @@ impl Settings {
             .values()
             .filter(|entry| entry.id() == self.model)
             .find_map(ModelEntry::max_output_tokens)
+    }
+
+    /// Returns the prices declared for the selected model, when any are.
+    #[must_use]
+    pub fn model_prices(&self) -> Option<ModelPrices> {
+        self.configured_models
+            .values()
+            .filter(|entry| entry.id() == self.model)
+            .find_map(ModelEntry::prices)
+    }
+
+    /// Returns the active provider's settings and the name they are stored under.
+    ///
+    /// The provider's own name is looked up first, then `canonical`, the
+    /// preset name it is an alias of, so `[providers.zai]` also applies when
+    /// the provider is written `glm`.
+    #[must_use]
+    pub fn provider_settings(&self, canonical: &str) -> Option<(&str, &ProviderSettings)> {
+        [self.provider.as_str(), canonical]
+            .into_iter()
+            .find_map(|name| self.providers.get_key_value(name))
+            .map(|(name, entry)| (name.as_str(), entry))
     }
 
     /// Returns true when any layer produced a diagnostic.
@@ -711,8 +1285,11 @@ impl Settings {
 
     /// Surfaces a rejected user layer before a command relies on its provider.
     pub fn require_valid_user_config(&self) -> Result<()> {
+        // A diagnostic naming a key cost only that key; the rest of the file loaded.
         if let Some(diagnostic) = self.diagnostics.iter().find(|diagnostic| {
-            diagnostic.layer == Layer::User && diagnostic.code == ErrorCode::InvalidConfiguration
+            diagnostic.layer == Layer::User
+                && diagnostic.code == ErrorCode::InvalidConfiguration
+                && diagnostic.key.is_none()
         }) {
             let location = diagnostic.path.as_ref().map_or_else(
                 || "user configuration".to_owned(),
@@ -761,14 +1338,45 @@ impl Settings {
             ),
             ("permission_mode", self.permission_mode.to_string()),
             ("anonymous", self.anonymous.to_string()),
+            ("offline", self.offline.to_string()),
             ("effort", self.effort.to_string()),
+            (
+                "temperature",
+                self.temperature
+                    .map_or_else(|| "model default".to_owned(), |value| value.to_string()),
+            ),
             ("fast_mode", self.fast_mode.to_string()),
             (
                 "theme",
                 self.theme.clone().unwrap_or_else(|| "auto".to_owned()),
             ),
+            ("color", self.color.clone()),
+            ("motion", self.motion.clone()),
+            ("reasoning", self.reasoning.clone()),
+            ("hyperlinks", self.hyperlinks.clone()),
+            ("notify", self.notify.clone()),
+            ("terminal_title", self.terminal_title.to_string()),
+            ("statusline", listed(&self.statusline)),
             ("ascii", self.ascii.to_string()),
             ("web_tools", self.web_tools.to_string()),
+            ("edit_tool", self.edit_tool.to_string()),
+            (
+                "mcp_tools",
+                match self.mcp_tools {
+                    McpTools::Auto => "auto",
+                    McpTools::Eager => "eager",
+                    McpTools::Deferred => "deferred",
+                }
+                .to_owned(),
+            ),
+            ("shell_network", self.shell_network.to_string()),
+            ("allow_unsandboxed", self.allow_unsandboxed.to_string()),
+            (
+                "sandbox_cache_roots",
+                self.sandbox_cache_roots
+                    .as_ref()
+                    .map_or_else(|| "default".to_owned(), |roots| listed(roots)),
+            ),
             (
                 "post_tool_hook",
                 self.post_tool_hook
@@ -782,16 +1390,56 @@ impl Settings {
                     .map_or_else(|| "disabled".to_owned(), |hook| hook.name.clone()),
             ),
             (
+                "hooks",
+                if self.hooks.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!("{} configured", self.hooks.len())
+                },
+            ),
+            (
+                "mcp_servers",
+                listed(&self.mcp_servers.keys().cloned().collect::<Vec<_>>()),
+            ),
+            (
                 "vision_model",
                 self.vision_model
                     .clone()
                     .unwrap_or_else(|| "unavailable".to_owned()),
             ),
-            ("auto_upgrade", self.auto_upgrade.to_string()),
+            (
+                "review_model",
+                self.review_model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+            ),
+            (
+                "compaction_model",
+                self.compaction_model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+            ),
+            ("auto_upgrade", self.auto_upgrade.as_str().to_owned()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
+            ("banner", self.banner.to_string()),
+            ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
+            ("checkpoints", self.checkpoints.to_string()),
+            ("cache_warming", self.cache_warming.to_string()),
             ("context", self.context.to_string()),
+            (
+                "additional_directories",
+                listed(
+                    &self
+                        .additional_directories
+                        .iter()
+                        .map(|path| path.as_str().to_owned())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            ("provider_order", listed(&self.provider_order)),
             ("provider_strict", self.provider_strict.to_string()),
+            ("shell_env", listed(&self.shell_env)),
         ];
 
         let mut out: Vec<Explained> = rows
@@ -800,6 +1448,7 @@ impl Settings {
                 key: key.to_owned(),
                 value,
                 source: self.sources.source(key),
+                help: setting_help(key),
             })
             .collect();
 
@@ -808,6 +1457,7 @@ impl Settings {
                 key: name.as_str().to_owned(),
                 value: self.limits.get(*name).to_string(),
                 source: self.limits.source(*name).unwrap_or(Layer::Default),
+                help: name.description(),
             });
         }
 
@@ -824,6 +1474,18 @@ pub struct Explained {
     pub value: String,
     /// Layer that supplied it.
     pub source: Layer,
+    /// One line describing the setting.
+    #[serde(skip_deserializing)]
+    pub help: &'static str,
+}
+
+/// Renders a list for `--explain`: `none` when empty, else comma separated.
+fn listed(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(",")
+    }
 }
 
 /// Environment overrides read for this process.
@@ -841,6 +1503,8 @@ pub struct EnvironmentOverrides {
     pub permission_mode: Option<String>,
     /// Reasoning effort.
     pub effort: Option<String>,
+    /// `RUNE_TEMPERATURE`, as written.
+    pub temperature: Option<String>,
     /// Fast mode.
     pub fast_mode: Option<bool>,
     /// Theme.
@@ -848,7 +1512,7 @@ pub struct EnvironmentOverrides {
     /// ASCII terminal decorations.
     pub ascii: Option<bool>,
     /// Automatic updates.
-    pub auto_upgrade: Option<bool>,
+    pub auto_upgrade: Option<AutoUpgrade>,
     /// Additional directories.
     pub additional_directories: Vec<Utf8PathBuf>,
     /// Limit overrides in `name=value` form.
@@ -857,12 +1521,28 @@ pub struct EnvironmentOverrides {
     pub provider_order: Option<String>,
     /// Whether to restrict to the listed providers.
     pub provider_strict: Option<bool>,
+    /// `RUNE_SHELL_ENV`: variables passed to shell commands, comma separated.
+    pub shell_env: Option<String>,
     /// Review model.
     pub review_model: Option<String>,
+    /// `RUNE_COMPACTION_MODEL`: model for a standalone summary.
+    pub compaction_model: Option<String>,
     /// Offline mode.
     pub offline: Option<bool>,
     /// Whether the web tools may reach the network.
     pub web_tools: Option<bool>,
+    /// `RUNE_NETWORK`: whether sandboxed shell commands may use the network.
+    pub network: Option<bool>,
+    /// `RUNE_ALLOW_UNSANDBOXED`: the environment form of `--allow-unsandboxed`.
+    pub allow_unsandboxed: Option<bool>,
+    /// `RUNE_TRACE`: the environment form of `--trace`.
+    pub trace: Option<String>,
+    /// `RUNE_EDIT_TOOL`: `auto`, `replace` or `patch`.
+    pub edit_tool: Option<String>,
+    /// `RUNE_CONTEXT_WINDOW`, as written.
+    pub context_window: Option<String>,
+    /// `RUNE_MAX_OUTPUT_TOKENS`, as written.
+    pub max_output_tokens: Option<String>,
     /// Boolean variables whose value was not a boolean, with that value.
     ///
     /// Kept so the value is reported rather than silently ignored: an
@@ -891,6 +1571,13 @@ impl EnvironmentOverrides {
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
         let mut lookup = move |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
         let mut invalid_booleans = Vec::new();
+        let auto_upgrade = lookup("RUNE_AUTO_UPGRADE").and_then(|raw| {
+            let parsed = AutoUpgrade::parse(&raw);
+            if parsed.is_none() {
+                invalid_booleans.push(("RUNE_AUTO_UPGRADE", raw));
+            }
+            parsed
+        });
         let mut boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &'static str| {
             let raw = lookup(key)?;
             let parsed = parse_bool(&raw);
@@ -907,17 +1594,26 @@ impl EnvironmentOverrides {
             api_key_env: lookup("RUNE_API_KEY_ENV"),
             permission_mode: lookup("RUNE_PERMISSION_MODE"),
             effort: lookup("RUNE_EFFORT"),
+            temperature: lookup("RUNE_TEMPERATURE"),
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
             ascii: boolean(&mut lookup, "RUNE_ASCII"),
-            auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
+            auto_upgrade,
             additional_directories: Vec::new(),
             limits: Vec::new(),
             provider_order: lookup("RUNE_PROVIDER_ORDER"),
             provider_strict: boolean(&mut lookup, "RUNE_PROVIDER_STRICT"),
+            shell_env: lookup("RUNE_SHELL_ENV"),
             review_model: lookup("RUNE_REVIEW_MODEL"),
+            compaction_model: lookup("RUNE_COMPACTION_MODEL"),
             offline: boolean(&mut lookup, "RUNE_OFFLINE"),
             web_tools: boolean(&mut lookup, "RUNE_WEB_TOOLS"),
+            network: boolean(&mut lookup, "RUNE_NETWORK"),
+            allow_unsandboxed: boolean(&mut lookup, "RUNE_ALLOW_UNSANDBOXED"),
+            trace: lookup("RUNE_TRACE"),
+            edit_tool: lookup("RUNE_EDIT_TOOL"),
+            context_window: lookup("RUNE_CONTEXT_WINDOW"),
+            max_output_tokens: lookup("RUNE_MAX_OUTPUT_TOKENS"),
             invalid_booleans: Vec::new(),
         };
         out.invalid_booleans = invalid_booleans;
@@ -956,11 +1652,12 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// Keys accepted in a project configuration file.
+/// Keys accepted in a project configuration file, every `ProjectConfig` field
+/// in declaration order.
 ///
 /// Any other known key found in a project file is ignored with a diagnostic,
 /// because a repository can be changed by anyone who can open a pull request.
-const PROJECT_SAFE_KEYS: &[&str] = &[
+pub const PROJECT_KEYS: &[&str] = &[
     "sandbox",
     "max_agent_steps",
     "max_tool_result_bytes",
@@ -968,12 +1665,105 @@ const PROJECT_SAFE_KEYS: &[&str] = &[
     "provider_order",
     "provider_strict",
     "limits",
+    "permission",
+];
+
+/// Values the `color` setting accepts, the default first.
+pub const COLOR_VALUES: [&str; 5] = ["auto", "truecolor", "256", "16", "none"];
+
+/// The accepted `motion` values, the default first.
+pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
+
+/// The accepted `reasoning` values, the default first.
+pub const REASONING_VALUES: [&str; 3] = ["collapsed", "tail", "full"];
+/// The accepted `auto_upgrade` values, the default first.
+pub const AUTO_UPGRADE_VALUES: [&str; 3] = ["notify", "off", "install"];
+
+/// Whether a newer release is looked for, and what happens when one exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpgrade {
+    /// No check.
+    Off,
+    /// A notice when a newer release exists.
+    #[default]
+    Notify,
+    /// The newer release is installed after the session ends.
+    Install,
+}
+
+impl AutoUpgrade {
+    /// The setting's word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Notify => "notify",
+            Self::Install => "install",
+        }
+    }
+
+    /// Reads a word or a boolean spelling: true is `notify`, false is `off`,
+    /// as the setting meant before it had three values.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "notify" => Some(Self::Notify),
+            "install" => Some(Self::Install),
+            other => parse_bool(other).map(|on| if on { Self::Notify } else { Self::Off }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoUpgrade {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Word(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Flag(true) => Ok(Self::Notify),
+            Raw::Flag(false) => Ok(Self::Off),
+            Raw::Word(word) => Self::parse(&word).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "`{word}` is not an auto_upgrade value; accepted: off, notify, install"
+                ))
+            }),
+        }
+    }
+}
+/// The accepted `hyperlinks` values, the default first.
+pub const HYPERLINK_VALUES: [&str; 3] = ["auto", "on", "off"];
+/// The accepted `notify` values, the default first.
+pub const NOTIFY_VALUES: [&str; 3] = ["auto", "bell", "off"];
+
+/// The status row fields the `statusline` setting names, in the default order.
+pub const STATUSLINE_FIELDS: [&str; 13] = [
+    "model",
+    "mode",
+    "unsandboxed",
+    "context",
+    "queued",
+    "effort",
+    "net",
+    "branch",
+    "mcp",
+    "cost",
+    "tasks",
+    "workspace",
+    "session",
 ];
 
 /// Profile-owned keys. Present in a project file, they are ignored and reported.
 const PROFILE_ONLY_KEYS: &[&str] = &[
     "post_tool_hook",
     "pre_tool_hook",
+    "hooks",
     "provider",
     "models",
     "model",
@@ -981,19 +1771,403 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "api_key_env",
     "anonymous",
     "permission_mode",
-    "permission",
     "effort",
+    "temperature",
+    "edit_tool",
+    "mcp_tools",
+    "mcp_servers",
     "fast_mode",
     "theme",
+    "color",
+    "motion",
+    "reasoning",
+    "hyperlinks",
+    "notify",
+    "terminal_title",
+    "statusline",
     "ascii",
     "auto_upgrade",
     "offline",
     "collapse_tool_calls",
+    "banner",
+    "ambiguous_width",
     "session_titles",
+    "checkpoints",
     "additional_directories",
     "review_model",
+    "compaction_model",
+    "cache_warming",
     "vision_model",
 ];
+
+/// Every `UserConfig` field name, in declaration order.
+pub const USER_KEYS: &[&str] = &[
+    "pre_tool_hook",
+    "post_tool_hook",
+    "hooks",
+    "provider",
+    "offline",
+    "web_tools",
+    "edit_tool",
+    "mcp_tools",
+    "mcp_servers",
+    "shell_network",
+    "sandbox_cache_roots",
+    "allow_unsandboxed",
+    "models",
+    "providers",
+    "base_url",
+    "api_key_env",
+    "anonymous",
+    "permission_mode",
+    "effort",
+    "temperature",
+    "fast_mode",
+    "theme",
+    "color",
+    "motion",
+    "reasoning",
+    "hyperlinks",
+    "notify",
+    "terminal_title",
+    "statusline",
+    "ascii",
+    "auto_upgrade",
+    "collapse_tool_calls",
+    "banner",
+    "ambiguous_width",
+    "session_titles",
+    "checkpoints",
+    "context",
+    "additional_directories",
+    "limits",
+    "permission",
+    "vision_model",
+    "review_model",
+    "compaction_model",
+    "cache_warming",
+    "provider_order",
+    "provider_strict",
+    "shell_env",
+];
+
+/// Top-level `UserConfig` keys that hold one value, which `rune config set` can write.
+pub const SCALAR_KEYS: &[&str] = &[
+    "provider",
+    "offline",
+    "web_tools",
+    "edit_tool",
+    "mcp_tools",
+    "shell_network",
+    "allow_unsandboxed",
+    "base_url",
+    "api_key_env",
+    "anonymous",
+    "permission_mode",
+    "effort",
+    "temperature",
+    "fast_mode",
+    "theme",
+    "color",
+    "motion",
+    "reasoning",
+    "hyperlinks",
+    "notify",
+    "terminal_title",
+    "ascii",
+    "auto_upgrade",
+    "collapse_tool_calls",
+    "banner",
+    "ambiguous_width",
+    "session_titles",
+    "checkpoints",
+    "context",
+    "vision_model",
+    "review_model",
+    "compaction_model",
+    "cache_warming",
+    "provider_strict",
+];
+
+/// The type of a value `rune config set` writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarKind {
+    /// Written `true` or `false`.
+    Boolean,
+    /// Written as a TOML number.
+    Number,
+    /// Written TOML-quoted.
+    Text,
+    /// One of the listed names, written TOML-quoted.
+    Choice(&'static [&'static str]),
+}
+
+/// Returns how a scalar key's value is typed, or `None` for any other key.
+#[must_use]
+pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
+    if !SCALAR_KEYS.contains(&key) {
+        return None;
+    }
+    Some(match key {
+        "offline"
+        | "web_tools"
+        | "shell_network"
+        | "allow_unsandboxed"
+        | "anonymous"
+        | "fast_mode"
+        | "ascii"
+        | "collapse_tool_calls"
+        | "banner"
+        | "terminal_title"
+        | "session_titles"
+        | "checkpoints"
+        | "context"
+        | "cache_warming"
+        | "provider_strict" => ScalarKind::Boolean,
+        "temperature" | "ambiguous_width" => ScalarKind::Number,
+        "edit_tool" => ScalarKind::Choice(&["auto", "replace", "patch"]),
+        "mcp_tools" => ScalarKind::Choice(&["auto", "eager", "deferred"]),
+        "permission_mode" => ScalarKind::Choice(&["ask", "auto", "full_access"]),
+        "effort" => ScalarKind::Choice(&[
+            "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ]),
+        "color" => ScalarKind::Choice(&COLOR_VALUES),
+        "motion" => ScalarKind::Choice(&MOTION_VALUES),
+        "reasoning" => ScalarKind::Choice(&REASONING_VALUES),
+        "auto_upgrade" => ScalarKind::Choice(&AUTO_UPGRADE_VALUES),
+        "hyperlinks" => ScalarKind::Choice(&HYPERLINK_VALUES),
+        "notify" => ScalarKind::Choice(&NOTIFY_VALUES),
+        _ => ScalarKind::Text,
+    })
+}
+
+/// Renders a value written on the command line as the TOML a scalar key takes.
+pub fn scalar_literal(key: &str, raw: &str) -> Result<String> {
+    let Some(kind) = scalar_kind(key) else {
+        return Err(RuneError::new(
+            ErrorCode::InvalidField,
+            format!("{key} is not a single value; use rune config edit"),
+        ));
+    };
+    match kind {
+        ScalarKind::Boolean => parse_bool(raw)
+            .map(|value| value.to_string())
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::InvalidField,
+                    format!("{key} takes a boolean, not `{raw}`"),
+                )
+                .with_hint(format!("use one of {BOOLEAN_SPELLINGS}"))
+            }),
+        ScalarKind::Number => {
+            let value: toml::Value = toml::from_str(&format!("value = {}", raw.trim()))
+                .ok()
+                .and_then(|table: toml::Table| table.get("value").cloned())
+                .filter(|value| value.is_integer() || value.is_float())
+                .ok_or_else(|| {
+                    RuneError::new(
+                        ErrorCode::InvalidField,
+                        format!("{key} takes a number, not `{raw}`"),
+                    )
+                })?;
+            Ok(value.to_string())
+        }
+        ScalarKind::Text => Ok(toml::Value::String(raw.to_owned()).to_string()),
+        ScalarKind::Choice(names) => {
+            if names.contains(&raw) {
+                Ok(toml::Value::String(raw.to_owned()).to_string())
+            } else {
+                Err(RuneError::new(
+                    ErrorCode::InvalidField,
+                    format!("{key} takes one of {}, not `{raw}`", names.join(", ")),
+                ))
+            }
+        }
+    }
+}
+
+/// Reads user configuration text the way a load does and returns its diagnostics.
+///
+/// The error is a diagnostic that would make a load skip the whole file.
+pub fn check_user_text(
+    path: &Utf8Path,
+    text: &str,
+) -> std::result::Result<Vec<Diagnostic>, Diagnostic> {
+    let parse_error = |err: toml::de::Error| {
+        Diagnostic::new(
+            Layer::User,
+            ErrorCode::InvalidConfiguration,
+            format!("could not parse: {err}"),
+        )
+        .with_path(path)
+    };
+    let value: toml::Value = toml::from_str(text).map_err(parse_error)?;
+    let (user, mut diagnostics) =
+        deserialize_lenient::<UserConfig>(text, value, Layer::User, path, USER_KEYS)
+            .map_err(parse_error)?;
+    let mut settings = Settings::default();
+    apply_user(&mut settings, &user, Layer::User);
+    diagnostics.append(&mut settings.diagnostics);
+    Ok(diagnostics)
+}
+
+/// One line describing each `rune config --explain` key that is not a limit.
+///
+/// Limits are described by [`LimitName::description`].
+pub const SETTING_HELP: &[(&str, &str)] = &[
+    (
+        "provider",
+        "Provider requests are sent to; set with rune connect.",
+    ),
+    ("model", "Model used for the active provider."),
+    ("context_window", "Input tokens the selected model accepts."),
+    ("base_url", "Endpoint for the active provider."),
+    (
+        "api_key_env",
+        "Environment variable that holds the credential.",
+    ),
+    (
+        "permission_mode",
+        "How tool calls are approved: ask, auto or full_access.",
+    ),
+    (
+        "anonymous",
+        "Connect to a loopback endpoint without a credential.",
+    ),
+    (
+        "offline",
+        "Refuse provider requests and keep tools off the network.",
+    ),
+    ("effort", "Reasoning effort requested from the model."),
+    (
+        "temperature",
+        "Sampling temperature, 0 to 2, for models that accept one.",
+    ),
+    (
+        "fast_mode",
+        "Request fast mode where the provider offers it.",
+    ),
+    ("theme", "Terminal theme name, or a light or dark pin."),
+    ("color", "Color depth: auto, truecolor, 256, 16 or none."),
+    (
+        "motion",
+        "Spinner motion: full, or reduced for a static glyph.",
+    ),
+    (
+        "reasoning",
+        "How reasoning is shown: collapsed to one line, tail with its newest line, or full.",
+    ),
+    (
+        "hyperlinks",
+        "Link file targets in tool rows: auto, on or off.",
+    ),
+    (
+        "notify",
+        "Notify when a turn ends or input is needed while the terminal is unfocused: auto, bell or off.",
+    ),
+    (
+        "terminal_title",
+        "Show the session and whether it is idle, working or waiting in the window title.",
+    ),
+    (
+        "statusline",
+        "Status row fields to show, highest priority first.",
+    ),
+    ("ascii", "Draw terminal decorations with ASCII only."),
+    (
+        "web_tools",
+        "Let the web fetch and search tools reach the network.",
+    ),
+    (
+        "edit_tool",
+        "File-edit tool offered to the model: auto, replace or patch.",
+    ),
+    (
+        "mcp_tools",
+        "How MCP tools are offered: auto, eager or deferred.",
+    ),
+    (
+        "shell_network",
+        "Let sandboxed shell commands use the network.",
+    ),
+    (
+        "allow_unsandboxed",
+        "Run commands unsandboxed when no sandbox works on this machine.",
+    ),
+    (
+        "sandbox_cache_roots",
+        "Directories commands may write besides the workspace.",
+    ),
+    (
+        "post_tool_hook",
+        "Command that observes each completed tool result.",
+    ),
+    (
+        "pre_tool_hook",
+        "Command that may veto a tool call before it runs.",
+    ),
+    ("hooks", "Programs run at points of a session."),
+    ("mcp_servers", "MCP servers connected in every workspace."),
+    (
+        "vision_model",
+        "Model that describes images on the active provider.",
+    ),
+    (
+        "review_model",
+        "Model that reviews tool calls in auto permission mode.",
+    ),
+    (
+        "compaction_model",
+        "Model that summarizes a conversation too large for its own.",
+    ),
+    ("auto_upgrade", "Check for a newer release automatically."),
+    (
+        "collapse_tool_calls",
+        "Collapse groups of tool calls in the transcript.",
+    ),
+    ("banner", "Open a session with the version line and a tip."),
+    (
+        "ambiguous_width",
+        "Columns an East Asian ambiguous character takes, 1 or 2.",
+    ),
+    ("session_titles", "Name sessions from their first prompt."),
+    (
+        "checkpoints",
+        "Snapshot the workspace at each turn so command changes can be undone.",
+    ),
+    (
+        "cache_warming",
+        "Keep the prompt cache warm while a session is idle.",
+    ),
+    (
+        "context",
+        "Load project instructions and workspace context.",
+    ),
+    (
+        "additional_directories",
+        "Workspace roots besides the current directory.",
+    ),
+    ("provider_order", "Upstream providers to prefer, in order."),
+    (
+        "provider_strict",
+        "Send requests only to the listed upstream providers.",
+    ),
+    (
+        "shell_env",
+        "Extra environment variables passed to shell commands.",
+    ),
+];
+
+/// Returns the help line of an explain key.
+#[must_use]
+pub fn setting_help(key: &str) -> &'static str {
+    SETTING_HELP
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, help)| *help)
+        .or_else(|| key.parse::<LimitName>().ok().map(LimitName::description))
+        .unwrap_or("")
+}
 
 /// Loads and merges every configuration layer.
 ///
@@ -1005,11 +2179,23 @@ pub fn load(
     user_path: Option<&Utf8Path>,
     env: &EnvironmentOverrides,
 ) -> Settings {
-    let mut settings = Settings::default();
+    let mut settings = Settings {
+        user_config_path: user_path.map(Utf8Path::to_path_buf),
+        workspace: project_path.and_then(Utf8Path::parent).map(|parent| {
+            std::fs::canonicalize(parent)
+                .ok()
+                .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+                .unwrap_or_else(|| parent.to_path_buf())
+        }),
+        ..Settings::default()
+    };
 
     if let Some(path) = user_path {
         match read_user(path) {
-            Ok(Some(user)) => apply_user(&mut settings, &user, Layer::User),
+            Ok(Some((user, diagnostics))) => {
+                settings.diagnostics.extend(diagnostics);
+                apply_user(&mut settings, &user, Layer::User);
+            }
             Ok(None) => {}
             Err(diagnostic) => settings.diagnostics.push(diagnostic),
         }
@@ -1032,11 +2218,14 @@ pub fn load(
 }
 
 /// Reads the user configuration file.
-fn read_user(path: &Utf8Path) -> std::result::Result<Option<UserConfig>, Diagnostic> {
+#[allow(clippy::type_complexity)]
+fn read_user(
+    path: &Utf8Path,
+) -> std::result::Result<Option<(UserConfig, Vec<Diagnostic>)>, Diagnostic> {
     let Some(text) = read_bounded(path, Layer::User)? else {
         return Ok(None);
     };
-    let config: UserConfig = toml::from_str(&text).map_err(|err| {
+    let parse_error = |err: toml::de::Error| {
         Diagnostic::new(
             Layer::User,
             ErrorCode::InvalidConfiguration,
@@ -1044,8 +2233,227 @@ fn read_user(path: &Utf8Path) -> std::result::Result<Option<UserConfig>, Diagnos
         )
         .with_path(path)
         .with_hint("run `rune doctor` for the resolved configuration")
-    })?;
-    Ok(Some(config))
+    };
+    let value: toml::Value = toml::from_str(&text).map_err(parse_error)?;
+    let (config, diagnostics) =
+        deserialize_lenient::<UserConfig>(&text, value, Layer::User, path, USER_KEYS)
+            .map_err(parse_error)?;
+    Ok(Some((config, diagnostics)))
+}
+
+/// Deserializes a configuration value, dropping each unknown key in turn.
+///
+/// One misspelled key costs only itself: it is removed, reported with its
+/// path and the nearest known name, and the rest is read again. Any other
+/// error is returned, and the caller skips the layer.
+fn deserialize_lenient<T: serde::de::DeserializeOwned>(
+    text: &str,
+    mut value: toml::Value,
+    layer: Layer,
+    path: &Utf8Path,
+    known: &[&str],
+) -> std::result::Result<(T, Vec<Diagnostic>), toml::de::Error> {
+    const MAX_REMOVALS: usize = 64;
+    let mut diagnostics = Vec::new();
+    let mut removals = 0;
+    loop {
+        let err = match value.clone().try_into::<T>() {
+            Ok(config) => return Ok((config, diagnostics)),
+            Err(err) => err,
+        };
+        if removals == MAX_REMOVALS {
+            return Err(err);
+        }
+        let message = err.message().to_owned();
+        let Some(name) = unknown_field(&message) else {
+            // Parsed from the text unchanged, the error names its line.
+            if removals == 0 {
+                toml::from_str::<T>(text)?;
+            }
+            return Err(err);
+        };
+        let Some(key_path) = remove_first_key(&mut value, name) else {
+            return Err(err);
+        };
+        removals = removals.saturating_add(1);
+        let expected = expected_fields(&message);
+        let candidates: Vec<&str> = if expected.is_empty() {
+            known.to_vec()
+        } else {
+            expected
+        };
+        let hint = suggest(name, candidates.iter().copied()).map_or_else(
+            || "remove it".to_owned(),
+            |key| format!("did you mean {key}?"),
+        );
+        diagnostics.push(
+            Diagnostic::new(
+                layer,
+                ErrorCode::InvalidConfiguration,
+                format!("unknown key {key_path}"),
+            )
+            .with_key(key_path)
+            .with_path(path)
+            .with_hint(hint),
+        );
+    }
+}
+
+/// Returns the field named by a serde ``unknown field `name` `` message.
+fn unknown_field(message: &str) -> Option<&str> {
+    let rest = message.split_once("unknown field `")?.1;
+    Some(rest.split_once('`')?.0)
+}
+
+/// Returns the names a serde unknown-field message says were expected.
+fn expected_fields(message: &str) -> Vec<&str> {
+    let Some((_, rest)) = message.split_once("expected ") else {
+        return Vec::new();
+    };
+    rest.split('`').skip(1).step_by(2).collect()
+}
+
+/// Removes the first key called `name`, breadth first, and returns its dotted path.
+fn remove_first_key(value: &mut toml::Value, name: &str) -> Option<String> {
+    use std::collections::VecDeque;
+
+    // Each entry is the route to a table: keys and array positions.
+    let mut queue: VecDeque<Vec<Step>> = VecDeque::from([Vec::new()]);
+    let mut found = None;
+    while let Some(route) = queue.pop_front() {
+        let node = walk(value, &route)?;
+        if let Some(table) = node.as_table() {
+            if table.contains_key(name) {
+                found = Some(route);
+                break;
+            }
+            for (key, child) in table {
+                let mut next = route.clone();
+                next.push(Step::Key(key.clone()));
+                match child {
+                    toml::Value::Table(_) => queue.push_back(next),
+                    toml::Value::Array(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if item.is_table() {
+                                let mut item_route = next.clone();
+                                item_route.push(Step::Index(index));
+                                queue.push_back(item_route);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let route = found?;
+    let mut node = &mut *value;
+    for step in &route {
+        node = match step {
+            Step::Key(key) => node.as_table_mut()?.get_mut(key)?,
+            Step::Index(index) => node.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    node.as_table_mut()?.remove(name)?;
+    let mut parts: Vec<&str> = route
+        .iter()
+        .filter_map(|step| match step {
+            Step::Key(key) => Some(key.as_str()),
+            Step::Index(_) => None,
+        })
+        .collect();
+    parts.push(name);
+    Some(parts.join("."))
+}
+
+/// One step on the way to a nested table.
+#[derive(Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn walk<'a>(value: &'a toml::Value, route: &[Step]) -> Option<&'a toml::Value> {
+    route.iter().try_fold(value, |node, step| match step {
+        Step::Key(key) => node.get(key.as_str()),
+        Step::Index(index) => node.get(*index),
+    })
+}
+
+/// Returns the known name nearest to `name`, when one is close enough to be a typo.
+///
+/// Close enough is an edit distance of at most 2, or a third of the known
+/// name's length when that is larger.
+pub fn suggest<'a>(name: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    known
+        .into_iter()
+        .filter(|candidate| *candidate != name)
+        .map(|candidate| (edit_distance(name, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= (candidate.chars().count() / 3).max(2))
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut current = vec![i.saturating_add(1)];
+        for (j, b) in right.iter().enumerate() {
+            let above = previous.get(j).copied().unwrap_or(usize::MAX);
+            let left_cell = current.get(j).copied().unwrap_or(usize::MAX);
+            let diagonal = previous
+                .get(j.saturating_add(1))
+                .copied()
+                .unwrap_or(usize::MAX);
+            let substitution = above.saturating_add(usize::from(a != *b));
+            let insertion = left_cell.saturating_add(1);
+            let deletion = diagonal.saturating_add(1);
+            current.push(substitution.min(insertion).min(deletion));
+        }
+        previous = current;
+    }
+    previous.last().copied().unwrap_or(0)
+}
+
+/// Top level of a project hooks file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectHooksFile {
+    #[serde(default)]
+    hooks: Vec<Hook>,
+}
+
+/// Reads a project hooks file: its exact text and its hooks, each marked as
+/// read from the project.
+///
+/// A missing file is `Ok(None)`. A file that cannot be read or parsed, has a
+/// top-level key other than `hooks`, or holds an invalid hook is one
+/// diagnostic, and none of its hooks are used.
+pub fn read_project_hooks(
+    path: &Utf8Path,
+) -> std::result::Result<Option<(String, Vec<Hook>)>, Diagnostic> {
+    let Some(text) = read_bounded(path, Layer::Project)? else {
+        return Ok(None);
+    };
+    let invalid = |message: String| {
+        Diagnostic::new(Layer::Project, ErrorCode::InvalidConfiguration, message)
+            .with_path(path)
+            .with_hint("fix the file; until then none of its hooks run")
+    };
+    let file: ProjectHooksFile = toml::from_str(&text)
+        .map_err(|err| invalid(format!("could not parse: {}", err.message())))?;
+    let mut hooks = file.hooks;
+    for (index, hook) in hooks.iter_mut().enumerate() {
+        if let Some(problem) = hook.validation_error() {
+            return Err(invalid(format!(
+                "hook {}: {problem}",
+                index.saturating_add(1)
+            )));
+        }
+        hook.project = true;
+    }
+    Ok(Some((text, hooks)))
 }
 
 /// Reads the project configuration file.
@@ -1083,30 +2491,21 @@ fn read_project(
                     .with_path(path)
                     .with_hint("set this in the user config instead"),
                 );
-            } else if !PROJECT_SAFE_KEYS.contains(&key.as_str()) {
-                return Err(Diagnostic::new(
-                    Layer::Project,
-                    ErrorCode::InvalidConfiguration,
-                    format!("unknown key `{key}`"),
-                )
-                .with_key(key)
-                .with_path(path)
-                .with_hint(format!(
-                    "accepted keys are {}",
-                    PROJECT_SAFE_KEYS.join(", ")
-                )));
             }
         }
     }
 
-    let config: ProjectConfig = value.try_into().map_err(|err: toml::de::Error| {
-        Diagnostic::new(
-            Layer::Project,
-            ErrorCode::InvalidConfiguration,
-            format!("could not parse: {err}"),
-        )
-        .with_path(path)
-    })?;
+    let (config, unknown) =
+        deserialize_lenient::<ProjectConfig>(&text, value, Layer::Project, path, PROJECT_KEYS)
+            .map_err(|err| {
+                Diagnostic::new(
+                    Layer::Project,
+                    ErrorCode::InvalidConfiguration,
+                    format!("could not parse: {err}"),
+                )
+                .with_path(path)
+            })?;
+    diagnostics.extend(unknown);
     Ok(Some((config, diagnostics)))
 }
 
@@ -1171,6 +2570,74 @@ fn read_bounded(path: &Utf8Path, layer: Layer) -> std::result::Result<Option<Str
     Ok(Some(text))
 }
 
+/// Returns the rules that can be applied, with a diagnostic for each one dropped.
+/// A project rule may not carry `workspace` or `saved`.
+fn usable_rules(
+    settings: &mut Settings,
+    rules: &[ConfiguredRule],
+    layer: Layer,
+    project: bool,
+) -> Vec<ConfiguredRule> {
+    let mut usable = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        let problem = if rule.tool.trim().is_empty() {
+            Some("`tool` is empty")
+        } else if rule.pattern.trim().is_empty() {
+            Some("`match` is empty")
+        } else if project && (rule.workspace.is_some() || rule.saved.is_some()) {
+            Some("a project file may not set `workspace` or `saved`")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!(
+                        "permission rule {} was ignored: {problem}",
+                        index.saturating_add(1)
+                    ),
+                )
+                .with_key("permission.rules")
+                .with_hint("fix the `[[permission.rules]]` entry or remove it"),
+            );
+        } else {
+            usable.push(rule.clone());
+        }
+    }
+    usable
+}
+
+/// Rebuilds `Settings::hooks` from the legacy tables and `[[hooks]]`, dropping invalid hooks.
+fn apply_hooks(settings: &mut Settings, user: &UserConfig, layer: Layer) {
+    let mut hooks: Vec<Hook> = settings
+        .pre_tool_hook
+        .iter()
+        .map(Hook::from)
+        .chain(settings.post_tool_hook.iter().map(Hook::from))
+        .collect();
+    if let Some(configured) = &user.hooks {
+        settings.sources.record("hooks", layer);
+        for (index, hook) in configured.iter().enumerate() {
+            if let Some(problem) = hook.validation_error() {
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("hook {} was ignored: {problem}", index.saturating_add(1)),
+                    )
+                    .with_key("hooks")
+                    .with_hint("fix the `[[hooks]]` entry or remove it"),
+                );
+            } else {
+                hooks.push(hook.clone());
+            }
+        }
+    }
+    settings.hooks = hooks;
+}
+
 /// Applies a user configuration to the settings.
 fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(hook) = &user.post_tool_hook {
@@ -1181,9 +2648,36 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.pre_tool_hook = Some(hook.clone());
         settings.sources.record("pre_tool_hook", layer);
     }
+    apply_hooks(settings, user, layer);
+    if let Some(table) = &user.permission {
+        settings.user_rules = usable_rules(settings, &table.rules, layer, false);
+    }
     if let Some(offline) = user.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
+    }
+    if let Some(edit_tool) = user.edit_tool {
+        settings.edit_tool = edit_tool;
+        settings.sources.record("edit_tool", layer);
+    }
+    if let Some(mcp_tools) = user.mcp_tools {
+        settings.mcp_tools = mcp_tools;
+        settings.sources.record("mcp_tools", layer);
+    }
+    if let Some(servers) = &user.mcp_servers {
+        settings.sources.record("mcp_servers", layer);
+        settings.mcp_servers.clear();
+        for (name, server) in servers {
+            if let Some(problem) = server.validation_error(name) {
+                settings.diagnostics.push(
+                    Diagnostic::new(layer, ErrorCode::InvalidField, problem)
+                        .with_key(format!("mcp_servers.{name}"))
+                        .with_hint("fix the `[mcp_servers]` entry or remove it"),
+                );
+            } else {
+                settings.mcp_servers.insert(name.clone(), server.clone());
+            }
+        }
     }
     if let Some(web_tools) = user.web_tools {
         // A project file cannot set this: it decides whether a repository can
@@ -1191,6 +2685,22 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         // owner's call rather than the repository's.
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
+    }
+    if let Some(roots) = &user.sandbox_cache_roots {
+        settings.sandbox_cache_roots = Some(roots.clone());
+        settings.sources.record("sandbox_cache_roots", layer);
+    }
+    if let Some(allow) = user.allow_unsandboxed {
+        // A user choice for machines with no working backend; a project file
+        // cannot make it.
+        settings.allow_unsandboxed = allow;
+        settings.sources.record("allow_unsandboxed", layer);
+    }
+    if let Some(network) = user.shell_network {
+        // Not in a project file either: a repository cannot grant its own
+        // commands the network.
+        settings.shell_network = network;
+        settings.sources.record("shell_network", layer);
     }
     if let Some(provider) = &user.provider {
         settings.provider = provider.clone();
@@ -1243,6 +2753,9 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
             }
         }
     }
+    if let Some(providers) = &user.providers {
+        apply_providers(settings, providers, layer);
+    }
     if let Some(mode) = user.permission_mode {
         settings.permission_mode = mode;
         settings.sources.record("permission_mode", layer);
@@ -1251,6 +2764,9 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.effort = effort;
         settings.sources.record("effort", layer);
     }
+    if let Some(temperature) = user.temperature {
+        set_temperature(settings, temperature, &temperature.to_string(), layer);
+    }
     if let Some(fast) = user.fast_mode {
         settings.fast_mode = fast;
         settings.sources.record("fast_mode", layer);
@@ -1258,6 +2774,110 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     if let Some(theme) = &user.theme {
         settings.theme = Some(theme.clone());
         settings.sources.record("theme", layer);
+    }
+    if let Some(raw) = &user.color {
+        let value = raw.trim().to_ascii_lowercase();
+        if COLOR_VALUES.contains(&value.as_str()) {
+            settings.color = value;
+            settings.sources.record("color", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, ErrorCode::InvalidField, format!("color is `{raw}`"))
+                    .with_key("color")
+                    .with_hint("accepted values are auto, truecolor, 256, 16, and none"),
+            );
+        }
+    }
+    if let Some(raw) = &user.motion {
+        let value = raw.trim().to_ascii_lowercase();
+        if MOTION_VALUES.contains(&value.as_str()) {
+            settings.motion = value;
+            settings.sources.record("motion", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(layer, ErrorCode::InvalidField, format!("motion is `{raw}`"))
+                    .with_key("motion")
+                    .with_hint("accepted values are full and reduced"),
+            );
+        }
+    }
+    if let Some(raw) = &user.reasoning {
+        let value = raw.trim().to_ascii_lowercase();
+        if REASONING_VALUES.contains(&value.as_str()) {
+            settings.reasoning = value;
+            settings.sources.record("reasoning", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("reasoning is `{raw}`"),
+                )
+                .with_key("reasoning")
+                .with_hint("accepted values are collapsed, tail, and full"),
+            );
+        }
+    }
+    if let Some(raw) = &user.hyperlinks {
+        let value = raw.trim().to_ascii_lowercase();
+        if HYPERLINK_VALUES.contains(&value.as_str()) {
+            settings.hyperlinks = value;
+            settings.sources.record("hyperlinks", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("hyperlinks is `{raw}`"),
+                )
+                .with_key("hyperlinks")
+                .with_hint("accepted values are auto, on, and off"),
+            );
+        }
+    }
+    if let Some(raw) = &user.notify {
+        let value = raw.trim().to_ascii_lowercase();
+        if NOTIFY_VALUES.contains(&value.as_str()) {
+            settings.notify = value;
+            settings.sources.record("notify", layer);
+        } else {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    "notify must be auto, bell or off",
+                )
+                .with_key("notify"),
+            );
+        }
+    }
+    if let Some(title) = user.terminal_title {
+        settings.terminal_title = title;
+        settings.sources.record("terminal_title", layer);
+    }
+    if let Some(names) = &user.statusline {
+        let mut fields: Vec<String> = Vec::with_capacity(names.len());
+        for raw in names {
+            let name = raw.trim().to_ascii_lowercase();
+            if !STATUSLINE_FIELDS.contains(&name.as_str()) {
+                settings.diagnostics.push(
+                    Diagnostic::new(
+                        layer,
+                        ErrorCode::InvalidField,
+                        format!("statusline names an unknown field `{raw}`"),
+                    )
+                    .with_key("statusline")
+                    .with_hint(format!(
+                        "accepted fields are {}",
+                        STATUSLINE_FIELDS.join(", ")
+                    )),
+                );
+            } else if !fields.contains(&name) {
+                fields.push(name);
+            }
+        }
+        settings.statusline = fields;
+        settings.sources.record("statusline", layer);
     }
     if let Some(ascii) = user.ascii {
         settings.ascii = ascii;
@@ -1271,9 +2891,33 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.collapse_tool_calls = collapse;
         settings.sources.record("collapse_tool_calls", layer);
     }
+    if let Some(banner) = user.banner {
+        settings.banner = banner;
+        settings.sources.record("banner", layer);
+    }
+    if let Some(columns) = user.ambiguous_width {
+        match u8::try_from(columns) {
+            Ok(columns @ (1 | 2)) => {
+                settings.ambiguous_width = columns;
+                settings.sources.record("ambiguous_width", layer);
+            }
+            _ => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    "ambiguous_width must be 1 or 2",
+                )
+                .with_key("ambiguous_width"),
+            ),
+        }
+    }
     if let Some(titles) = user.session_titles {
         settings.session_titles = titles;
         settings.sources.record("session_titles", layer);
+    }
+    if let Some(checkpoints) = user.checkpoints {
+        settings.checkpoints = checkpoints;
+        settings.sources.record("checkpoints", layer);
     }
     if let Some(context) = user.context {
         settings.context = context;
@@ -1287,6 +2931,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.provider_order.clone_from(order);
         settings.sources.record("provider_order", layer);
     }
+    if let Some(names) = &user.shell_env {
+        settings.shell_env.clone_from(names);
+        settings.sources.record("shell_env", layer);
+    }
     if let Some(strict) = user.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
@@ -1299,6 +2947,14 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
     }
+    if let Some(compaction) = &user.compaction_model {
+        settings.compaction_model = Some(compaction.clone());
+        settings.sources.record("compaction_model", layer);
+    }
+    if let Some(warming) = user.cache_warming {
+        settings.cache_warming = warming;
+        settings.sources.record("cache_warming", layer);
+    }
     apply_limit_table(
         &mut settings.limits,
         user.limits.as_ref(),
@@ -1307,8 +2963,100 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
     );
 }
 
+/// Merges `[providers.<name>]` tables: `compat` values are kept as text.
+///
+/// Every setting is a name or a boolean, so any other value type is reported
+/// and skipped rather than guessed at.
+fn apply_providers(
+    settings: &mut Settings,
+    providers: &BTreeMap<String, ProviderEntry>,
+    layer: Layer,
+) {
+    for (name, entry) in providers {
+        if let Some(head) = entry.head_timeout_ms.filter(|ms| *ms > 0) {
+            settings
+                .providers
+                .entry(name.clone())
+                .or_default()
+                .head_timeout_ms = Some(head);
+        }
+        if let Some(headers) = &entry.headers {
+            apply_provider_headers(settings, name, headers, layer);
+        }
+        let Some(compat) = &entry.compat else {
+            continue;
+        };
+        let target = settings.providers.entry(name.clone()).or_default();
+        for (key, value) in compat {
+            let text = match value {
+                toml::Value::String(text) => text.clone(),
+                toml::Value::Boolean(flag) => flag.to_string(),
+                _ => {
+                    settings.diagnostics.push(
+                        Diagnostic::new(
+                            layer,
+                            ErrorCode::InvalidField,
+                            format!("`{key}` takes a string or a boolean"),
+                        )
+                        .with_key(format!("providers.{name}.compat.{key}")),
+                    );
+                    continue;
+                }
+            };
+            target.compat.insert(key.clone(), text);
+        }
+    }
+    settings.sources.record("providers", layer);
+}
+
+/// Headers the transport writes itself, which a configured value would corrupt.
+const RESERVED_HEADERS: &[&str] = &["content-type", "accept", "host", "content-length"];
+
+/// Returns true when a header name is a valid token that a user may set.
+fn settable_header(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        && !RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Merges one provider's `headers` table, reporting names that cannot be sent.
+///
+/// A later layer replaces the value of a name an earlier layer set.
+fn apply_provider_headers(
+    settings: &mut Settings,
+    name: &str,
+    headers: &BTreeMap<String, String>,
+    layer: Layer,
+) {
+    for (header, value) in headers {
+        if !settable_header(header) {
+            settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("`{header}` cannot be set here"),
+                )
+                .with_key(format!("providers.{name}.headers.{header}")),
+            );
+            continue;
+        }
+        let target = &mut settings
+            .providers
+            .entry(name.to_owned())
+            .or_default()
+            .headers;
+        target.retain(|(existing, _)| !existing.eq_ignore_ascii_case(header));
+        target.push((header.clone(), value.clone()));
+    }
+}
+
 /// Applies a project configuration, ignoring anything not repository safe.
 fn apply_project(settings: &mut Settings, project: &ProjectConfig, layer: Layer) {
+    if let Some(table) = &project.permission {
+        settings.project_rules = usable_rules(settings, &table.rules, layer, true);
+    }
     // A repository may state the sandbox posture, and the only value it may
     // state is the restrictive one: a repository cannot grant itself the right
     // to run commands unrestricted on someone else's machine.
@@ -1504,6 +3252,19 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             ),
         }
     }
+    if let Some(raw) = &env.temperature {
+        match raw.trim().parse::<f64>() {
+            Ok(temperature) => set_temperature(settings, temperature, raw.trim(), layer),
+            Err(_) => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("RUNE_TEMPERATURE is `{raw}`, which is not a number"),
+                )
+                .with_key("temperature"),
+            ),
+        }
+    }
     if let Some(fast) = env.fast_mode {
         settings.fast_mode = fast;
         settings.sources.record("fast_mode", layer);
@@ -1520,13 +3281,56 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
         settings.auto_upgrade = auto;
         settings.sources.record("auto_upgrade", layer);
     }
+    if let Some(raw) = &env.edit_tool {
+        let parsed = match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(EditToolSetting::Auto),
+            "replace" => Some(EditToolSetting::Replace),
+            "patch" => Some(EditToolSetting::Patch),
+            _ => None,
+        };
+        match parsed {
+            Some(edit_tool) => {
+                settings.edit_tool = edit_tool;
+                settings.sources.record("edit_tool", layer);
+            }
+            None => settings.diagnostics.push(
+                Diagnostic::new(
+                    layer,
+                    ErrorCode::InvalidField,
+                    format!("RUNE_EDIT_TOOL is `{raw}`"),
+                )
+                .with_key("edit_tool")
+                .with_hint("accepted values are auto, replace and patch"),
+            ),
+        }
+    }
     if let Some(web_tools) = env.web_tools {
         settings.web_tools = web_tools;
         settings.sources.record("web_tools", layer);
     }
+    if let Some(network) = env.network {
+        settings.shell_network = network;
+        settings.sources.record("shell_network", layer);
+    }
+    if let Some(allow) = env.allow_unsandboxed {
+        settings.allow_unsandboxed = allow;
+        settings.sources.record("allow_unsandboxed", layer);
+    }
     if let Some(offline) = env.offline {
         settings.offline = offline;
         settings.sources.record("offline", layer);
+    }
+    if let Some(dir) = &env.trace {
+        settings.trace_dir = Some(Utf8PathBuf::from(dir.trim()));
+        settings.sources.record("trace_dir", layer);
+    }
+    if let Some(raw) = &env.context_window {
+        settings.context_window_override =
+            token_count(settings, "RUNE_CONTEXT_WINDOW", "context_window", raw);
+    }
+    if let Some(raw) = &env.max_output_tokens {
+        settings.max_output_override =
+            token_count(settings, "RUNE_MAX_OUTPUT_TOKENS", "max_output_tokens", raw);
     }
     if !env.additional_directories.is_empty() {
         settings
@@ -1543,6 +3347,15 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             .collect();
         settings.sources.record("provider_order", layer);
     }
+    if let Some(names) = &env.shell_env {
+        settings.shell_env = names
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        settings.sources.record("shell_env", layer);
+    }
     if let Some(strict) = env.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
@@ -1550,6 +3363,10 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
     if let Some(review) = &env.review_model {
         settings.review_model = Some(review.clone());
         settings.sources.record("review_model", layer);
+    }
+    if let Some(compaction) = &env.compaction_model {
+        settings.compaction_model = Some(compaction.clone());
+        settings.sources.record("compaction_model", layer);
     }
     for (variable, raw) in &env.invalid_booleans {
         settings.diagnostics.push(
@@ -1583,6 +3400,43 @@ fn apply_environment(settings: &mut Settings, env: &EnvironmentOverrides) {
             &mut settings.diagnostics,
         );
     }
+}
+
+/// Reads a positive token count from an environment variable.
+///
+/// Anything else is reported and ignored, so a mistyped window falls back to
+/// the next source rather than budgeting against a zero.
+/// Sets the temperature when it is within 0 to 2, and reports it otherwise.
+fn set_temperature(settings: &mut Settings, temperature: f64, raw: &str, layer: Layer) {
+    if (0.0..=2.0).contains(&temperature) {
+        settings.temperature = Some(temperature);
+        settings.sources.record("temperature", layer);
+    } else {
+        settings.diagnostics.push(
+            Diagnostic::new(
+                layer,
+                ErrorCode::InvalidField,
+                format!("`{raw}` is outside 0 to 2"),
+            )
+            .with_key("temperature"),
+        );
+    }
+}
+
+fn token_count(settings: &mut Settings, variable: &str, key: &str, raw: &str) -> Option<u64> {
+    let parsed = raw.trim().parse::<u64>().ok().filter(|value| *value > 0);
+    if parsed.is_none() {
+        settings.diagnostics.push(
+            Diagnostic::new(
+                Layer::Environment,
+                ErrorCode::InvalidField,
+                format!("{variable} is `{raw}`, which is not a positive integer"),
+            )
+            .with_key(key)
+            .with_hint("set a positive token count or unset the variable"),
+        );
+    }
+    parsed
 }
 
 /// Applies one limit override written as text.
@@ -1683,7 +3537,7 @@ pub fn unconfigured_model_error() -> RuneError {
 /// Renders the project configuration keys, for documentation consistency tests.
 #[must_use]
 pub const fn project_safe_keys() -> &'static [&'static str] {
-    PROJECT_SAFE_KEYS
+    PROJECT_KEYS
 }
 
 /// Renders the profile-owned keys, for documentation consistency tests.
@@ -1702,17 +3556,30 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "permission_mode": settings.permission_mode,
         "permission_label": settings.permission_mode.label(),
         "effort": settings.effort,
+        "edit_tool": settings.edit_tool,
         "fast_mode": settings.fast_mode,
         "theme": settings.theme,
+        "color": settings.color,
+        "motion": settings.motion,
+        "reasoning": settings.reasoning,
+        "hyperlinks": settings.hyperlinks,
+        "notify": settings.notify,
+        "terminal_title": settings.terminal_title,
+        "statusline": settings.statusline,
         "ascii": settings.ascii,
-        "auto_upgrade": settings.auto_upgrade,
+        "auto_upgrade": settings.auto_upgrade.as_str(),
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
+        "banner": settings.banner,
+        "ambiguous_width": settings.ambiguous_width,
         "session_titles": settings.session_titles,
         "additional_directories": settings.additional_directories,
         "provider_order": settings.provider_order,
         "provider_strict": settings.provider_strict,
+        "shell_env": settings.shell_env,
         "review_model": settings.review_model,
+        "compaction_model": settings.compaction_model,
+        "cache_warming": settings.cache_warming,
         "vision_model": settings.vision_model,
         "pre_tool_hook": settings.pre_tool_hook,
         "post_tool_hook": settings.post_tool_hook,
@@ -1746,6 +3613,62 @@ mod tests {
 
     fn empty_env() -> EnvironmentOverrides {
         EnvironmentOverrides::default()
+    }
+
+    #[test]
+    fn shell_env_comes_from_user_and_environment_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "shell_env = [\"DATABASE_URL\", \"MYAPP_*\"]\n",
+        );
+        let project = write(&dir, "project.toml", "shell_env = [\"*\"]\n");
+        let from_user = load(None, Some(&user), &empty_env());
+        assert_eq!(from_user.shell_env, ["DATABASE_URL", "MYAPP_*"]);
+        // A repository cannot widen what commands receive.
+        let with_project = load(Some(&project), Some(&user), &empty_env());
+        assert_eq!(with_project.shell_env, ["DATABASE_URL", "MYAPP_*"]);
+        let env = EnvironmentOverrides {
+            shell_env: Some(" CI_* , EXTRA ,".to_owned()),
+            ..EnvironmentOverrides::default()
+        };
+        let from_env = load(None, Some(&user), &env);
+        assert_eq!(from_env.shell_env, ["CI_*", "EXTRA"]);
+    }
+
+    #[test]
+    fn the_limit_variables_take_positive_token_counts() {
+        let env = EnvironmentOverrides::from_lookup(|key| match key {
+            "RUNE_CONTEXT_WINDOW" => Some("64000".to_owned()),
+            "RUNE_MAX_OUTPUT_TOKENS" => Some(" 8192 ".to_owned()),
+            _ => None,
+        });
+        let settings = load(None, None, &env);
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        assert_eq!(settings.context_window_override, Some(64_000));
+        assert_eq!(settings.max_output_override, Some(8_192));
+
+        for raw in ["0", "-5", "lots"] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_CONTEXT_WINDOW").then(|| raw.to_owned())
+            });
+            let settings = load(None, None, &env);
+            assert_eq!(settings.context_window_override, None);
+            assert!(
+                settings.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == ErrorCode::InvalidField
+                        && diagnostic.key.as_deref() == Some("context_window")
+                        && diagnostic.message.contains("RUNE_CONTEXT_WINDOW")
+                }),
+                "{:?}",
+                settings.diagnostics
+            );
+        }
     }
 
     #[test]
@@ -1862,9 +3785,252 @@ mod tests {
                     && row.value == "fixture guard"
                     && row.source == Layer::User)
         );
-        let encoded =
-            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        let encoded = toml::to_string(&read_user(&user).expect("read").expect("config").0)
+            .expect("serialize");
         assert!(encoded.contains("pre_tool_hook"));
+    }
+
+    #[test]
+    fn hooks_tables_parse_and_follow_the_legacy_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[pre_tool_hook]\nname = 'old guard'\nargv = ['/bin/true']\n\
+             [post_tool_hook]\nname = 'old observer'\nargv = ['/bin/true']\n\
+             [[hooks]]\nevent = 'user_prompt'\nname = 'prompt check'\nargv = ['check']\n\
+             [[hooks]]\nevent = 'pre_tool'\nname = 'shell guard'\nargv = ['guard', '--strict']\n\
+             timeout_ms = 900\non_error = 'allow'\ntools = ['shell']\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        let summary: Vec<_> = settings
+            .hooks
+            .iter()
+            .map(|hook| (hook.event, hook.name.as_str(), hook.on_error(), hook.legacy))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (HookEvent::PreTool, "old guard", OnError::Deny, true),
+                (HookEvent::PostTool, "old observer", OnError::Allow, true),
+                (HookEvent::UserPrompt, "prompt check", OnError::Deny, false),
+                (HookEvent::PreTool, "shell guard", OnError::Allow, false),
+            ]
+        );
+        let guard = &settings.hooks[3];
+        assert_eq!(guard.timeout_ms, 900);
+        assert!(guard.applies_to("shell") && !guard.applies_to("read_file"));
+        assert_eq!(settings.hooks[2].timeout_ms, 5_000);
+        assert!(settings.hooks[2].applies_to("read_file"));
+        assert!(settings.hooks.iter().all(|hook| !hook.project));
+        assert_eq!(settings.source_of("hooks"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "hooks" && row.value == "4 configured")
+        );
+        assert!(
+            Settings::default()
+                .explain()
+                .iter()
+                .any(|row| row.key == "hooks" && row.value == "none")
+        );
+        for (event, name) in [
+            (HookEvent::SessionStart, "session_start"),
+            (HookEvent::TurnEnd, "turn_end"),
+            (HookEvent::PreCompact, "pre_compact"),
+            (HookEvent::Notification, "notification"),
+            (HookEvent::SessionEnd, "session_end"),
+        ] {
+            assert_eq!(event.name(), name);
+            let hook: Hook =
+                toml::from_str(&format!("event = '{name}'\nname = 'n'\nargv = ['x']\n"))
+                    .expect("hook");
+            assert_eq!(hook.event, event);
+            assert_eq!(hook.on_error(), OnError::Allow);
+        }
+    }
+
+    #[test]
+    fn invalid_hooks_are_reported_and_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[[hooks]]\nevent = 'pre_tool'\nname = ' '\nargv = ['x']\n\
+             [[hooks]]\nevent = 'pre_tool'\nname = 'no program'\nargv = ['']\n\
+             [[hooks]]\nevent = 'post_tool'\nname = 'no argv'\nargv = []\n\
+             [[hooks]]\nevent = 'turn_end'\nname = 'zero'\nargv = ['x']\ntimeout_ms = 0\n\
+             [[hooks]]\nevent = 'turn_end'\nname = 'long'\nargv = ['x']\ntimeout_ms = 60001\n\
+             [[hooks]]\nevent = 'user_prompt'\nname = 'filtered'\nargv = ['x']\ntools = ['shell']\n\
+             [[hooks]]\nevent = 'post_tool'\nname = 'kept'\nargv = ['x']\ntimeout_ms = 60000\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        let names: Vec<_> = settings
+            .hooks
+            .iter()
+            .map(|hook| hook.name.as_str())
+            .collect();
+        assert_eq!(names, ["kept"]);
+        let messages: Vec<_> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == ErrorCode::InvalidField
+                    && diagnostic.key.as_deref() == Some("hooks")
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "hook 1 was ignored: a hook needs a nonempty `name`",
+                "hook 2 was ignored: a hook needs a nonempty `argv` program",
+                "hook 3 was ignored: a hook needs a nonempty `argv` program",
+                "hook 4 was ignored: `timeout_ms` must be from 1 to 60000",
+                "hook 5 was ignored: `timeout_ms` must be from 1 to 60000",
+                "hook 6 was ignored: `tools` applies only to pre_tool and post_tool hooks",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_file_cannot_set_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[hooks]]\nevent = 'pre_tool'\nname = 'repo guard'\nargv = ['/bin/false']\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.hooks.is_empty());
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("hooks")
+        }));
+        assert_eq!(settings.source_of("hooks"), Layer::Default);
+    }
+
+    #[test]
+    fn permission_rules_parse_in_both_layers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'git status*'\ndecision = 'allow'\n\
+             workspace = '/elsewhere'\nsaved = '2026-11-10'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = ''\ndecision = 'allow'\n",
+        );
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[permission.rules]]\ntool = 'write_file'\nmatch = 'migrations/*'\ndecision = 'ask'\n",
+        );
+        let settings = load(Some(&project), Some(&user), &empty_env());
+        assert_eq!(settings.user_rules.len(), 2);
+        assert_eq!(settings.user_rules[0].pattern, "rm *");
+        assert_eq!(settings.user_rules[0].decision, RuleDecision::Deny);
+        assert_eq!(
+            settings.user_rules[1].workspace.as_deref(),
+            Some(Utf8Path::new("/elsewhere"))
+        );
+        assert_eq!(settings.user_rules[1].saved.as_deref(), Some("2026-11-10"));
+        assert_eq!(settings.project_rules.len(), 1);
+        assert_eq!(settings.project_rules[0].tool, "write_file");
+        assert_eq!(settings.project_rules[0].decision, RuleDecision::Ask);
+        assert_eq!(settings.user_config_path.as_ref(), Some(&user));
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonical");
+        assert_eq!(
+            settings.workspace.as_deref().map(Utf8Path::as_std_path),
+            Some(canonical.as_path())
+        );
+        // The empty `match` is reported and dropped, and nothing else is.
+        let dropped: Vec<&Diagnostic> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.key.as_deref() == Some("permission.rules"))
+            .collect();
+        assert_eq!(dropped.len(), 1, "{:?}", settings.diagnostics);
+        assert!(dropped[0].message.contains("`match` is empty"));
+        assert_eq!(dropped[0].layer, Layer::User);
+        // A project file may set the table now; it is not a user-only key.
+        assert!(
+            !settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == ErrorCode::KeyNotAllowedInScope)
+        );
+    }
+
+    #[test]
+    fn project_rules_cannot_carry_workspace_or_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[[permission.rules]]\ntool = 'shell'\nmatch = 'curl*'\ndecision = 'allow'\n\
+             workspace = '/w'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'ls*'\ndecision = 'allow'\n\
+             saved = '2026-11-10'\n\n\
+             [[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.project_rules.len(), 1);
+        assert_eq!(settings.project_rules[0].pattern, "rm *");
+        let dropped: Vec<&Diagnostic> = settings
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.key.as_deref() == Some("permission.rules"))
+            .collect();
+        assert_eq!(dropped.len(), 2, "{:?}", settings.diagnostics);
+        for diagnostic in dropped {
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert!(
+                diagnostic
+                    .message
+                    .contains("a project file may not set `workspace` or `saved`")
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_hooks_file_marks_its_hooks_and_keeps_its_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = "[[hooks]]\nevent = 'pre_tool'\nname = 'repo guard'\nargv = ['/bin/true']\n";
+        let path = write(&dir, "hooks.toml", body);
+        let (text, hooks) = read_project_hooks(&path)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(text, body);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].project);
+        assert_eq!(hooks[0].event, HookEvent::PreTool);
+        let missing = Utf8PathBuf::from_path_buf(dir.path().join("absent.toml")).expect("utf8");
+        assert!(read_project_hooks(&missing).expect("missing").is_none());
+    }
+
+    #[test]
+    fn a_malformed_project_hooks_file_gives_a_diagnostic_and_no_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = "[[hooks]]\nevent = 'pre_tool'\nname = 'ok'\nargv = ['/bin/true']\n";
+        for body in [
+            format!("model = 'other'\n{hook}"),
+            format!("{hook}[[hooks]]\nevent = 'pre_tool'\nname = ''\nargv = ['/bin/true']\n"),
+            "[[hooks]\n".to_owned(),
+        ] {
+            let path = write(&dir, "hooks.toml", &body);
+            let diagnostic = read_project_hooks(&path).expect_err(&body);
+            assert_eq!(diagnostic.code, ErrorCode::InvalidConfiguration, "{body}");
+            assert_eq!(diagnostic.layer, Layer::Project);
+            assert_eq!(diagnostic.path.as_ref(), Some(&path));
+        }
     }
 
     #[test]
@@ -1895,8 +4061,8 @@ mod tests {
                     && row.value == "fixture guard"
                     && row.source == Layer::User)
         );
-        let encoded =
-            toml::to_string(&read_user(&user).expect("read").expect("config")).expect("serialize");
+        let encoded = toml::to_string(&read_user(&user).expect("read").expect("config").0)
+            .expect("serialize");
         assert!(encoded.contains("post_tool_hook"));
         assert_eq!(
             to_status_json(&settings, Utf8Path::new("/fixture"))["post_tool_hook"]["name"],
@@ -1922,6 +4088,401 @@ mod tests {
             assert_eq!(settings.web_tools, !enabled);
             assert_eq!(settings.source_of("web_tools"), Layer::Environment);
         }
+    }
+
+    #[test]
+    fn user_mcp_servers_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[mcp_servers.github]\nurl = \"https://example.test/mcp\"\n\
+             headers = { authorization = \"Bearer ${GITHUB_TOKEN}\" }\n\
+             tools = [\"search\"]\noauth_client_id = \"abc\"\noauth_scope = \"repo\"\n\
+             [mcp_servers.local]\ncommand = \"fixture\"\nargs = [\"--quiet\"]\n\
+             env = { LEVEL = \"${LEVEL:-info}\" }\nenabled = false\nrequired = true\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        let github = &settings.mcp_servers["github"];
+        assert_eq!(github.url.as_deref(), Some("https://example.test/mcp"));
+        assert_eq!(github.headers["authorization"], "Bearer ${GITHUB_TOKEN}");
+        assert_eq!(github.tools.as_deref(), Some(&["search".to_owned()][..]));
+        assert!(github.enabled && !github.required);
+        assert_eq!(github.oauth_client_id.as_deref(), Some("abc"));
+        assert_eq!(github.oauth_scope.as_deref(), Some("repo"));
+        let local = &settings.mcp_servers["local"];
+        assert_eq!(local.command.as_deref(), Some("fixture"));
+        assert_eq!(local.args, ["--quiet"]);
+        assert_eq!(local.env["LEVEL"], "${LEVEL:-info}");
+        assert!(!local.enabled && local.required && local.tools.is_none());
+        assert_eq!(settings.source_of("mcp_servers"), Layer::User);
+        assert!(
+            settings
+                .explain()
+                .iter()
+                .any(|row| row.key == "mcp_servers" && row.value == "github,local")
+        );
+    }
+
+    #[test]
+    fn mcp_server_needs_command_or_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[mcp_servers.both]\ncommand = \"x\"\nurl = \"https://example.test\"\n\
+             [mcp_servers.neither]\nargs = [\"x\"]\n\
+             [mcp_servers.good]\ncommand = \"x\"\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(
+            settings.mcp_servers.keys().collect::<Vec<_>>(),
+            ["good"],
+            "invalid servers are dropped"
+        );
+        let messages: Vec<&str> = settings
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(messages.contains(&"mcp server both: set command or url, not both"));
+        assert!(messages.contains(&"mcp server neither: set command or url, not both"));
+        let long = "a".repeat(MAX_MCP_SERVER_NAME_BYTES + 1);
+        let user = write(
+            &dir,
+            "long.toml",
+            &format!("[mcp_servers.{long}]\ncommand = \"x\"\n"),
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.mcp_servers.is_empty());
+        assert_eq!(settings.diagnostics.len(), 1, "{:?}", settings.diagnostics);
+    }
+
+    #[test]
+    fn a_project_file_cannot_declare_user_mcp_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "[mcp_servers.evil]\ncommand = \"/bin/sh\"\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(settings.mcp_servers.is_empty());
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::KeyNotAllowedInScope
+                && diagnostic.key.as_deref() == Some("mcp_servers")
+        }));
+        assert_eq!(settings.source_of("mcp_servers"), Layer::Default);
+    }
+
+    #[test]
+    fn mcp_tools_defaults_to_auto() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(load(None, None, &empty_env()).mcp_tools, McpTools::Auto);
+        for (text, expected) in [
+            ("auto", McpTools::Auto),
+            ("eager", McpTools::Eager),
+            ("deferred", McpTools::Deferred),
+        ] {
+            let user = write(&dir, "config.toml", &format!("mcp_tools = \"{text}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.mcp_tools, expected);
+            assert_eq!(settings.source_of("mcp_tools"), Layer::User);
+        }
+        let user = write(&dir, "config.toml", "mcp_tools = \"lazy\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(!settings.diagnostics.is_empty());
+        assert_eq!(settings.mcp_tools, McpTools::Auto);
+    }
+
+    #[test]
+    fn edit_tool_is_read_from_the_user_file_and_the_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(
+            load(None, None, &empty_env()).edit_tool,
+            EditToolSetting::Auto
+        );
+        let user = write(&dir, "config.toml", "edit_tool = \"patch\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.edit_tool, EditToolSetting::Patch);
+        assert_eq!(settings.source_of("edit_tool"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_EDIT_TOOL").then(|| String::from("Replace"))
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.edit_tool, EditToolSetting::Replace);
+        assert_eq!(settings.source_of("edit_tool"), Layer::Environment);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_EDIT_TOOL").then(|| String::from("diff"))
+        });
+        let settings = load(None, None, &env);
+        assert_eq!(settings.edit_tool, EditToolSetting::Auto);
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "RUNE_EDIT_TOOL is `diff`")
+        );
+    }
+
+    #[test]
+    fn cache_warming_is_off_unless_the_user_file_turns_it_on() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(!load(None, None, &empty_env()).cache_warming);
+        let user = write(&dir, "config.toml", "cache_warming = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert!(settings.cache_warming);
+        assert_eq!(settings.source_of("cache_warming"), Layer::User);
+    }
+
+    #[test]
+    fn compaction_model_is_read_from_the_user_file_and_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(load(None, None, &empty_env()).compaction_model.is_none());
+        let user = write(&dir, "config.toml", "compaction_model = \"small\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.diagnostics.is_empty());
+        assert_eq!(settings.compaction_model.as_deref(), Some("small"));
+        assert_eq!(settings.source_of("compaction_model"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_COMPACTION_MODEL").then(|| String::from("smaller"))
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.compaction_model.as_deref(), Some("smaller"));
+        assert_eq!(settings.source_of("compaction_model"), Layer::Environment);
+    }
+
+    #[test]
+    fn edit_tool_is_ignored_in_a_project_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(&dir, "project.toml", "edit_tool = \"patch\"\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.edit_tool, EditToolSetting::Auto);
+        assert_eq!(settings.source_of("edit_tool"), Layer::Default);
+        assert!(!settings.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_provider_head_timeout_is_read_from_its_table() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[providers.ollama]\nhead_timeout_ms = 600000\n\n[providers.openai]\nhead_timeout_ms = 0\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(
+            settings.diagnostics.is_empty(),
+            "{:?}",
+            settings.diagnostics
+        );
+        assert_eq!(
+            settings
+                .providers
+                .get("ollama")
+                .and_then(|entry| entry.head_timeout_ms),
+            Some(600_000)
+        );
+        // Zero is not a timeout, so the limit applies.
+        assert_eq!(
+            settings
+                .providers
+                .get("openai")
+                .and_then(|entry| entry.head_timeout_ms),
+            None
+        );
+    }
+
+    #[test]
+    fn a_provider_compat_table_round_trips() {
+        let text = "provider = \"glm\"\n\n\
+                    [providers.deepseek.compat]\n\
+                    thinking_format = \"none\"\n\
+                    reasoning_always = false\n\n\
+                    [providers.zai.compat]\n\
+                    strict_schema = true\n\
+                    tool_call_id = 9\n";
+        let parsed: UserConfig = toml::from_str(text).expect("parse");
+        let written = toml::to_string(&parsed).expect("serialize");
+        let reparsed: UserConfig = toml::from_str(&written).expect("reparse");
+        assert_eq!(
+            reparsed.providers.as_ref().map(BTreeMap::len),
+            parsed.providers.as_ref().map(BTreeMap::len)
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", text);
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(
+            settings
+                .providers
+                .get("deepseek")
+                .map(|entry| &entry.compat),
+            Some(&BTreeMap::from([
+                ("reasoning_always".to_owned(), "false".to_owned()),
+                ("thinking_format".to_owned(), "none".to_owned()),
+            ]))
+        );
+        assert_eq!(
+            settings.providers.get("zai").map(|entry| &entry.compat),
+            Some(&BTreeMap::from([(
+                "strict_schema".to_owned(),
+                "true".to_owned()
+            )]))
+        );
+        let diagnostic = settings
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.key.as_deref() == Some("providers.zai.compat.tool_call_id")
+            })
+            .expect("a non-scalar value is reported");
+        assert_eq!(
+            diagnostic.message,
+            "`tool_call_id` takes a string or a boolean"
+        );
+        assert!(settings.require_valid_user_config().is_ok());
+        assert_eq!(
+            settings
+                .provider_settings("zai")
+                .map(|(name, entry)| (name, entry.compat.len())),
+            Some(("zai", 1))
+        );
+        assert!(settings.provider_settings("glm").is_none());
+    }
+
+    #[test]
+    fn allow_unsandboxed_is_read_from_user_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "allow_unsandboxed = true\nsandbox_cache_roots = [\"~/.cache\"]\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::User);
+        assert_eq!(
+            settings.sandbox_cache_roots.as_deref(),
+            Some(["~/.cache".to_owned()].as_slice())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_defaults_to_allow_unsandboxed() {
+        let settings = load(None, None, &empty_env());
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Default);
+    }
+
+    #[test]
+    fn explicit_false_wins_on_windows() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "allow_unsandboxed = false\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(!settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::User);
+    }
+
+    #[test]
+    fn the_environment_overrides_a_user_allow_unsandboxed() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "allow_unsandboxed = true\n");
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_ALLOW_UNSANDBOXED").then(|| "false".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(!settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Environment);
+    }
+
+    #[test]
+    fn a_project_file_cannot_set_allow_unsandboxed() {
+        let dir = TempDir::new().expect("tempdir");
+        let project = write(
+            &dir,
+            "project.toml",
+            "allow_unsandboxed = true\nsandbox_cache_roots = [\"~\"]\n",
+        );
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.allow_unsandboxed, cfg!(windows));
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Default);
+        assert!(settings.sandbox_cache_roots.is_none());
+    }
+
+    #[test]
+    fn allow_unsandboxed_reads_its_environment_variable() {
+        let with = |value: &'static str| {
+            load(
+                None,
+                None,
+                &EnvironmentOverrides::from_lookup(move |key| {
+                    (key == "RUNE_ALLOW_UNSANDBOXED").then(|| value.to_owned())
+                }),
+            )
+        };
+        assert_eq!(
+            load(None, None, &empty_env()).allow_unsandboxed,
+            cfg!(windows)
+        );
+        let settings = with("1");
+        assert!(settings.allow_unsandboxed);
+        assert_eq!(settings.source_of("allow_unsandboxed"), Layer::Environment);
+        assert!(with("yes").allow_unsandboxed);
+        let invalid = with("nope");
+        assert_eq!(invalid.allow_unsandboxed, cfg!(windows));
+        assert!(
+            !invalid.diagnostics.is_empty(),
+            "an invalid boolean is reported"
+        );
+    }
+
+    #[test]
+    fn shell_network_comes_from_user_and_environment_only() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(!load(None, None, &empty_env()).shell_network);
+        let user = write(&dir, "config.toml", "shell_network = true\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert!(settings.shell_network);
+        assert_eq!(settings.source_of("shell_network"), Layer::User);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_NETWORK").then(|| "false".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert!(!settings.shell_network);
+        assert_eq!(settings.source_of("shell_network"), Layer::Environment);
+
+        // A repository cannot grant itself network.
+        let project = write(&dir, "project.toml", "shell_network = true\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert!(!settings.shell_network);
+
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_NETWORK").then(|| "maybe".to_owned())
+        });
+        let settings = load(None, None, &env);
+        assert!(!settings.shell_network);
+        assert!(
+            !settings.diagnostics.is_empty(),
+            "an invalid boolean is reported"
+        );
     }
 
     #[test]
@@ -2051,6 +4612,20 @@ max_agent_steps = 50
     }
 
     #[test]
+    fn the_trace_directory_comes_from_the_environment_and_is_off_by_default() {
+        assert_eq!(load(None, None, &empty_env()).trace_dir, None);
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_TRACE").then(|| String::from("/tmp/rune-trace"))
+        });
+        let settings = load(None, None, &env);
+        assert_eq!(
+            settings.trace_dir.as_deref(),
+            Some(Utf8Path::new("/tmp/rune-trace"))
+        );
+        assert_eq!(settings.source_of("trace_dir"), Layer::Environment);
+    }
+
+    #[test]
     fn project_cannot_change_the_user_offline_setting() {
         let dir = TempDir::new().expect("tempdir");
         for offline in [true, false] {
@@ -2109,13 +4684,151 @@ max_agent_steps = 50
     }
 
     #[test]
-    fn unknown_project_key_is_rejected_with_the_accepted_set() {
+    fn unknown_project_key_drops_only_itself() {
         let dir = TempDir::new().expect("tempdir");
-        let project = write(&dir, ".rune.toml", "nonsense = true\n");
-        let diagnostic = read_project(&project).expect_err("rejected");
+        let project = write(
+            &dir,
+            ".rune.toml",
+            "nonsense = true\nmax_agent_step = 4\nmax_agent_steps = 5\n",
+        );
+        let (config, diagnostics) = read_project(&project).expect("read").expect("present");
+        assert_eq!(config.max_agent_steps, Some(5));
+        let keys: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.key.as_deref()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (ErrorCode::InvalidConfiguration, Some("max_agent_step")),
+                (ErrorCode::InvalidConfiguration, Some("nonsense")),
+            ]
+        );
+        assert_eq!(
+            diagnostics[0].hint.as_deref(),
+            Some("did you mean max_agent_steps?")
+        );
+        assert_eq!(diagnostics[1].hint.as_deref(), Some("remove it"));
+    }
+
+    #[test]
+    fn an_unknown_key_drops_only_itself() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(&dir, "config.toml", "theme = \"dark\"\nbogus_key = 1\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+        assert_eq!(settings.diagnostics.len(), 1);
+        let diagnostic = &settings.diagnostics[0];
+        assert_eq!(diagnostic.layer, Layer::User);
         assert_eq!(diagnostic.code, ErrorCode::InvalidConfiguration);
-        assert_eq!(diagnostic.key.as_deref(), Some("nonsense"));
-        assert!(diagnostic.hint.is_some());
+        assert_eq!(diagnostic.message, "unknown key bogus_key");
+        assert_eq!(diagnostic.hint.as_deref(), Some("remove it"));
+        assert!(settings.require_valid_user_config().is_ok());
+
+        let misspelled = write(&dir, "typo.toml", "permision_mode = \"ask\"\n");
+        let settings = load(None, Some(&misspelled), &empty_env());
+        assert_eq!(
+            settings.diagnostics[0].hint.as_deref(),
+            Some("did you mean permission_mode?")
+        );
+    }
+
+    #[test]
+    fn nested_unknown_keys_are_reported_with_their_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "theme = \"dark\"\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\ntimout_ms = 9\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+        let hook = settings.pre_tool_hook.as_ref().expect("hook kept");
+        assert_eq!(hook.name, "guard");
+        assert_eq!(hook.timeout_ms, 5_000);
+        assert_eq!(settings.diagnostics.len(), 1);
+        assert_eq!(
+            settings.diagnostics[0].message,
+            "unknown key pre_tool_hook.timout_ms"
+        );
+        assert_eq!(
+            settings.diagnostics[0].hint.as_deref(),
+            Some("did you mean timeout_ms?")
+        );
+    }
+
+    #[test]
+    fn user_keys_list_every_field() {
+        fn expected_by_serde<T: serde::de::DeserializeOwned + fmt::Debug>() -> Vec<String> {
+            let err = toml::from_str::<T>("not_a_field_of_anything = 1\n").expect_err("unknown");
+            expected_fields(err.message())
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        assert_eq!(expected_by_serde::<UserConfig>(), USER_KEYS);
+        assert_eq!(expected_by_serde::<ProjectConfig>(), PROJECT_KEYS);
+        // A TOML that sets every listed key to a value of its type parses.
+        let mut table = toml::Table::new();
+        for key in USER_KEYS {
+            let value = match scalar_kind(key) {
+                Some(ScalarKind::Boolean) => toml::Value::Boolean(true),
+                Some(ScalarKind::Number) => toml::Value::Integer(1),
+                Some(ScalarKind::Choice(names)) => toml::Value::String(names[0].to_owned()),
+                Some(ScalarKind::Text) => toml::Value::String("x".to_owned()),
+                None => match *key {
+                    "pre_tool_hook" | "post_tool_hook" => toml::Value::Table(
+                        toml::from_str("name = \"h\"\nargv = [\"true\"]\n").expect("hook"),
+                    ),
+                    "models" | "providers" | "limits" | "permission" | "mcp_servers" => {
+                        toml::Value::Table(toml::Table::new())
+                    }
+                    _ => toml::Value::Array(Vec::new()),
+                },
+            };
+            table.insert((*key).to_owned(), value);
+        }
+        let parsed: std::result::Result<UserConfig, _> = toml::Value::Table(table).try_into();
+        assert!(parsed.is_ok(), "{parsed:?}");
+        for key in SCALAR_KEYS {
+            assert!(USER_KEYS.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn every_explain_row_has_help() {
+        for row in Settings::default().explain() {
+            assert!(!row.help.is_empty(), "{} has no help line", row.key);
+        }
+        for (key, help) in SETTING_HELP {
+            assert!(
+                Settings::default()
+                    .explain()
+                    .iter()
+                    .any(|row| row.key == *key),
+                "{key} is not explained"
+            );
+            assert!(help.ends_with('.'), "{key}");
+        }
+    }
+
+    #[test]
+    fn scalar_values_are_typed_by_their_key() {
+        assert_eq!(scalar_literal("offline", "yes").expect("bool"), "true");
+        assert!(scalar_literal("offline", "maybe").is_err());
+        assert_eq!(scalar_literal("theme", "dark").expect("text"), "\"dark\"");
+        assert_eq!(
+            scalar_literal("effort", "high").expect("choice"),
+            "\"high\""
+        );
+        assert!(scalar_literal("effort", "huge").is_err());
+        assert_eq!(scalar_literal("temperature", "0.5").expect("number"), "0.5");
+        assert!(scalar_literal("temperature", "warm").is_err());
+        let err = scalar_literal("models", "x").expect_err("table");
+        assert_eq!(
+            err.message(),
+            "models is not a single value; use rune config edit"
+        );
     }
 
     #[test]
@@ -2126,6 +4839,48 @@ max_agent_steps = 50
         assert_eq!(settings.diagnostics.len(), 1);
         assert_eq!(settings.diagnostics[0].layer, Layer::User);
         assert_eq!(settings.permission_mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn ambiguous_width_accepts_one_or_two_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = load(None, None, &empty_env());
+        assert_eq!(settings.ambiguous_width, 1);
+        assert_eq!(settings.source_of("ambiguous_width"), Layer::Default);
+        for (body, expected) in [("ambiguous_width = 1\n", 1), ("ambiguous_width = 2\n", 2)] {
+            let user = write(&dir, "config.toml", body);
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.ambiguous_width, expected);
+            assert_eq!(settings.source_of("ambiguous_width"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["ambiguous_width"],
+                expected
+            );
+        }
+        for body in [
+            "ambiguous_width = 0\n",
+            "ambiguous_width = 3\n",
+            "ambiguous_width = -2\n",
+            "ambiguous_width = 258\n",
+        ] {
+            let user = write(&dir, "config.toml", body);
+            let settings = load(None, Some(&user), &empty_env());
+            assert_eq!(settings.ambiguous_width, 1, "{body}");
+            assert_eq!(settings.diagnostics.len(), 1, "{body}");
+            assert_eq!(settings.diagnostics[0].code, ErrorCode::InvalidField);
+            assert_eq!(
+                settings.diagnostics[0].message,
+                "ambiguous_width must be 1 or 2"
+            );
+        }
+        let project = write(&dir, ".rune.toml", "ambiguous_width = 2\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.ambiguous_width, 1);
     }
 
     #[test]
@@ -2370,6 +5125,40 @@ max_agent_steps = 50
     }
 
     #[test]
+    fn auto_upgrade_accepts_words_and_booleans() {
+        for (raw, expected) in [
+            ("auto_upgrade = 'off'", AutoUpgrade::Off),
+            ("auto_upgrade = 'notify'", AutoUpgrade::Notify),
+            ("auto_upgrade = 'install'", AutoUpgrade::Install),
+            ("auto_upgrade = true", AutoUpgrade::Notify),
+            ("auto_upgrade = false", AutoUpgrade::Off),
+        ] {
+            let config: UserConfig = toml::from_str(raw).expect(raw);
+            assert_eq!(config.auto_upgrade, Some(expected), "{raw}");
+        }
+        assert!(toml::from_str::<UserConfig>("auto_upgrade = 'weekly'").is_err());
+        assert_eq!(Settings::default().auto_upgrade, AutoUpgrade::Notify);
+        for (raw, expected) in [
+            ("install", AutoUpgrade::Install),
+            ("0", AutoUpgrade::Off),
+            ("yes", AutoUpgrade::Notify),
+        ] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_AUTO_UPGRADE").then(|| raw.to_owned())
+            });
+            assert_eq!(env.auto_upgrade, Some(expected), "{raw}");
+        }
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_AUTO_UPGRADE").then(|| "weekly".to_owned())
+        });
+        assert_eq!(env.auto_upgrade, None);
+        assert_eq!(
+            env.invalid_booleans,
+            vec![("RUNE_AUTO_UPGRADE", "weekly".to_owned())]
+        );
+    }
+
+    #[test]
     fn boolean_env_parsing_accepts_the_documented_spellings() {
         for raw in ["1", "true", "on", "yes", "TRUE", "On"] {
             assert_eq!(parse_bool(raw), Some(true), "{raw}");
@@ -2525,7 +5314,7 @@ max_agent_steps = 50
         };
         apply_user(
             &mut settings,
-            &read_user(&user).expect("read").expect("present"),
+            &read_user(&user).expect("read").expect("present").0,
             Layer::User,
         );
         assert_eq!(settings.model, "claude-x");
@@ -2556,6 +5345,38 @@ max_agent_steps = 50
             .expect("entry");
         assert_eq!(entry.id(), "claude-x");
         assert_eq!(entry.context_window(), Some(1_000_000));
+    }
+
+    #[test]
+    fn model_prices_are_read_from_a_detailed_model_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let user = write(
+            &dir,
+            "config.toml",
+            "[models.anthropic]\nid = \"claude-x\"\nprices = { input = 280000, output = 420000 }\n",
+        );
+        let mut settings = Settings {
+            provider: Provider::Anthropic,
+            ..Settings::default()
+        };
+        apply_user(
+            &mut settings,
+            &read_user(&user).expect("read").expect("present").0,
+            Layer::User,
+        );
+        assert_eq!(
+            settings.model_prices(),
+            Some(ModelPrices {
+                input: 280_000,
+                output: 420_000,
+                cache_read: None,
+                cache_write: None,
+            })
+        );
+        let unknown: std::result::Result<UserConfig, _> = toml::from_str(
+            "[models.anthropic]\nid = \"claude-x\"\nprices = { input = 1, output = 1, extra = 1 }\n",
+        );
+        assert!(unknown.is_err());
     }
 
     #[test]
@@ -2972,5 +5793,155 @@ max_agent_steps = 50
     fn unconfigured_provider_renders_as_text() {
         assert_eq!(Provider::Unconfigured.to_string(), "unconfigured");
         assert_eq!(provider_key(&Provider::Unconfigured), "default");
+    }
+
+    #[test]
+    fn hyperlinks_setting_accepts_auto_on_and_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().hyperlinks, "auto");
+        for (raw, expected) in [("auto", "auto"), ("On", "on"), (" off ", "off")] {
+            let user = write(&dir, "config.toml", &format!("hyperlinks = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty(), "{raw}");
+            assert_eq!(settings.hyperlinks, expected);
+            assert_eq!(settings.source_of("hyperlinks"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["hyperlinks"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "hyperlinks = \"always\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.hyperlinks, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("hyperlinks")
+                && diagnostic.code == ErrorCode::InvalidField
+        }));
+    }
+
+    #[test]
+    fn notify_setting_accepts_auto_bell_and_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().notify, "auto");
+        for (raw, expected) in [("auto", "auto"), ("Bell", "bell"), (" off ", "off")] {
+            let user = write(&dir, "config.toml", &format!("notify = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(settings.diagnostics.is_empty(), "{raw}");
+            assert_eq!(settings.notify, expected);
+            assert_eq!(settings.source_of("notify"), Layer::User);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["notify"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "notify = \"loud\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.notify, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("notify")
+                && diagnostic.code == ErrorCode::InvalidField
+                && diagnostic.message == "notify must be auto, bell or off"
+        }));
+    }
+
+    #[test]
+    fn color_setting_accepts_the_five_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().color, "auto");
+        for (raw, expected) in [
+            ("auto", "auto"),
+            ("truecolor", "truecolor"),
+            ("256", "256"),
+            ("16", "16"),
+            ("none", "none"),
+            (" TrueColor ", "truecolor"),
+            ("NONE", "none"),
+        ] {
+            let user = write(&dir, "config.toml", &format!("color = \"{raw}\"\n"));
+            let settings = load(None, Some(&user), &empty_env());
+            assert!(
+                settings.diagnostics.is_empty(),
+                "{raw}: {:?}",
+                settings.diagnostics
+            );
+            assert_eq!(settings.color, expected);
+            assert_eq!(settings.source_of("color"), Layer::User);
+            let row = settings
+                .explain()
+                .into_iter()
+                .find(|row| row.key == "color")
+                .expect("color is explained");
+            assert_eq!(row.value, expected);
+            assert_eq!(
+                to_status_json(&settings, Utf8Path::new("/w"))["color"],
+                expected
+            );
+        }
+        let user = write(&dir, "config.toml", "color = \"millions\"\n");
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.color, "auto");
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("color")
+                && diagnostic.code == ErrorCode::InvalidField
+                && diagnostic
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("auto, truecolor, 256, 16, and none"))
+        }));
+        // The depth belongs to the profile, so a project file cannot set it.
+        let project = write(&dir, ".rune.toml", "color = \"none\"\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.color, "auto");
+    }
+
+    #[test]
+    fn statusline_setting_lists_known_fields_from_the_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(Settings::default().statusline, STATUSLINE_FIELDS);
+        let user = write(
+            &dir,
+            "config.toml",
+            "statusline = [\"Session\", \"model\", \"bogus\", \"model\"]\n",
+        );
+        let settings = load(None, Some(&user), &empty_env());
+        assert_eq!(settings.statusline, ["session", "model"]);
+        assert_eq!(settings.source_of("statusline"), Layer::User);
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.key.as_deref() == Some("statusline")
+                && diagnostic.message == "statusline names an unknown field `bogus`"
+                && diagnostic
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("model, mode, unsandboxed"))
+        }));
+        let row = settings
+            .explain()
+            .into_iter()
+            .find(|row| row.key == "statusline")
+            .expect("statusline is explained");
+        assert_eq!(row.value, "session,model");
+        assert_eq!(
+            to_status_json(&settings, Utf8Path::new("/w"))["statusline"],
+            serde_json::json!(["session", "model"])
+        );
+        let project = write(&dir, ".rune.toml", "statusline = [\"model\"]\n");
+        let settings = load(Some(&project), None, &empty_env());
+        assert_eq!(settings.statusline, STATUSLINE_FIELDS);
+    }
+
+    #[test]
+    fn the_temperature_is_read_and_held_to_its_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = write(&dir, "config.toml", "temperature = 0.2\n");
+        assert_eq!(load(None, Some(&user), &empty_env()).temperature, Some(0.2));
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_TEMPERATURE").then(|| "3".to_owned())
+        });
+        let settings = load(None, Some(&user), &env);
+        assert_eq!(settings.temperature, Some(0.2));
+        assert!(settings.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "`3` is outside 0 to 2"
+                && diagnostic.key.as_deref() == Some("temperature")
+        }));
     }
 }

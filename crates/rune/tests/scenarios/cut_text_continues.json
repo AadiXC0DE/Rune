@@ -1,0 +1,24 @@
+{
+  "prompt": "Answer in two parts.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "text": "Part one, ",
+      "finish": "length"
+    },
+    {
+      "text": "part two."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Part one, part two.",
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "Your reply was cut at the output limit."
+      }
+    ]
+  }
+}

@@ -61,6 +61,17 @@ impl Provider for Responses {
         Box::new(Reducer::new())
     }
 
+    fn replay_is_signed(&self, replay: &str) -> bool {
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_str(replay) else {
+            return false;
+        };
+        items.iter().any(|item| {
+            item.get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        })
+    }
+
     fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
         let mut input: Vec<serde_json::Value> = Vec::new();
 
@@ -81,7 +92,9 @@ impl Provider for Responses {
         body.insert("instructions".to_owned(), serde_json::json!(instructions));
         body.insert(
             "prompt_cache_key".to_owned(),
-            serde_json::json!(prefix_cache_key(&instructions, &plan.tools)),
+            serde_json::json!(plan.cache_key.clone().unwrap_or_else(|| {
+                crate::provider::prefix_cache_key(&instructions, &plan.tools)
+            })),
         );
         body.insert("input".to_owned(), serde_json::Value::Array(input));
         body.insert(
@@ -89,11 +102,19 @@ impl Provider for Responses {
             serde_json::json!(["reasoning.encrypted_content"]),
         );
 
-        if let Some(effort) = effort_wire(plan.effort) {
-            body.insert(
-                "reasoning".to_owned(),
-                serde_json::json!({ "effort": effort }),
-            );
+        let summary = plan.reasoning_summary;
+        let reasoning = match effort_wire(plan.effort) {
+            Some(effort) if summary => {
+                Some(serde_json::json!({ "effort": effort, "summary": "auto" }))
+            }
+            Some(effort) => Some(serde_json::json!({ "effort": effort })),
+            None if summary && plan.traits.family == crate::compat::Family::Gpt => {
+                Some(serde_json::json!({ "summary": "auto" }))
+            }
+            None => None,
+        };
+        if let Some(reasoning) = reasoning {
+            body.insert("reasoning".to_owned(), reasoning);
         }
 
         if plan.has_tools() {
@@ -152,7 +173,7 @@ fn encode_message(
             Ok(())
         }
         Role::Tool => {
-            encode_tool(message, out);
+            encode_tool(message, plan, out);
             Ok(())
         }
     }
@@ -230,7 +251,10 @@ fn encode_assistant(message: &Message, out: &mut Vec<serde_json::Value>) {
 }
 
 /// Encodes tool results as function call output items.
-fn encode_tool(message: &Message, out: &mut Vec<serde_json::Value>) {
+///
+/// An output item carries text only, so images attached to the results follow
+/// the outputs in one user message.
+fn encode_tool(message: &Message, plan: &RequestPlan, out: &mut Vec<serde_json::Value>) {
     for part in &message.parts {
         if let ContentPart::ToolResult {
             id,
@@ -250,6 +274,17 @@ fn encode_tool(message: &Message, out: &mut Vec<serde_json::Value>) {
                 "output": output,
             }));
         }
+    }
+    if let Some((text, images)) = crate::provider::tool_turn_images(message, plan) {
+        let mut content = vec![serde_json::json!({ "type": "input_text", "text": text })];
+        content.extend(images.into_iter().map(|(media_type, data)| {
+            serde_json::json!({
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })
+        }));
+        out.push(serde_json::json!({ "role": "user", "content": content }));
     }
 }
 
@@ -784,35 +819,6 @@ fn parse_usage(value: &serde_json::Value) -> Usage {
     }
 }
 
-/// Names the cacheable prefix of a request: the instructions and the tools.
-///
-/// The endpoint routes requests with the same key to the same cache, which is
-/// what makes a long shared prefix actually hit. Deriving the key from the
-/// prefix itself means two requests share a key exactly when they share that
-/// prefix, across turns and across sessions in one workspace, with no
-/// identifier leaving the machine that is not already implied by the request.
-fn prefix_cache_key(instructions: &str, tools: &[crate::message::ToolSpec]) -> String {
-    use sha2::{Digest as _, Sha256};
-    use std::fmt::Write as _;
-
-    let mut hasher = Sha256::new();
-    hasher.update(instructions.as_bytes());
-    for tool in tools {
-        hasher.update(b"\x1e");
-        hasher.update(tool.name.as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(tool.description.as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(tool.input_schema.to_string().as_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut key = String::from("rune-");
-    for byte in digest.iter().take(16) {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +941,7 @@ mod tests {
                     is_error: false,
                 }],
                 replay: None,
+                origin: None,
             },
         ];
         let body = Responses.build_request(&plan).expect("build");
@@ -957,6 +964,7 @@ mod tests {
                 is_error: true,
             }],
             replay: None,
+            origin: None,
         }];
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0]["output"], "error: not found");
@@ -980,6 +988,90 @@ mod tests {
         let body = Responses.build_request(&plan).expect("build");
         assert_eq!(body["input"][0], item);
         assert_eq!(body["input"][1]["type"], "message");
+    }
+
+    fn tool_turn(parts: Vec<ContentPart>) -> RequestPlan {
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+            origin: None,
+        }];
+        plan
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: ToolCallId::new(id).expect("id"),
+            name: "read_file".to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn image(id: u64) -> ContentPart {
+        ContentPart::Image {
+            image: crate::message::ImageRef {
+                id,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tool_image_follows_the_tool_messages_as_a_user_message() {
+        let mut plan = tool_turn(vec![
+            result("call_1", "image a.png attached"),
+            image(1),
+            result("call_2", "contents"),
+        ]);
+        plan.image_data.insert(1, "QUJD".into());
+        let body = Responses.build_request(&plan).expect("build");
+        let input = body["input"].as_array().expect("array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"], "image a.png attached");
+        assert_eq!(input[1]["call_id"], "call_2");
+        assert_eq!(
+            input[2],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Images from the tool results above."},
+                    {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,QUJD"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_turn_without_images_is_encoded_as_before() {
+        let plan = tool_turn(vec![result("call_1", "contents")]);
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "contents",
+            }])
+        );
+    }
+
+    #[test]
+    fn a_missing_image_is_left_out() {
+        let plan = tool_turn(vec![result("call_1", "image a.png attached"), image(1)]);
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["input"][1]["content"],
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Images from the tool results above are no longer available.",
+            }])
+        );
+        assert!(!body.to_string().contains("image-ref"));
     }
 
     #[test]
@@ -1026,10 +1118,41 @@ mod tests {
             let body = Responses.build_request(&plan).expect("build");
             assert_eq!(
                 body["reasoning"],
-                serde_json::json!({ "effort": wire }),
+                serde_json::json!({ "effort": wire, "summary": "auto" }),
                 "{effort}"
             );
         }
+    }
+
+    #[test]
+    fn a_reasoning_summary_is_requested() {
+        use rune_core::config::Effort;
+        let mut plan = plan_with_user("hi");
+        plan.traits.family = crate::compat::Family::Gpt;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["reasoning"], serde_json::json!({ "summary": "auto" }));
+
+        plan.effort = Effort::None;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({ "effort": "low", "summary": "auto" })
+        );
+
+        plan.reasoning_summary = false;
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "low" }));
+        plan.effort = Effort::Auto;
+        let body = Responses.build_request(&plan).expect("build");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_supplied_cache_key_wins_over_the_prefix_hash() {
+        let mut plan = plan_with_user("hi");
+        plan.cache_key = Some("session-key".to_owned());
+        let body = Responses.build_request(&plan).expect("build");
+        assert_eq!(body["prompt_cache_key"], "session-key");
     }
 
     #[test]
@@ -1174,6 +1297,15 @@ mod tests {
             r#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
         ]);
         assert!(reducer.replay().is_none());
+    }
+
+    #[test]
+    fn replay_is_signed_for_encrypted_reasoning_only() {
+        let signed = r#"[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}]"#;
+        let plain = r#"[{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":""}]"#;
+        assert!(Responses.replay_is_signed(signed));
+        assert!(!Responses.replay_is_signed(plain));
+        assert!(!Responses.replay_is_signed("not json"));
     }
 
     #[test]

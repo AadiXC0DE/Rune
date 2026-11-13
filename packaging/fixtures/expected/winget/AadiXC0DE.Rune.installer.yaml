@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: AadiXC0DE.Rune
+PackageVersion: 1.2.3
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: rune.exe
+    PortableCommandAlias: rune
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/AadiXC0DE/Rune/releases/download/v1.2.3/rune-1.2.3-x86_64-pc-windows-msvc.zip
+    InstallerSha256: 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+ManifestType: installer
+ManifestVersion: 1.6.0

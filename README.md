@@ -23,11 +23,49 @@ with that.
 
 ## Install
 
+On Linux and macOS, one line installs the latest release after checking it
+against the release's `SHA256SUMS` (into `~/.local/bin`; `--dir` or
+`RUNE_INSTALL_DIR` choose another directory, and it never uses `sudo`):
+
+```sh
+curl -fsSL https://rune.heyaadi.com/install.sh | sh
+```
+
+On Windows, in PowerShell (into `%LOCALAPPDATA%\Programs\rune`):
+
+```powershell
+irm https://rune.heyaadi.com/install.ps1 | iex
+```
+
 Homebrew:
 
 ```sh
 brew install aadixc0de/tap/rune
 ```
+
+Each release publishes these archives, each with a `.sha256` sidecar, and one
+`SHA256SUMS` listing them all:
+
+| Target | Archive |
+|---|---|
+| macOS on Apple silicon | `rune-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS on Intel | `rune-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux on x86_64 | `rune-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux on aarch64 | `rune-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| Windows on x86_64 | `rune-<version>-x86_64-pc-windows-msvc.zip` |
+
+With `SHA256SUMS` in the same folder as the archives you downloaded:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing    # macOS
+sha256sum -c SHA256SUMS --ignore-missing        # Linux
+```
+
+On Windows, compare `(Get-FileHash -Algorithm SHA256 <archive>).Hash` with the
+archive's line in `SHA256SUMS`.
+
+`gh attestation verify <archive> --repo AadiXC0DE/Rune` shows which workflow run
+built an archive.
 
 From a release archive on Linux or macOS: download the `.tar.gz` for your
 target and its `.sha256` sidecar from the same release. Set `archive` to its
@@ -37,6 +75,12 @@ absolute path and `prefix` to a writable installation directory, for example:
 archive="$PWD/rune-<version>-<target>.tar.gz"
 prefix="$HOME/.local"
 ```
+
+The Linux archives are `rune-<version>-x86_64-unknown-linux-musl.tar.gz` and
+`rune-<version>-aarch64-unknown-linux-musl.tar.gz`. The Linux binaries are
+static and run on any distribution, including Alpine. They carry their own
+certificate roots, so a minimal image needs no CA package; a private certificate
+authority is not used for Rune's own provider requests.
 
 Verify the checksum before extracting, then install the executable:
 
@@ -97,6 +141,14 @@ regular executable member, and stages it beside the target before replacement.
 Rune's ZIP decoder accepts the single-member Deflate format emitted by release
 staging, without ZIP64, extra fields, comments, encryption, or data descriptors.
 
+To upgrade, `rune upgrade` downloads the latest release for this platform,
+checks it against the release's `SHA256SUMS` (and, on macOS, its signature when
+it is signed) and replaces the running binary; `rune upgrade --check` only says
+whether a newer release exists. A copy installed by Homebrew, Scoop or npm is
+left to that tool. Interactive sessions look for a newer release once a day and
+say so once; `auto_upgrade = "off"` turns that off, and `auto_upgrade =
+"install"` installs it when the session ends.
+
 From source:
 
 ```sh
@@ -106,12 +158,29 @@ cargo build --release
 ./target/release/rune doctor
 ```
 
+Or with Cargo, from the repository (the crates.io name `rune` belongs to another
+project):
+
+```sh
+cargo install --git https://github.com/AadiXC0DE/Rune --locked rune
+```
+
+Shell completion, generated from the command table:
+
+```sh
+rune completion bash > ~/.local/share/bash-completion/completions/rune
+rune completion zsh > "${fpath[1]}/_rune"
+rune completion fish > ~/.config/fish/completions/rune.fish
+rune completion powershell >> $PROFILE   # in PowerShell
+```
+
 Then connect a provider. There is no default: a fresh install has none, and any
 command that needs one says so and names how to connect it.
 
 ```sh
 rune connect                # lists the providers and asks for what it needs
 rune doctor                 # check what your machine supports
+rune doctor --provider NAME # send one short tool call and report what works
 ```
 
 Running `connect` with no argument lists the providers and takes a choice, then
@@ -144,7 +213,7 @@ models may impose further restrictions. Gemini reports complete tool calls in
 stream frames; the other dialects support incremental tool arguments. Use
 `--require-images` or `--require-tool-streaming` to require image content or
 incremental tool arguments. An unsupported requirement or selected control,
-such as `rune capabilities --provider gemini --effort high`, exits 1 and reports
+such as `rune capabilities --provider gemini --fast`, exits 1 and reports
 the rejection. Actual requests reject unsupported effort, fast mode, image
 content, and routing selections before sending them.
 
@@ -220,11 +289,19 @@ is blocked, disabled or skipped offline; an unknown name is an error. JSON adds
 a `check` object to each server entry. An empty workspace reports no servers
 and succeeds.
 
-Interactive sessions connect approved, enabled stdio and HTTP servers from `.mcp.json`
-once at startup. Their discovered schemas are advertised as
-`mcp_<server>_<tool>`, and each call still goes through tool permission checks.
+Interactive sessions and `rune ask` connect approved, enabled stdio and HTTP servers
+from `.mcp.json` once at startup (`rune review` connects none). When the combined
+schemas of the connected tools fit in 2,048 bytes they are advertised as
+`mcp_<server>_<tool>`. Larger catalogs are deferred: the model finds a tool with
+`capability_search`, which returns the schemas of the best matches, and calls it
+through `mcp_call`, so the tool list does not grow with the catalog. The
+`mcp_tools` setting (`auto`, `eager` or `deferred`) overrides that choice. Each
+call still goes through tool permission checks; a deferred call is checked as
+`mcp_call` with the target `mcp:<server>/<tool>`, and a rule written for the
+tool's own name still applies to it; the stricter answer wins.
 Full-access mode does not grant project startup trust. Optional startup failures
-appear as notices; a required server failure prevents the session from starting.
+appear as notices (warnings on standard error in `rune ask`); a required server
+failure prevents the session or run from starting.
 Startup and calls use the configured MCP timeouts. Ctrl-C cancels a pending
 stdio call, and exiting the session terminates its server process groups with a
 bounded termination grace. HTTP servers are skipped with `--offline`, including
@@ -274,6 +351,22 @@ them. Set `offline = true` in the user configuration to enable the
 [offline enforcement boundary](#offline-enforcement-boundary), including refusal
 of requests to the model.
 
+Models are offered one file-edit tool: GPT-5 and later, Codex and gpt-oss
+models get `apply_patch`, which takes a multi-file patch in the format they are
+trained on, and every other model gets `edit_file`. `write_file` is offered to
+both. Set `edit_tool = "replace"` or `edit_tool = "patch"` in the user
+configuration (or `RUNE_EDIT_TOOL`) to choose for every model; `auto` is the
+default. An interactive session keeps the choice made at its start. A shell
+command that is only `apply_patch <<'EOF'` ... `EOF` (optionally after
+`cd <dir> && `) is applied as a patch, under the same policy as the edit
+tools, whichever tool is offered.
+
+Models whose vendors publish sampling values get them: Qwen, Gemini, GLM 4.6
+and later, and MiniMax. Set `temperature` (0 to 2) in the user configuration
+(or `RUNE_TEMPERATURE`) to replace the default temperature. Claude, GPT and
+Kimi models, and DeepSeek while it thinks, are sent no sampling values; a set
+temperature is then reported once per session instead.
+
 For image analysis, set `vision_model = "<image-capable-model>"` in the user
 configuration. Interactive sessions, `rune ask`, and ACP use that model with
 the active provider's endpoint and credential. A permitted `vision` call with
@@ -313,6 +406,23 @@ Setting `RUNE_MODEL` to a different identifier discards the configured model's
 declared window. Until the new model's capacity is resolved, configuration
 reports the default 128000-token window.
 
+A model the models.dev catalog does not price can declare its prices, in
+millionths of a dollar per million tokens ($0.28 and $0.42 here). Costs, `/budget`
+and `rune ask --max-cost` then use them:
+
+```toml
+[models.chat_completions]
+id = "my-model"
+prices = { input = 280000, output = 420000 }
+```
+
+`cache_read` and `cache_write` are optional and default to the input price.
+
+`rune ask --timeout SECONDS` and `rune ask --max-cost USD` bound a run. Reaching
+either stops it with the steps, usage and answer so far, and an error naming the
+limit; `--max-cost` needs known prices and checks the spend before each request,
+so the request that crosses the limit is the last.
+
 The providers that ship in the table are:
 
 | Provider | What it is |
@@ -339,6 +449,55 @@ Text, function calls and results, thought-signature replay, and reported token
 usage use the native wire format. The Rust SDK selects it with `Dialect::Gemini`.
 This dialect uses the model's automatic thinking settings; explicit reasoning
 effort and fast mode currently return `unsupported`.
+
+### Linux sandbox
+
+Commands on Linux run inside namespaces built by bubblewrap (the `bwrap`
+program). When it is missing, commands are refused with the install command for
+your distribution:
+
+| Distribution | Install |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt-get install bubblewrap` |
+| Fedora, RHEL, CentOS | `sudo dnf install bubblewrap` |
+| Arch | `sudo pacman -S bubblewrap` |
+| Alpine | `sudo apk add bubblewrap` |
+| openSUSE, SUSE | `sudo zypper install bubblewrap` |
+
+Ubuntu 24.04 and later block unprivileged user namespaces through AppArmor, so
+`bwrap` cannot start without a profile. Save this as `/etc/apparmor.d/bwrap`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+```
+
+then reload AppArmor:
+
+```sh
+sudo systemctl reload apparmor
+```
+
+`rune sandbox explain` and `rune doctor` show the backend in use and what to
+change when there is none.
+
+## Running in a container
+
+Containers usually cannot create the namespaces Rune's Linux sandbox needs, so
+commands are refused there, with a message that says so. The container is the
+isolation boundary; run Rune without its own sandbox:
+
+```sh
+RUNE_PROVIDER=openai RUNE_MODEL=<model> OPENAI_API_KEY=<key> \
+rune --permission-mode full-access --allow-unsandboxed ask --json -- "<task>"
+```
+
+`RUNE_ALLOW_UNSANDBOXED=1` does the same as `--allow-unsandboxed`. Commands then
+have the container's network unless the container itself restricts it.
 
 ## Use
 
@@ -369,7 +528,7 @@ tokens per run, cache share, and cost where the model's prices are known.
 run and the summary as one object. Runs use your configuration, so a model or
 provider given to `rune bench` applies to each of them. The exit status is 0
 only when every run passed. `bench/tasks/` holds six tasks in JavaScript, Python, Go
-and Rust, each with a `solution/` that `bench/check.sh` uses to prove the task
+and Rust, each with a `solution/` that `python3 bench/kit/run.py validate` uses to prove the task
 fails as shipped and passes once solved; see `bench/README.md`.
 
 Enable Bash completion for command names, aliases, and flags in the current
@@ -490,19 +649,40 @@ remain in force when the output limit is raised or set to `off`.
 under the configured permission mode and workspace boundaries; calls requiring
 interactive approval return an error to the model without waiting for input.
 The shared host loop allows three consecutive failures of the same tool name
-and exact argument string per turn, ignoring call IDs. The next duplicate stops
-with `limit_exceeded` naming `max_consecutive_tool_failures`, before execution.
+and exact argument string per turn, ignoring call IDs. The next duplicate is not
+run: the model is told it already failed and asked to change something, and the
+turn goes on. A duplicate sent again after two such refusals stops the run as
+`stalled`, with `limit_exceeded` naming `max_consecutive_tool_failures`, and the
+usage, steps and calls so far still reported.
 A successful call or a different call resets the streak. Configure the cap in
 `[limits]` or with `--limit max_consecutive_tool_failures=N`; `off` disables it.
 Adjacent duplicate reads run in order to enforce this cap.
-The next request includes the tool results. A positive `max_agent_steps` sets
-the model step cap; zero or an unlimited setting uses a cap of 16 for `ask`.
+The next request includes the tool results. `ask` has no step cap unless one is
+set with `--max-steps N` or a positive `max_agent_steps`. With a cap, the last
+allowed request still lists the tools but forbids calling them and tells the
+model it is the last step, so the run ends with its final answer.
 Transient provider failures retry within each step up to `provider_max_attempts`,
 honoring `Retry-After` or using bounded backoff. Each attempt uses the configured
-`provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines.
+`provider_head_timeout_ms` and `provider_request_timeout_ms` deadlines; a
+provider's own `head_timeout_ms` under `[providers.<name>]` in the user
+configuration replaces the first, for example for a slow local model.
+The same table takes headers added to every request to that provider; a value
+set there replaces a header the provider requires under the same name:
+
+```toml
+[providers.openrouter.headers]
+"HTTP-Referer" = "https://example.com"
+"X-Title" = "my-tool"
+```
+
+Model requests go through the proxy in `HTTPS_PROXY`, `ALL_PROXY` or
+`HTTP_PROXY` (first set wins), except for hosts in `NO_PROXY` and loopback
+addresses. `SSL_CERT_FILE` names extra certificate authorities, trusted for
+model and MCP requests together with the system bundle; `rune doctor` shows
+which roots are in use.
 Rejected credentials never retry. Retries consume no extra model steps or usage.
-Reaching the cap before a final answer exits 1 with `limit_exceeded` and an
-empty `final_output`. JSON reports the steps, summed usage, and each tool's
+Reaching the cap exits 3 with `limit_exceeded`; the last step's answer is the
+`final_output`. JSON reports the steps, summed usage, and each tool's
 `success` or `error` status. Usage includes `cache_read_tokens` and
 `cache_write_tokens` when the provider reports them; both are parts of
 `input_tokens`.
@@ -518,21 +698,63 @@ Completed exchanges are saved as sessions for the current workspace, and
 `--json` reports their `session_id`. Pass `--no-save` to create no session and
 return an empty ID.
 
+### Headless runs
+
+`rune ask` and `rune review` add a short note after the prompt saying the run is
+non-interactive: nobody can answer questions or approve actions, so the model
+should choose, say why, and continue. The note is in the first user message, not
+the system prompt, which stays the same as an interactive session's; the saved
+session keeps the prompt without it.
+
+Every `--json` result has a `stop_reason`, and the exit code says how the run
+ended: 0 the model finished (`end_turn`); 1 it failed (`provider_error`,
+`refused`, `content_filter`, `stalled`, or an error before the first request); 3
+a limit ended it and the output is usable (`max_model_turns`,
+`max_output_tokens`, `time_limit`, `spend_limit`, `objective_token_budget`); 130
+SIGINT; 143 SIGTERM or SIGHUP. `rune help ask` lists the same table.
+
+SIGINT, SIGTERM or SIGHUP stops a run the way its limits do: the turn is
+cancelled, every command it started is asked to exit and killed after two
+seconds, the session is recorded, and `--json` or `--jsonl` still prints the
+result, with `error_code` `cancelled`. The exit code is 130 for SIGINT and 143
+for SIGTERM and SIGHUP. A second signal exits at once.
+
 `rune ask --jsonl "prompt"` streams one JSON object per stdout line, flushing
 each record as it arrives. `--jsonl` takes precedence over `--json`. The stream
-begins with `{"type":"start"}` before prompt validation, then emits `step_start`
-with a `step` number and `text_delta` records with `step` and `delta`. A
-`step_restart` tells consumers to discard deltas from the failed attempt of
-that step. Deltas from earlier tool steps are intermediate text; the final
-answer is in the last record, `{"type":"final","result":{...}}`, whose `result`
-has the same fields as `--json`, including failures and saved session IDs.
-Diagnostics go only to stderr. Each record is capped at 1 MiB including its
-newline; deltas are split at UTF-8 boundaries into at most 8 KiB of raw text.
-Serialization stages at most one bounded record, and a slow stdout reader
-applies backpressure instead of growing an event queue. An oversized final
-result produces a small `too_large` final failure and exit 1, after any deltas
-already delivered. Its model and session ID are empty; a completed exchange
-may already have been saved unless `--no-save` was used.
+is enough to rebuild every step, tool call, result and its usage without reading
+the session log. Every record has a `type`; `ts` is UTC with milliseconds, such
+as `2026-11-10T09:12:03.123Z`, and a count the provider did not report is `null`.
+
+| `type` | Fields |
+| --- | --- |
+| `start` | `schema` (2), `session_id` (`""` with `--no-save`), `model`, `provider`, `cwd`, `version`, `ts`. Written before the prompt is validated. |
+| `prompt` | `text` (cut to 512 KiB), `ts` |
+| `step_start` | `step`, `ts` |
+| `text_delta` | `step`, `delta` (at most 8 KiB, split at character boundaries) |
+| `reasoning` | `step`, `text` (cut to 256 KiB), `truncated` |
+| `step_finish` | `step`, `finish`, `usage` (`input_tokens`, `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`), `cost_usd` (when prices are known), `ts` |
+| `tool_call` | `step`, `id`, `name`, `arguments` (parsed JSON, or the raw string), `ts` |
+| `tool_result` | `step`, `id`, `ok`, `executed` (false for a refused or repeated call), `elapsed_ms`, `bytes`, `preview` (first 2 KiB), `ts` |
+| `retry` | `step`, `attempt`, `wait_ms`, `retry_at` (when the next attempt is sent), `kind` (such as `rate_limited`), `ts` |
+| `notice` | `text`: a line about the run, such as a feature the provider refused |
+| `context_pruned` | `results` (old tool results replaced by receipts), `tokens_freed` (estimated) |
+| `compaction` | `before_tokens`, `after_tokens`, `ts` |
+| `step_restart` | `step`: discard the deltas of the failed attempt of that step |
+| `plan_updated` | `update` |
+| `final` | `result`, with the same fields as `--json`, including failures and saved session IDs |
+
+A step's `step_finish` comes after its text and before its tool calls. Each
+`tool_call` comes before its `tool_result`; independent reads in one reply run
+together, so several `tool_call` records can come before their results, which
+are matched by `id`. The sum of `step_finish` input
+tokens is the run's input usage, except summary requests, which only `final`
+counts. Deltas from earlier tool steps are intermediate text; the answer is in
+`final`. Diagnostics go only to stderr. Each record is capped at 1 MiB including
+its newline. Serialization stages at most one bounded record, and a slow stdout
+reader applies backpressure instead of growing an event queue. An oversized
+final result produces a small `too_large` final failure and exit 1, after any
+records already delivered. Its model and session ID are empty; a completed
+exchange may already have been saved unless `--no-save` was used.
 
 `rune ask --json` failures include `error_detail` when structured context is available.
 Provider failures retain the redacted `provider_code` and numeric
@@ -625,7 +847,14 @@ approval says. Each prompt sent in plan mode tells the model it is planning.
 `/plan <task>` enters plan mode and places the task in the composer to send;
 `/plan off` leaves it so the plan can be carried out. `/effort` shows the
 reasoning effort in force and the levels the provider accepts, and
-`/effort <level>` sets it for the requests that follow.
+`/effort <level>` sets it for the requests that follow. `/permissions` shows
+the permission mode, the session's remembered approvals and the configured rules
+with where each came from, and `/permissions ask|auto|full-access` switches it
+for the calls that follow, rebuilding the rules as if the session had started in
+that mode; a switch to a mode that allows less forgets the session's remembered
+approvals. `/permissions delete <n>` removes rule n from the user file; a rule
+from the project file is edited there. `/fork` copies the conversation into a new
+session and continues there, leaving the earlier session as it was.
 
 When the model's prices are known, each turn's summary line, `/cost`, the status
 row and the usage ledger carry its estimated cost. `/budget <dollars>` sets a
@@ -649,13 +878,23 @@ so a team can ship a workflow with the code. Discovered project and user command
 appear alongside builtins in slash-command completion, with descriptions and
 argument hints. Up/Down selects a candidate; Tab or Enter completes a partial
 name. Enter on the complete name shows its expanded prompt for review.
-Before each CLI session request, Rune estimates the serialized input, including
-instructions and tool schemas,
+Arguments follow shell quoting, so `/fix "two words" three` passes two arguments.
+Files in `.claude/commands` load too. Of the frontmatter, `description`,
+`argument-hint` and `model` are honoured; `model` applies to the one turn the
+command prepares. Every other key, `` !`command` `` lines and `@file` references
+are ignored and never executed: they stay in the prompt as text, and `/help` and
+the first run of the command name what was ignored.
+Before each request of an interactive session or a `rune ask` run, Rune estimates
+the serialized input, including instructions and tool schemas,
 and summarizes earlier turns at `compaction_trigger_percent` of usable input
 capacity. Requests above capacity remain eligible for compaction when the retained
 tail fits with instructions, tool schemas, and the output reserve. A failed summary,
 including one stopped at the token limit, preserves the conversation and stops
-that request with an explicit error.
+that request with an explicit error. `rune ask` uses the configured
+`context_window`, else the cached models.dev window, else 128,000 tokens, and
+its reported usage and cost include the summary requests.
+A request the provider rejects as longer than the context window is compacted
+and sent again, at most twice per step and without using a provider attempt.
 
 Use `/compact preview` to see the exact counts of conversation records that
 manual compaction would summarize and retain verbatim. Records are the current
@@ -762,8 +1001,12 @@ failure within the available output budget.
   command. The preview uses the current workspace and configured additional
   directories (`--add-dir` adds roots;
   `--no-additional-dirs` ignores saved roots).
-  Network access requires an explicit shell context grant, previewed with
-  `--external-access`; offline mode overrides it. `--json` emits the same report.
+  Sandboxed commands have no network access unless `--network`,
+  `RUNE_NETWORK=1` or `shell_network = true` in the user configuration allows it
+  (`/network on` in a session); `--offline` overrides all three. Permission modes
+  never grant network access. A failed command whose output looks like a blocked
+  connection says so and names `--network`. `sandbox explain` previews the policy,
+  also with `--external-access`; `--json` emits the same report.
   Refused commands apply no protections; an unsandboxed fallback has unrestricted
   access. This explains sandbox policy, independently of command approval.
 - **Offline mode.** `--offline` refuses provider requests, disables web tools,
@@ -776,12 +1019,13 @@ failure within the available output budget.
 
 Enable offline mode with `--offline`, `RUNE_OFFLINE=true`, or `offline = true`
 in the user configuration. This is enforced at the paths below; it is not a
-process-wide network filter. Loopback endpoints are included in the provider
-and remote MCP refusals, so offline mode also blocks a locally hosted model.
+process-wide network filter. Provider requests to a loopback endpoint
+(`127.0.0.1`, `localhost` or `::1`) are still sent, so a locally hosted model
+keeps working offline; loopback remote MCP servers are still refused.
 
 | Traffic | Offline behavior | Test evidence |
 |---|---|---|
-| Model/provider requests and model discovery | Provider transport refuses before contacting the endpoint, with `permission_denied` and no retry delay. `rune models --offline` reports only the configured model. | [`an_offline_endpoint_refuses_before_any_network_call` and `an_offline_model_list_is_a_policy_refusal_before_any_network_call`](crates/rune-net/src/transport.rs); [`offline_mode_produces_no_connection`](crates/rune/tests/egress.rs); [`listing_models_offline_reports_the_configured_model_without_a_request`](crates/rune/tests/cli.rs); [`an_offline_turn_refuses_without_fetch_calls_or_retry_delay`](crates/rune-agent/tests/turn_loop.rs) |
+| Model/provider requests and model discovery | Provider transport refuses a non-loopback endpoint before contacting it, with `permission_denied` and no retry delay; a loopback endpoint is still reached. `rune models --offline` reports only the configured model. | [`an_offline_endpoint_refuses_before_any_network_call`, `an_offline_model_list_is_a_policy_refusal_before_any_network_call` and `an_offline_loopback_endpoint_is_still_reached`](crates/rune-net/src/transport.rs); [`offline_mode_produces_no_connection` and `offline_mode_still_reaches_a_loopback_server`](crates/rune/tests/egress.rs); [`offline_works_with_a_local_server`](crates/rune/tests/ollama_endpoint.rs); [`listing_models_offline_reports_the_configured_model_without_a_request`](crates/rune/tests/cli.rs); [`an_offline_turn_refuses_without_fetch_calls_or_retry_delay`](crates/rune-agent/tests/turn_loop.rs) |
 | Web fetch and search | The CLI installs neither web backend and keeps the tools denied, even with `web_tools = true`. | [`an_offline_run_gets_no_clients`](crates/rune/src/web_client.rs); [`an_offline_run_does_not_enable_the_web_tools`](crates/rune/src/permissions.rs) |
 | Image analysis | The CLI omits the vision backend and labels the tool unavailable, even with `vision_model` set. Configured tools also refuse an offline execution context before reading images. | [`absent_configuration_and_offline_runs_have_no_vision_client`](crates/rune/src/vision_client.rs); [`an_offline_context_does_not_reach_a_configured_backend`](crates/rune-tools/src/vision.rs) |
 | Remote MCP over HTTP or SSE | `rune mcp list`, `rune mcp check` and interactive sessions skip remote declarations before resolving credentials or connecting, including approved loopback servers. Online interactive sessions connect approved, enabled HTTP servers; SSE remains unsupported there. | [`pending_rejected_disabled_and_offline_servers_are_never_contacted` and `check_respects_trust_disabled_and_offline_states_without_contact_or_expansion`](crates/rune/tests/mcp_list.rs); [interactive HTTP MCP fixture](crates/rune/tests/mcp_http.rs) |
@@ -840,12 +1084,28 @@ limits are described under [Contributing](#contributing).
 On Windows, [atomic file moves](crates/rune-exec/src/rename.rs) call
 `MoveFileExW` with live, NUL-terminated UTF-16 path buffers and zero flags.
 This keeps no-replace renames atomic without enabling copy/delete fallback.
+Each command runs in a [job object](crates/rune-exec/src/job.rs): creating it,
+setting its kill-on-close limit, assigning the child's live process handle,
+listing its processes and terminating it are FFI calls on the job handle, which
+is owned and closed exactly once.
 
 ## Configuration
 
 Five layers, highest first: command-line flags, `RUNE_*` environment variables,
 the project file `.rune.toml`, the user file at `$XDG_CONFIG_HOME/rune/config.toml`,
 then built-in defaults.
+
+The default locations:
+
+| | Configuration | State (sessions, usage, credentials) | Data (skills, themes) |
+|---|---|---|---|
+| Linux and macOS | `~/.config/rune` | `~/.local/state/rune` | `~/.local/share/rune` |
+| Windows | `%APPDATA%\rune` | `%LOCALAPPDATA%\rune` | `%LOCALAPPDATA%\rune\data` |
+
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` move them on every
+system, and `RUNE_HOME` moves the state. On Windows, any `XDG_*` variable or an
+existing `~/.config/rune` keeps the first layout, so an earlier setup is not
+moved; `rune doctor` says where new installs keep it.
 
 Set `RUNE_CONFIG` to use a different user configuration file. Workspace edits
 and provider selections read and write that file. An empty or unset value uses
@@ -906,8 +1166,9 @@ shell, once per eligible call before tool execution, including concurrent reads.
 The command receives `RUNE_PRE_TOOL_CALL`, a JSON object with `event` set to
 `pre_tool`, the call `id`, tool `name`, and decoded `arguments`. Input is limited
 to 32 KiB. The command gets the normal minimal command environment, excluding
-provider credentials, and closed stdin. It runs with the user's authority;
-only configure commands you trust.
+provider credentials, and the same event as a JSON payload on standard input
+(see Hooks below). It runs with the user's authority; only configure commands
+you trust.
 
 Exit successfully and print exactly one JSON decision on stdout:
 `{"decision":"allow"}` or `{"decision":"veto","reason":"generated file"}`.
@@ -937,13 +1198,138 @@ credential and credential-shaped content, and truncates the redacted output to
 Arguments are omitted. The complete event is limited to 32 KiB.
 
 Post-tool commands use the same workspace directory, explicit argv, minimal
-environment, closed stdin, and user authority as pre-tool commands. Their output
+environment, payload on standard input, and user authority as pre-tool commands. Their output
 is captured with a 4 KiB bound per pipe and ignored. Nonzero exits, invalid hook
 configuration, and timeouts report a named warning without changing the tool
 result or retrying the hook. The deadline defaults to 5 seconds and accepts
 1 to 60,000 milliseconds; timeout and cancellation stop the supervised process
 group. Cancellation also skips hooks for pending results. Ask, review, interactive
 sessions, and delegated child calls support it.
+
+
+Shell commands get a minimal environment, not Rune's own: the system,
+locale, toolchain, proxy and certificate variables, plus the build and test
+settings a task sets (`CI`, `PYTHONPATH`, `NODE_PATH`, `LD_LIBRARY_PATH`,
+`CARGO_TARGET_DIR`, `RUSTFLAGS`, `GOFLAGS`, `JAVA_TOOL_OPTIONS`, `CC`, `CFLAGS`,
+`MAKEFLAGS`, `DOCKER_HOST`, `KUBECONFIG` and the like; the full list is
+`ALLOWED_ENVIRONMENT` in `crates/rune-exec/src/command.rs`). Pass more with
+`shell_env` in the user configuration, or `RUNE_SHELL_ENV` (comma separated):
+
+```toml
+shell_env = ["DATABASE_URL", "MYAPP_*"]
+```
+
+Entries are exact names, `PREFIX_*` patterns, or `*` for the whole environment.
+A name containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIAL`
+passes only when listed exactly, and the active provider's credential variable
+never passes. A repository's project configuration cannot set `shell_env`. Unless
+the environment already sets them, commands get `PAGER`, `GIT_PAGER`, `GH_PAGER`
+and `MANPAGER` set to `cat`, `GIT_TERMINAL_PROMPT=0`, `PIP_PROGRESS_BAR=off`,
+`TQDM_DISABLE=1` and `AI_AGENT=rune`; a command without a terminal also gets
+`TERM=dumb` and `NO_COLOR=1`.
+
+Sandboxed commands may also write the build tools' caches under the home
+directory: `~/.cache`, `~/Library/Caches`, `~/.cargo/registry`, `~/.cargo/git`,
+`~/.npm`, `~/.local/share/pnpm`, `~/Library/pnpm`, `~/.yarn`,
+`~/.bun/install/cache`, `~/go/pkg/mod`, `~/.gradle`, `~/.m2` and
+`~/.local/share/uv` when they exist, plus the directories `GOCACHE`,
+`GOMODCACHE`, `npm_config_cache`, `PIP_CACHE_DIR` and `UV_CACHE_DIR` name, and
+`$CARGO_HOME/registry` and `$CARGO_HOME/git`. `sandbox_cache_roots` replaces
+that list (`sandbox_cache_roots = []` allows none). The home directory itself,
+`~/.ssh`, `~/.gnupg`, `~/.config`, `~/.aws`, `~/.cargo/bin`, `~/.local/bin` and
+the credential locations are refused, and credentials stay hidden inside every
+cache root. `rune sandbox explain` lists the roots and what added each.
+
+`allow_unsandboxed = true` in the user configuration has the effect of
+`--allow-unsandboxed` on every run: on a machine where no sandbox backend works,
+commands run without one, and the footer and `rune status` say so. It never
+turns off a backend that works, and a project file cannot set it.
+
+### Permissions
+
+Rules in `[[permission.rules]]` decide actions. `tool` names a tool, `shell` for
+commands or `*` for any; `match` is a command pattern for `shell` and a path glob
+for file tools; `decision` is `allow`, `ask` or `deny`:
+
+```toml
+[[permission.rules]]
+tool = "shell"
+match = "make lint*"
+decision = "allow"
+
+[[permission.rules]]
+tool = "write_file"
+match = "migrations/*"
+decision = "ask"
+```
+
+The most specific matching rule wins, so a `deny` for `rm *` refuses `rm -rf x`
+and leaves every other built-in allow in place. A user rule with
+`workspace = "/abs/path"` applies only in that workspace. A project file may add
+`deny` and `ask` rules freely; its `allow` rules apply only after
+`rune projects approve`, and a change to them needs approval again. A project
+rule cannot set `workspace` or `saved`, and an empty `match` is reported and the
+rule ignored. `rune permissions --explain shell:'npm test'` names the deciding
+rule and where it came from: the user file, a prompt, the project file or the
+built-in set.
+
+## Hooks
+
+Hooks are programs Rune runs at points of a session. Configure them in the user
+file as `[[hooks]]` tables; project files cannot set them. Hooks of the same
+event run in file order, after the `pre_tool_hook` and `post_tool_hook` tables
+above.
+
+```toml
+[[hooks]]
+event = "turn_end"
+name = "tests ran"
+argv = ["/usr/local/bin/check-tests-ran"]
+timeout_ms = 5000
+```
+
+| Key | Meaning |
+| --- | --- |
+| `event` | `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `turn_end`, `pre_compact`, `notification` or `session_end` |
+| `name` | Shown in warnings, denials and notes |
+| `argv` | The program and its arguments, run without a shell |
+| `timeout_ms` | Deadline, 1 to 60,000; default 5,000 |
+| `on_error` | `deny` or `allow`: what a failing hook means |
+| `tools` | Tool names a `pre_tool` or `post_tool` hook applies to; absent means all |
+
+Hooks run as you, outside the sandbox, with a minimal environment.
+
+Each hook gets one JSON object on standard input, at most 256 KiB, and
+`RUNE_HOOK_EVENT` set to the event name. The object has `event`, `session_id`
+(empty when the session is not saved), `cwd` (the workspace, also the hook's
+working directory), `turn`, and the event's own fields:
+
+| Event | Fields | Accepted reply |
+| --- | --- | --- |
+| `session_start` | `resumed` | ignored |
+| `user_prompt` | `prompt` | `{}`, `{"context": "text"}` or `{"decision": "block", "reason": "..."}` |
+| `pre_tool` | `id`, `name`, `arguments` | `{"decision": "allow"}`, `{"decision": "deny", "reason": "..."}` or `{"decision": "rewrite", "arguments": {...}}` |
+| `post_tool` | `id`, `name`, `arguments`, `output`, `output_truncated`, `is_error`, `executed` | `{}`, `{"append": "text"}` or `{"replace": "text"}` |
+| `turn_end` | `text`, `continues` | `{}` or `{"decision": "continue", "message": "..."}` |
+| `pre_compact` | `automatic` | ignored |
+| `notification` | `kind` (`approval_needed`, `turn_finished` or `turn_failed`), `message` | ignored |
+| `session_end` | `reason` (`exit` or `error`) | ignored |
+
+An empty reply is the same as `{}`. A reply is at most 16 KiB; `context`,
+`append` and the `turn_end` message are at most 4 KiB each. `user_prompt`
+context from every hook is added to the prompt in a `<hook-context>` block
+named for the hook; a block stops the prompt, and `rune ask` then exits with
+status 2. A rewritten tool call is checked by policy again. `turn_end` runs
+when a turn is about to end by itself and can continue it at most three times
+in a row; a tool call resets the count. `turn_end` text and `post_tool` output
+are cut at 16 KiB and have credentials removed. Notification hooks run in the
+background in an interactive session, so a slow one never delays the terminal.
+
+A hook fails when it cannot start, passes its deadline, exits nonzero, prints
+something that is not an accepted reply, or prints too much. A failure denies
+the call or blocks the prompt when `on_error` is `deny`, the default for
+`pre_tool` and `user_prompt`; for every other event the default is `allow`,
+and a failure only shows a warning.
 
 ## Embedding
 
@@ -1077,6 +1463,8 @@ links in the existing CI fast job.
 Early development, and usable for a real session. The command surface,
 configuration, agent loop, tools, permissions, sessions, and terminal interface
 are in place. See [CHANGELOG.md](CHANGELOG.md) for what has landed.
+[SECURITY.md](SECURITY.md) says what the sandbox and the permission rules
+defend against, what they do not, and how to report a problem.
 
 ## Contributing
 
@@ -1093,7 +1481,7 @@ then the workspace tests. A failed step stops the gate immediately.
 `budget` reports raw process latency for `--version` and `--help`, including
 minimum-of-31, median and p95 (nearest rank, the 30th sorted sample). Each run
 measures wall time from process spawn through exit with stdout and stderr discarded.
-The enforced work budgets are 5 ms for `--version` and 8 ms for `--help`: the
+The enforced work budgets are 2 ms for `--version` and for `--help`: the
 minimum-of-31 minus the process baseline minimum-of-31, clamped to zero.
 The baseline is system `true` on Unix, an empty Rust executable on Windows.
 The Windows baseline is compiled with release settings and no dependencies; its
@@ -1181,7 +1569,10 @@ never executes the extracted code. SHA-1 identifies the certificate in Apple's
 requirement language; artifact checksums remain SHA-256. Certificate rotation
 requires publishing and trusting the new fingerprint.
 
-The manual `signed macOS release` workflow requires the repository variable
+The manual `release` workflow builds the macOS archives, signed when the
+credentials below are present, and static Linux archives for x86_64 and aarch64,
+each checked in Alpine and Debian before publishing. Signing requires the
+repository variable
 `MACOS_SIGNING_IDENTITY`, the base64 PKCS#12 secret
 `MACOS_SIGNING_CERTIFICATE_P12`, and secret `MACOS_SIGNING_CERTIFICATE_PASSWORD`.
 Use a Developer ID Application certificate for distribution. The workflow

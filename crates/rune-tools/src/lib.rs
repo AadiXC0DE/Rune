@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod apply_patch;
 pub mod ask_user;
 pub mod contract;
 pub mod create_directory;
@@ -11,6 +12,8 @@ pub mod git_diff;
 pub mod glob_files;
 pub mod grep_files;
 pub mod inventory;
+pub mod matching;
+pub mod mcp_tools;
 pub mod mutation;
 pub mod read_file;
 pub mod read_tool_result;
@@ -21,13 +24,16 @@ pub mod shell;
 pub mod skill;
 pub mod syntax_diagnostics;
 pub mod test_report;
+pub mod tool_text;
 pub mod update_plan;
 pub mod vision;
 pub mod web;
 pub mod workspace;
 pub mod write_file;
 
-pub use contract::{Activity, Cancellation, ExecutionContext, Tool, ToolOutput};
+pub use contract::{
+    Activity, BackgroundTask, Cancellation, CheckRun, ExecutionContext, Tool, ToolImage, ToolOutput,
+};
 pub use create_directory::CreateDirectory;
 pub use edit_file::EditFile;
 pub use git_diff::GitDiff;
@@ -39,6 +45,7 @@ pub use read_tool_result::ReadToolResult;
 pub use registry::Registry;
 pub use rename_file::RenameFile;
 pub use result_store::{Handle, Preview as ResultPreview, Store};
+pub use rune_exec::EnvironmentPolicy;
 pub use syntax_diagnostics::SyntaxDiagnostics;
 pub use update_plan::{PlanUpdate, UpdatePlan};
 pub use vision::{ImageAnalysis, Vision, VisionBackend, VisionSource};

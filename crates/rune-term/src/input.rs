@@ -10,48 +10,172 @@
 //! it rather than where the editor thinks it is.
 
 use std::io::IsTerminal;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Composer;
+use crate::keys::{ACTIONS, Context, Keymap};
+use crate::probe::Tri;
+
+/// Columns of the prompt marker until the session reports its layout.
+const DEFAULT_PROMPT_WIDTH: usize = 2;
+
+/// Terminal columns until the session reports its layout.
+const DEFAULT_WIDTH: usize = 80;
+
+/// How long a blocking key read waits before checking for a redraw request.
+const REDRAW_POLL: Duration = Duration::from_millis(100);
+
+/// The longest gap between two keys of a paste that arrives as keystrokes.
+const BURST_GAP: Duration = Duration::from_millis(8);
+
+/// Keys that arrive this close together before they count as a paste.
+const BURST_MIN: usize = 3;
+
+/// How long after a paste's last key an Enter still inserts a line break.
+const BURST_ENTER_GRACE: Duration = Duration::from_millis(120);
+
+/// How long without a key ends a paste that arrives as keystrokes.
+#[cfg(windows)]
+const BURST_IDLE: Duration = Duration::from_millis(60);
+#[cfg(not(windows))]
+const BURST_IDLE: Duration = Duration::from_millis(8);
+
+/// Tracks keys that arrive faster than anyone types, which is how a paste
+/// looks on a terminal that does not bracket it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Burst {
+    /// When the last key of the current run arrived.
+    last: Option<Instant>,
+    /// Keys in the current run.
+    run: usize,
+    /// Caret position where the current run began.
+    start_char: usize,
+    /// Until when Enter and Tab are taken as pasted text.
+    active_until: Option<Instant>,
+}
+
+impl Burst {
+    /// Returns whether the current run is long enough to be a paste.
+    const fn active(&self) -> bool {
+        self.run >= BURST_MIN
+    }
+}
+
+/// The image files a paste names, with their sizes, when every word of it is
+/// one: a dropped path as terminals write it (`my\\ shot.png`, quoted, or a
+/// `file://` URL). Anything else is text.
+#[must_use]
+pub fn image_paths(text: &str) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (None, ' ') => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut found = Vec::new();
+    for word in words {
+        let path = word
+            .strip_prefix("file://")
+            .map_or_else(|| word.clone(), |rest| rest.replace("%20", " "));
+        let path = std::path::PathBuf::from(path);
+        let image = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp"
+                )
+            });
+        let meta = std::fs::metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        if !image {
+            return None;
+        }
+        found.push((path, meta.len()));
+    }
+    (!found.is_empty()).then_some(found)
+}
 
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
+/// The rebindable keys come from the action table and the keymap in use.
 #[must_use]
-pub fn render_bindings_help(active: bool) -> String {
+pub fn render_bindings_help(active: bool, keymap: &Keymap) -> String {
     if !active {
         return "Input: terminal line mode\nEnter submits one line; end of input leaves the session.\nComposer shortcuts, menus, and live steering require interactive key input."
             .to_owned();
     }
+    let rows = |contexts: &[Context]| {
+        ACTIONS
+            .iter()
+            .filter(|info| contexts.contains(&info.context))
+            .map(|info| {
+                let keys: Vec<String> = keymap
+                    .keys(info.id)
+                    .iter()
+                    .map(|name| key_label(name))
+                    .collect();
+                let keys = if keys.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    keys.join(" / ")
+                };
+                format!("  {keys:<32} {}  ({})", info.summary, info.id)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
         "Keyboard bindings (interactive key input)
+Actions are rebound by id in keys.toml; `rune keys` lists them.
 
 Composer:
-  Enter         submit the draft; while a turn runs, queue steering
-  Alt-Enter     insert a newline at the caret
+{}
   Left / Right  move by one grapheme, including across newlines
-  Home / Ctrl-A move to the start of the whole draft
-  End / Ctrl-E  move to the end of the whole draft
-  Ctrl-B / Alt-Left   move one word left
-  Ctrl-F / Alt-Right  move one word right
+  Up / Down     move between rows of a long or multiline draft
   Backspace     delete the grapheme before the caret
   Delete        delete the grapheme at the caret
   Ctrl-D        delete at the caret; empty idle draft leaves the session
-  Ctrl-W        delete the word before the caret
-  Ctrl-U        cut from the caret to the start of the draft
-  Ctrl-K        cut from the caret to the end of the draft
-  Ctrl-Y        yank the last cut text at the caret
-  Ctrl-_        undo a draft edit (Ctrl-Shift-minus; legacy Ctrl-7)
-  Alt-R         redo a draft edit (Alt with lowercase r)
-  Ctrl-G        edit the draft in VISUAL, EDITOR, or vi
+  Alt-T         cycle how reasoning is shown
+
+While a turn runs (composer keys also apply):
+{}
 
 Idle prompt and menus:
-  Up / Down     recall prompts; select a menu row when a menu is open
-  Tab           complete a slash command or workspace path
+  Up / Down     recall prompts from the first / last draft row;
+                select a menu row when a menu is open
   Enter         accept an incomplete command; run a complete command
   Tab / Enter   accept a path, model, or history selection
-  Ctrl-R        search workspace history by substring; type to filter
+                Ctrl-R again in history search switches to all workspaces
   Esc / Ctrl-C / Ctrl-D  cancel model/history menus (Ctrl-D: empty query)
                 cancelling preserves the draft and caret
   Esc           close a path menu first; otherwise clear the idle draft
@@ -61,28 +185,71 @@ Permission and question menus:
   Enter         confirm the selected option
   Esc / Ctrl-C / Ctrl-D  cancel the turn, preserving the draft and caret
 
-Cancellation (outside menus and the transcript):
-  Ctrl-C        clear a nonempty draft first; with an empty draft,
-                cancel a running turn or leave an idle session
-  Esc           while running, clear the draft and arm cancellation;
-                press again within {} ms to cancel; other keys disarm
-  Ctrl-D        with an empty draft during a turn, keep the turn running
+Interrupting:
+  Esc           with an empty draft, stop the running turn now;
+                with text, press twice within {} ms
+  Ctrl-C        clear the draft (Up brings it back); with an empty
+                draft, stop the turn, or press twice to leave when idle
 
 Transcript:
-  Ctrl-O        open a snapshot while idle or during a turn
-  Up / Down     scroll one row
+{}
+  Up / Down / k / j  scroll one row
   PageUp / PageDown  scroll one page
-  Home / End    jump to the beginning / end
-  Tab / Shift-Tab  select the next / previous tool
-  Space         collapse or expand the selected tool (16 KiB / 200 rows)
-  Esc / Ctrl-O / Ctrl-C / Ctrl-D  close and restore the draft and caret
+  Home / End    jump to the beginning / end; the end follows new output
+  g / G         the same as Home / End
+  Enter         run a search while one is typed
+  Tab / Shift-Tab  select the next / previous entry
+  Space         collapse or expand the selected entry
+  Ctrl-C        close and restore the draft and caret
 
 Paste:
   Bracketed paste inserts at the caret without submitting or completing.
   Newlines and tabs stay in the draft; CR/CRLF become LF; other controls
-  are removed. Terminals without bracketed paste send ordinary keys.",
-        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis()
+  are removed. Terminals without bracketed paste send ordinary keys.{}",
+        rows(&[Context::Editor]),
+        rows(&[Context::Turn]),
+        crate::shell::ESCAPE_CANCEL_WINDOW.as_millis(),
+        rows(&[Context::Viewer]),
+        WINDOWS_QUIRKS,
     )
+}
+
+/// What Windows Terminal does with keys Rune also uses.
+#[cfg(windows)]
+const WINDOWS_QUIRKS: &str = "
+
+Windows Terminal:
+  alt-enter  Windows Terminal uses it for full screen; unbind it there or use ctrl-g
+  ctrl-v     Windows Terminal pastes with it; alt-v attaches a clipboard image";
+
+#[cfg(not(windows))]
+const WINDOWS_QUIRKS: &str = "";
+
+/// Spells a key file name the way help writes keys: `ctrl+r` is `Ctrl-R`.
+fn key_label(name: &str) -> String {
+    let parts: Vec<&str> = name.split('+').collect();
+    let parts = if name.ends_with("++") || name == "+" {
+        let mut parts: Vec<&str> = name.trim_end_matches('+').split('+').collect();
+        parts.retain(|part| !part.is_empty());
+        parts.push("+");
+        parts
+    } else {
+        parts
+    };
+    parts
+        .iter()
+        .map(|part| match *part {
+            "pageup" => "PageUp".to_owned(),
+            "pagedown" => "PageDown".to_owned(),
+            part => {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// What a key asks the session to do.
@@ -118,12 +285,42 @@ pub enum KeyAction {
     ExternalEditor,
     /// Search recorded prompts without submitting the composer.
     HistorySearch,
+    /// Pause the process, as the terminal's suspend key does.
+    Suspend,
+    /// Cycle how reasoning is shown: collapsed, tail, full.
+    CycleReasoning,
+    /// Move to the next permission mode: ask, auto, then plan.
+    ModeCycle,
+    /// Take the newest message waiting for a turn back into the draft.
+    PullQueued,
+    /// Hold the draft as a new turn that starts once the running one ends.
+    Queue,
+    /// Show or hide the plan pinned above the prompt.
+    TogglePlan,
+    /// Show the key overlay.
+    Help,
+    /// Attach the image on the clipboard.
+    PasteImage,
+    /// Replace the paste chip at the caret with its text.
+    ExpandChip,
+}
+
+/// A key read while a one-key answer is awaited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChoiceKey {
+    /// A key bound to an approval action in the approval keys.
+    Bound(&'static str),
+    /// A character typed without Control or Alt.
+    Char(char),
+    /// Any other key, as the action it maps to.
+    Action(KeyAction),
 }
 
 /// Navigation while the transcript owns the terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TranscriptAction {
-    /// Leave the viewer and restore the draft.
+    /// Leave the viewer and restore the draft; while typing a search, leave
+    /// the search.
     Close,
     /// Scroll one row up.
     Up,
@@ -134,22 +331,90 @@ pub enum TranscriptAction {
     /// Scroll one page down.
     PageDown,
     /// Jump to the beginning.
-    Home,
-    /// Jump to the end.
-    End,
-    /// Select the next tool entry.
+    Top,
+    /// Jump to the end and follow new rows.
+    Bottom,
+    /// Select the next collapsible entry.
     NextTool,
-    /// Select the previous tool entry.
+    /// Select the previous collapsible entry.
     PreviousTool,
-    /// Collapse or expand the selected tool entry.
+    /// Collapse or expand the selected entry.
     ToggleTool,
+    /// Start typing a search.
+    Search,
+    /// Jump to the next match.
+    NextMatch,
+    /// Jump to the previous match.
+    PreviousMatch,
+    /// Expand or collapse the selected entry, choosing one when none is.
+    Expand,
+    /// Expand every entry, or collapse them all when all are expanded.
+    ExpandAll,
+    /// Hand the whole transcript to a pager.
+    Pager,
+    /// A plain character no action holds.
+    Char(char),
+    /// Backspace.
+    Backspace,
+    /// Enter.
+    Enter,
     /// Ignore editing, paste, and non-input events.
     Ignored,
 }
 
 /// Maps viewer input without touching a composer or its editing history.
 #[must_use]
-pub fn transcript_event(event: &Event) -> TranscriptAction {
+pub fn transcript_event(keymap: &Keymap, event: &Event) -> TranscriptAction {
+    let Event::Key(key) = event else {
+        return TranscriptAction::Ignored;
+    };
+    if key.kind == KeyEventKind::Release {
+        return TranscriptAction::Ignored;
+    }
+    let bound = match keymap.action(Context::Viewer, key) {
+        Some("viewer_close") => Some(TranscriptAction::Close),
+        Some("viewer_search") => Some(TranscriptAction::Search),
+        Some("viewer_next") => Some(TranscriptAction::NextMatch),
+        Some("viewer_previous") => Some(TranscriptAction::PreviousMatch),
+        Some("viewer_expand") => Some(TranscriptAction::Expand),
+        Some("viewer_expand_all") => Some(TranscriptAction::ExpandAll),
+        Some("viewer_pager") => Some(TranscriptAction::Pager),
+        _ => None,
+    };
+    if let Some(action) = bound {
+        return action;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('c') if control => TranscriptAction::Close,
+        KeyCode::Up => TranscriptAction::Up,
+        KeyCode::Down => TranscriptAction::Down,
+        KeyCode::PageUp => TranscriptAction::PageUp,
+        KeyCode::PageDown => TranscriptAction::PageDown,
+        KeyCode::Home => TranscriptAction::Top,
+        KeyCode::End => TranscriptAction::Bottom,
+        KeyCode::Tab if !control => TranscriptAction::NextTool,
+        KeyCode::BackTab if !control => TranscriptAction::PreviousTool,
+        KeyCode::Enter => TranscriptAction::Enter,
+        KeyCode::Backspace => TranscriptAction::Backspace,
+        KeyCode::Char(c) if plain => match c {
+            'k' => TranscriptAction::Up,
+            'j' => TranscriptAction::Down,
+            'g' => TranscriptAction::Top,
+            'G' => TranscriptAction::Bottom,
+            ' ' => TranscriptAction::ToggleTool,
+            c => TranscriptAction::Char(c),
+        },
+        _ => TranscriptAction::Ignored,
+    }
+}
+
+/// Maps input while a viewer search is typed: every plain character is text.
+#[must_use]
+pub fn search_event(keymap: &Keymap, event: &Event) -> TranscriptAction {
     let Event::Key(key) = event else {
         return TranscriptAction::Ignored;
     };
@@ -157,17 +422,16 @@ pub fn transcript_event(event: &Event) -> TranscriptAction {
         return TranscriptAction::Ignored;
     }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    match (key.code, control) {
-        (KeyCode::Esc, _) | (KeyCode::Char('o' | 'c' | 'd'), true) => TranscriptAction::Close,
-        (KeyCode::Up, _) => TranscriptAction::Up,
-        (KeyCode::Down, _) => TranscriptAction::Down,
-        (KeyCode::PageUp, _) => TranscriptAction::PageUp,
-        (KeyCode::PageDown, _) => TranscriptAction::PageDown,
-        (KeyCode::Home, _) => TranscriptAction::Home,
-        (KeyCode::End, _) => TranscriptAction::End,
-        (KeyCode::Tab, false) => TranscriptAction::NextTool,
-        (KeyCode::BackTab, false) => TranscriptAction::PreviousTool,
-        (KeyCode::Char(' '), false) => TranscriptAction::ToggleTool,
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => TranscriptAction::Close,
+        KeyCode::Char('c') if control => TranscriptAction::Close,
+        KeyCode::Enter => TranscriptAction::Enter,
+        KeyCode::Backspace => TranscriptAction::Backspace,
+        KeyCode::Char(c) if plain => TranscriptAction::Char(c),
+        _ if keymap.action(Context::Viewer, key) == Some("viewer_close") => TranscriptAction::Close,
         _ => TranscriptAction::Ignored,
     }
 }
@@ -180,6 +444,18 @@ pub fn transcript_event(event: &Event) -> TranscriptAction {
 pub struct KeyReader {
     composer: Composer,
     active: bool,
+    prompt_width: usize,
+    width: usize,
+    menu_open: bool,
+    focus: Tri,
+    keymap: Keymap,
+    context: Context,
+    burst_enabled: bool,
+    /// Whether pasted image paths become attachments.
+    images_allowed: bool,
+    /// Whether an image paste was refused since the session last asked.
+    image_refused: bool,
+    burst: Burst,
 }
 
 impl KeyReader {
@@ -197,16 +473,34 @@ impl KeyReader {
             std::io::stdin().is_terminal() && crossterm::terminal::enable_raw_mode().is_ok();
         if active {
             install_panic_hook();
+            crate::modes::install_signal_handlers();
             // A terminal that cannot bracket a paste delivers it as keystrokes,
             // which still works, so a failure is ignored.
             let _ = crossterm::ExecutableCommand::execute(
                 &mut std::io::stdout(),
                 crossterm::event::EnableBracketedPaste,
             );
+            crate::modes::mark(|modes| {
+                modes.raw = true;
+                modes.bracketed_paste = true;
+            });
         }
         Self {
             composer: Composer::new(),
             active,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
+            focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
+            // Bracketed paste covers other terminals, and keys written
+            // quickly by a test harness would otherwise look like a paste.
+            burst_enabled: cfg!(windows)
+                || std::env::var_os("RUNE_PASTE_BURST").is_some_and(|value| value == "1"),
+            images_allowed: true,
+            image_refused: false,
+            burst: Burst::default(),
         }
     }
 
@@ -216,7 +510,54 @@ impl KeyReader {
         Self {
             composer: Composer::new(),
             active: false,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
+            focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
+            burst_enabled: false,
+            images_allowed: true,
+            image_refused: false,
+            burst: Burst::default(),
         }
+    }
+
+    /// Records how the draft is drawn, so Up and Down move by drawn rows.
+    pub const fn set_layout(&mut self, prompt_width: usize, width: usize) {
+        self.prompt_width = prompt_width;
+        self.width = width;
+    }
+
+    /// Records whether a menu under the draft takes the vertical arrows.
+    pub const fn set_menu_open(&mut self, open: bool) {
+        self.menu_open = open;
+    }
+
+    /// Replaces the keys every action answers to.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+    }
+
+    /// Returns the keys every action answers to.
+    #[must_use]
+    pub const fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Records where keys are being read, which decides what a key means.
+    ///
+    /// A reader starts in [`Context::Menu`]; the session names the idle
+    /// prompt and the running turn around the reads it makes there.
+    pub const fn set_context(&mut self, context: Context) {
+        self.context = context;
+    }
+
+    /// Returns whether the terminal window has focus, as its last focus report
+    /// said: [`Tri::Unknown`] until one arrives.
+    #[must_use]
+    pub const fn focus(&self) -> Tri {
+        self.focus
     }
 
     /// Returns whether keys are being read directly.
@@ -225,10 +566,59 @@ impl KeyReader {
         self.active
     }
 
-    /// Returns the line being edited.
+    /// Returns the line being edited, as drawn: a paste chip shows as its
+    /// marker.
     #[must_use]
     pub fn line(&self) -> &str {
         self.composer.text()
+    }
+
+    /// Returns the line with every paste chip replaced by its text, which
+    /// is what a submitted or queued draft sends.
+    #[must_use]
+    pub fn expanded_line(&self) -> String {
+        self.composer.expanded()
+    }
+
+    /// Puts an image chip at the caret.
+    pub fn attach_image(&mut self, path: std::path::PathBuf, bytes: u64) {
+        self.composer.attach_image(path, bytes);
+    }
+
+    /// The draft's image files, in order, with their sizes and markers.
+    #[must_use]
+    pub fn images(&self) -> Vec<(std::path::PathBuf, u64, String)> {
+        self.composer.images()
+    }
+
+    /// Removes one image chip by its marker.
+    pub fn remove_image(&mut self, marker: &str) -> bool {
+        self.composer.remove_marker(marker)
+    }
+
+    /// Says whether pasted image paths may become attachments: false while
+    /// the model does not accept images.
+    pub const fn set_images_allowed(&mut self, allowed: bool) {
+        self.images_allowed = allowed;
+    }
+
+    /// Returns true once after an image paste was refused.
+    pub const fn take_image_refusal(&mut self) -> bool {
+        let refused = self.image_refused;
+        self.image_refused = false;
+        refused
+    }
+
+    /// Replaces the paste chip at or before the caret with its text, as one
+    /// undoable edit. Returns whether there was one.
+    pub fn expand_chip_at_caret(&mut self) -> bool {
+        self.composer.expand_chip_at_caret()
+    }
+
+    /// Returns whether the caret touches a paste chip.
+    #[must_use]
+    pub fn caret_on_chip(&self) -> bool {
+        self.composer.caret_on_chip()
     }
 
     /// Returns the displayed prefix width, counting each newline and tab as
@@ -251,6 +641,12 @@ impl KeyReader {
     /// Replaces a completed token as one undoable edit, preserving its suffix.
     pub fn complete_path(&mut self, range: std::ops::Range<usize>, replacement: &str) {
         self.composer.replace_range(range, replacement);
+    }
+
+    /// Inserts text typed before the reader started at the caret, as one
+    /// undoable edit.
+    pub fn type_ahead(&mut self, text: &str) {
+        self.composer.insert(text);
     }
 
     /// Empties the line.
@@ -294,6 +690,18 @@ impl KeyReader {
         self.composer.move_end();
     }
 
+    /// Runs `action` with the terminal in its ordinary line mode, as a child
+    /// program would find it, and puts the session's modes back after.
+    pub fn with_cooked_terminal<T>(&mut self, action: impl FnOnce() -> T) -> std::io::Result<T> {
+        if !self.active {
+            return Ok(action());
+        }
+        let suspension = TerminalSuspension::new()?;
+        let result = action();
+        suspension.resume()?;
+        Ok(result)
+    }
+
     /// Hands the terminal to VISUAL, EDITOR, or vi, then reloads the draft.
     /// Failed edits leave the complete composer untouched.
     pub fn edit_external(&mut self) -> std::io::Result<()> {
@@ -311,6 +719,22 @@ impl KeyReader {
         Ok(())
     }
 
+    /// Shows `text` in the user's pager with the terminal handed over, and
+    /// takes it back after.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no pager could be started.
+    pub fn page(&self, text: &str) -> std::io::Result<()> {
+        if !self.active {
+            return crate::external_editor::page(text);
+        }
+        let suspension = TerminalSuspension::new()?;
+        let result = crate::external_editor::page(text);
+        suspension.resume()?;
+        result
+    }
+
     /// Waits for one key and applies it.
     ///
     /// Blocks until a key arrives, so the caller can render between keystrokes
@@ -321,10 +745,31 @@ impl KeyReader {
         if !self.active {
             return KeyAction::Ignored;
         }
+        // Polled rather than blocking, so a resumed process redraws without
+        // waiting for a key.
+        let queued = self.queued();
+        loop {
+            if crate::modes::redraw_pending() {
+                return KeyAction::Ignored;
+            }
+            let wait = if self.burst.active() {
+                BURST_IDLE
+            } else {
+                REDRAW_POLL
+            };
+            if crossterm::event::poll(wait).unwrap_or(true) {
+                break;
+            }
+            if self.burst.active() {
+                self.end_burst();
+                return KeyAction::Ignored;
+            }
+        }
         let Ok(event) = crossterm::event::read() else {
             return KeyAction::Ignored;
         };
-        self.handle(event).unwrap_or(KeyAction::Ignored)
+        self.handle_at(event, Instant::now(), queued)
+            .unwrap_or(KeyAction::Ignored)
     }
 
     /// Returns the next key if one is already waiting, without blocking.
@@ -333,13 +778,37 @@ impl KeyReader {
     /// that may never come: the turn's own progress still has to be drawn.
     /// Returns `None` when nothing is ready.
     pub fn poll_key(&mut self, timeout: Duration) -> Option<KeyAction> {
-        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+        if !self.active {
+            return None;
+        }
+        let queued = self.queued();
+        let wait = if self.burst.active() {
+            timeout.min(BURST_IDLE)
+        } else {
+            timeout
+        };
+        if !crossterm::event::poll(wait).unwrap_or(false) {
+            let idle = self
+                .burst
+                .last
+                .is_none_or(|last| last.elapsed() >= BURST_IDLE);
+            if self.burst.active() && idle {
+                self.end_burst();
+                return Some(KeyAction::Ignored);
+            }
             return None;
         }
         let Ok(event) = crossterm::event::read() else {
             return None;
         };
-        self.handle(event)
+        self.handle_at(event, Instant::now(), queued)
+    }
+
+    /// Returns whether an event is already waiting, which means it arrived
+    /// while the last one was being handled: as part of a paste, when the
+    /// burst check is on.
+    fn queued(&self) -> bool {
+        self.burst_enabled && crossterm::event::poll(Duration::ZERO).unwrap_or(false)
     }
 
     /// Polls a choice without changing the draft, caret, or editing history.
@@ -353,12 +822,85 @@ impl KeyReader {
         action
     }
 
-    /// Polls viewer navigation, leaving the complete composer untouched.
-    pub fn poll_transcript(&self, timeout: Duration) -> Option<TranscriptAction> {
+    /// Polls a one-key answer without changing the draft: a plain character
+    /// is reported as itself, anything else as the action it maps to. Pastes
+    /// are ignored, so pasted text never answers.
+    pub fn poll_choice_key(&mut self, timeout: Duration) -> Option<ChoiceKey> {
         if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
             return None;
         }
-        crossterm::event::read().ok().as_ref().map(transcript_event)
+        let event = crossterm::event::read().ok()?;
+        self.choice_event(event)
+    }
+
+    /// Maps one event the way [`Self::poll_choice_key`] does. In the
+    /// approval context a key bound to an approval action is reported by
+    /// the action's id, so `keys.toml` can move it.
+    pub fn choice_event(&mut self, event: Event) -> Option<ChoiceKey> {
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+        {
+            if self.context == Context::Approval
+                && let Some(id) = self.keymap.action(Context::Approval, key)
+                && ACTIONS
+                    .iter()
+                    .any(|info| info.id == id && info.context == Context::Approval)
+            {
+                return Some(ChoiceKey::Bound(id));
+            }
+            if let KeyCode::Char(ch) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return Some(ChoiceKey::Char(ch));
+            }
+        }
+        if matches!(event, Event::Paste(_)) {
+            return None;
+        }
+        let draft = std::mem::take(&mut self.composer);
+        let action = self.handle(event);
+        self.composer = draft;
+        action.map(ChoiceKey::Action)
+    }
+
+    /// Reads and drops every event already waiting, so keys typed before a
+    /// question appeared cannot answer it.
+    pub fn discard_pending(&mut self) {
+        if !self.active {
+            return;
+        }
+        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(event) => self.note_focus(&event),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Polls viewer navigation, leaving the complete composer untouched.
+    /// While `typing` a search, characters arrive as text.
+    pub fn poll_transcript(&mut self, timeout: Duration, typing: bool) -> Option<TranscriptAction> {
+        if !self.active || !crossterm::event::poll(timeout).unwrap_or(false) {
+            return None;
+        }
+        let event = crossterm::event::read().ok()?;
+        self.note_focus(&event);
+        Some(if typing {
+            search_event(&self.keymap, &event)
+        } else {
+            transcript_event(&self.keymap, &event)
+        })
+    }
+
+    /// Records a focus report.
+    const fn note_focus(&mut self, event: &Event) {
+        match event {
+            Event::FocusGained => self.focus = Tri::Yes,
+            Event::FocusLost => self.focus = Tri::No,
+            _ => {}
+        }
     }
 
     /// Applies one terminal event, returning `None` for one that is not input.
@@ -366,13 +908,26 @@ impl KeyReader {
     /// Shared by both ways of reading, so a paste means the same thing whether
     /// it arrives at the prompt or while a turn runs.
     pub fn handle(&mut self, event: Event) -> Option<KeyAction> {
+        self.handle_at(event, Instant::now(), false)
+    }
+
+    /// Applies one event that arrived at `now`; `queued` says it was
+    /// already waiting when the read began.
+    fn handle_at(&mut self, event: Event, now: Instant, queued: bool) -> Option<KeyAction> {
         match event {
             // A release also arrives on some terminals, and acting on it would
             // insert every character twice.
-            Event::Key(key) if key.kind != KeyEventKind::Release => Some(self.apply(key)),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                Some(self.apply_burst(key, now, queued))
+            }
             Event::Paste(text) => {
                 self.paste(&text);
                 Some(KeyAction::Ignored)
+            }
+            // A focus report is not input: it is recorded, never typed.
+            Event::FocusGained | Event::FocusLost => {
+                self.note_focus(&event);
+                None
             }
             _ => None,
         }
@@ -385,26 +940,224 @@ impl KeyReader {
     /// other control characters are dropped, because the line is drawn back to
     /// the terminal and a pasted sequence would act on it.
     pub fn paste(&mut self, text: &str) {
+        // A dropped or pasted image file becomes an attachment.
+        if let Some(paths) = image_paths(text) {
+            if self.images_allowed {
+                for (path, bytes) in paths {
+                    self.composer.attach_image(path, bytes);
+                }
+            } else {
+                self.image_refused = true;
+            }
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        // Nothing is withheld: the line is what is submitted, and a marker in
-        // place of the text would send the marker. The drawn row is cut to the
-        // window whatever its length.
+        // A large paste is drawn as a chip; the submitted line is expanded.
         self.composer
-            .paste(&crate::transcript::sanitize(&text), usize::MAX);
+            .paste_text(&crate::transcript::sanitize(&text));
+    }
+
+    /// Applies one key as though it arrived at `now`, so a test can control
+    /// the time that paste burst detection sees.
+    pub fn apply_at(&mut self, key: KeyEvent, now: Instant) -> KeyAction {
+        self.apply_burst(key, now, false)
+    }
+
+    /// Applies a key, first taking Enter and Tab as text inside a burst of
+    /// keys that arrive faster than anyone types.
+    fn apply_burst(&mut self, key: KeyEvent, now: Instant, queued: bool) -> KeyAction {
+        if !self.burst_enabled {
+            return self.apply(key);
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let counted = match key.code {
+            KeyCode::Char(_) => plain,
+            KeyCode::Enter | KeyCode::Tab => key.modifiers.is_empty(),
+            _ => false,
+        };
+        if !counted {
+            self.end_burst();
+            self.burst.last = None;
+            return self.apply(key);
+        }
+        let close = queued
+            || self
+                .burst
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) <= BURST_GAP);
+        if close && self.burst.run > 0 {
+            self.burst.run = self.burst.run.saturating_add(1);
+        } else {
+            self.end_burst();
+            self.burst.run = 1;
+            self.burst.start_char = self.composer.cursor();
+        }
+        self.burst.last = Some(now);
+        if self.burst.active() {
+            self.burst.active_until = now.checked_add(BURST_ENTER_GRACE);
+        }
+        let pasting = self.burst.active_until.is_some_and(|until| now <= until);
+        match key.code {
+            KeyCode::Enter if pasting => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
+            KeyCode::Tab if pasting => {
+                self.composer.insert("\t");
+                KeyAction::Ignored
+            }
+            _ => self.apply(key),
+        }
+    }
+
+    /// Ends a burst of pasted keys, turning its text into a chip when it is
+    /// as large as a bracketed paste that would become one.
+    fn end_burst(&mut self) {
+        if self.burst.active() {
+            let start = self.burst.start_char;
+            let end = self.composer.cursor();
+            let pasted: String = self
+                .composer
+                .text()
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect();
+            if end > start && crate::editor::exceeds_chip_thresholds(&pasted) {
+                self.composer.collapse_into_chip(start, end);
+            }
+        }
+        self.burst.run = 0;
     }
 
     /// Applies one key to the line.
     ///
     /// Split from reading so a test drives the same mapping a terminal does.
+    /// The keymap decides first; a key no action holds keeps its fixed
+    /// meaning or is typed.
     pub fn apply(&mut self, key: KeyEvent) -> KeyAction {
+        match self.keymap.action(self.context, &key) {
+            // The overlay opens only on an empty draft at the idle prompt;
+            // anywhere else the key is typed.
+            Some("help") if self.context != Context::Editor || !self.composer.text().is_empty() => {
+                self.apply_unbound(key)
+            }
+            Some("help") => KeyAction::Help,
+            Some(id) => self.run_action(id),
+            None => self.apply_unbound(key),
+        }
+    }
+
+    /// Runs one action of the keymap.
+    fn run_action(&mut self, id: &str) -> KeyAction {
+        match id {
+            "submit" => {
+                if self.composer.newline_after_backslash() {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Submit
+                }
+            }
+            "newline" => {
+                self.composer.insert("\n");
+                KeyAction::Ignored
+            }
+            // Tab completes rather than inserting a tab. Pasted tabs stay in
+            // the draft and are displayed as spaces.
+            "complete" => KeyAction::Complete,
+            "queue" => KeyAction::Queue,
+            "pull_queued" => KeyAction::PullQueued,
+            "interrupt" => KeyAction::Escape,
+            // While a turn runs, Escape is the interrupt gesture, so clearing
+            // on another key only empties the draft.
+            "clear" if self.context == Context::Turn => {
+                self.composer.clear();
+                KeyAction::Ignored
+            }
+            "clear" => KeyAction::Escape,
+            "history_search" => KeyAction::HistorySearch,
+            // On a paste chip at the idle prompt Ctrl-O opens the paste
+            // instead; during a turn it always opens the viewer.
+            "transcript" if self.context != Context::Turn && self.composer.caret_on_chip() => {
+                KeyAction::ExpandChip
+            }
+            "transcript" => KeyAction::Transcript,
+            "paste_image" => KeyAction::PasteImage,
+            "external_editor" => KeyAction::ExternalEditor,
+            // An open menu keeps the key, so it never changes the mode behind it.
+            "mode_cycle" if self.menu_open => KeyAction::Ignored,
+            "mode_cycle" => KeyAction::ModeCycle,
+            "toggle_plan" => KeyAction::TogglePlan,
+            "line_start" => {
+                if !self.composer.move_line_start() {
+                    self.composer.move_home();
+                }
+                KeyAction::Ignored
+            }
+            "line_end" => {
+                if !self.composer.move_line_end() {
+                    self.composer.move_end();
+                }
+                KeyAction::Ignored
+            }
+            "kill_to_line_start" => {
+                self.composer.kill_to_start();
+                KeyAction::Ignored
+            }
+            "kill_to_line_end" => {
+                self.composer.kill_to_end();
+                KeyAction::Ignored
+            }
+            "yank" => {
+                self.composer.yank();
+                KeyAction::Ignored
+            }
+            "yank_pop" => {
+                self.composer.yank_pop();
+                KeyAction::Ignored
+            }
+            "undo" => {
+                self.composer.undo();
+                KeyAction::Ignored
+            }
+            "redo" => {
+                self.composer.redo();
+                KeyAction::Ignored
+            }
+            "kill_word_back" => {
+                self.composer.kill_word_back();
+                KeyAction::Ignored
+            }
+            "kill_word_forward" => {
+                self.composer.kill_word_forward();
+                KeyAction::Ignored
+            }
+            "word_left" => {
+                self.composer.move_word_left();
+                KeyAction::Ignored
+            }
+            "word_right" => {
+                self.composer.move_word_right();
+                KeyAction::Ignored
+            }
+            _ => KeyAction::Ignored,
+        }
+    }
+
+    /// Applies a key that no action holds.
+    fn apply_unbound(&mut self, key: KeyEvent) -> KeyAction {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Menus keep Tab and Escape even when their actions moved elsewhere,
+        // so a picker can always be accepted and left.
+        let menu = matches!(self.context, Context::Menu | Context::Approval);
 
         match (key.code, control, alt) {
-            (KeyCode::Char('r'), true, _) => KeyAction::HistorySearch,
-            (KeyCode::Char('g'), true, _) => KeyAction::ExternalEditor,
-            (KeyCode::Char('o'), true, _) => KeyAction::Transcript,
             (KeyCode::Char('c'), true, _) => KeyAction::Cancel,
+            #[cfg(unix)]
+            (KeyCode::Char('z'), true, _) => KeyAction::Suspend,
             (KeyCode::Char('d'), true, _) => {
                 if self.composer.is_empty() {
                     KeyAction::Interrupt
@@ -413,58 +1166,12 @@ impl KeyReader {
                     KeyAction::Ignored
                 }
             }
-            (KeyCode::Char('a'), true, _) => {
-                self.composer.move_home();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('e'), true, _) => {
-                self.composer.move_end();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('u'), true, _) => {
-                self.composer.kill_to_start();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('k'), true, _) => {
-                self.composer.kill_to_end();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('y'), true, _) => {
-                self.composer.yank();
-                KeyAction::Ignored
-            }
-            // Legacy terminals send Ctrl-_ as 0x1f, which Crossterm decodes
-            // as Ctrl-7. Enhanced keyboard events can report '_' directly.
-            (KeyCode::Char('_' | '7'), true, _) => {
-                self.composer.undo();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('r'), false, true) => {
-                self.composer.redo();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('w'), true, _) => {
-                self.composer.delete_word();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('b'), true, _) | (KeyCode::Left, _, true) => {
-                self.composer.move_word_left();
-                KeyAction::Ignored
-            }
-            (KeyCode::Char('f'), true, _) | (KeyCode::Right, _, true) => {
-                self.composer.move_word_right();
-                KeyAction::Ignored
-            }
-            (KeyCode::Enter, _, true) => {
-                self.composer.insert("\n");
-                KeyAction::Ignored
-            }
-            (KeyCode::Enter, _, _) => KeyAction::Submit,
-            // Tab completes rather than inserting a tab. Pasted tabs stay in
-            // the draft and are displayed as spaces.
-            (KeyCode::Tab, _, _) => KeyAction::Complete,
-            (KeyCode::Esc, _, _) => KeyAction::Escape,
-            (KeyCode::Backspace, _, _) => {
+            (KeyCode::Char('t'), false, true) => KeyAction::CycleReasoning,
+            (KeyCode::Tab, _, _) if menu => KeyAction::Complete,
+            (KeyCode::Esc, _, _) if menu => KeyAction::Escape,
+            // Ctrl-H is the traditional backspace, and some consoles send it
+            // for the Backspace key.
+            (KeyCode::Backspace, _, _) | (KeyCode::Char('h'), true, _) => {
                 self.composer.delete_back();
                 KeyAction::Ignored
             }
@@ -480,18 +1187,31 @@ impl KeyReader {
                 self.composer.move_right();
                 KeyAction::Ignored
             }
-            // The vertical arrows are reported rather than applied, because
-            // what they mean depends on what is on screen: a picker moves its
-            // selection, and a plain line recalls an earlier prompt.
-            (KeyCode::Up, _, _) => KeyAction::Up,
-            (KeyCode::Down, _, _) => KeyAction::Down,
-            (KeyCode::Home, _, _) => {
-                self.composer.move_home();
-                KeyAction::Ignored
+            (KeyCode::Up, _, true) => KeyAction::Ignored,
+            // An open menu takes the vertical arrows. Otherwise they move
+            // between drawn rows and are reported only from the first or last
+            // row, where the session recalls an earlier prompt.
+            (KeyCode::Up, _, _) => {
+                if !self.menu_open
+                    && self
+                        .composer
+                        .move_up(self.prompt_width, self.prompt_width, self.width)
+                {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Up
+                }
             }
-            (KeyCode::End, _, _) => {
-                self.composer.move_end();
-                KeyAction::Ignored
+            (KeyCode::Down, _, _) => {
+                if !self.menu_open
+                    && self
+                        .composer
+                        .move_down(self.prompt_width, self.prompt_width, self.width)
+                {
+                    KeyAction::Ignored
+                } else {
+                    KeyAction::Down
+                }
             }
             // A control combination that is not a known binding must not insert
             // its letter, which is what a naive fallthrough would do.
@@ -516,11 +1236,8 @@ struct TerminalSuspension(bool);
 
 impl TerminalSuspension {
     fn new() -> std::io::Result<Self> {
-        use crossterm::ExecutableCommand;
         let guard = Self(true);
-        std::io::stdout().execute(crossterm::event::DisableBracketedPaste)?;
-        std::io::stdout().execute(crossterm::cursor::Show)?;
-        crossterm::terminal::disable_raw_mode()?;
+        crate::modes::pause_for_child();
         Ok(guard)
     }
 
@@ -531,9 +1248,7 @@ impl TerminalSuspension {
     }
 
     fn restore() -> std::io::Result<()> {
-        use crossterm::ExecutableCommand;
-        crossterm::terminal::enable_raw_mode()?;
-        std::io::stdout().execute(crossterm::event::EnableBracketedPaste)?;
+        crate::modes::reapply();
         Ok(())
     }
 }
@@ -602,14 +1317,14 @@ pub fn secret_event(secret: &mut String, event: Event) -> SecretStep {
     }
 }
 
-/// Reads one line from the terminal without showing it.
+/// Writes `prompt`, then reads one line from the terminal without showing it.
 ///
 /// A credential that is echoed stays on screen and in the terminal's
 /// scrollback. Raw mode keeps the terminal from echoing, and bracketed paste
 /// delivers a pasted key in one piece, so a line break copied with it does not
 /// end the read. Returns `None` when input ends before anything is typed, and
 /// an interrupted error for Control-C.
-pub fn read_secret() -> std::io::Result<Option<String>> {
+pub fn read_secret(prompt: &str) -> std::io::Result<Option<String>> {
     /// Puts the terminal back however the read ends.
     struct Restore;
     impl Drop for Restore {
@@ -625,6 +1340,18 @@ pub fn read_secret() -> std::io::Result<Option<String>> {
         &mut std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
     );
+    crate::modes::mark(|modes| {
+        modes.raw = true;
+        modes.bracketed_paste = true;
+    });
+    // The prompt is written once echo is off, so nothing typed after it can
+    // appear on screen.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        out.write_all(prompt.as_bytes())?;
+        out.flush()?;
+    }
     let mut secret = String::new();
     loop {
         match secret_event(&mut secret, crossterm::event::read()?) {
@@ -644,16 +1371,7 @@ pub fn read_secret() -> std::io::Result<Option<String>> {
 /// cursor while it writes a frame, so a process that stops partway through one
 /// would otherwise leave the cursor hidden as well.
 fn restore_terminal() {
-    write_restore(&mut std::io::stdout());
-    let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// Writes the sequences that turn bracketed paste off and show the cursor.
-fn write_restore(out: &mut impl std::io::Write) {
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::terminal::LeaveAlternateScreen);
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::event::DisableBracketedPaste);
-    let _ = crossterm::QueueableCommand::queue(out, crossterm::cursor::Show);
-    let _ = out.flush();
+    crate::modes::restore();
 }
 
 thread_local! {
@@ -693,11 +1411,13 @@ fn install_panic_hook() {
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if cfg!(panic = "abort") {
-                restore_terminal();
-            } else if CATCHING_WORKER_PANIC.get() {
+            // A caught worker panic is reported by the session, which goes on
+            // in the modes it needs; every other panic restores first, so its
+            // message is readable.
+            if CATCHING_WORKER_PANIC.get() && !cfg!(panic = "abort") {
                 return;
             }
+            restore_terminal();
             previous(info);
         }));
     });
@@ -713,6 +1433,39 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn control_h_deletes_the_character_before_the_caret() {
+        let mut reader = KeyReader::new();
+        reader.replace("abc");
+        reader.apply(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(reader.line(), "ab");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_help_names_the_terminal_quirks() {
+        let help = render_bindings_help(true, &Keymap::default());
+        assert!(help.contains("alt-enter  Windows Terminal uses it for full screen"));
+        assert!(help.contains("ctrl-v     Windows Terminal pastes with it"));
+    }
+
+    #[test]
+    fn focus_events_update_focus_and_are_not_keys() {
+        let mut reader = reader();
+        typed(&mut reader, "draft");
+        assert_eq!(reader.focus(), Tri::Unknown);
+        assert_eq!(reader.handle(Event::FocusLost), None);
+        assert_eq!(reader.focus(), Tri::No);
+        assert_eq!(reader.handle(Event::FocusGained), None);
+        assert_eq!(reader.focus(), Tri::Yes);
+        assert_eq!(reader.line(), "draft");
+        assert_eq!(reader.column(), 5);
+        // A key afterwards still edits the line and leaves focus as it was.
+        assert!(reader.handle(Event::Key(key(KeyCode::Char('s')))).is_some());
+        assert_eq!(reader.line(), "drafts");
+        assert_eq!(reader.focus(), Tri::Yes);
     }
 
     #[test]
@@ -734,6 +1487,20 @@ mod tests {
         reader.apply(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
         assert_eq!(reader.line(), "界 read 'file space.txt' please e\u{301}");
         assert_eq!(reader.cursor_byte(), "界 read 'file space.txt'".len());
+    }
+
+    #[test]
+    fn type_ahead_is_one_undoable_edit_at_the_caret() {
+        let mut reader = reader();
+        reader.type_ahead("");
+        assert_eq!(reader.line(), "");
+        reader.replace("ab");
+        reader.apply(key(KeyCode::Left));
+        reader.type_ahead("hello ");
+        assert_eq!(reader.line(), "ahello b");
+        assert_eq!(reader.cursor_byte(), "ahello ".len());
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "ab");
     }
 
     #[test]
@@ -815,8 +1582,8 @@ mod tests {
                 Event::Key(key(KeyCode::PageDown)),
                 TranscriptAction::PageDown,
             ),
-            (Event::Key(key(KeyCode::Home)), TranscriptAction::Home),
-            (Event::Key(key(KeyCode::End)), TranscriptAction::End),
+            (Event::Key(key(KeyCode::Home)), TranscriptAction::Top),
+            (Event::Key(key(KeyCode::End)), TranscriptAction::Bottom),
             (Event::Key(key(KeyCode::Tab)), TranscriptAction::NextTool),
             (
                 Event::Key(key(KeyCode::BackTab)),
@@ -828,19 +1595,19 @@ mod tests {
             ),
             (
                 Event::Key(key(KeyCode::Char('x'))),
-                TranscriptAction::Ignored,
+                TranscriptAction::Char('x'),
             ),
             (
                 Event::Paste(String::from("replace\nthis")),
                 TranscriptAction::Ignored,
             ),
-            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Ignored),
+            (Event::Key(key(KeyCode::Enter)), TranscriptAction::Enter),
             (Event::Resize(32, 8), TranscriptAction::Ignored),
             (Event::Key(key(KeyCode::Esc)), TranscriptAction::Close),
             (Event::Key(control('o')), TranscriptAction::Close),
             (Event::Key(control('c')), TranscriptAction::Close),
         ] {
-            assert_eq!(transcript_event(&event), expected);
+            assert_eq!(transcript_event(&Keymap::defaults(), &event), expected);
             assert_eq!((reader.line().to_owned(), reader.column()), before);
         }
         reader.recall_previous(&history);
@@ -848,11 +1615,96 @@ mod tests {
         assert_eq!((reader.line().to_owned(), reader.column()), before);
     }
 
+    #[test]
+    fn viewer_keys_map_to_actions() {
+        let keymap = Keymap::defaults();
+        let shifted = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        for (event, expected) in [
+            (key(KeyCode::Char('j')), TranscriptAction::Down),
+            (key(KeyCode::Down), TranscriptAction::Down),
+            (key(KeyCode::Char('k')), TranscriptAction::Up),
+            (key(KeyCode::Up), TranscriptAction::Up),
+            (key(KeyCode::PageUp), TranscriptAction::PageUp),
+            (key(KeyCode::PageDown), TranscriptAction::PageDown),
+            (key(KeyCode::Char('g')), TranscriptAction::Top),
+            (key(KeyCode::Home), TranscriptAction::Top),
+            (shifted('G'), TranscriptAction::Bottom),
+            (key(KeyCode::End), TranscriptAction::Bottom),
+            (key(KeyCode::Char('q')), TranscriptAction::Close),
+            (key(KeyCode::Esc), TranscriptAction::Close),
+            (control('o'), TranscriptAction::Close),
+            (control('c'), TranscriptAction::Close),
+            (control('d'), TranscriptAction::Close),
+            (key(KeyCode::Tab), TranscriptAction::NextTool),
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                TranscriptAction::PreviousTool,
+            ),
+            (key(KeyCode::Char(' ')), TranscriptAction::ToggleTool),
+            (key(KeyCode::Enter), TranscriptAction::Enter),
+            (key(KeyCode::Backspace), TranscriptAction::Backspace),
+            (key(KeyCode::Char('/')), TranscriptAction::Search),
+            (key(KeyCode::Char('n')), TranscriptAction::NextMatch),
+            (shifted('N'), TranscriptAction::PreviousMatch),
+            (key(KeyCode::Char('e')), TranscriptAction::Expand),
+            (shifted('E'), TranscriptAction::ExpandAll),
+            (key(KeyCode::Char('v')), TranscriptAction::Pager),
+            (key(KeyCode::Char('z')), TranscriptAction::Char('z')),
+            (control('z'), TranscriptAction::Ignored),
+        ] {
+            assert_eq!(
+                transcript_event(&keymap, &Event::Key(event)),
+                expected,
+                "{event:?}"
+            );
+        }
+        for (event, expected) in [
+            (key(KeyCode::Char('q')), TranscriptAction::Char('q')),
+            (key(KeyCode::Char('n')), TranscriptAction::Char('n')),
+            (key(KeyCode::Char('/')), TranscriptAction::Char('/')),
+            (shifted('G'), TranscriptAction::Char('G')),
+            (key(KeyCode::Char(' ')), TranscriptAction::Char(' ')),
+            (key(KeyCode::Backspace), TranscriptAction::Backspace),
+            (key(KeyCode::Enter), TranscriptAction::Enter),
+            (key(KeyCode::Esc), TranscriptAction::Close),
+            (control('c'), TranscriptAction::Close),
+            (control('o'), TranscriptAction::Close),
+            (key(KeyCode::Up), TranscriptAction::Ignored),
+        ] {
+            assert_eq!(
+                search_event(&keymap, &Event::Key(event)),
+                expected,
+                "{event:?}"
+            );
+        }
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("viewer_search".to_owned(), vec!["ctrl+f".to_owned()]);
+        let moved = Keymap::with_overrides(&file).expect("valid");
+        assert_eq!(
+            transcript_event(&moved, &Event::Key(control('f'))),
+            TranscriptAction::Search
+        );
+        assert_eq!(
+            transcript_event(&moved, &Event::Key(key(KeyCode::Char('/')))),
+            TranscriptAction::Char('/')
+        );
+    }
+
     /// Builds a reader with keys enabled, without touching a real terminal.
     fn reader() -> KeyReader {
         KeyReader {
             composer: Composer::new(),
             active: true,
+            prompt_width: DEFAULT_PROMPT_WIDTH,
+            width: DEFAULT_WIDTH,
+            menu_open: false,
+            focus: Tri::Unknown,
+            keymap: Keymap::defaults(),
+            context: Context::Menu,
+            burst_enabled: false,
+            images_allowed: true,
+            image_refused: false,
+            burst: Burst::default(),
         }
     }
 
@@ -860,6 +1712,123 @@ mod tests {
         for c in text.chars() {
             reader.apply(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(reader.apply(shift), KeyAction::Ignored);
+        typed(&mut reader, "b");
+        assert_eq!(reader.line(), "a\nb");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        assert_eq!(reader.apply(control('j')), KeyAction::Ignored);
+        typed(&mut reader, "b");
+        assert_eq!(reader.line(), "a\nb");
+    }
+
+    #[test]
+    fn backslash_enter_replaces_the_backslash() {
+        let enter_after = |text: &str| {
+            let mut reader = reader();
+            typed(&mut reader, text);
+            let action = reader.apply(key(KeyCode::Enter));
+            (action, reader.line().to_owned())
+        };
+        assert_eq!(enter_after("a\\"), (KeyAction::Ignored, "a\n".to_owned()));
+        // A backslash alone becomes a newline too.
+        assert_eq!(enter_after("\\"), (KeyAction::Ignored, "\n".to_owned()));
+        // Two backslashes keep the first.
+        assert_eq!(enter_after("\\\\"), (KeyAction::Ignored, "\\\n".to_owned()));
+        // With the caret away from the backslash, Enter submits.
+        assert_eq!(enter_after("a\\b"), (KeyAction::Submit, "a\\b".to_owned()));
+        let mut middle = reader();
+        typed(&mut middle, "a\\b");
+        middle.apply(key(KeyCode::Left));
+        assert_eq!(middle.apply(key(KeyCode::Enter)), KeyAction::Ignored);
+        assert_eq!(middle.line(), "a\nb");
+    }
+
+    #[test]
+    fn plain_enter_submits() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        assert_eq!(reader.apply(key(KeyCode::Enter)), KeyAction::Submit);
+        assert_eq!(reader.line(), "a");
+        // Control+Enter is not one of the newline keys.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(reader.apply(enter), KeyAction::Submit);
+    }
+
+    #[test]
+    fn alt_enter_still_inserts_a_newline() {
+        let mut reader = reader();
+        typed(&mut reader, "a");
+        let alt = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(reader.apply(alt), KeyAction::Ignored);
+        assert_eq!(reader.line(), "a\n");
+    }
+
+    #[test]
+    fn alt_letters_edit_instead_of_inserting() {
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let mut reader = reader();
+        typed(&mut reader, "alpha beta");
+        reader.apply(alt('b'));
+        assert_eq!(reader.column(), 6);
+        reader.apply(alt('f'));
+        assert_eq!(reader.column(), 10);
+        reader.apply(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(reader.line(), "alpha ");
+        reader.apply(control('y'));
+        assert_eq!(reader.line(), "alpha beta");
+        reader.apply(key(KeyCode::Home));
+        reader.apply(alt('d'));
+        assert_eq!(reader.line(), " beta");
+        reader.apply(control('y'));
+        assert_eq!(reader.line(), "alpha beta");
+        reader.apply(alt('y'));
+        assert_eq!(reader.line(), "beta beta");
+        assert_eq!(reader.column(), 4);
+    }
+
+    #[test]
+    fn alt_up_pulls_a_queued_message_without_moving_the_caret() {
+        let mut reader = reader();
+        reader.set_context(Context::Turn);
+        typed(&mut reader, "one");
+        reader.apply(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut reader, "two");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(reader.apply(alt_up), KeyAction::PullQueued);
+        assert_eq!(reader.column(), 7);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 3);
+    }
+
+    #[test]
+    fn arrows_go_to_an_open_menu() {
+        let mut reader = reader();
+        typed(&mut reader, "one");
+        reader.apply(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut reader, "two");
+        reader.set_menu_open(true);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Up);
+        assert_eq!(reader.column(), 7, "the caret stays while a menu is open");
+        reader.set_menu_open(false);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 3);
+        assert_eq!(reader.apply(key(KeyCode::Up)), KeyAction::Up);
+        assert_eq!(reader.apply(key(KeyCode::Down)), KeyAction::Ignored);
+        assert_eq!(reader.column(), 7);
+        assert_eq!(reader.apply(key(KeyCode::Down)), KeyAction::Down);
+        assert_eq!(reader.line(), "one\ntwo");
     }
 
     #[test]
@@ -1394,11 +2363,249 @@ mod tests {
     fn restoring_turns_paste_off_and_shows_the_cursor() {
         // What a panic hook writes before an aborting build ends the process;
         // raw mode is restored beside it through the terminal settings.
-        let mut out: Vec<u8> = Vec::new();
-        write_restore(&mut out);
+        let out = crate::modes::restore_bytes(&crate::modes::ModeState {
+            raw: true,
+            bracketed_paste: true,
+            ..crate::modes::ModeState::default()
+        });
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("\u{1b}[?2004l"), "{text:?}");
         assert!(text.contains("\u{1b}[?25h"), "{text:?}");
+    }
+
+    #[test]
+    fn ctrl_z_is_a_suspend_key() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let action = reader.apply(control('z'));
+        if cfg!(unix) {
+            assert_eq!(action, KeyAction::Suspend);
+        } else {
+            assert_eq!(action, KeyAction::Ignored);
+        }
+        assert_eq!(reader.line(), "draft");
+    }
+
+    #[test]
+    fn alt_t_cycles_reasoning_and_inserts_nothing() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let action = reader.apply(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(action, KeyAction::CycleReasoning);
+        assert_eq!(reader.line(), "draft");
+        assert!(
+            render_bindings_help(true, &Keymap::defaults())
+                .contains("Alt-T         cycle how reasoning is shown")
+        );
+    }
+
+    #[test]
+    fn a_rebound_queue_key_returns_the_queue_action() {
+        let mut reader = reader();
+        reader.set_context(Context::Turn);
+        let tab = key(KeyCode::Tab);
+        let control_q = control('q');
+        assert_eq!(reader.apply(tab), KeyAction::Queue);
+        assert_eq!(reader.apply(control_q), KeyAction::Ignored);
+
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("queue".to_owned(), vec!["ctrl+q".to_owned()]);
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        assert_eq!(reader.apply(control_q), KeyAction::Queue);
+        assert_eq!(reader.apply(tab), KeyAction::Complete);
+        reader.set_context(Context::Editor);
+        assert_eq!(reader.apply(control_q), KeyAction::Ignored);
+        assert_eq!(reader.apply(tab), KeyAction::Complete);
+        assert_eq!(reader.line(), "");
+    }
+
+    #[test]
+    fn a_rebound_clear_key_leaves_escape_to_menus_only() {
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("clear".to_owned(), vec!["ctrl+x".to_owned()]);
+        file.insert("interrupt".to_owned(), vec!["ctrl+n".to_owned()]);
+        let mut reader = reader();
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        let escape = key(KeyCode::Esc);
+        reader.set_context(Context::Editor);
+        assert_eq!(reader.apply(escape), KeyAction::Ignored);
+        assert_eq!(reader.apply(control('x')), KeyAction::Escape);
+        reader.set_context(Context::Menu);
+        assert_eq!(reader.apply(escape), KeyAction::Escape);
+        reader.set_context(Context::Turn);
+        typed(&mut reader, "draft");
+        assert_eq!(reader.apply(escape), KeyAction::Ignored);
+        assert_eq!(reader.line(), "draft");
+        assert_eq!(reader.apply(control('n')), KeyAction::Escape);
+        assert_eq!(reader.apply(control('x')), KeyAction::Ignored);
+        assert_eq!(reader.line(), "");
+    }
+
+    #[test]
+    fn the_bindings_help_shows_the_keys_in_use() {
+        let help = render_bindings_help(true, &Keymap::defaults());
+        assert!(help.contains("Shift-Tab"), "{help}");
+        assert!(help.contains("Home / Ctrl-A"), "{help}");
+        assert!(help.contains("(mode_cycle)"), "{help}");
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("transcript".to_owned(), vec!["ctrl+s".to_owned()]);
+        let help = render_bindings_help(true, &Keymap::with_overrides(&file).expect("valid"));
+        let row = help
+            .lines()
+            .find(|line| line.ends_with("(transcript)"))
+            .expect("a transcript row");
+        assert!(row.contains("Ctrl-S") && !row.contains("Ctrl-O"), "{row}");
+    }
+
+    #[test]
+    fn shift_tab_cycles_modes() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+        assert_eq!(reader.line(), "draft");
+        reader.set_menu_open(true);
+        assert_eq!(reader.apply(back_tab), KeyAction::Ignored);
+        reader.set_menu_open(false);
+        assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+    }
+
+    fn image_fixture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").expect("image");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_pasted_image_path_attaches() {
+        let (_dir, path) = image_fixture("shot.png");
+        let mut pasted = reader();
+        pasted.replace("see");
+        pasted.paste(&format!("{}\n", path.display()));
+        assert_eq!(pasted.images().len(), 1);
+        assert!(
+            pasted.line().starts_with("see [image #1: shot.png 0 KB]"),
+            "{}",
+            pasted.line()
+        );
+        let mut refused = reader();
+        refused.set_images_allowed(false);
+        refused.paste(&path.display().to_string());
+        assert!(refused.images().is_empty());
+        assert!(refused.take_image_refusal());
+        assert!(!refused.take_image_refusal());
+    }
+
+    #[test]
+    fn an_escaped_dropped_path_attaches() {
+        let (_dir, path) = image_fixture("my shot.PNG");
+        let escaped = path.display().to_string().replace(' ', "\\ ");
+        let mut pasted = reader();
+        pasted.paste(&escaped);
+        assert_eq!(pasted.images().len(), 1, "{}", pasted.line());
+        let mut quoted = reader();
+        quoted.paste(&format!("'{}'", path.display()));
+        assert_eq!(quoted.images().len(), 1);
+        let mut url = reader();
+        url.paste(&format!(
+            "file://{}",
+            path.display().to_string().replace(' ', "%20")
+        ));
+        assert_eq!(url.images().len(), 1);
+    }
+
+    #[test]
+    fn a_pasted_text_path_stays_text() {
+        let (dir, _path) = image_fixture("shot.png");
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "notes").expect("text");
+        let mut pasted = reader();
+        pasted.paste(&text.display().to_string());
+        assert!(pasted.images().is_empty());
+        assert_eq!(pasted.line(), text.display().to_string());
+        let missing = dir.path().join("gone.png");
+        let mut absent = reader();
+        absent.paste(&missing.display().to_string());
+        assert!(absent.images().is_empty());
+    }
+
+    #[test]
+    fn poll_choice_key_reports_plain_characters() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(reader.choice_event(plain), Some(ChoiceKey::Char('y')));
+        let shifted = Event::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+        assert_eq!(reader.choice_event(shifted), Some(ChoiceKey::Char('Y')));
+        let control = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            reader.choice_event(control),
+            Some(ChoiceKey::Action(KeyAction::Cancel))
+        );
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            reader.choice_event(enter),
+            Some(ChoiceKey::Action(KeyAction::Submit))
+        );
+        assert_eq!(reader.choice_event(Event::Paste("y".to_owned())), None);
+        assert_eq!(reader.line(), "draft");
+
+        // In the approval keys a bound key reports its action, and a key file
+        // moves it.
+        reader.set_context(Context::Approval);
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('y'))),
+            Some(ChoiceKey::Bound("approve_once"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Esc)),
+            Some(ChoiceKey::Bound("deny"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Tab)),
+            Some(ChoiceKey::Bound("deny_with_message"))
+        );
+        let mut file = std::collections::BTreeMap::new();
+        file.insert("approve_once".to_owned(), vec!["o".to_owned()]);
+        reader.set_keymap(Keymap::with_overrides(&file).expect("valid"));
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('o'))),
+            Some(ChoiceKey::Bound("approve_once"))
+        );
+        assert_eq!(
+            reader.choice_event(key(KeyCode::Char('y'))),
+            Some(ChoiceKey::Char('y'))
+        );
+    }
+
+    #[test]
+    fn question_mark_opens_help_only_on_an_empty_idle_draft() {
+        let mut reader = reader();
+        reader.set_context(Context::Editor);
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(reader.apply(question), KeyAction::Help);
+        assert_eq!(reader.line(), "");
+        reader.replace("why");
+        assert_eq!(reader.apply(question), KeyAction::Ignored);
+        assert_eq!(reader.line(), "why?");
+        reader.clear();
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(question), KeyAction::Ignored);
+        assert_eq!(reader.line(), "?");
+    }
+
+    #[test]
+    fn ctrl_t_toggles_the_plan_at_the_prompt_and_during_a_turn() {
+        let mut reader = reader();
+        reader.replace("draft");
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(reader.apply(ctrl_t), KeyAction::TogglePlan);
+        assert_eq!(reader.line(), "draft");
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(ctrl_t), KeyAction::TogglePlan);
+        assert_eq!(reader.line(), "draft");
     }
 
     #[test]
@@ -1414,5 +2621,123 @@ mod tests {
         let mut reader = reader();
         typed(&mut reader, "書");
         assert_eq!(reader.column(), 2);
+    }
+
+    #[test]
+    fn ctrl_o_on_a_chip_expands_it() {
+        let mut reader = reader();
+        reader.set_context(Context::Editor);
+        typed(&mut reader, "x ");
+        reader.paste("one\ntwo\nthree\nfour");
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        assert_eq!(reader.expanded_line(), "x one\ntwo\nthree\nfour");
+        assert!(reader.caret_on_chip());
+        assert_eq!(reader.apply(control('o')), KeyAction::ExpandChip);
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        assert!(reader.expand_chip_at_caret());
+        assert_eq!(reader.line(), "x one\ntwo\nthree\nfour");
+        // Off the chip, and always during a turn, the key opens the viewer.
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "x [pasted #1: 4 lines]");
+        reader.set_context(Context::Turn);
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+        reader.set_context(Context::Editor);
+        reader.apply(key(KeyCode::Home));
+        assert_eq!(reader.apply(control('o')), KeyAction::Transcript);
+    }
+
+    #[test]
+    fn burst_enter_inserts_a_newline() {
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        for (ms, code) in [
+            (0, KeyCode::Char('a')),
+            (2, KeyCode::Char('b')),
+            (4, KeyCode::Enter),
+            (6, KeyCode::Char('c')),
+            (8, KeyCode::Char('d')),
+        ] {
+            assert_eq!(reader.apply_at(key(code), at(ms)), KeyAction::Ignored);
+        }
+        assert_eq!(reader.line(), "ab\ncd");
+        // Inside the grace after the last pasted key Enter is still text,
+        // and Tab is a tab rather than a completion.
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Tab), at(100)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(110)),
+            KeyAction::Ignored
+        );
+        assert_eq!(reader.line(), "ab\ncd\t\n");
+        // After it, Enter submits again.
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(400)),
+            KeyAction::Submit
+        );
+    }
+
+    #[test]
+    fn slow_typing_is_not_a_burst() {
+        let mut plain = reader();
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Char('a')), at(0)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Char('b')), at(90)),
+            KeyAction::Ignored
+        );
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(180)),
+            KeyAction::Submit
+        );
+        assert_eq!(reader.line(), "ab");
+        // Two quick keys are not yet a burst.
+        reader.clear();
+        reader.apply_at(key(KeyCode::Char('o')), at(1000));
+        assert_eq!(
+            reader.apply_at(key(KeyCode::Enter), at(1003)),
+            KeyAction::Submit
+        );
+        // Off, as it is by default where the terminal brackets pastes, a
+        // fast Enter submits.
+        typed(&mut plain, "ab");
+        assert_eq!(
+            plain.apply_at(key(KeyCode::Enter), at(0)),
+            KeyAction::Submit
+        );
+    }
+
+    #[test]
+    fn a_large_burst_becomes_a_chip_when_it_ends() {
+        let mut reader = reader();
+        reader.burst_enabled = true;
+        typed(&mut reader, "see ");
+        let start = Instant::now();
+        let mut ms = 1000u64;
+        for line in ["l1", "l2", "l3", "l4"] {
+            for c in line.chars() {
+                reader.apply_at(key(KeyCode::Char(c)), start + Duration::from_millis(ms));
+                ms += 1;
+            }
+            reader.apply_at(key(KeyCode::Enter), start + Duration::from_millis(ms));
+            ms += 1;
+        }
+        assert_eq!(reader.line(), "see l1\nl2\nl3\nl4\n");
+        reader.end_burst();
+        assert_eq!(reader.line(), "see [pasted #1: 4 lines]");
+        assert_eq!(reader.expanded_line(), "see l1\nl2\nl3\nl4\n");
+        // The collapse is one edit.
+        reader.apply(control('_'));
+        assert_eq!(reader.line(), "see l1\nl2\nl3\nl4\n");
     }
 }

@@ -206,18 +206,31 @@ fn completion_prints_only_a_script_without_loading_paths_or_config() {
 fn completion_rejects_missing_unsupported_and_extra_shell_arguments() {
     for args in [
         &["completion"][..],
-        &["completion", "fish"][..],
+        &["completion", "tcsh"][..],
         &["completion", "bash", "extra"][..],
     ] {
         let output = run(args);
         assert_eq!(output.status, Some(1), "{args:?}");
         assert!(output.stdout.is_empty(), "{}", output.stdout);
-        assert!(output.stderr.contains("shell"), "{}", output.stderr);
-        assert!(output.stderr.contains("rune completion bash"));
+        assert!(
+            output
+                .stderr
+                .contains("expected one supported shell: bash, zsh, fish or powershell"),
+            "{}",
+            output.stderr
+        );
+        assert!(
+            output
+                .stderr
+                .contains("use rune completion zsh, for example")
+        );
     }
     let help = run(&["completion", "--help"]);
     assert_eq!(help.status, Some(0));
-    assert!(help.stdout.contains("rune completion bash"));
+    assert!(
+        help.stdout
+            .contains("rune completion <bash|zsh|fish|powershell>")
+    );
 }
 
 #[test]
@@ -937,22 +950,28 @@ fn usage_period_flag_filters_the_ledger_to_seven_days() {
 }
 
 #[test]
-fn doctor_passes_on_a_clean_setup() {
+fn doctor_names_the_missing_provider_and_exits_one() {
     let out = run(&["doctor"]);
     assert_eq!(
         out.status,
-        Some(0),
+        Some(1),
         "stdout: {}\nstderr: {}",
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("ok "), "{}", out.stdout);
+    assert!(out.stdout.contains("ok      version"), "{}", out.stdout);
+    assert!(out.stdout.contains("problem provider"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("        fix: run rune connect"),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
 fn doctor_json_is_parseable_and_names_every_check() {
     let out = run(&["doctor", "--json"]);
-    assert_eq!(out.status, Some(0));
+    assert_eq!(out.status, Some(1));
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     let checks = value["checks"].as_array().expect("checks array");
     assert!(!checks.is_empty());
@@ -966,7 +985,7 @@ fn doctor_json_is_parseable_and_names_every_check() {
 }
 
 #[test]
-fn doctor_reports_an_unconfigured_provider_as_unknown_not_failed() {
+fn doctor_reports_an_unconfigured_provider_as_a_problem() {
     let out = run(&["doctor", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     let checks = value["checks"].as_array().expect("checks array");
@@ -974,7 +993,7 @@ fn doctor_reports_an_unconfigured_provider_as_unknown_not_failed() {
         .iter()
         .find(|check| check["name"] == "provider")
         .expect("provider check");
-    assert_eq!(provider["outcome"], "unknown");
+    assert_eq!(provider["outcome"], "fail");
     assert!(
         provider["hint"]
             .as_str()
@@ -1083,7 +1102,7 @@ fn permissions_explanations_preserve_positional_and_text_output() {
     assert_eq!(flagged.stdout, positional.stdout);
     assert_eq!(
         flagged.stdout,
-        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer)\n"
+        "shell `pwd`: allowed (allow: matched `shell pwd` at the default layer); source: built in\n"
     );
 
     let json = run(&["permissions", "shell", "pwd", "--json"]);
@@ -1750,6 +1769,15 @@ fn an_unknown_workspace_subcommand_is_rejected() {
 }
 
 #[test]
+fn prompt_show_has_no_run_context() {
+    // The headless note goes in `ask`'s user turn, never the system prompt.
+    let out = run(&["--offline", "prompt", "--show"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    assert!(!out.stdout.is_empty());
+    assert!(!out.stdout.contains("run_context"), "{}", out.stdout);
+}
+
+#[test]
 fn prompt_reports_the_built_in_source() {
     let out = run(&["prompt"]);
     assert_eq!(out.status, Some(0));
@@ -1876,6 +1904,9 @@ impl Listener {
     }
 }
 
+/// A remote endpoint, which offline mode refuses before resolving its name.
+const REMOTE_BASE_URL: (&str, &str) = ("RUNE_BASE_URL", "https://provider.example.invalid/v1");
+
 /// Runs the binary against a provider served at the listener's port.
 fn run_against(
     listener: &Listener,
@@ -1916,12 +1947,13 @@ fn run_against(
 #[test]
 fn offline_after_the_command_refuses_the_request() {
     // Offline after the command refuses the request just as it does before it.
+    // A loopback server is still reached offline, so the endpoint is remote.
     let listener = Listener::start();
     for args in [
         vec!["ask", "--offline", "hi"],
         vec!["ask", "hi", "--offline"],
     ] {
-        let out = run_against(&listener, Some("m"), &[], &args);
+        let out = run_against(&listener, Some("m"), &[REMOTE_BASE_URL], &args);
         assert_eq!(out.status, Some(1), "{args:?}: {}", out.stderr);
         assert!(out.stderr.contains("disabled"), "{args:?}: {}", out.stderr);
     }
@@ -1934,6 +1966,16 @@ fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let config_dir = dir.path().join("config").join("rune");
     std::fs::create_dir_all(&config_dir).expect("mkdir");
+    // Private, as Rune creates it: `ask` opens its session before the first
+    // request, and a session refuses a configuration directory others can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for private in [dir.path().join("config"), config_dir.clone()] {
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+                .expect("private configuration directory");
+        }
+    }
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
@@ -1941,14 +1983,14 @@ fn offline_in_the_user_file_preserves_the_model_and_refuses_requests() {
 offline = true
 web_tools = true
 provider = "chat_completions"
-base_url = "http://127.0.0.1:{}/v1"
+base_url = "{}"
 api_key_env = "RUNE_CLI_TEST_KEY"
 [models]
 chat_completions = "configured-model"
 [limits]
 provider_request_timeout_ms = 1000
 "#,
-            listener.port
+            REMOTE_BASE_URL.1
         ),
     )
     .expect("write config");
@@ -1993,7 +2035,7 @@ fn a_model_named_after_the_command_is_used() {
     let out = run_against(
         &listener,
         None,
-        &[],
+        &[REMOTE_BASE_URL],
         &["ask", "--model", "m", "--offline", "hi"],
     );
     assert!(
@@ -2042,6 +2084,42 @@ fn listing_models_offline_reports_the_configured_model_without_a_request() {
         0,
         "an offline listing reached the endpoint"
     );
+}
+
+#[test]
+fn models_explain_names_the_rule_for_each_setting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let explain = |args: &[&str]| {
+        config_mutation_command(root)
+            .env("RUNE_PROVIDER", "deepseek")
+            .env("RUNE_MODEL", "deepseek-flash")
+            .args(args)
+            .output()
+            .expect("models --explain")
+    };
+
+    let out = explain(&["--offline", "models", "--explain"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|line| line.contains("thinking_format")
+            && line.contains("deepseek")
+            && line.contains("preset deepseek")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("model     deepseek-flash"), "{stdout}");
+
+    let out = explain(&["--offline", "models", "--explain", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(value["provider"], "deepseek");
+    assert_eq!(value["model"], "deepseek-flash");
+    assert_eq!(value["compat"].as_array().map(Vec::len), Some(17));
+    assert!(value["traits"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row["field"] == "family" && row["value"] == "deepseek")
+    }));
 }
 
 /// Runs `rune connect` for a machine caller, with or without the key exported.
@@ -2102,6 +2180,54 @@ fn connecting_with_the_key_exported_succeeds() {
             .contains("rune connect anthropic --model <id>")
     );
     assert!(!out.stdout.contains("sk-ant-test"), "{}", out.stdout);
+}
+
+#[test]
+fn an_alias_or_a_number_connects_under_the_preset_name() {
+    for (named, preset, variable, endpoint) in [
+        (
+            "kimi",
+            "moonshot",
+            "MOONSHOT_API_KEY",
+            "https://api.moonshot.ai/v1",
+        ),
+        (
+            "4",
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com",
+        ),
+    ] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let output = Command::new(binary())
+            .args(["connect", named, "--json"])
+            .isolated_env()
+            .env("HOME", dir.path())
+            .env("RUNE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env(variable, "scratch-key")
+            .output()
+            .expect("run binary");
+        assert!(
+            output.status.success(),
+            "{named}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+        assert_eq!(value["provider"], preset, "{named}");
+        let saved =
+            std::fs::read_to_string(dir.path().join("config").join("rune").join("config.toml"))
+                .expect("config written");
+        assert!(
+            saved.contains(&format!("provider = \"{preset}\"")),
+            "{named}: {saved}"
+        );
+        assert!(
+            saved.contains(&format!("base_url = \"{endpoint}\"")),
+            "{named}: {saved}"
+        );
+    }
 }
 
 #[test]
@@ -2361,7 +2487,7 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
     let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
     let path = root.join("config/rune/config.toml");
     rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("directory");
-    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    rune_core::paths::write_private(&path, "offline = 'maybe'\n").expect("config");
     for args in [
         vec!["auth"],
         vec!["auth", "--json"],
@@ -2378,7 +2504,7 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
         let error = String::from_utf8(out.stderr).expect("stderr");
         assert!(
             error.contains("user configuration")
-                && error.contains("unknown field `model`")
+                && error.contains("offline = 'maybe'")
                 && error.contains("rune doctor"),
             "{args:?}: {error}"
         );
@@ -2389,5 +2515,953 @@ fn malformed_user_config_names_the_field_for_provider_commands() {
         .output()
         .expect("doctor");
     let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor report");
-    assert!(report.to_string().contains("unknown field `model`"));
+    assert!(
+        report.to_string().contains("expected a boolean"),
+        "{report}"
+    );
+
+    // An unknown key costs only itself, and doctor names it.
+    rune_core::paths::write_private(&path, "model = 'wrong-key'\n").expect("config");
+    let doctor = config_mutation_command(root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(report.contains("unknown key model"), "{report}");
+    assert!(report.contains("did you mean models?"), "{report}");
+}
+
+#[test]
+fn trace_flag_writes_pairs_for_an_ask_run() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("a.txt"), "alpha\n").expect("a.txt");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("c1", "read_file", r#"{"path":"a.txt"}"#),
+        Turn::text("done"),
+    ]);
+    let trace = root.join("trace");
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", root.join("home"))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", provider.base_url())
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_TRACE_TEST_KEY")
+        .env("RUNE_TRACE_TEST_KEY", "test-key")
+        .current_dir(&workspace)
+        .arg("--trace")
+        .arg(&trace)
+        .args(["ask", "Read a.txt."])
+        .output()
+        .expect("ask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("rune: tracing provider requests to")
+            && stderr.contains("(credentials redacted)"),
+        "{stderr}"
+    );
+    assert_eq!(provider.request_count(), 2);
+
+    let mut names: Vec<String> = std::fs::read_dir(&trace)
+        .expect("trace directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "0001-request.json",
+            "0001-response.txt",
+            "0002-request.json",
+            "0002-response.txt",
+        ]
+    );
+    for name in &names {
+        let text = std::fs::read_to_string(trace.join(name)).expect("trace file");
+        assert!(!text.contains("test-key"), "{name} holds the credential");
+    }
+    let request: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(trace.join("0002-request.json")).expect("request"),
+    )
+    .expect("request json");
+    assert!(
+        request["url"]
+            .as_str()
+            .expect("url")
+            .ends_with("/chat/completions")
+    );
+    assert_eq!(request["headers"]["authorization"], "[REDACTED]");
+    assert_eq!(request["body"]["model"], "scripted");
+    let response = std::fs::read_to_string(trace.join("0001-response.txt")).expect("response");
+    assert!(response.starts_with("status: 200\n\n"), "{response}");
+    assert!(response.contains("read_file"), "{response}");
+}
+
+/// Runs `rune config ...` against one user file.
+fn config_command(
+    root: &camino::Utf8Path,
+    path: &camino::Utf8Path,
+    args: &[&str],
+) -> std::process::Output {
+    config_mutation_command(root)
+        .arg("config")
+        .args(args)
+        .env("RUNE_CONFIG", path)
+        .output()
+        .expect("config")
+}
+
+fn private_file(path: &camino::Utf8Path, text: &str) {
+    rune_core::paths::create_dir_private(path.parent().expect("parent")).expect("parent");
+    rune_core::paths::write_private(path, text).expect("write");
+}
+
+#[test]
+fn config_set_edits_one_line_and_keeps_the_rest() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    let before = "# my settings\n\ntheme   =   \"light\"   # old\n  effort = 'low'\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n";
+    private_file(&path, before);
+    let out = config_command(root, &path, &["set", "theme", "dark"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("set theme = \"dark\" in {path}\n")
+    );
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        after,
+        before.replace("theme   =   \"light\"   # old", "theme = \"dark\"")
+    );
+
+    // A value of the wrong type is refused and the file is left alone.
+    let refused = config_command(root, &path, &["set", "offline", "maybe"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+
+    let table = config_command(root, &path, &["set", "models", "x"]);
+    assert!(!table.status.success());
+    assert!(
+        String::from_utf8_lossy(&table.stderr)
+            .contains("models is not a single value; use rune config edit"),
+        "{table:?}"
+    );
+
+    let typo = config_command(root, &path, &["set", "permision_mode", "ask"]);
+    assert_eq!(typo.status.code(), Some(2), "{typo:?}");
+    let stderr = String::from_utf8_lossy(&typo.stderr);
+    assert!(
+        stderr.contains("unknown setting permision_mode"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did you mean permission_mode?"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), after);
+}
+
+#[test]
+fn config_set_inserts_before_the_first_table() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(
+        &path,
+        "# top\neffort = \"low\"\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n",
+    );
+    let out = config_command(root, &path, &["set", "offline", "yes"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# top\neffort = \"low\"\noffline = true\n\n[pre_tool_hook]\nname = \"guard\"\nargv = [\"true\"]\n"
+    );
+
+    // A file of comments only gets the line at the top.
+    let comments = root.join("custom/comments.toml");
+    private_file(&comments, "# one\n# two\n");
+    let out = config_command(root, &comments, &["set", "theme", "dark"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&comments).expect("read"),
+        "theme = \"dark\"\n# one\n# two\n"
+    );
+}
+
+#[test]
+fn config_unset_removes_the_line() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(&path, "# keep\ntheme = \"dark\"\neffort = \"low\"\n");
+    let out = config_command(root, &path, &["unset", "theme"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# keep\neffort = \"low\"\n"
+    );
+    let again = config_command(root, &path, &["unset", "theme"]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains(&format!("theme is not set in {path}")),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn config_get_prints_value_and_source_json() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("custom/config.toml");
+    private_file(&path, "theme = \"dark\"\nbogus_key = 1\n");
+    let text = config_command(root, &path, &["get", "theme"]);
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "dark\n");
+    let json = config_command(root, &path, &["get", "theme", "--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(
+        value,
+        serde_json::json!({"key": "theme", "value": "dark", "source": "user"})
+    );
+    let unknown = config_command(root, &path, &["get", "them"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("unknown setting them"), "{stderr}");
+    assert!(stderr.contains("did you mean theme?"), "{stderr}");
+}
+
+#[test]
+fn config_path_honours_rune_config() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+    let path = root.join("elsewhere/settings.toml");
+    let text = config_command(root, &path, &["path"]);
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), format!("{path}\n"));
+    let json = config_command(root, &path, &["path", "--json"]);
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(value["path"], path.as_str());
+    assert!(
+        value["project"]
+            .as_str()
+            .is_some_and(|project| project.ends_with(".rune.toml")),
+        "{value}"
+    );
+}
+
+/// Runs `rune projects` in `workspace`, with state under it.
+fn projects(workspace: &std::path::Path, args: &[&str]) -> Output {
+    let output = Command::new(binary())
+        .isolated_env()
+        .arg("projects")
+        .args(args)
+        .env("HOME", workspace)
+        .env("RUNE_HOME", workspace.join("state"))
+        .env("XDG_CONFIG_HOME", workspace.join("config"))
+        .env("XDG_DATA_HOME", workspace.join("data"))
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run binary");
+    Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+const PROJECT_HOOKS: &str = "[[hooks]]\nevent = 'pre_tool'\nname = 'guard'\n\
+    argv = ['/bin/sh', '-c', 'echo checked']\n\
+    [[hooks]]\nevent = 'turn_end'\nname = 'lint'\nargv = ['/bin/sh', 'lint.sh']\n";
+
+fn write_project_hooks(workspace: &std::path::Path, body: &str) {
+    std::fs::create_dir_all(workspace.join(".rune")).expect("project directory");
+    std::fs::write(workspace.join(".rune/hooks.toml"), body).expect("hooks file");
+}
+
+fn explain_in(workspace: &std::path::Path, action: &str) -> serde_json::Value {
+    let output = Command::new(binary())
+        .isolated_env()
+        .args(["permissions", "--explain", action, "--json"])
+        .env("HOME", workspace)
+        .env("RUNE_HOME", workspace.join("state"))
+        .env("XDG_CONFIG_HOME", workspace.join("config"))
+        .env("XDG_DATA_HOME", workspace.join("data"))
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run binary");
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).expect("JSON")
+}
+
+#[test]
+fn projects_approve_lists_and_approves_project_allow_rules() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join(".rune.toml"),
+        "[[permission.rules]]\ntool = 'shell'\nmatch = 'curl*'\ndecision = 'allow'\n\n\
+         [[permission.rules]]\ntool = 'shell'\nmatch = 'rm *'\ndecision = 'deny'\n",
+    )
+    .expect("project file");
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project allow rules: not approved\n  allow shell \"curl*\"\n"),
+        "{}",
+        status.stdout
+    );
+    assert!(!status.stdout.contains("rm *"), "{}", status.stdout);
+    // The deny applies at once; the allow does not.
+    assert_eq!(explain_in(dir.path(), "shell:rm -rf x")["outcome"], "deny");
+    let curl = explain_in(dir.path(), "shell:curl https://example.com");
+    assert_eq!(curl["outcome"], "ask", "{curl}");
+
+    let refused = projects(dir.path(), &["approve"]);
+    assert_eq!(refused.status, Some(0), "{}", refused.stderr);
+    assert!(
+        refused.stdout.contains(
+            "project allow rules not approved: pass --yes to approve them without a prompt"
+        ),
+        "{}",
+        refused.stdout
+    );
+    let approved = projects(dir.path(), &["approve", "--yes"]);
+    assert_eq!(approved.status, Some(0), "{}", approved.stderr);
+    assert!(
+        approved
+            .stdout
+            .contains("approved the allow rules in .rune.toml"),
+        "{}",
+        approved.stdout
+    );
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status.stdout.contains("project allow rules: approved\n"),
+        "{}",
+        status.stdout
+    );
+    let curl = explain_in(dir.path(), "shell:curl https://example.com");
+    assert_eq!(curl["outcome"], "allow", "{curl}");
+    assert_eq!(curl["source"], "project", "{curl}");
+}
+
+#[test]
+fn projects_status_lists_project_hook_commands() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let none = projects(dir.path(), &["status"]);
+    assert_eq!(none.status, Some(0), "{}", none.stderr);
+    assert!(
+        none.stdout.contains("project hooks: none\n"),
+        "{}",
+        none.stdout
+    );
+
+    write_project_hooks(dir.path(), PROJECT_HOOKS);
+    let out = projects(dir.path(), &["status"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.contains(
+            "project hooks: not approved (2 hooks)\n  pre_tool guard: /bin/sh -c \"echo checked\"\n  turn_end lint: /bin/sh lint.sh\n"
+        ),
+        "{}",
+        out.stdout
+    );
+
+    write_project_hooks(dir.path(), "model = 'other'\n");
+    let malformed = projects(dir.path(), &["status"]);
+    assert_eq!(malformed.status, Some(0), "{}", malformed.stderr);
+    assert!(
+        malformed
+            .stdout
+            .contains("project hooks: none\n  .rune/hooks.toml was ignored: "),
+        "{}",
+        malformed.stdout
+    );
+}
+
+#[test]
+fn projects_approve_without_a_terminal_needs_yes() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    write_project_hooks(dir.path(), PROJECT_HOOKS);
+
+    let refused = projects(dir.path(), &["approve"]);
+    assert_eq!(refused.status, Some(0), "{}", refused.stderr);
+    assert!(refused.stdout.contains("approved "), "{}", refused.stdout);
+    assert!(
+        refused
+            .stdout
+            .contains("  pre_tool guard: /bin/sh -c \"echo checked\"\n"),
+        "{}",
+        refused.stdout
+    );
+    assert!(
+        refused
+            .stdout
+            .contains("project hooks not approved: pass --yes to approve them without a prompt"),
+        "{}",
+        refused.stdout
+    );
+    let status = projects(dir.path(), &["status"]);
+    assert!(status.stdout.contains(": approved\n"), "{}", status.stdout);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+
+    let approved = projects(dir.path(), &["approve", "--yes"]);
+    assert_eq!(approved.status, Some(0), "{}", approved.stderr);
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status.stdout.contains("project hooks: approved\n"),
+        "{}",
+        status.stdout
+    );
+
+    // One changed argument needs approval again.
+    write_project_hooks(dir.path(), &PROJECT_HOOKS.replace("lint.sh", "lint2.sh"));
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+
+    assert_eq!(projects(dir.path(), &["approve", "--yes"]).status, Some(0));
+    let reset = projects(dir.path(), &["reset"]);
+    assert_eq!(reset.status, Some(0), "{}", reset.stderr);
+    let status = projects(dir.path(), &["status"]);
+    assert!(
+        status
+            .stdout
+            .contains("project hooks: not approved (2 hooks)"),
+        "{}",
+        status.stdout
+    );
+}
+
+/// Runs `rune keys` with a config root that holds `keys` as `keys.toml`.
+fn keys(file: Option<&str>, args: &[&str]) -> (Output, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let config = dir.path().join("config").join("rune");
+    std::fs::create_dir_all(&config).expect("config root");
+    let path = config.join("keys.toml");
+    if let Some(text) = file {
+        std::fs::write(&path, text).expect("keys file");
+    }
+    let output = Command::new(binary())
+        .arg("keys")
+        .args(args)
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .output()
+        .expect("run binary");
+    let output = Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    (output, path)
+}
+
+#[test]
+fn keys_lists_every_action() {
+    let (output, _) = keys(None, &["--json"]);
+    assert_eq!(output.status, Some(0), "{}", output.stderr);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&output.stdout).expect("json");
+    assert_eq!(rows.len(), rune_term::keys::ACTIONS.len());
+    let queue = rows
+        .iter()
+        .find(|row| row["id"] == "queue")
+        .expect("queue row");
+    assert_eq!(queue["context"], "turn");
+    assert_eq!(queue["keys"], serde_json::json!(["tab"]));
+    assert!(queue["summary"].is_string());
+
+    let (output, path) = keys(Some("queue = \"ctrl+q\"\n"), &[]);
+    assert_eq!(output.status, Some(0), "{}", output.stderr);
+    let mut lines = output.stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("keys file: {} (present)", path.display()).as_str())
+    );
+    let row = lines
+        .find(|line| line.starts_with("queue "))
+        .expect("queue row");
+    assert_eq!(
+        row,
+        format!(
+            "{:<20} {:<9} ctrl+q  queue the draft for after this turn",
+            "queue", "turn"
+        )
+    );
+
+    let (output, _) = keys(None, &[]);
+    assert!(
+        output.stdout.starts_with("keys file: "),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .ends_with(" (absent)")
+    );
+}
+
+#[test]
+fn an_invalid_keys_file_fails_with_the_path() {
+    let (output, path) = keys(Some("transcript = \"ctrl+r\"\n"), &[]);
+    assert_eq!(output.status, Some(1), "{}", output.stdout);
+    assert!(
+        output.stderr.contains(
+            "`ctrl+r` is bound to both `history_search` and `transcript` in the editor keys"
+        ),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains(&format!("fix {} or remove it", path.display())),
+        "{}",
+        output.stderr
+    );
+}
+
+#[test]
+fn sessions_prune_requires_older_than() {
+    let out = run(&["sessions", "prune"]);
+    assert_ne!(out.status, Some(0), "{}", out.stdout);
+    assert!(
+        out.stderr
+            .contains("--older-than is required; nothing is pruned automatically"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn sessions_prune_dry_run_lists_old_sessions() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    // One recent session and two from long ago, the older one older still.
+    for (raw, age) in [
+        ("prunenew0001", None),
+        ("pruneold0001", Some(2_000)),
+        ("pruneold0002", Some(1_000)),
+    ] {
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::UserMessage {
+                text: format!("prompt {raw}"),
+            })
+            .expect("save message");
+        drop(store);
+        if let Some(stamp) = age {
+            let log = paths.session_dir(&id).join("events.jsonl");
+            let text = std::fs::read_to_string(&log).expect("log");
+            let mut rewritten = String::new();
+            for line in text.lines() {
+                let mut frame: serde_json::Value = serde_json::from_str(line).expect("frame");
+                frame["timestamp_ms"] = serde_json::json!(stamp);
+                rewritten.push_str(&frame.to_string());
+                rewritten.push('\n');
+            }
+            std::fs::write(&log, rewritten).expect("rewrite");
+        }
+    }
+    let prune = |args: &[&str]| {
+        let out = Command::new(binary())
+            .args(["sessions", "prune"])
+            .args(args)
+            .env("RUNE_HOME", &paths.state_root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .output()
+            .expect("run binary");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let listed = prune(&["--older-than", "30", "--dry-run"]);
+    assert!(listed.contains("would remove pruneold0001"), "{listed}");
+    assert!(listed.contains("would remove pruneold0002"), "{listed}");
+    assert!(!listed.contains("prunenew0001"), "{listed}");
+    assert!(listed.contains("2 sessions, "), "{listed}");
+    // Nothing was removed.
+    for raw in ["prunenew0001", "pruneold0001", "pruneold0002"] {
+        let id: SessionId = raw.parse().expect("id");
+        assert!(paths.session_dir(&id).exists(), "{raw}");
+    }
+    // Keeping the two most recent leaves only the oldest to remove.
+    let value: serde_json::Value =
+        serde_json::from_str(&prune(&["--older-than", "30", "--keep", "2", "--json"]))
+            .expect("json");
+    assert_eq!(value["removed"], serde_json::json!(["pruneold0002"]));
+    assert_eq!(value["dry_run"], false);
+    let gone: SessionId = "pruneold0002".parse().expect("id");
+    assert!(!paths.session_dir(&gone).exists());
+    let kept: SessionId = "pruneold0001".parse().expect("id");
+    assert!(paths.session_dir(&kept).exists());
+}
+
+/// Runs `rune doctor --json` against a chat-completions provider at `base`.
+fn doctor_against(base: &str, extra: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = Command::new(binary())
+        .args(["doctor", "--json"])
+        .args(extra)
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", base)
+        .env("RUNE_MODEL", "doctor-model")
+        .env("RUNE_API_KEY_ENV", "RUNE_DOCTOR_TEST_KEY")
+        .env("RUNE_DOCTOR_TEST_KEY", "wrong-key")
+        .output()
+        .expect("run binary");
+    let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "doctor printed no report:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), report)
+}
+
+fn check_named<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} check: {report}"))
+}
+
+#[test]
+fn doctor_reports_a_refused_key() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let server = std::thread::spawn(move || {
+        // Every request the doctor makes is refused.
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            let body = r#"{"error":{"message":"invalid api key"}}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if String::from_utf8_lossy(&buffer[..read]).contains("x-stop") {
+                break;
+            }
+        }
+    });
+    let (code, report) = doctor_against(&format!("http://127.0.0.1:{port}/v1"), &[]);
+    assert_eq!(code, Some(1), "{report}");
+    let provider = check_named(&report, "provider");
+    assert_eq!(provider["outcome"], "fail", "{report}");
+    assert!(
+        provider["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("refused the key from $RUNE_DOCTOR_TEST_KEY")),
+        "{report}"
+    );
+    assert_eq!(provider["hint"], "run rune connect");
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port))
+        .and_then(|mut stream| stream.write_all(b"GET / HTTP/1.1\r\nx-stop: 1\r\n\r\n"));
+    let _ = server.join();
+}
+
+#[test]
+fn doctor_offline_contacts_nothing() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("address").port();
+    let (_, report) = doctor_against(&format!("http://127.0.0.1:{port}/v1"), &["--offline"]);
+    assert!(
+        listener.accept().is_err(),
+        "the doctor opened a connection offline"
+    );
+    for name in ["update", "clock", "provider"] {
+        assert_eq!(
+            check_named(&report, name)["outcome"],
+            "unknown",
+            "{name}: {report}"
+        );
+    }
+    assert!(
+        check_named(&report, "network")["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.ends_with("offline mode")),
+        "{report}"
+    );
+}
+
+/// Runs `rune` against a scripted chat completions provider in `dir`.
+fn run_scripted(dir: &std::path::Path, base_url: &str, args: &[&str]) -> Output {
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", dir.join("home"))
+        .env("RUNE_HOME", dir.join("state"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", base_url)
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_FIXTURE_KEY")
+        .env("RUNE_FIXTURE_KEY", "fixture-key")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run binary");
+    Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn doctor_provider_reports_every_check() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("call_1", "current_directory", "{}"),
+        Turn::text("workspace"),
+    ]);
+    let out = run_scripted(
+        dir.path(),
+        &provider.base_url(),
+        &["doctor", "--provider", "chat_completions"],
+    );
+    assert_eq!(out.status, Some(0), "{}\n{}", out.stdout, out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("sending 2 short requests to chat_completions (scripted); estimated cost unknown")
+    );
+    let expected = [
+        format!(
+            "provider   chat_completions (scripted) at {}",
+            provider.base_url()
+        ),
+        "reachable          ok".to_owned(),
+        "authenticated      ok".to_owned(),
+        "tool call parsed   ok".to_owned(),
+        "reasoning replay   not applicable (no reasoning)".to_owned(),
+        "cache fields       seen".to_owned(),
+        "cost               unknown".to_owned(),
+    ];
+    for line in &expected {
+        assert!(
+            lines.contains(&line.as_str()),
+            "missing {line:?} in\n{}",
+            out.stdout
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("usage reported     ok (input ")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("limits             context ")),
+        "{}",
+        out.stdout
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second: serde_json::Value = serde_json::from_str(&requests[1].body).expect("body");
+    let messages = second["messages"].as_array().expect("messages");
+    let answer = messages.last().expect("tool answer");
+    assert_eq!(answer["role"], "tool");
+    let name = dir
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("name");
+    assert!(answer["content"].to_string().contains(name), "{answer}");
+    assert_eq!(second["tools"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn doctor_provider_reports_a_refused_key() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(vec![Turn::http_error(
+        401,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )]);
+    let out = run_scripted(
+        dir.path(),
+        &provider.base_url(),
+        &["doctor", "--provider", "chat_completions", "--json"],
+    );
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("sending 2 short requests"),
+        "{}",
+        out.stderr
+    );
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["provider"], "chat_completions");
+    assert_eq!(value["model"], "scripted");
+    assert_eq!(value["endpoint"], provider.base_url());
+    assert!(value["cost_usd"].is_null());
+    let checks = value["checks"].as_array().expect("checks");
+    let status = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .map(|check| check["status"].as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
+    assert_eq!(status("reachable"), "ok");
+    assert_eq!(status("authenticated"), "failed");
+    assert_eq!(status("tool call parsed"), "not_applicable");
+    assert_eq!(status("usage reported"), "not_applicable");
+    assert_eq!(provider.request_count(), 1);
+}
+
+#[test]
+fn doctor_without_provider_sends_nothing() {
+    use rune_testkit::scripted::ScriptedProvider;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(Vec::new());
+    let out = run_scripted(dir.path(), &provider.base_url(), &["doctor"]);
+    assert!(!out.stdout.contains("sending"), "{}", out.stdout);
+    assert!(out.stdout.contains("provider"), "{}", out.stdout);
+    assert_eq!(provider.request_count(), 0);
+}
+
+#[test]
+fn doctor_provider_offline_refuses_a_public_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_scripted(
+        dir.path(),
+        "https://api.example.com/v1",
+        &["--offline", "doctor", "--provider", "chat_completions"],
+    );
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stdout
+            .contains("reachable          failed: outbound requests are disabled"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("authenticated      not applicable"),
+        "{}",
+        out.stdout
+    );
+}
+
+/// The key never reaches a trace file: not in the request headers, and not in
+/// a tool result that printed it.
+#[test]
+fn traces_redact_the_key() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let key = "sk-trace-credential-0123456789";
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("key.txt"), format!("{key}\n")).expect("key.txt");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("c1", "read_file", r#"{"path":"key.txt"}"#),
+        Turn::text("done"),
+    ]);
+    let trace = root.join("trace");
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", root.join("home"))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", provider.base_url())
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_TRACE_TEST_KEY")
+        .env("RUNE_TRACE_TEST_KEY", key)
+        .current_dir(&workspace)
+        .arg("--trace")
+        .arg(&trace)
+        .args(["ask", "Read key.txt."])
+        .output()
+        .expect("ask");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut files = 0;
+    for entry in std::fs::read_dir(&trace).expect("trace directory") {
+        let text = std::fs::read_to_string(entry.expect("entry").path()).expect("trace file");
+        assert!(!text.contains(key), "{text}");
+        files += 1;
+    }
+    assert_eq!(files, 4);
+    assert!(
+        provider.requests()[1]
+            .body
+            .contains("[redacted credential]")
+    );
 }

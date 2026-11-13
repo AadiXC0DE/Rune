@@ -711,17 +711,32 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
     let mut native_assistant = false;
+    let mut queue = rune_agent::history::JournalQueue::default();
 
     for frame in rune_session::replay::replay_events(frames) {
+        if let Some(entry) = journal_entry(&frame.event) {
+            queue.push(entry);
+            queue.apply_ready(&mut history);
+            continue;
+        }
         match &frame.event {
             // Model settings are metadata, not conversation boundaries. A
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
+            // A workspace snapshot can be written while a tool batch runs.
+            SessionEvent::WorkspaceCheckpoint { .. } | SessionEvent::Restored { .. } => {}
+            // The call it describes is already recorded as it ran.
+            SessionEvent::ToolCallRepaired { .. } => {}
             SessionEvent::AssistantContent { message } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 if let Ok(message) = serde_json::from_str::<rune_net::message::Message>(message) {
-                    history.push_assistant_with_replay(message.parts, message.replay);
+                    history.push_assistant_with_replay(
+                        message.parts,
+                        message.replay,
+                        message.origin,
+                    );
+                    queue.apply_ready(&mut history);
                     native_assistant = true;
                 }
             }
@@ -737,7 +752,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             } => {
                 // A result run always follows the calls it answers, so a new
                 // call closes the previous result group.
-                flush_results(&mut history, &mut results);
+                flush_results(&mut history, &mut results, &mut queue);
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     calls.push(ContentPart::ToolCall {
                         id,
@@ -751,7 +766,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 ok,
                 output,
             } => {
-                flush_calls(&mut history, &mut calls);
+                flush_calls(&mut history, &mut calls, &mut queue);
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     results.push(ContentPart::ToolResult {
                         id,
@@ -769,17 +784,22 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             }
             SessionEvent::UserMessage { text } => {
                 native_assistant = false;
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 history.push_user(text.clone());
+                queue.apply_ready(&mut history);
             }
             SessionEvent::AssistantMessage { text, .. } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 if !text.is_empty() {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
+                    queue.apply_ready(&mut history);
                 }
             }
+            SessionEvent::HarnessNote { .. }
+            | SessionEvent::Checkpoint { .. }
+            | SessionEvent::ResultReplaced { .. } => {}
             SessionEvent::AssistantDelta { .. }
             | SessionEvent::AssistantReset { .. }
             | SessionEvent::TurnInterrupted { .. }
@@ -796,30 +816,82 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
             }
         }
     }
-    flush_calls(&mut history, &mut calls);
-    flush_results(&mut history, &mut results);
+    flush_calls(&mut history, &mut calls, &mut queue);
+    flush_results(&mut history, &mut results, &mut queue);
+    queue.apply_ready(&mut history);
     history
 }
 
+/// Decodes a journaled history change; `None` for any other event.
+fn journal_entry(event: &SessionEvent) -> Option<rune_agent::turn::JournalEntry> {
+    use rune_agent::turn::{JournalEntry, NotePlacement};
+    match event.clone() {
+        SessionEvent::HarnessNote {
+            at,
+            placement,
+            text,
+        } => Some(JournalEntry::Note {
+            at,
+            placement: match placement {
+                rune_session::NotePlacement::PromptPrefix => NotePlacement::PromptPrefix,
+                rune_session::NotePlacement::PromptSuffix => NotePlacement::PromptSuffix,
+                rune_session::NotePlacement::UserPart => NotePlacement::UserPart,
+                rune_session::NotePlacement::UserTurn => NotePlacement::UserTurn,
+                rune_session::NotePlacement::AssistantTurn => NotePlacement::AssistantTurn,
+            },
+            text,
+        }),
+        SessionEvent::Checkpoint {
+            at,
+            through,
+            message,
+        } => Some(JournalEntry::Checkpoint {
+            at,
+            through,
+            message,
+        }),
+        SessionEvent::ResultReplaced {
+            at,
+            call_id,
+            content,
+        } => Some(JournalEntry::ResultReplaced {
+            at,
+            call_id,
+            content,
+        }),
+        _ => None,
+    }
+}
+
 /// Appends the collected assistant turn, when there is one.
-fn flush_calls(history: &mut History, calls: &mut Vec<ContentPart>) {
+fn flush_calls(
+    history: &mut History,
+    calls: &mut Vec<ContentPart>,
+    queue: &mut rune_agent::history::JournalQueue,
+) {
     if calls.is_empty() {
         return;
     }
     history.push_assistant(std::mem::take(calls));
+    queue.apply_ready(history);
 }
 
 /// Appends the collected tool results, when there are any.
-fn flush_results(history: &mut History, results: &mut Vec<ContentPart>) {
+fn flush_results(
+    history: &mut History,
+    results: &mut Vec<ContentPart>,
+    queue: &mut rune_agent::history::JournalQueue,
+) {
     if results.is_empty() {
         return;
     }
     history.push_tool_results(std::mem::take(results));
+    queue.apply_ready(history);
 }
 
 /// Formats milliseconds since the epoch as an ISO 8601 timestamp.
@@ -1550,6 +1622,65 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(history.to_messages()[0].text().contains(text));
         history.validate().expect("valid pinned history");
+    }
+
+    #[test]
+    fn acp_history_applies_checkpoints() {
+        let text = |text: &str| SessionEvent::UserMessage {
+            text: text.to_owned(),
+        };
+        let answer = |text: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            text: text.to_owned(),
+        };
+        let frames: Vec<_> = [
+            text("first"),
+            SessionEvent::HarnessNote {
+                at: 0,
+                placement: rune_session::NotePlacement::PromptSuffix,
+                text: "NOTE".to_owned(),
+            },
+            answer("one"),
+            text("second"),
+            answer("two"),
+            SessionEvent::Checkpoint {
+                at: 4,
+                through: 2,
+                message: "<conversation-checkpoint>".to_owned(),
+            },
+            text("third"),
+            answer("three"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| EventFrame::new(EventSeq(index as u64 + 1), 0, event))
+        .collect();
+        let history = history_from_events(&frames);
+        history.validate().expect("valid");
+        let texts: Vec<String> = history
+            .turns()
+            .iter()
+            .map(rune_agent::history::Turn::text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "<conversation-checkpoint>",
+                "second",
+                "two",
+                "third",
+                "three"
+            ]
+        );
+
+        // Without the checkpoint record the note still applies and every turn stays.
+        let old: Vec<_> = frames
+            .into_iter()
+            .filter(|frame| !matches!(frame.event, SessionEvent::Checkpoint { .. }))
+            .collect();
+        let history = history_from_events(&old);
+        assert_eq!(history.len(), 6);
+        assert_eq!(history.turns()[0].text(), "first\n\nNOTE");
     }
 
     #[test]

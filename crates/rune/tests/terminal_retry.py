@@ -134,13 +134,13 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         offset = len(transcript)
 
     try:
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         os.write(master, b"retry please\r")
-        capture("provider retry 2/3 in 1000ms")
+        capture("rate limited, retrying in 1s (attempt 2 of 3)", "attempt 2 of 3)")
         assert len(requests) == 1, requests
         capture("provider retry 2/3 |")
         release_second.set()
-        capture("provider retry 3/3 in 2000ms")
+        capture("provider error, retrying in 2s (attempt 3 of 3)", "attempt 3 of 3)")
         assert len(requests) == 2, requests
         capture("provider retry 3/3 |")
         release_third.set()
@@ -154,13 +154,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r075-") as directory:
         assert len(requests) == 3, requests
         assert all(request["messages"][-1]["content"] == "retry please" for request in requests)
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         print(json.dumps(captures))
     finally:
         release_second.set()
         release_third.set()
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

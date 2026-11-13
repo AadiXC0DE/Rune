@@ -1,0 +1,35 @@
+{
+  "prompt": "Print the environment the command sees.",
+  "workspace": "workspaces/readme_only.json",
+  "env": {
+    "PYTHONPATH": "/opt/scenario",
+    "TERM": "xterm-256color"
+  },
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "e1",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "printf '%s|%s|%s\\n' \"$PYTHONPATH\" \"$PAGER\" \"$TERM\""
+          }
+        }
+      ]
+    },
+    {
+      "text": "Printed."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "stop_reason": "end_turn",
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "/opt/scenario|cat|dumb"
+      }
+    ]
+  }
+}

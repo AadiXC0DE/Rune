@@ -8,10 +8,12 @@
 //! A handle is scoped to one session and is not guessable from another, so one
 //! session cannot read another's retained output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
-use rune_core::budget::{BudgetSet, EMERGENCY_CEILING_BYTES, LimitName};
+use camino::{Utf8Path, Utf8PathBuf};
+use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,11 +23,17 @@ use crate::workspace::truncate_to_bytes;
 /// Preview size shown to the model when a result is retained.
 pub const DEFAULT_PREVIEW_BYTES: usize = 4096;
 
+/// Largest preview a spilled result keeps in the conversation.
+pub const SPILL_PREVIEW_BYTES: usize = 16 * 1024;
+
 /// Largest byte range one read may return.
 pub const MAX_READ_BYTES: usize = 64 * 1024;
 
-/// Largest number of retained results in one session.
-pub const MAX_RETAINED_RESULTS: usize = 256;
+/// Bytes of retained results one session keeps; past this the oldest are dropped.
+pub const SESSION_STORE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The file in a store directory that records each insert and eviction in order.
+const INDEX_FILE: &str = "index.jsonl";
 
 /// A handle identifying one retained result.
 ///
@@ -96,12 +104,24 @@ impl std::fmt::Display for Handle {
 }
 
 /// One retained result.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Retained {
     handle: Handle,
     tool: String,
-    content: String,
+    content: Arc<str>,
     is_error: bool,
+}
+
+/// One line of a store directory's index.
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexLine {
+    handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    evicted: bool,
 }
 
 /// What the model receives in place of a full result.
@@ -144,23 +164,223 @@ impl Preview {
 }
 
 /// The session-scoped store of retained results.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Store {
     session: String,
     entries: BTreeMap<Handle, Retained>,
     /// Total retained bytes, for the session bound.
     total_bytes: usize,
+    /// Bytes kept before the oldest results are dropped.
+    budget: usize,
+    /// Handles in insertion order, oldest first.
+    order: VecDeque<Handle>,
+    /// Handles dropped to keep the store under its budget.
+    evicted: BTreeSet<Handle>,
+    /// Where results are also kept on disk, when attached.
+    directory: Option<Utf8PathBuf>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
 }
 
 impl Store {
     /// Builds a store for one session.
     #[must_use]
     pub fn new(session: impl Into<String>) -> Self {
+        Self::with_budget(session, SESSION_STORE_BYTES)
+    }
+
+    /// Builds a store that keeps at most `budget` bytes.
+    #[must_use]
+    fn with_budget(session: impl Into<String>, budget: usize) -> Self {
         Self {
             session: session.into(),
             entries: BTreeMap::new(),
             total_bytes: 0,
+            budget,
+            order: VecDeque::new(),
+            evicted: BTreeSet::new(),
+            directory: None,
         }
+    }
+
+    /// Keeps every retained result under `directory` as well as in memory, and loads
+    /// what an earlier run of the same session stored there.
+    pub fn attach_directory(&mut self, directory: Utf8PathBuf) -> Result<()> {
+        rune_core::paths::create_dir_private(&directory)?;
+        let index = rune_core::paths::read_private(&directory.join(INDEX_FILE), u64::MAX)?
+            .unwrap_or_default();
+        // A line cut short by an interrupted write is ended, so the next line
+        // appended starts on its own.
+        if !index.is_empty() && !index.ends_with('\n') {
+            append_to_index(&directory, "\n");
+        }
+
+        // The final state of each handle the index names, then the order the
+        // survivors were last inserted in.
+        let mut recorded: BTreeMap<Handle, (String, bool)> = BTreeMap::new();
+        let mut evicted = BTreeSet::new();
+        let mut inserted = Vec::new();
+        for line in index.lines() {
+            let Ok(record) = serde_json::from_str::<IndexLine>(line) else {
+                continue;
+            };
+            let Ok(handle) = Handle::parse(&record.handle) else {
+                continue;
+            };
+            if record.evicted {
+                recorded.remove(&handle);
+                evicted.insert(handle);
+                continue;
+            }
+            let Some(tool) = record.tool else {
+                continue;
+            };
+            evicted.remove(&handle);
+            if recorded
+                .insert(handle.clone(), (tool, record.is_error.unwrap_or(false)))
+                .is_none()
+            {
+                inserted.push(handle);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut loaded_order: Vec<Handle> = inserted
+            .into_iter()
+            .rev()
+            .filter(|handle| recorded.contains_key(handle) && seen.insert(handle.clone()))
+            .collect();
+        loaded_order.reverse();
+
+        let mut on_disk = BTreeSet::new();
+        let mut order = VecDeque::new();
+        for handle in loaded_order {
+            let Some((tool, is_error)) = recorded.remove(&handle) else {
+                continue;
+            };
+            let budget = u64::try_from(self.budget).unwrap_or(u64::MAX);
+            let Ok(Some(content)) =
+                rune_core::paths::read_private(&content_path(&directory, &handle), budget)
+            else {
+                continue;
+            };
+            on_disk.insert(handle.clone());
+            order.push_back(handle.clone());
+            self.entries.entry(handle.clone()).or_insert(Retained {
+                handle,
+                tool,
+                content: content.into(),
+                is_error,
+            });
+        }
+        for handle in std::mem::take(&mut self.order) {
+            if !on_disk.contains(&handle) {
+                order.push_back(handle);
+            }
+        }
+        self.order = order;
+        evicted.extend(std::mem::take(&mut self.evicted));
+        self.evicted = evicted
+            .into_iter()
+            .filter(|handle| !self.entries.contains_key(handle))
+            .collect();
+        self.total_bytes = self.entries.values().map(|entry| entry.content.len()).sum();
+        self.directory = Some(directory);
+
+        self.enforce_budget();
+        let unsaved: Vec<Handle> = self
+            .order
+            .iter()
+            .filter(|handle| !on_disk.contains(*handle))
+            .cloned()
+            .collect();
+        for handle in unsaved {
+            if let Some(entry) = self.entries.get(&handle) {
+                self.persist(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when the handle's result can be read.
+    #[must_use]
+    pub fn is_available(&self, handle: &Handle) -> bool {
+        self.entries.contains_key(handle)
+    }
+
+    /// Stores an entry, keeping the place of a handle already present, then
+    /// drops the oldest entries until the store is within its budget.
+    fn insert(&mut self, entry: Retained) {
+        let handle = entry.handle.clone();
+        let bytes = entry.content.len();
+        self.persist(&entry);
+        match self.entries.insert(handle.clone(), entry) {
+            Some(replaced) => {
+                self.total_bytes = self.total_bytes.saturating_sub(replaced.content.len());
+            }
+            None => self.order.push_back(handle.clone()),
+        }
+        self.evicted.remove(&handle);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.enforce_budget();
+    }
+
+    /// Drops the oldest entries while the store holds more than its budget.
+    fn enforce_budget(&mut self) {
+        while self.total_bytes > self.budget {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.content.len());
+                if let Some(directory) = &self.directory {
+                    let _ = std::fs::remove_file(content_path(directory, &oldest));
+                    append_index(
+                        directory,
+                        &IndexLine {
+                            handle: oldest.to_string(),
+                            tool: None,
+                            is_error: None,
+                            evicted: true,
+                        },
+                    );
+                }
+                self.evicted.insert(oldest);
+            }
+        }
+    }
+
+    /// Writes an entry to the attached directory. A failure is ignored: the
+    /// entry stays in memory and only a later resume loses it.
+    fn persist(&self, entry: &Retained) {
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        if rune_core::paths::write_private(&content_path(directory, &entry.handle), &entry.content)
+            .is_ok()
+        {
+            append_index(
+                directory,
+                &IndexLine {
+                    handle: entry.handle.to_string(),
+                    tool: Some(entry.tool.clone()),
+                    is_error: Some(entry.is_error),
+                    evicted: false,
+                },
+            );
+        }
+    }
+
+    /// The error for a result that cannot be stored.
+    fn full() -> RuneError {
+        RuneError::new(
+            ErrorCode::LimitExceeded,
+            "the session's retained tool result store is full",
+        )
+        .with_hint("start a new session to retain more")
     }
 
     /// Returns the session this store belongs to.
@@ -197,9 +417,9 @@ impl Store {
     /// Spills a full result that would otherwise be cut from the conversation.
     ///
     /// Unlike `retain`, the model's per-result cap does not cut the stored body.
-    /// The session's emergency byte ceiling and entry bound still apply. A
-    /// failure leaves the store unchanged so the caller can report that the
-    /// result could not be retained.
+    /// Older results are dropped to keep the session within its byte budget. A
+    /// result larger than the whole budget is refused and leaves the store
+    /// unchanged, so the caller can report that it could not be retained.
     pub fn spill(
         &mut self,
         tool: &str,
@@ -208,41 +428,22 @@ impl Store {
         is_error: bool,
         preview_bytes: usize,
     ) -> Result<Preview> {
-        let handle = Handle::derive(&self.session, tool_call, &content);
-        let replaced_bytes = self
-            .entries
-            .get(&handle)
-            .map_or(0, |entry| entry.content.len());
-        let total_bytes = self
-            .total_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(content.len());
-        if (self.entries.len() >= MAX_RETAINED_RESULTS && !self.entries.contains_key(&handle))
-            || u64::try_from(total_bytes).unwrap_or(u64::MAX) > EMERGENCY_CEILING_BYTES
-        {
-            return Err(RuneError::new(
-                ErrorCode::LimitExceeded,
-                "the session's retained tool result store is full",
-            )
-            .with_hint("start a new session to retain more"));
+        if content.len() > self.budget {
+            return Err(Self::full());
         }
-
+        let handle = Handle::derive(&self.session, tool_call, &content);
         let preview = Self::build_preview(
             &content,
             &handle,
             is_error,
-            preview_bytes.min(DEFAULT_PREVIEW_BYTES),
+            preview_bytes.min(SPILL_PREVIEW_BYTES),
         );
-        self.entries.insert(
-            handle.clone(),
-            Retained {
-                handle,
-                tool: tool.to_owned(),
-                content,
-                is_error,
-            },
-        );
-        self.total_bytes = total_bytes;
+        self.insert(Retained {
+            handle,
+            tool: tool.to_owned(),
+            content: content.into(),
+            is_error,
+        });
         Ok(preview)
     }
 
@@ -276,14 +477,6 @@ impl Store {
             });
         }
 
-        if self.entries.len() >= MAX_RETAINED_RESULTS {
-            return Err(RuneError::new(
-                ErrorCode::LimitExceeded,
-                format!("the session already holds {MAX_RETAINED_RESULTS} retained results"),
-            )
-            .with_hint("start a new session to retain more"));
-        }
-
         // The retained content is itself bounded, so one enormous result cannot
         // exhaust memory on its own.
         let bounded: String = if content.len() > retained_limit {
@@ -296,24 +489,17 @@ impl Store {
             content.to_owned()
         };
 
+        if bounded.len() > self.budget {
+            return Err(Self::full());
+        }
         let handle = Handle::derive(&self.session, tool_call, &bounded);
         let preview = Self::build_preview(&bounded, &handle, is_error, preview_bytes);
-
-        let retained_bytes = bounded.len();
-        let replaced = self.entries.insert(
-            handle.clone(),
-            Retained {
-                handle: handle.clone(),
-                tool: tool.to_owned(),
-                content: bounded,
-                is_error,
-            },
-        );
-        self.total_bytes = self
-            .total_bytes
-            .saturating_sub(replaced.map_or(0, |entry| entry.content.len()))
-            .saturating_add(retained_bytes);
-
+        self.insert(Retained {
+            handle,
+            tool: tool.to_owned(),
+            content: bounded.into(),
+            is_error,
+        });
         Ok(preview)
     }
 
@@ -341,31 +527,32 @@ impl Store {
         let entry = self
             .entries
             .get(handle)
-            .ok_or_else(|| unknown_handle(handle))?;
+            .ok_or_else(|| self.unknown_handle(handle))?;
+        let content: &str = &entry.content;
 
         let length = length.clamp(1, MAX_READ_BYTES);
-        if offset >= entry.content.len() {
+        if offset >= content.len() {
             return Ok(ReadOutcome {
                 text: String::new(),
                 offset,
-                total_bytes: u64::try_from(entry.content.len()).unwrap_or(u64::MAX),
+                total_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
                 tool: entry.tool.clone(),
             });
         }
 
-        let mut end = offset.saturating_add(length).min(entry.content.len());
-        while end > offset && !entry.content.is_char_boundary(end) {
+        let mut end = offset.saturating_add(length).min(content.len());
+        while end > offset && !content.is_char_boundary(end) {
             end = end.saturating_sub(1);
         }
         let mut start = offset;
-        while start < entry.content.len() && !entry.content.is_char_boundary(start) {
+        while start < content.len() && !content.is_char_boundary(start) {
             start = start.saturating_add(1);
         }
 
         Ok(ReadOutcome {
-            text: entry.content.get(start..end).unwrap_or_default().to_owned(),
+            text: content.get(start..end).unwrap_or_default().to_owned(),
             offset: start,
-            total_bytes: u64::try_from(entry.content.len()).unwrap_or(u64::MAX),
+            total_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
             tool: entry.tool.clone(),
         })
     }
@@ -380,14 +567,15 @@ impl Store {
         let entry = self
             .entries
             .get(handle)
-            .ok_or_else(|| unknown_handle(handle))?;
+            .ok_or_else(|| self.unknown_handle(handle))?;
         if needle.is_empty() {
             return Err(RuneError::invalid_field("query", "must not be empty"));
         }
+        let content: &str = &entry.content;
 
         let mut matches = Vec::new();
         let mut truncated = false;
-        for (line_index, line) in entry.content.lines().enumerate() {
+        for (line_index, line) in content.lines().enumerate() {
             if !line.contains(needle) {
                 continue;
             }
@@ -423,7 +611,65 @@ impl Store {
     /// Drops every retained result.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
         self.total_bytes = 0;
+    }
+
+    /// Builds the error for a handle this store cannot read.
+    ///
+    /// A handle dropped to keep the session under its budget says so. Any other
+    /// handle does not distinguish "never existed" from "belongs to another
+    /// session", because the difference is not useful to a caller and naming it
+    /// would confirm the existence of another session's content.
+    fn unknown_handle(&self, handle: &Handle) -> RuneError {
+        if self.evicted.contains(handle) {
+            return RuneError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "the result for handle `{handle}` was dropped to keep this session's stored results under 64 MiB"
+                ),
+            )
+            .with_hint("run the command or read the file again");
+        }
+        RuneError::new(
+            ErrorCode::NotFound,
+            format!("no retained result for handle `{handle}`"),
+        )
+        .with_hint("handles work only within the session that produced them")
+    }
+}
+
+/// Path of one result's content in a store directory.
+fn content_path(directory: &Utf8Path, handle: &Handle) -> Utf8PathBuf {
+    directory.join(format!("{handle}.txt"))
+}
+
+/// Appends one line to a store directory's index. A failure is ignored, as for
+/// the content files.
+fn append_index(directory: &Utf8Path, line: &IndexLine) {
+    if let Ok(mut text) = serde_json::to_string(line) {
+        text.push('\n');
+        append_to_index(directory, &text);
+    }
+}
+
+/// Appends text to a store directory's index, creating it private.
+fn append_to_index(directory: &Utf8Path, text: &str) {
+    use std::io::Write as _;
+
+    let path = directory.join(INDEX_FILE);
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+        return;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(&path) {
+        let _ = file.write_all(text.as_bytes());
     }
 }
 
@@ -458,19 +704,6 @@ pub struct SearchOutcome {
     pub truncated: bool,
     /// The tool that produced the result.
     pub tool: String,
-}
-
-/// Builds the error for a handle that is unknown in this session.
-///
-/// Deliberately does not distinguish "never existed" from "belongs to another
-/// session", because the difference is not useful to a caller and naming it
-/// would confirm the existence of another session's content.
-fn unknown_handle(handle: &Handle) -> RuneError {
-    RuneError::new(
-        ErrorCode::NotFound,
-        format!("no retained result for handle `{handle}`"),
-    )
-    .with_hint("handles work only within the session that produced them")
 }
 
 /// Bytes a preview keeps for the marker naming the range it leaves out.
@@ -604,15 +837,38 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_previews_up_to_sixteen_kib() {
+        let mut store = store();
+        let content = format!("HEAD\n{}TAIL", "line of output\n".repeat(40 * 1024 / 15));
+        let preview = store
+            .spill("shell", "call-1", content.clone(), false, 32 * 1024)
+            .expect("spilled");
+        assert!(preview.text.len() <= SPILL_PREVIEW_BYTES);
+        assert!(
+            preview.text.len() > SPILL_PREVIEW_BYTES - 512,
+            "{}",
+            preview.text.len()
+        );
+        assert!(preview.text.starts_with("HEAD\n"));
+        assert!(preview.text.ends_with("TAIL"));
+
+        // A smaller cap still bounds the preview.
+        let preview = store
+            .spill("shell", "call-2", content, false, 6_000)
+            .expect("spilled");
+        assert!(preview.text.len() <= 6_000);
+    }
+
+    #[test]
     fn a_large_result_is_retained_and_previewed() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         assert_eq!(store.len(), 1);
         assert!(preview.text.len() <= DEFAULT_PREVIEW_BYTES);
-        assert_eq!(preview.retained_bytes, 50_000);
+        assert_eq!(preview.retained_bytes, 30_000);
     }
 
     #[test]
@@ -702,21 +958,21 @@ mod tests {
     }
 
     #[test]
-    fn spilling_refuses_a_full_store_without_losing_existing_results() {
-        let mut store = store();
+    fn spilling_refuses_a_result_larger_than_the_budget_without_losing_existing_results() {
+        let mut store = Store::with_budget("session-abc", 1024);
         let mut first = None;
-        for index in 0..MAX_RETAINED_RESULTS {
+        for index in 0..4 {
             let preview = store
                 .spill("shell", &index.to_string(), "kept".to_owned(), false, 4)
                 .expect("spilled");
             first.get_or_insert(preview.handle);
         }
         let err = store
-            .spill("shell", "overflow", "lost".to_owned(), false, 4)
-            .expect_err("full");
+            .spill("shell", "overflow", "x".repeat(1025), false, 4)
+            .expect_err("larger than the budget");
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
-        assert_eq!(store.len(), MAX_RETAINED_RESULTS);
-        assert_eq!(store.total_bytes(), 4 * MAX_RETAINED_RESULTS);
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.total_bytes(), 16);
         assert_eq!(
             store
                 .read(&first.expect("first"), 0, 4)
@@ -727,36 +983,252 @@ mod tests {
     }
 
     #[test]
-    fn spilled_bytes_cannot_exceed_the_session_emergency_ceiling() {
+    fn spilled_bytes_cannot_exceed_the_session_budget() {
         let mut store = store();
-        let ceiling = usize::try_from(EMERGENCY_CEILING_BYTES).expect("ceiling fits");
         let preview = store
-            .spill("shell", "full", "x".repeat(ceiling), false, 8)
-            .expect("at ceiling");
+            .spill("shell", "full", "x".repeat(SESSION_STORE_BYTES), false, 8)
+            .expect("at the budget");
         let err = store
-            .spill("shell", "overflow", "x".to_owned(), false, 1)
-            .expect_err("past ceiling");
+            .spill(
+                "shell",
+                "overflow",
+                "x".repeat(SESSION_STORE_BYTES + 1),
+                false,
+                1,
+            )
+            .expect_err("past the budget");
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
         assert_eq!(store.len(), 1);
-        assert_eq!(store.total_bytes(), ceiling);
+        assert_eq!(store.total_bytes(), SESSION_STORE_BYTES);
         assert_eq!(
             store
-                .read(&preview.handle, ceiling - 1, 1)
+                .read(&preview.handle, SESSION_STORE_BYTES - 1, 1)
                 .expect("existing tail")
                 .text,
             "x"
+        );
+
+        // One more byte keeps the store within the budget by dropping the oldest.
+        store
+            .spill("shell", "next", "y".to_owned(), false, 1)
+            .expect("spilled");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 1);
+        assert!(!store.is_available(&preview.handle));
+    }
+
+    #[test]
+    fn more_than_256_results_are_kept() {
+        let mut store = store();
+        let content = "r".repeat(1024);
+        let handles: Vec<Handle> = (0..300)
+            .map(|index| {
+                store
+                    .spill("shell", &format!("call-{index}"), content.clone(), false, 0)
+                    .expect("spilled")
+                    .handle
+            })
+            .collect();
+        assert_eq!(store.len(), 300);
+        assert_eq!(store.total_bytes(), 300 * 1024);
+        for handle in &handles {
+            assert_eq!(store.read(handle, 0, 2048).expect("kept").text, content);
+        }
+    }
+
+    #[test]
+    fn the_oldest_results_are_dropped_past_the_byte_budget() {
+        let mut store = Store::with_budget("session-abc", 64 * 1024);
+        let handles: Vec<Handle> = (0..65)
+            .map(|index| {
+                store
+                    .spill(
+                        "shell",
+                        &format!("call-{index}"),
+                        format!("{index:04}{}", "z".repeat(1020)),
+                        false,
+                        0,
+                    )
+                    .expect("spilled")
+                    .handle
+            })
+            .collect();
+        assert_eq!(store.len(), 64);
+        assert_eq!(store.total_bytes(), 64 * 1024);
+        assert!(!store.is_available(&handles[0]));
+        for handle in &handles[1..] {
+            assert!(store.is_available(handle));
+        }
+
+        // Storing an existing handle again keeps its place, so the next drop
+        // still takes the oldest.
+        store
+            .spill(
+                "shell",
+                "call-1",
+                format!("{:04}{}", 1, "z".repeat(1020)),
+                false,
+                0,
+            )
+            .expect("again");
+        store
+            .spill("shell", "call-65", "w".repeat(1024), false, 0)
+            .expect("spilled");
+        assert!(!store.is_available(&handles[1]));
+        assert!(store.is_available(&handles[2]));
+        assert!(store.total_bytes() <= 64 * 1024);
+    }
+
+    #[test]
+    fn a_dropped_handle_says_it_was_dropped() {
+        let mut store = Store::with_budget("session-abc", 8);
+        let dropped = store
+            .spill("shell", "first", "12345678".to_owned(), false, 0)
+            .expect("spilled")
+            .handle;
+        store
+            .spill("shell", "second", "abcdefgh".to_owned(), false, 0)
+            .expect("spilled");
+
+        let err = store.read(&dropped, 0, 8).expect_err("dropped");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            err.message(),
+            format!(
+                "the result for handle `{dropped}` was dropped to keep this session's stored results under 64 MiB"
+            )
+        );
+        assert_eq!(
+            err.detail().hint.as_deref(),
+            Some("run the command or read the file again")
+        );
+        let err = store.search(&dropped, "1", 8).expect_err("dropped");
+        assert!(err.message().contains("was dropped"), "{err}");
+
+        let unknown = Handle::derive("session-abc", "never", "stored");
+        let err = store.read(&unknown, 0, 8).expect_err("unknown");
+        assert_eq!(
+            err.message(),
+            format!("no retained result for handle `{unknown}`")
+        );
+    }
+
+    fn directory(temp: &tempfile::TempDir) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(temp.path().join("results")).expect("utf8")
+    }
+
+    #[test]
+    fn results_written_to_a_directory_load_in_a_new_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = store();
+        store.attach_directory(directory(&temp)).expect("attached");
+        let first = store
+            .spill("shell", "first", "first body".to_owned(), false, 0)
+            .expect("spilled")
+            .handle;
+        let second = store
+            .spill("read_file", "second", "second body".to_owned(), true, 0)
+            .expect("spilled")
+            .handle;
+
+        let mut resumed = Store::new("another-session-string");
+        resumed.attach_directory(directory(&temp)).expect("loaded");
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(resumed.total_bytes(), 21);
+        assert_eq!(
+            resumed.read(&first, 0, 64).expect("first").text,
+            "first body"
+        );
+        assert_eq!(
+            resumed.read(&second, 0, 64).expect("second").text,
+            "second body"
+        );
+        assert_eq!(resumed.describe(&second), Some(("read_file", 11, true)));
+    }
+
+    #[test]
+    fn an_eviction_is_replayed_from_the_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::with_budget("session-abc", 16);
+        store.attach_directory(directory(&temp)).expect("attached");
+        let dropped = store
+            .spill("shell", "first", "a".repeat(10), false, 0)
+            .expect("spilled")
+            .handle;
+        let kept = store
+            .spill("shell", "second", "b".repeat(10), false, 0)
+            .expect("spilled")
+            .handle;
+        assert!(!directory(&temp).join(format!("{dropped}.txt")).exists());
+
+        let mut resumed = Store::with_budget("session-def", 16);
+        resumed.attach_directory(directory(&temp)).expect("loaded");
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed.is_available(&kept));
+        let err = resumed.read(&dropped, 0, 8).expect_err("dropped");
+        assert!(err.message().contains("was dropped"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_last_index_line_is_skipped() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = store();
+        store.attach_directory(directory(&temp)).expect("attached");
+        let kept = store
+            .spill("shell", "first", "first body".to_owned(), false, 0)
+            .expect("spilled")
+            .handle;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory(&temp).join(INDEX_FILE))
+            .expect("index")
+            .write_all(b"{\"handle\":\"result-")
+            .expect("torn line");
+
+        let mut resumed = store_in(&temp);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed.read(&kept, 0, 64).expect("kept").text, "first body");
+        let next = resumed
+            .spill("shell", "next", "next body".to_owned(), false, 0)
+            .expect("spilled")
+            .handle;
+        let again = store_in(&temp);
+        assert_eq!(again.read(&kept, 0, 64).expect("kept").text, "first body");
+        assert_eq!(again.read(&next, 0, 64).expect("next").text, "next body");
+    }
+
+    fn store_in(temp: &tempfile::TempDir) -> Store {
+        let mut store = Store::new("session-xyz");
+        store.attach_directory(directory(temp)).expect("loaded");
+        store
+    }
+
+    #[test]
+    fn results_held_before_attaching_are_written_to_the_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = store();
+        let early = store
+            .spill("shell", "early", "early body".to_owned(), false, 0)
+            .expect("spilled")
+            .handle;
+        store.attach_directory(directory(&temp)).expect("attached");
+        assert_eq!(
+            store_in(&temp).read(&early, 0, 64).expect("early").text,
+            "early body"
         );
     }
 
     #[test]
     fn the_rendered_preview_states_the_size_and_handle() {
         let mut store = store();
-        let content = "y".repeat(50_000);
+        let content = "y".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         let rendered = preview.render();
-        assert!(rendered.contains("50000 bytes retained"), "{rendered}");
+        assert!(rendered.contains("30000 bytes retained"), "{rendered}");
         assert!(rendered.contains(preview.handle.as_str()), "{rendered}");
         assert!(rendered.contains("read_tool_result"), "{rendered}");
     }
@@ -810,13 +1282,13 @@ mod tests {
     #[test]
     fn reading_past_the_end_returns_nothing_rather_than_failing() {
         let mut store = store();
-        let content = "z".repeat(50_000);
+        let content = "z".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         let outcome = store.read(&preview.handle, 10_000_000, 10).expect("read");
         assert!(outcome.text.is_empty());
-        assert_eq!(outcome.total_bytes, 50_000);
+        assert_eq!(outcome.total_bytes, 30_000);
     }
 
     #[test]
@@ -889,33 +1361,11 @@ mod tests {
     #[test]
     fn an_empty_search_query_is_rejected() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
         assert!(store.search(&preview.handle, "", 10).is_err());
-    }
-
-    #[test]
-    fn the_retained_count_is_bounded() {
-        let mut store = store();
-        let content = "x".repeat(50_000);
-        for index in 0..MAX_RETAINED_RESULTS {
-            store
-                .retain(
-                    &limits(),
-                    "shell",
-                    &format!("call-{index}"),
-                    &content,
-                    false,
-                )
-                .expect("retained");
-        }
-        let err = store
-            .retain(&limits(), "shell", "one-more", &content, false)
-            .expect_err("bounded");
-        assert_eq!(err.code(), ErrorCode::LimitExceeded);
-        assert!(err.detail().hint.is_some());
     }
 
     #[test]
@@ -1048,7 +1498,7 @@ mod tests {
     #[test]
     fn describe_reports_the_tool_and_size() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         let preview = store
             .retain(&limits(), "read_file", "call-1", &content, false)
             .expect("retained");
@@ -1061,7 +1511,7 @@ mod tests {
     #[test]
     fn clearing_drops_everything() {
         let mut store = store();
-        let content = "x".repeat(50_000);
+        let content = "x".repeat(30_000);
         store
             .retain(&limits(), "shell", "call-1", &content, false)
             .expect("retained");
