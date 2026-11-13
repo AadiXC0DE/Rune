@@ -55,6 +55,15 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+thread_local! {
+    /// The bytes of the last event replay on this thread, escaped, so a grid
+    /// that differs on another system shows what that system wrote.
+    static RAW_CAPTURES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Most bytes of one stage kept for a failure message.
+const RAW_STAGE_BYTES: usize = 6_000;
+
 /// Compares a replayed grid with its fixture, or rewrites the fixture when
 /// `RUNE_BLESS_GRIDS` is exactly `1`.
 fn compare_grid(name: &str, actual: &str) {
@@ -88,9 +97,10 @@ fn compare_grid(name: &str, actual: &str) {
         eprintln!("blessed {name}: {changed} of {total} lines differ\n{pairs}");
         return;
     }
+    let raw = RAW_CAPTURES.with(|raw| std::mem::take(&mut *raw.borrow_mut()));
     assert!(
         changed == 0,
-        "{name}: {changed} of {total} lines differ\n{pairs}run with RUNE_BLESS_GRIDS=1 to accept the new grid, then review the fixture diff"
+        "{name}: {changed} of {total} lines differ\n{pairs}run with RUNE_BLESS_GRIDS=1 to accept the new grid, then review the fixture diff\n{raw}"
     );
 }
 
@@ -235,6 +245,24 @@ fn event_replay(scenario: &str) -> String {
             .expect("event captures");
     let first = captures.first().expect("at least one capture");
     let mut grid = Grid::new(first.cols, first.rows).expect("grid");
+    RAW_CAPTURES.with(|raw| {
+        let mut raw = raw.borrow_mut();
+        raw.clear();
+        for capture in &captures {
+            let kept = capture
+                .bytes
+                .get(..RAW_STAGE_BYTES)
+                .unwrap_or(&capture.bytes);
+            let _ = writeln!(
+                raw,
+                "bytes of {} at {}x{}: {}",
+                capture.stage,
+                capture.cols,
+                capture.rows,
+                kept.escape_ascii()
+            );
+        }
+    });
     let mut snapshot = String::new();
     let mut scrollback = Vec::new();
     for capture in captures {
