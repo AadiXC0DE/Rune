@@ -208,6 +208,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -216,10 +218,7 @@ jobs:
         with:
           path: dist
 
-      - name: Publish the release from what this run produced
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+      - name: Gather the release files and write SHA256SUMS
         run: |
           set -euo pipefail
           mkdir -p release
@@ -237,8 +236,32 @@ jobs:
               fi
             done
           done
+          (cd release && sha256sum rune-*.tar.gz rune-*.zip > SHA256SUMS)
+          # Every sidecar must agree with the list, or one of them is not the
+          # file this run built.
+          for sidecar in release/*.sha256; do
+            expected=$(awk '{ print $1 }' "$sidecar")
+            archive=$(basename "${sidecar%.sha256}")
+            listed=$(awk -v name="$archive" '$2 == name { print $1 }' release/SHA256SUMS)
+            if [ "$expected" != "$listed" ]; then
+              echo "::error::$sidecar does not match SHA256SUMS"
+              exit 1
+            fi
+          done
           ls -l release
+          cat release/SHA256SUMS
 
+      - name: Record where the archives were built
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/rune-*.tar.gz, release/rune-*.zip'
+
+      - name: Publish a draft release from what this run produced
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+        run: |
+          set -euo pipefail
           # The tag comes from the archives themselves, so the release can only be
           # named after something this run produced.
           version=$(basename "$(ls release/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')

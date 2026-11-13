@@ -42,6 +42,15 @@ def check():
         fail("publish does not refuse a published version")
     if "x86_64-pc-windows-msvc" not in job("windows"):
         fail("the windows job does not build x86_64-pc-windows-msvc")
+    if "sha256sum rune-*.tar.gz rune-*.zip > SHA256SUMS" not in publish:
+        fail("publish does not write SHA256SUMS")
+    attest = publish.find("actions/attest-build-provenance@v2")
+    upload = publish.find("gh release upload")
+    if attest < 0 or upload < 0 or attest > upload:
+        fail("the provenance attestation does not come before the upload")
+    for permission in ("id-token: write", "attestations: write"):
+        if permission not in publish:
+            fail(f"publish lacks `{permission}`")
 
 
 check()

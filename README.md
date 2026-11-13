@@ -64,6 +64,9 @@ sha256sum -c SHA256SUMS --ignore-missing        # Linux
 On Windows, compare `(Get-FileHash -Algorithm SHA256 <archive>).Hash` with the
 archive's line in `SHA256SUMS`.
 
+`gh attestation verify <archive> --repo AadiXC0DE/Rune` shows which workflow run
+built an archive.
+
 From a release archive on Linux or macOS: download the `.tar.gz` for your
 target and its `.sha256` sidecar from the same release. Set `archive` to its
 absolute path and `prefix` to a writable installation directory, for example:
