@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 import pathlib
-import pty
 import re
 import select
 import struct
@@ -21,7 +20,7 @@ def controlling_terminal():
 
 
 def capture(binary, root, environment):
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     child = subprocess.Popen(
         [binary, "--offline", "--theme", "high-contrast"],
@@ -44,21 +43,18 @@ def capture(binary, root, environment):
     try:
         wait_for(b"ctrl-c cancel")
         start = len(transcript)
-        os.write(master, b"/")
+        write_terminal(master, b"/", transcript)
         wait_for(b"/model", start)
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.1)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.1)
         result = list(transcript)
-        os.write(master, b"\x03/quit\r")
-        assert child.wait(timeout=10) == 0, transcript.decode(errors="replace")
+        write_terminal(master, b"\x03/quit\r", transcript)
+        assert wait_for_exit(child, master, transcript, 10) == 0, transcript.decode(errors="replace")
         return result
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
-        os.close(master)
+        wait_for_exit(child, master, transcript, 10)
+        close_terminal(master)
 
 
 with tempfile.TemporaryDirectory(prefix="rune-r071-") as directory:
@@ -68,10 +64,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r071-") as directory:
     config_file = config / "config.toml"
     config_file.write_text("auto_upgrade = false\n")
     config_file.chmod(0o600)
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key not in {"NO_COLOR", "COLORTERM"}
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),

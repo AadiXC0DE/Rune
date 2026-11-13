@@ -1,0 +1,1012 @@
+    Checking rune-tools v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-tools)
+    Checking rune-agent v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-agent)
+    Checking rune-acp v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-acp)
+    Checking rune-sdk v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-sdk)
+    Checking rune v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune)
+    Checking rune-web v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-web)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 6.52s
+   Compiling ring v0.17.14
+   Compiling xtask v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/xtask)
+   Compiling rustls-webpki v0.103.15
+   Compiling rustls v0.23.46
+   Compiling ureq v3.4.2
+   Compiling rune-context v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-context)
+   Compiling rune-net v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-net)
+   Compiling rune-tools v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-tools)
+   Compiling rune-agent v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-agent)
+   Compiling rune-acp v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-acp)
+   Compiling rune-sdk v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-sdk)
+   Compiling rune-web v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-web)
+   Compiling rune v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune)
+   Compiling rune-testkit v0.1.16 (/home/hermes/worktrees/ci-macos-mcp/crates/rune-testkit)
+    Finished `test` profile [optimized + debuginfo] target(s) in 39.76s
+     Running unittests src/main.rs (target/debug/deps/rune-df878ad85b1058df)
+
+running 485 tests
+test ask::tests::a_failure_result_serializes_with_the_stable_code ... ok
+test ask::tests::a_missing_provider_is_reported_before_any_request ... ok
+test ask::tests::a_missing_credential_names_every_source_tried ... ok
+test ask::tests::a_reported_zero_usage_count_is_present ... ok
+test ask::tests::a_missing_endpoint_is_reported_with_a_remedy ... ok
+test ask::tests::a_missing_model_is_reported_before_any_request ... ok
+test ask::tests::a_success_result_has_no_error_fields ... ok
+test ask::tests::jsonl_propagates_output_failure ... ok
+test ask::tests::an_unreported_usage_count_is_absent_rather_than_zero ... ok
+test ask::tests::a_tool_call_report_carries_a_name_and_status ... ok
+test ask::tests::the_json_key_order_is_stable ... ok
+test ask::tests::the_json_object_has_the_documented_key_set ... ok
+test ask::tests::the_environment_override_reaches_the_settings ... ok
+test attachments::tests::attachments_reach_each_supporting_dialect_as_inline_image_parts ... ok
+test ask::tests::jsonl_splits_escaped_unicode_deltas_and_flushes_each_record ... ok
+test auto_review::tests::a_caution_holds_the_action ... ok
+test auto_review::tests::a_clear_answer_authorizes_the_action_it_named ... ok
+test auto_review::tests::a_long_excerpt_is_cut_without_splitting_a_character ... ok
+test auto_review::tests::a_rendered_request_names_the_action_and_its_targets ... ok
+test auto_review::tests::a_request_without_targets_says_so_rather_than_leaving_a_gap ... ok
+test auto_review::tests::a_short_excerpt_is_left_alone ... ok
+test auto_review::tests::an_offline_reviewer_reports_that_it_is_unavailable ... ok
+test auto_review::tests::evidence_is_included_and_marked_when_shortened ... ok
+test auto_review::tests::an_unreachable_reviewer_is_unavailable_and_not_cautioned ... ok
+test auto_review::tests::no_review_model_means_no_reviewer ... ok
+test attachments::tests::invalid_missing_and_nonregular_attachments_are_refused ... ok
+test attachments::tests::attachment_count_is_bounded_before_reading_files ... ok
+test auto_review::tests::only_a_timeout_earns_a_retry ... ok
+test auto_review::tests::the_instructions_fix_the_vocabulary ... ok
+test auto_review::tests::the_instructions_treat_the_action_as_data ... ok
+test cli::tests::a_command_flag_is_not_taken_for_a_global_one ... ok
+test auto_review::tests::the_retry_count_stays_at_one ... ok
+test cli::tests::a_flag_the_command_does_not_take_is_refused ... ok
+test cli::tests::a_dash_before_the_prompt_is_refused_unless_flags_are_ended ... ok
+test cli::tests::a_prompt_keeps_words_that_start_with_a_dash ... ok
+test cli::tests::accepted_efforts_on_the_command_line_are_applied ... ok
+test cli::tests::aliases_map_to_their_canonical_command ... ok
+test cli::tests::ascii_flag_selects_decorations_before_or_after_the_command ... ok
+test cli::tests::accessible_mode_is_explicit_and_accepts_no_value ... ok
+test cli::tests::benchmark_flag_is_recorded ... ok
+test cli::tests::command_flag_with_separate_value_is_captured ... ok
+test cli::tests::command_line_recorded_as_the_source_layer ... ok
+test ask::tests::jsonl_rejects_oversized_serialized_records_before_writing_stdout ... ok
+test cli::tests::command_flag_with_equals_value_is_captured ... ok
+test cli::tests::dash_prefixed_session_ids_are_positional_and_known_flags_keep_precedence ... ok
+test cli::tests::declared_aliases_preserve_arguments_and_flags ... ok
+test cli::tests::declared_boolean_flags_preserve_bare_flags_and_positional_text ... ok
+test cli::tests::double_dash_stops_flag_parsing ... ok
+test cli::tests::every_global_setting_flag_is_accepted_after_a_command ... ok
+test cli::tests::fast_and_no_fast_set_the_override_both_ways ... ok
+test cli::tests::flag_without_its_value_is_rejected ... ok
+test cli::tests::flags_after_the_command_belong_to_the_command ... ok
+test cli::tests::declared_boolean_flags_reject_attached_values ... ok
+test cli::tests::global_flags_before_the_command_are_parsed ... ok
+test cli::tests::invalid_effort_on_the_command_line_is_rejected ... ok
+test cli::tests::help_after_a_command_describes_that_command ... ok
+test cli::tests::global_flags_after_the_command_are_applied ... ok
+test cli::tests::limit_out_of_range_is_rejected_when_resolved ... ok
+test cli::tests::help_and_version_short_circuit_before_a_command ... ok
+test cli::tests::limit_overrides_are_collected_and_validated ... ok
+test cli::tests::no_arguments_starts_an_interactive_session ... ok
+test cli::tests::limit_without_equals_is_rejected ... ok
+test cli::tests::provider_override_does_not_inherit_an_anonymous_connection ... ok
+test cli::tests::repeatable_add_dir_collects_every_value ... ok
+test cli::tests::resume_flags_are_classified ... ok
+test cli::tests::subcommand_is_recognized ... ok
+test cli::tests::unknown_command_names_the_help_command ... ok
+test cli::tests::unknown_global_flag_lists_the_supported_set ... ok
+test cli::tests::provider_override_resolves_the_default_model_and_the_new_endpoint ... ok
+test cli::tests::unknown_limit_name_is_rejected_when_resolved ... ok
+test compaction_archive::tests::original_parts_and_replay_survive_restart_and_later_renumbering ... ok
+test compaction_archive::tests::archive_failure_preserves_prior_records_and_refuses_corrupt_ids ... ok
+test connect_flow::tests::a_provider_with_a_default_does_not_need_one ... ok
+test connect_flow::tests::the_listed_order_matches_the_numbering_offered ... ok
+test connect_flow::tests::a_provider_without_a_default_asks_for_an_endpoint ... ok
+test diagnostics::tests::config_json_reports_the_layer_order ... ok
+test diagnostics::tests::config_text_lists_every_limit_key ... ok
+test diagnostics::tests::configured_provider_without_model_warns ... ok
+test diagnostics::tests::limits_json_includes_every_limit ... ok
+test diagnostics::tests::limits_text_lists_every_limit_with_its_source ... ok
+test diagnostics::tests::partial_and_unsupported_sandboxes_name_the_refusal_and_override ... ok
+test diagnostics::tests::configuration_diagnostics_become_a_warning_with_a_hint ... ok
+test diagnostics::tests::report_names_a_missing_workspace ... ok
+test diagnostics::tests::report_passes_on_a_clean_setup ... ok
+test diagnostics::tests::unconfigured_provider_reports_unknown_not_failure ... ok
+test help::tests::aliases_resolve_to_command_help ... ok
+test help::tests::every_command_help_is_rendered ... ok
+test diagnostics::tests::status_json_marks_the_provider_as_not_connected ... ok
+test help::tests::help_text_has_no_double_hyphen_dashes ... ok
+test help::tests::json_support_is_mentioned_in_help ... ok
+test help::tests::top_level_help_lists_every_command ... ok
+test help::tests::top_level_help_lists_every_global_flag ... ok
+test help::tests::top_level_help_names_every_group ... ok
+test help::tests::unknown_command_has_no_help ... ok
+test install::tests::a_checksum_that_is_not_hexadecimal_is_refused ... ok
+test install::tests::a_checksum_round_trips_through_its_written_form ... ok
+test install::tests::a_local_source_needs_no_network ... ok
+test install::tests::a_missing_checksum_is_refused ... ok
+test install::tests::a_remote_source_is_recognized_rather_than_treated_as_a_path ... ok
+test install::tests::a_refused_install_leaves_the_original_untouched ... ok
+test install::tests::a_source_names_a_file_or_a_url ... ok
+test install::tests::a_tampered_artifact_is_refused ... ok
+test completion::tests::bash_offers_every_declared_command_alias_and_global_flag ... ok
+test install::tests::a_verified_artifact_replaces_the_target ... ok
+test install::tests::an_installed_binary_is_executable ... ok
+test install::tests::exclusive_staging_creation_does_not_truncate_existing_files ... ok
+test install::tests::exclusive_staging_creation_refuses_live_and_dangling_symlinks ... ok
+test install::tests::reading_a_missing_artifact_names_the_path ... ok
+test install::tests::reading_an_artifact_from_a_file_matches_its_bytes ... ok
+test install::tests::removing_a_binary_reports_whether_one_was_there ... ok
+test install::tests::removing_state_removes_what_is_there_and_reports_a_miss ... ok
+test install::tests::staging_files_have_unique_names_beside_the_target ... ok
+test install::tests::the_digest_of_known_bytes_is_stable ... ok
+test install::tests::installing_twice_over_the_same_target_succeeds ... ok
+test path_completion::tests::completion_quotes_spaces_quotes_and_shell_metacharacters ... ok
+test path_completion::tests::directories_with_spaces_can_be_completed_again ... ok
+test path_completion::tests::configured_additional_roots_are_permitted ... ok
+test path_completion::tests::external_and_dangling_symlinks_are_not_offered_or_traversed ... ok
+test path_completion::tests::listing_is_bounded_and_control_characters_are_not_offered ... ok
+test path_completion::tests::quoted_and_escaped_tokens_are_completed_as_one_path_at_the_caret ... ok
+test path_completion::tests::external_paths_never_reach_directory_read_even_with_external_tool_access ... ok
+test permissions::tests::a_built_in_allow_does_not_carry_a_second_command ... ok
+test permissions::tests::a_built_in_allow_does_not_cover_a_command_known_to_write ... ok
+test permissions::tests::a_default_configuration_refuses_the_web_tools ... ok
+test permissions::tests::a_destructive_command_still_asks ... ok
+test permissions::tests::a_file_rename_is_allowed_by_default_and_can_be_denied_by_user_policy ... ok
+test install::tests::a_replacement_never_leaves_a_half_written_file ... ok
+test permissions::tests::a_fresh_install_allows_reading_without_asking ... ok
+test permissions::tests::a_fresh_install_refuses_outbound_requests ... ok
+test permissions::tests::a_more_specific_ruleset_overrides_a_built_in ... ok
+test permissions::tests::a_refusal_of_outbound_traffic_survives_full_access ... ok
+test permissions::tests::a_plain_read_command_is_allowed_without_a_prompt ... ok
+test permissions::tests::a_user_allow_still_covers_what_its_author_wrote ... ok
+test permissions::tests::a_user_refusal_holds_however_the_program_is_spelled ... ok
+test permissions::tests::an_offline_run_does_not_enable_the_web_tools ... ok
+test permissions::tests::a_user_rule_is_reported_alongside_the_built_in_ones ... ok
+test permissions::tests::directory_creation_is_allowed_by_default_and_user_denials_take_precedence ... ok
+test permissions::tests::ask_mode_leaves_the_shell_unanswered ... ok
+test permissions::tests::explain_names_the_effect_and_the_reason ... ok
+test permissions::tests::rendering_an_empty_ruleset_says_the_mode_decides ... ok
+test permissions::tests::explain_says_when_a_prompt_is_coming ... ok
+test permissions::tests::retained_output_can_be_read_without_an_approval_prompt ... ok
+test permissions::tests::simulation_preserves_order_rule_provenance_and_workspace_matching ... ok
+test permissions::tests::simulation_reports_policy_denials_and_full_access_overrides_separately ... ok
+test permissions::tests::the_built_in_rules_validate ... ok
+test permissions::tests::git_diff_is_allowed_by_default_and_user_denials_take_precedence ... ok
+test permissions::tests::the_rendered_table_has_a_row_per_rule ... ok
+test permissions::tests::the_effect_names_are_the_wire_names ... ok
+test permissions::tests::the_reported_json_lists_every_rule ... ok
+test permissions::tests::the_validated_ruleset_carries_the_builtins_and_the_web_setting ... ok
+test permissions::tests::the_web_tools_are_refused_when_the_setting_is_off ... ok
+test post_tool_hook::tests::event_redacts_nested_short_secrets_and_bounds_utf8_after_redaction ... ok
+test post_tool_hook::tests::cancellation_stops_a_running_post_tool_hook ... ok
+test pre_tool_hook::tests::cancellation_stops_a_running_hook ... ok
+test prompt_history::tests::a_damaged_line_is_skipped_and_the_rest_survive ... ok
+test prompt_history::tests::a_missing_file_is_an_empty_history ... ok
+test prompt_history::tests::a_prompt_holding_a_newline_stays_one_entry ... ok
+test ask::tests::saved_ask_preserves_native_assistant_replay ... ok
+test prompt_history::tests::a_repeat_after_a_different_prompt_is_recorded ... ok
+test prompt_history::tests::a_repeat_of_the_last_prompt_is_not_recorded_twice ... ok
+test prompt_history::tests::an_empty_prompt_is_not_recorded ... ok
+test prompt_history::tests::an_entry_round_trips_through_its_encoding ... ok
+test prompt_history::tests::an_oversized_prompt_is_truncated_on_a_character_boundary ... ok
+test prompt_history::tests::a_rewrite_leaves_no_staging_file_behind ... ok
+test prompt_history::tests::clearing_removes_every_entry_from_disk ... ok
+test prompt_history::tests::history_survives_a_reopen ... ok
+test prompt_history::tests::recall_can_be_scoped_to_a_workspace_or_a_session ... ok
+test prompt_history::tests::a_file_that_outgrew_the_cap_is_opened_and_brought_back_under_it ... ok
+test prompt_history::tests::the_history_file_is_private ... ok
+test completion::tests::bash_skips_option_values_and_respects_prefixes_and_end_of_flags ... ok
+test provider_setup::tests::a_catalog_with_no_model_configured_says_so ... ok
+test provider_setup::tests::a_compatible_endpoint_still_has_to_be_named ... ok
+test provider_setup::tests::a_configured_endpoint_wins_over_the_default ... ok
+test provider_setup::tests::a_configured_endpoint_wins_over_the_published_one ... ok
+test provider_setup::tests::a_cached_catalog_supplies_the_capacity_the_listing_omitted ... ok
+test provider_setup::tests::a_corrupt_cache_is_ignored_rather_than_fatal ... ok
+test prompt_history::tests::recording_keeps_the_file_small_enough_to_open_again ... ok
+test provider_setup::tests::a_declared_model_appears_in_the_catalog ... ok
+test provider_setup::tests::a_known_provider_is_reached_at_its_published_endpoint ... ok
+test provider_setup::tests::a_malformed_endpoint_is_refused ... ok
+test provider_setup::tests::a_figure_the_endpoint_stated_is_not_replaced ... ok
+test provider_setup::tests::a_provider_with_a_single_home_has_a_default_endpoint ... ok
+test provider_setup::tests::a_provider_with_no_configured_endpoint_inherits_nothing ... ok
+test provider_setup::tests::a_provider_the_catalog_does_not_describe_is_left_alone ... ok
+test provider_setup::tests::a_saved_selection_is_a_configuration_the_loader_accepts ... ok
+test provider_setup::tests::a_credential_round_trips_and_is_removed ... ok
+test provider_setup::tests::a_second_provider_does_not_inherit_the_first_endpoint ... ok
+test provider_setup::tests::an_empty_credential_is_refused_rather_than_stored ... ok
+test provider_setup::tests::a_request_to_anthropic_carries_the_key_in_its_own_header ... ok
+test provider_setup::tests::an_openai_compatible_provider_has_no_default_endpoint ... ok
+test provider_setup::tests::an_offline_run_with_no_cache_adds_nothing_and_does_not_fail ... ok
+test provider_setup::tests::every_credential_source_has_a_readable_name ... ok
+test provider_setup::tests::every_provider_presents_its_credential_the_way_it_expects ... ok
+test provider_setup::tests::removing_a_credential_that_is_not_there_reports_so ... ok
+test provider_setup::tests::resolving_without_a_default_or_a_value_names_the_remedy ... ok
+test provider_setup::tests::a_surrounding_whitespace_is_trimmed_rather_than_stored ... ok
+test provider_setup::tests::saving_a_selection_writes_the_provider_and_endpoint ... ok
+test provider_setup::tests::saving_a_selection_preserves_keys_it_does_not_set ... ok
+test provider_setup::tests::the_catalog_falls_back_to_the_compiled_context_window ... ok
+test provider_setup::tests::the_catalog_reports_where_its_entries_came_from ... ok
+test provider_setup::tests::the_config_file_written_by_a_selection_is_private ... ok
+test provider_setup::tests::saving_over_a_corrupt_config_refuses_rather_than_discarding_it ... ok
+test provider_setup::tests::anonymous_endpoint_ignores_stored_credentials_and_survives_model_selection ... ok
+test provider_setup::tests::the_connection_report_names_the_provider_and_model ... ok
+test provider_setup::tests::the_rendered_catalog_names_the_configured_model ... ok
+test reference::tests::every_command_in_the_table_appears_in_the_reference ... ok
+test reference::tests::every_global_flag_appears ... ok
+test reference::tests::every_limit_appears_with_its_default_and_range ... ok
+test reference::tests::the_committed_reference_matches_the_generator ... ok
+test reference::tests::the_reference_is_not_empty ... ok
+test reference::tests::the_reference_names_the_opt_out ... ok
+test reference::tests::writing_the_reference_creates_the_file ... ok
+test provider_setup::tests::the_connection_report_never_shows_the_credential ... ok
+test session::send_probe::session_host_can_cross_a_thread ... ok
+test provider_setup::tests::the_stored_credential_file_is_private ... ok
+test session::tests::a_bare_model_command_asks_for_the_picker ... ok
+test session::tests::a_bare_rename_asks_for_a_title ... ok
+test session::tests::a_bare_slash_offers_a_window_and_says_how_many_there_are ... ok
+test session::tests::a_cancelled_turn_keeps_what_streamed_and_says_it_was_cancelled ... ok
+test sandbox::tests::a_report_distinguishes_enforcement_refusal_and_explicit_fallback ... ok
+test session::tests::a_cautioning_review_holds_the_action_with_its_reason ... ok
+test session::tests::a_colorless_terminal_cannot_be_forced_into_color ... ok
+test session::tests::a_colorless_theme_emits_no_escapes_in_the_dropdown ... ok
+test session::tests::a_command_missing_its_argument_reports_instead_of_expanding ... ok
+test session::tests::a_configured_window_is_not_overridden_by_the_endpoint ... ok
+test session::tests::a_custom_read_tool_keeps_its_activity_in_transcript_summaries ... ok
+test session::tests::a_declared_model_window_overrides_the_compiled_default ... ok
+test session::tests::a_failed_turn_names_the_failure_and_what_to_do ... ok
+test session::tests::a_finished_turn_hands_back_what_it_added ... ok
+test session::tests::a_caught_worker_panic_reports_an_internal_failure ... ok
+test session::tests::a_list_that_fits_carries_no_position_row ... ok
+test session::tests::a_loaded_zero_context_window_cannot_create_a_zero_capacity_session ... ok
+test session::tests::a_finished_turn_is_printed_once_above_the_live_region ... ok
+test session::tests::a_delta_keeps_the_caret_where_the_reader_left_it ... ok
+test session::tests::a_long_draft_stays_visible_as_a_turn_streams_and_closes ... ok
+test session::tests::a_named_catalog_budget_survives_the_derivation ... ok
+test session::tests::a_model_choice_is_reported_above_the_input_and_stays_there ... ok
+test session::tests::a_prompt_override_replaces_the_built_in_text ... ok
+test session::tests::a_question_that_cannot_be_displayed_requires_input ... ok
+test session::tests::a_refused_file_rename_does_not_create_an_undo_record ... ok
+test session::tests::a_reply_holds_no_tool_call_arguments ... ok
+test session::tests::a_reported_turn_yields_its_text_as_lines ... ok
+test session::tests::a_reported_window_is_adopted_when_none_was_configured ... ok
+test session::tests::a_review_that_cannot_complete_holds_the_action_without_ending_the_turn ... ok
+test session::tests::a_reviewer_is_only_consulted_in_automatic_mode ... ok
+test session::tests::a_session_driven_by_a_script_runs_every_line ... ok
+test session::tests::a_restarted_step_drops_the_text_of_the_failed_attempt ... ok
+test session::tests::a_shrinking_reading_never_lowers_the_reported_size ... ok
+test session::tests::a_status_line_never_prints_the_credential ... ok
+test session::tests::a_session_runs_with_the_rules_that_ship_with_it ... ok
+test session::tests::a_streamed_delta_is_drawn_before_the_turn_ends ... ok
+test session::tests::a_terminal_answer_resolves_only_the_displayed_call ... ok
+test session::tests::a_turn_that_panics_keeps_the_conversation_it_started_with ... ok
+test session::tests::a_user_command_expands_for_review_instead_of_running ... ok
+test session::tests::a_window_never_looks_past_the_end_of_a_short_list ... ok
+test session::tests::accepting_the_highlighted_row_names_it ... ok
+test session::tests::accepting_uses_the_selection_the_window_is_showing ... ok
+test session::tests::accessible_frames_append_settled_lines_and_ignore_live_regions ... ok
+test session::tests::an_absent_or_zero_reported_window_leaves_the_limit_alone ... ok
+test session::tests::an_allowlisted_action_never_reaches_the_reviewer ... ok
+test session::tests::an_anthropic_session_presents_its_key_the_way_anthropic_reads_it ... ok
+test session::tests::an_approval_prompt_that_cannot_be_displayed_denies ... ok
+test session::tests::an_empty_override_file_is_ignored ... ok
+test session::tests::a_metadata_write_failure_keeps_showing_durable_text_and_reports_repair ... ok
+test session::tests::an_oversized_short_history_without_a_removable_prefix_is_refused ... ok
+test session::tests::an_undeclared_window_keeps_the_catalog_fallback ... ok
+test session::tests::an_unresolved_action_is_cleared_by_review_in_automatic_mode ... ok
+test session::tests::an_unresolved_action_is_never_approved_without_a_decision ... ok
+test session::tests::approval_scope_cannot_hide_terminal_controls_or_clip_long_commands ... ok
+test session::tests::ascii_session_covers_status_menus_streaming_and_transcript ... ok
+test session::tests::an_oversized_removable_prefix_compacts_with_a_small_retained_tail ... ok
+test session::tests::base64_encodes_multibyte_text_by_its_bytes ... ok
+test session::tests::base64_matches_the_standard_encoding ... ok
+test session::tests::below_the_trigger_no_summary_request_is_sent ... ok
+test session::tests::budgeted_goal_dispatch_requires_an_explicit_positive_budget_and_objective ... ok
+test session::tests::a_streamed_delta_cannot_drive_the_terminal ... ok
+test session::tests::automatic_compaction_keeps_three_exact_pins_in_every_following_provider_request ... ok
+test session::tests::cancellation_wakes_a_worker_waiting_for_approval ... ok
+test session::tests::cancelled_answers_keep_only_text_not_already_in_the_conversation ... ok
+test session::tests::clearing_a_lane_forgets_its_rows ... ok
+test session::tests::cancellation_wakes_a_worker_waiting_for_question_input ... ok
+test session::tests::clearing_the_line_before_anything_streams_takes_it_off_the_screen ... ok
+test session::tests::compact_preview_arguments_dispatch_without_starting_compaction ... ok
+test session::tests::closed_approval_input_never_allows_a_call ... ok
+test session::tests::compacting_a_short_conversation_says_so_rather_than_failing ... ok
+test session::tests::caught_worker_panic_renders_one_diagnostic_without_duplicate_status_rows ... ok
+test session::tests::compaction_during_a_turn_keeps_new_transcript_entries_and_partial_answers ... ok
+test session::tests::compaction_estimates_include_instructions_tools_and_dialect_output_reserve ... ok
+test session::tests::context_usage_is_the_size_of_the_conversation_not_a_running_sum ... ok
+test session::tests::crossing_the_configured_trigger_compacts_before_the_next_request ... ok
+test session::tests::custom_completion_navigation_includes_project_and_user_commands ... ok
+test session::tests::compaction_preview_matches_the_applied_plan_and_preserves_history ... ok
+test session::tests::escape_at_the_prompt_clears_the_line_and_never_leaves ... ok
+test session::tests::discovered_custom_command_completes_and_expands_for_review ... ok
+test session::tests::failed_automatic_compaction_preserves_history_and_blocks_the_model_request ... ok
+test session::tests::every_frame_hides_the_cursor_while_it_writes ... ok
+test session::tests::fifo_rename_snapshot_is_refused_without_opening_it ... ok
+test session::tests::full_transcript_keeps_recorded_calls_replies_and_every_tool_row ... ok
+test session::tests::help_lists_the_commands ... ok
+test session::tests::help_reports_a_command_file_that_was_skipped ... ok
+test session::tests::history_search_matches_middle_words_in_workspace_prompts_newest_first ... ok
+test session::tests::compaction_charges_the_objective_and_refuses_an_exhausted_budget ... ok
+test session::tests::live_usage_supersedes_the_resume_estimate_and_new_clears_its_source ... ok
+test session::tests::max_tokens_compaction_summary_preserves_history_with_an_incomplete_summary_error ... ok
+test session::tests::missing_or_partial_usage_is_estimated_and_explicit_zero_is_reported ... ok
+test session::tests::model_menus_keep_the_selection_visible_after_resizing_and_narrowing ... ok
+test session::tests::leaving_removes_the_live_region ... ok
+test session::tests::naming_a_model_inline_asks_for_a_switch ... ok
+test session::tests::failed_manual_archive_keeps_history_and_previous_records ... ok
+test session::tests::no_color_overrides_the_named_high_contrast_theme ... ok
+test session::tests::no_override_leaves_the_built_in_text_alone ... ok
+test session::tests::multiline_caret_survives_streaming_notices_and_turn_close ... ok
+test session::tests::only_an_explicit_user_private_network_rule_can_grant_access ... ok
+test session::tests::only_the_two_file_rewriting_tools_are_treated_as_mutations ... ok
+test session::tests::oversized_rename_snapshot_refuses_mutation_and_undo_records ... ok
+test session::tests::oversized_retained_requests_are_refused_before_summarizing ... ok
+test session::tests::path_menus_scroll_with_the_selection_and_keep_within_available_rows ... ok
+test session::tests::pin_dispatch_preserves_exact_arguments_and_supports_listing ... ok
+test session::tests::pins_that_exceed_retained_capacity_block_compaction_without_dropping_constraints ... ok
+test session::tests::preparing_a_session_without_a_provider_fails_before_the_terminal ... ok
+test session::tests::private_network_access_requires_a_user_answer_in_every_mode ... ok
+test session::tests::question_choices_keep_indices_and_sanitize_displayed_text ... ok
+test session::tests::question_input_unavailable_or_closed_never_selects_an_answer ... ok
+test session::tests::renaming_a_session_asks_for_a_new_title ... ok
+test session::tests::reporting_a_denied_call_names_the_tool ... ok
+test session::tests::reporting_a_step_limit_names_it ... ok
+test session::tests::retry_frames_replace_one_status_row_and_preserve_the_draft ... ok
+test session::tests::short_completion_menus_keep_every_command_visible_and_selectable ... ok
+test session::tests::starting_a_new_session_forgets_the_old_context_reading ... ok
+test session::tests::starting_a_new_session_repoints_the_status_line ... ok
+test session::tests::streamed_fenced_code_matches_the_finished_transcript_across_resize ... ok
+test session::tests::streamed_text_is_drawn_above_the_status_and_input ... ok
+test session::tests::switching_the_model_changes_what_the_session_sends ... ok
+test session::tests::switching_the_model_moves_the_context_window_only_when_one_is_known ... ok
+test session::tests::tab_completes_one_match_without_opening_a_menu_or_changing_slash_commands ... ok
+test session::tests::terminal_approval_does_not_override_a_rule_or_approve_without_input ... ok
+test completion::tests::bash_offers_every_commands_flags_through_names_and_aliases ... ok
+test session::tests::the_catalog_budget_follows_the_window_it_is_given ... ok
+test session::tests::the_copy_and_new_commands_are_recognized ... ok
+test session::tests::the_cost_command_counts_only_what_was_reported ... ok
+test session::tests::the_dropdown_is_absent_unless_a_command_is_being_typed ... ok
+test session::tests::the_dropdown_offers_a_command_being_typed ... ok
+test session::tests::the_first_state_of_a_file_is_what_undo_returns_to ... ok
+test session::tests::the_help_text_names_the_commands_that_exist ... ok
+test session::tests::the_highlight_is_always_inside_the_window ... ok
+test session::tests::the_highlighted_row_is_the_one_the_arrows_moved_to ... ok
+test session::tests::the_last_reply_is_read_from_the_conversation_not_the_screen ... ok
+test session::tests::the_last_reply_is_the_most_recent_one ... ok
+test session::tests::the_live_region_carries_the_status_line ... ok
+test session::tests::the_plural_models_spelling_means_the_same_thing ... ok
+test session::tests::the_prompt_and_its_cursor_are_drawn_where_the_caret_is ... ok
+test session::tests::the_quit_command_leaves_the_shell ... ok
+test session::tests::the_rows_line_up_their_descriptions ... ok
+test session::tests::the_settings_command_reports_what_is_in_force ... ok
+test session::tests::the_shell_reports_an_unknown_command_without_leaving ... ok
+test session::tests::the_status_command_names_an_unknown_window_rather_than_a_share_of_it ... ok
+test session::tests::the_status_command_names_the_model_in_effect ... ok
+test session::tests::the_status_line_is_drawn_above_the_input ... ok
+test session::tests::the_status_line_names_the_model_and_the_mode ... ok
+test session::tests::the_status_line_reports_the_context_already_spent ... ok
+test session::tests::the_truecolor_check_reads_the_advertised_variables ... ok
+test session::tests::the_undo_command_is_recognized_rather_than_unknown ... ok
+test session::tests::the_width_comes_from_the_terminal_rather_than_a_constant ... ok
+test session::tests::the_window_follows_the_selection_without_the_input_moving ... ok
+test session::tests::transcript_ownership_suppresses_streaming_frames_and_restores_after_drop ... ok
+test session::tests::undo_diffs_cover_context_newlines_binary_empty_and_unchanged_files ... ok
+test session::tests::undo_preview_arguments_dispatch_without_applying_undo ... ok
+test session::tests::undo_preview_of_a_rename_shows_restoration_and_removal_without_applying_them ... ok
+test session::tests::new_usage_accumulates_onto_restored_cost_totals ... ok
+test session::tests::undo_preview_refuses_large_files_without_consuming_records ... ok
+test session::tests::undo_preview_reports_read_errors_and_keeps_all_records ... ok
+test session::tests::undo_preview_refuses_fifo ... ok
+test session::tests::undoing_a_change_restores_the_original_bytes ... ok
+test session::tests::undoing_a_creation_removes_the_file ... ok
+test session::tests::undoing_a_file_rename_restores_the_source_and_removes_the_destination ... ok
+test session::tests::undoing_twice_reports_nothing_left_rather_than_doing_it_again ... ok
+test session::tests::unreadable_rename_source_is_not_recorded_as_absent ... ok
+test session::tests::usage_from_a_turn_is_added_to_the_session_total ... ok
+test session::tests::wrapping_across_several_lines_keeps_every_line ... ok
+test session::tests::wrapping_incrementally_matches_wrapping_the_whole_text ... ok
+test session::tests::the_active_objective_is_in_model_instructions_after_restart ... ok
+test session_log::tests::a_child_is_still_inspectable_by_identifier ... ok
+test session::tests::undo_preview_shows_file_diffs_and_preserves_bytes_and_journals ... ok
+test session::tests::objective_budget_stops_real_session_requests_after_resume ... ok
+test session_log::tests::a_call_the_log_never_answered_is_replayed_as_interrupted ... ok
+test session_log::tests::a_child_session_cannot_be_resumed_directly ... ok
+test session_log::tests::a_long_title_is_truncated ... ok
+test session_log::tests::a_malformed_exact_resume_target_is_refused ... ok
+test session_log::tests::a_page_size_is_clamped_to_the_documented_bound ... ok
+test session_log::tests::a_later_successful_refresh_clears_the_pending_metadata_warning ... ok
+test session_log::tests::a_reported_zero_is_recorded ... ok
+test session_log::tests::a_long_preview_is_truncated ... ok
+test session_log::tests::a_child_session_is_absent_from_the_listing ... ok
+test session_log::tests::a_timestamp_renders_for_a_plausible_instant ... ok
+test session_log::tests::a_title_comes_from_the_opening_line ... ok
+test session_log::tests::a_title_set_once_is_read_back_by_the_recorder ... ok
+test session_log::tests::a_session_tree_follows_its_log_in_order ... ok
+test session_log::tests::a_session_with_no_recorded_workspace_is_not_attributed_to_one ... ok
+test session_log::tests::a_resumed_session_continues_its_turn_numbering ... ok
+test session_log::tests::an_empty_directory_lists_nothing ... ok
+test session_log::tests::an_empty_prompt_has_no_title_to_derive ... ok
+test session_log::tests::an_empty_session_has_an_empty_tree ... ok
+test session_log::tests::an_exact_resume_target_is_parsed_rather_than_looked_up ... ok
+test session_log::tests::an_absent_usage_count_is_not_recorded_as_zero ... ok
+test session_log::tests::an_unknown_cursor_is_refused_rather_than_guessed ... ok
+test session_log::tests::a_wide_preview_is_truncated_by_characters_not_bytes ... ok
+test session_log::tests::a_turn_round_trips_through_the_log ... ok
+test session_log::tests::creating_a_session_that_already_exists_is_refused ... ok
+test session_log::tests::an_untitled_session_renders_as_untitled ... ok
+test post_tool_hook::tests::timeout_stops_the_hooks_descendants ... ok
+test session_log::tests::explicit_objectives_survive_reopen_and_compaction_without_entering_history ... ok
+test session_log::tests::explicit_pins_survive_restart_and_compaction_events_verbatim ... ok
+test session_log::tests::inspecting_a_session_reports_its_log ... ok
+test session_log::tests::inspecting_an_unknown_session_names_the_problem ... ok
+test session_log::tests::cancelled_exchanges_round_trip_without_duplicate_text_or_invented_usage ... ok
+test session_log::tests::forked_tool_pair_replays_as_a_valid_history_and_continues_with_the_next_turn ... ok
+test session_log::tests::listing_nothing_says_so ... ok
+test session_log::tests::gemini_responses_survive_the_journal_resume_and_fork ... ok
+test session_log::tests::listing_renders_a_row_per_session ... ok
+test session_log::tests::loading_an_unknown_session_names_the_problem ... ok
+test session_log::tests::failed_exchanges_round_trip_with_the_visible_answer_and_cause ... ok
+test session_log::tests::legacy_tool_results_recover_their_function_names ... ok
+test session_log::tests::journal_frames_are_bounded_and_recover_unicode_before_a_torn_tail ... ok
+test session_log::tests::ordinary_reply_text_does_not_become_a_failure_boundary ... ok
+test session_log::tests::objective_budget_usage_survives_compaction_and_resets_only_on_replacement ... ok
+test session_log::tests::listing_puts_the_most_recent_first ... ok
+test session_log::tests::resuming_an_empty_log_keeps_an_empty_context_meter ... ok
+test session_log::tests::resuming_with_no_saved_session_explains_why ... ok
+test session_log::tests::registry_failure_code_and_hint_survive_session_recording_and_replay ... ok
+test session_log::tests::resuming_the_latest_session_works_when_one_exists ... ok
+test session_log::tests::the_last_page_reports_no_cursor ... ok
+test session_log::tests::resume_estimates_context_without_summing_repeated_inputs ... ok
+test session_log::tests::the_rendered_tree_names_each_turn ... ok
+test session_log::tests::the_latest_session_is_the_newest_one ... ok
+test session_log::tests::the_session_detail_json_carries_the_totals ... ok
+test spec::tests::aliases_do_not_collide_with_names ... ok
+test spec::tests::command_names_are_unique ... ok
+test spec::tests::every_command_has_a_summary_and_usage ... ok
+test spec::tests::find_resolves_names_and_aliases ... ok
+test spec::tests::flags_are_kebab_case ... ok
+test spec::tests::help_and_version_need_nothing_from_the_runtime ... ok
+test spec::tests::json_support_is_declared_consistently ... ok
+test spec::tests::only_interactive_commands_require_the_terminal ... ok
+test spec::tests::resume_declares_its_interactive_runtime_requirements ... ok
+test subagent::tests::a_child_charges_the_parent_objective_and_cannot_continue_after_exhaustion ... ok
+test subagent::tests::child_limit_and_cancellation_refuse_before_any_provider_request ... ok
+test subagent::tests::child_schemas_intersect_admission_parent_advertisement_and_read_only_registry ... ok
+test subagent::tests::direct_child_execution_enforces_the_allowlist_even_when_parent_policy_allows ... ok
+test subagent::tests::fixture_role_can_only_narrow_inherited_tools_and_keeps_parent_policy ... ok
+test tests::a_path_without_a_tilde_is_left_alone ... ok
+test tests::a_project_request_is_described_before_it_is_approved ... ok
+test tests::a_project_that_asks_for_nothing_is_trusted ... ok
+test session_log::tests::the_latest_session_is_scoped_to_its_workspace ... ok
+test tests::a_tilde_is_expanded_against_the_home_directory ... ok
+test tests::a_usage_period_is_recognized_by_name ... ok
+test tests::an_unapproved_project_is_refused_rather_than_allowed_by_default ... ok
+test tests::an_unknown_usage_period_names_the_accepted_ones ... ok
+test tests::interrupt_maps_to_the_documented_exit_code ... ok
+test tests::other_commands_need_the_environment ... ok
+test tests::a_repository_with_no_commits_yields_no_changes ... ok
+test tests::pending_changes_are_empty_outside_a_repository ... ok
+test tests::recover_and_migrate_require_a_session_argument ... ok
+test tests::resolving_a_directory_that_does_not_exist_names_the_problem ... ok
+test tests::resolving_returns_a_canonical_path ... ok
+test session_log::tests::tree_previews_escape_saved_newlines_and_controls_without_injecting_rows ... ok
+test tests::runtime_free_commands_are_handled_without_loading ... ok
+test tests::the_session_subcommands_are_dispatched_before_an_identifier_is_parsed ... ok
+test tests::unimplemented_surfaces_say_so_rather_than_failing_generically ... ok
+test version::tests::version_is_semantic ... ok
+test version::tests::version_line_names_the_program_and_version ... ok
+test vision_client::tests::absent_configuration_and_offline_runs_have_no_vision_client ... ok
+test vision_client::tests::helper_requests_embed_real_image_bytes_in_each_provider_dialect ... ok
+test vision_client::tests::native_gemini_helper_embeds_image_bytes_and_delegates_the_model_path ... ok
+test web_client::tests::a_fixture_fetch_requires_an_explicit_web_opt_in ... ok
+test web_client::tests::a_hostname_resolving_to_loopback_is_refused_before_http ... ok
+test web_client::tests::a_live_search_returns_results ... ignored, reaches the network; run with --ignored to check the real endpoint
+test web_client::tests::a_run_without_the_web_tools_gets_no_clients ... ok
+test web_client::tests::a_search_query_is_escaped ... ok
+test web_client::tests::an_enabled_run_gets_both_clients ... ok
+test web_client::tests::an_offline_run_gets_no_clients ... ok
+test tests::review_fixtures_report_failed_git_setup ... ok
+test session_log::tests::paging_covers_every_session_without_a_gap_or_a_repeat ... ok
+test tests::pending_changes_include_a_modified_and_an_untracked_file ... ok
+test session_log::tests::tool_calls_and_results_round_trip_in_order ... ok
+test prompt_history::tests::the_file_is_compacted_to_the_entry_bound ... ok
+
+test result: ok. 484 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.68s
+
+     Running tests/acp_cwd.rs (target/debug/deps/acp_cwd-2fe41032ddb4b06a)
+
+running 1 test
+client `unknown` opened a connection
+test client_cwd_roots_reads_listing_and_project_instructions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/anonymous_endpoint.rs (target/debug/deps/anonymous_endpoint-25fcb50ef33cdb3f)
+
+running 2 tests
+test an_anonymous_remote_connection_is_refused_before_saving_anything ... ok
+test connect_list_and_ask_an_anonymous_loopback_without_storing_a_credential ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/archive_install.rs (target/debug/deps/archive_install-6669e975a94bd4e7)
+
+running 5 tests
+test smoke_rejects_an_uninstall_that_leaves_the_binary_installed ... ok
+test smoke_rejects_an_uninstall_that_changes_user_state ... ok
+test smoke_rejects_an_archive_with_a_mismatched_checksum ... ok
+test documented_archive_install_runs_real_rune_and_preserves_user_state ... ok
+test smoke_rejects_an_installed_version_that_disagrees_with_the_manifest ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.82s
+
+     Running tests/ask.rs (target/debug/deps/ask-d1edd62769aa8751)
+
+running 34 tests
+test ask_jsonl_bounds_the_final_record_and_reports_size_failure_on_stderr ... ok
+test ask_attaches_one_png_content_part_on_every_tool_step ... ok
+test ask_json_reports_an_empty_prompt_as_one_failure_object ... ok
+test ask_jsonl_delivers_flushed_events_before_provider_completion ... ok
+test ask_json_preserves_provider_code_and_retry_delay_with_secrets_redacted ... ok
+test ask_jsonl_stream_failure_emits_a_final_failure_and_stderr_diagnostic ... ok
+test ask_jsonl_validation_failures_emit_start_and_final_only ... ok
+test ask_never_retries_an_invalid_credential_even_with_retry_after ... ok
+test ask_no_save_creates_no_session ... ok
+test ask_plain_text_empty_prompt_keeps_stdout_empty ... ok
+test ask_oversized_image_and_batch_fail_before_any_provider_request ... ok
+test ask_jsonl_preserves_tool_steps_and_saved_exchange ... ok
+test ask_refreshes_a_capped_repository_map_after_an_edit ... ok
+test ask_plain_text_step_limit_does_not_print_a_final_answer ... ok
+test ask_jsonl_marks_retry_resets_and_keeps_the_recovered_final_result ... ok
+test ask_repeated_image_flags_preserve_attachment_order ... ok
+test ask_rejects_a_tool_calls_finish_without_completed_calls ... ok
+test ask_bounds_repeated_tool_requests_with_configured_and_default_step_caps ... ok
+test ask_returns_denied_unknown_and_malformed_calls_to_the_model_without_running_them ... ok
+test ask_reads_an_allowed_file_and_sends_its_result_before_the_final_answer ... ok
+test ask_json_reports_tool_errors_and_stops_at_the_configured_cap ... ok
+test ask_sends_the_resolved_instructions_shown_by_prompt_show ... ok
+test ask_stops_rate_limit_retries_at_the_configured_attempt_cap ... ok
+test ask_without_a_provider_reports_one_error_and_one_hint ... ok
+test ask_saves_a_tool_exchange_stopped_at_the_step_cap ... ok
+test model_plan_updates_emit_versioned_events_without_duplicates_or_workspace_mutations ... ok
+test ask_saves_a_resolvable_exchange_in_its_workspace ... ok
+test post_tool_timeout_and_nonzero_exit_preserve_completed_results_and_continue ... ok
+test ask_text_only_completion_still_succeeds ... ok
+test user_post_tool_hook_receives_one_redacted_result_without_changing_the_tool_pair ... ok
+test pre_tool_allow_runs_the_tool_and_hook_failures_hold_it ... ok
+test user_pre_tool_hook_veto_preserves_the_pair_and_reports_its_named_reason ... ok
+test ask_retries_a_rate_limit_after_the_requested_delay_within_the_configured_deadline ... ok
+test review_refuses_mutations_by_a_named_rule_and_still_reads_in_every_permission_mode ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+
+     Running tests/automatic_compaction.rs (target/debug/deps/automatic_compaction-9b51706064220716)
+
+running 1 test
+test fixture_turns_compact_before_the_next_cli_model_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/capabilities.rs (target/debug/deps/capabilities-6f3944f31f7952db)
+
+running 4 tests
+test diagnostics_report_support_and_configured_context_without_credentials_or_a_turn ... ok
+test local_context_discovery_reports_ollama_provenance_without_a_completion ... ok
+test offline_context_provenance_distinguishes_cached_capacity_from_the_default ... ok
+test unsupported_controls_are_reviewable_and_rejected_before_credentials_or_requests ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/cli.rs (target/debug/deps/cli-aa1f6488c4c5cb29)
+
+running 75 tests
+test a_flag_the_command_does_not_take_is_refused ... ok
+test a_limit_outside_its_range_is_rejected ... ok
+test a_malformed_user_config_warns_without_failing ... ok
+test a_fresh_install_has_no_provider_and_says_how_to_connect_one ... ok
+test a_limit_override_is_visible_in_limits_output ... ok
+test a_limit_after_the_command_is_applied ... ok
+test a_project_file_cannot_set_the_model ... ok
+test an_unavailable_surface_says_so_explicitly ... ok
+test an_unknown_limit_name_is_rejected ... ok
+test an_unknown_workspace_subcommand_is_rejected ... ok
+test auth_status_json_matches_the_default_inspection ... ok
+test auth_status_text_matches_the_default_inspection ... ok
+test benchmark_does_not_suppress_help_or_version ... ok
+test benchmark_short_circuits_before_configuration ... ok
+test completion_prints_only_a_script_without_loading_paths_or_config ... ok
+test completion_rejects_missing_unsupported_and_extra_shell_arguments ... ok
+test cli_provider_and_model_overrides_resolve_only_their_own_settings ... ok
+test accepted_permission_modes_and_aliases_still_apply ... ok
+test config_explain_reports_the_source_layer ... ok
+test config_mutations_create_an_override_without_creating_the_default ... ok
+test ask_selects_native_gemini_from_configuration_and_environment_credentials ... ok
+test connecting_without_a_credential_fails_and_saves_nothing ... ok
+test connecting_with_the_key_exported_succeeds ... ok
+test doctor_json_is_parseable_and_names_every_check ... ok
+test declared_boolean_flags_with_attached_values_fail ... ok
+test doctor_passes_on_a_clean_setup ... ok
+test a_model_named_after_the_command_is_used ... ok
+test doctor_reports_an_unconfigured_provider_as_unknown_not_failed ... ok
+test help_lists_every_command_group ... ok
+test help_for_one_command_shows_its_usage ... ok
+test help_for_an_unknown_command_fails_with_a_hint ... ok
+test limits_json_lists_every_limit_with_its_source ... ok
+test limits_text_shows_defaults ... ok
+test interactive_connect_offers_endpoint_models_and_saves_the_choice ... ok
+test listing_models_offline_reports_the_configured_model_without_a_request ... ok
+test missing_flag_value_is_reported_as_a_missing_field ... ok
+test accepted_aliases_are_documented_in_help_and_reference ... ok
+test offline_in_the_user_file_preserves_the_model_and_refuses_requests ... ok
+test logout_alias_shows_status_until_given_a_logout_action ... ok
+test permissions_explain_preserves_colons_in_the_target ... ok
+test permissions_explain_flag_reports_one_structured_decision ... ok
+test malformed_user_config_names_the_field_for_provider_commands ... ok
+test permissions_explain_rejects_malformed_actions ... ok
+test permissions_explain_reports_mode_defaults_and_effective_outcomes ... ok
+test prompt_reports_the_built_in_source ... ok
+test permissions_explanations_preserve_positional_and_text_output ... ok
+test permissions_without_an_action_still_lists_rules ... ok
+test provider_selection_preserves_the_override_and_leaves_the_default_unchanged ... ok
+test resume_help_and_reference_document_the_same_usage ... ok
+test session_inspection_still_requires_a_valid_selector ... ok
+test session_last_without_saved_sessions_reports_not_found ... ok
+test stdout_stays_clean_of_diagnostics ... ok
+test concurrent_connect_processes_preserve_both_credentials_after_reopening ... ok
+test top_level_help_forms_exit_zero ... ok
+test tree_id_flag_requires_a_valid_exact_identifier ... ok
+test session_id_flag_inspects_the_exact_saved_session ... ok
+test tree_last_without_saved_sessions_reports_not_found ... ok
+test offline_after_the_command_refuses_the_request ... ok
+test session_last_inspects_the_saved_session_in_the_current_workspace ... ok
+test unknown_command_fails_with_a_hint ... ok
+test tree_still_rejects_an_invalid_exact_id ... ok
+test unknown_global_flag_fails_before_loading_configuration ... ok
+test connecting_in_a_fresh_home_creates_private_state_and_opens_a_session ... ok
+test usage_rejects_an_invalid_period_flag ... ok
+test unknown_effort_fails_with_the_accepted_values ... ok
+test usage_period_flag_filters_the_ledger_to_seven_days ... ok
+test version_prints_one_line_and_exits_zero ... ok
+test version_short_flag_matches_long_flag ... ok
+test unknown_permission_mode_fails_with_the_accepted_values ... ok
+test workspace_list_is_empty_on_a_fresh_install ... ok
+test usage_reports_the_selected_period_and_interval ... ok
+test workspace_clear_reports_an_empty_list_and_persists_it ... ok
+test tree_id_flag_reports_the_exact_saved_sessions_branch_structure ... ok
+test tree_last_reports_the_saved_branch_structure_in_the_current_workspace ... ok
+test workspace_mutations_read_and_write_the_active_config ... ok
+
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/compaction_preview.rs (target/debug/deps/compaction_preview-f4170e0eaf50569c)
+
+running 3 tests
+test empty_and_short_histories_report_zero_records_to_summarize ... ok
+test preview_counts_an_existing_summary_without_changing_archived_records ... ok
+test preview_counts_respect_tool_pairs_and_configured_retention ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests/egress.rs (target/debug/deps/egress-5cee6f8c78f89e94)
+
+running 8 tests
+test a_settings_default_is_online ... ok
+test a_settings_value_carries_offline_into_the_endpoint ... ok
+test offline_shell_fallback_requires_opt_in_and_applies_no_isolation ... ok
+test the_transport_module_is_where_egress_lives ... ok
+test offline_documentation_maps_all_five_paths_without_promising_total_isolation ... ok
+test no_crate_constructs_a_network_client_outside_the_transport ... ok
+test offline_mode_produces_no_connection ... ok
+test an_online_transport_reaches_its_endpoint ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/fixture_support.rs (target/debug/deps/fixture_support-931bed2bf46a6c1c)
+
+running 1 test
+test pty_drain_handles_eof_quiet_output_and_shutdown ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.35s
+
+     Running tests/manual_compaction_archive.rs (target/debug/deps/manual_compaction_archive-131b333bfafef8c0)
+
+running 1 test
+test compact_restart_and_retrieve_every_removed_message_and_complete_tool_batch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/mcp_http.rs (target/debug/deps/mcp_http-e5fd5b620a7f9d0a)
+
+running 1 test
+test interactive_http_mcp_obeys_trust_policy_and_offline_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.05s
+
+     Running tests/mcp_import.rs (target/debug/deps/mcp_import-2f01723e1f931af2)
+
+running 6 tests
+test minimal_and_empty_configs_import_with_stable_server_order ... ok
+test fixture_import_emits_reviewable_project_json_without_writes_or_execution ... ok
+test import_validates_usage_and_help_explains_the_format ... ok
+test imported_project_command_requires_trust_even_in_full_access_mode ... ok
+test malformed_or_unsupported_imports_emit_no_partial_config_or_secret_values ... ok
+test import_enforces_file_and_server_count_limits ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/mcp_list.rs (target/debug/deps/mcp_list-d6d0e63cc3d32a0f)
+
+running 12 tests
+test check_unknown_name_does_not_start_other_servers_and_errors_are_redacted ... ok
+test approved_stdio_can_start_during_offline_listing ... ok
+test check_local_stdio_works_offline_without_a_provider ... ok
+test check_respects_trust_disabled_and_offline_states_without_contact_or_expansion ... ok
+test malformed_declarations_do_not_echo_secret_values_or_hide_other_errors ... ok
+test empty_listing_and_help_work_without_a_provider ... ok
+test every_eligible_startup_is_reported_even_after_required_failure_without_secrets ... ok
+test check_reports_protocol_and_all_tools_without_model_requests_or_sessions ... ok
+test offline_stdio_mcp_can_send_network_traffic ... ok
+test pending_rejected_disabled_and_offline_servers_are_never_contacted ... ok
+test startup_timeout_is_reported_in_text_and_json_and_untrusted_commands_do_not_run ... ok
+test check_reports_startup_and_discovery_timeouts_and_checks_later_servers ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.28s
+
+     Running tests/mcp_stdio.rs (target/debug/deps/mcp_stdio-d74201d28cdffc65)
+
+running 1 test
+test interactive_stdio_mcp_obeys_trust_policy_and_lifecycle_bounds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.79s
+
+     Running tests/ollama_endpoint.rs (target/debug/deps/ollama_endpoint-6aa9532bb4734bba)
+
+running 3 tests
+test a_fresh_connection_saves_the_default_local_endpoint_without_a_key ... ok
+test connecting_ollama_to_a_remote_host_is_refused_without_saving ... ok
+test imports_two_local_models_without_a_remote_catalog_and_keeps_inference_working ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/permissions_simulate.rs (target/debug/deps/permissions_simulate-41ddcf29efac8fe2)
+
+running 3 tests
+test text_replay_reports_rules_and_an_empty_recording_is_valid ... ok
+test replay_reports_every_call_without_execution_or_approval_writes ... ok
+test invalid_recordings_and_conflicting_actions_fail_without_partial_output_or_writes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/provider_deadline.rs (target/debug/deps/provider_deadline-23e7ee5e34445490)
+
+running 2 tests
+test the_agent_stops_ongoing_output_at_the_configured_total_deadline ... ok
+test ask_enforces_the_configured_total_deadline_for_success_and_error_bodies ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s
+
+     Running tests/sandbox.rs (target/debug/deps/sandbox-6f6ee4ecc773d842)
+
+running 11 tests
+test absent_hooks_report_the_read_only_git_parent_without_creating_hooks ... ok
+test missing_backend_reports_refusal_or_explicit_unsandboxed_fallback ... ok
+test a_root_alias_is_reported_where_the_backend_resolves_it ... ok
+test fixture_command_reports_paths_and_sources_without_executing ... ok
+test a_supported_backend_only_runs_its_probe_and_never_the_fixture_command ... ok
+test nested_repository_protections_are_reported_in_workspace_and_additional_roots ... ok
+test missing_command_invalid_action_and_missing_root_are_rejected ... ok
+test saved_roots_can_be_ignored_while_command_line_roots_remain ... ok
+test offline_overrides_an_explicit_context_grant_and_reports_its_source ... ok
+test top_level_help_names_sandbox_and_mcp_actions ... ok
+test shorthand_matches_explicit_explain_in_text_and_json ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/session_cost.rs (target/debug/deps/session_cost-69fa3340abb30cca)
+
+running 5 tests
+test empty_resumed_session_still_reports_no_requests ... ok
+test legacy_completed_requests_without_usage_still_count ... ok
+test legacy_usage_survives_resume_and_compaction_without_finish_markers ... ok
+test resumed_three_turn_session_reports_saved_requests_and_tokens ... ok
+test completed_requests_without_usage_count_but_failed_attempts_do_not ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/session_export.rs (target/debug/deps/session_export-06e91fe31b9feaab)
+
+running 5 tests
+test empty_export_is_empty_and_torn_tail_warns_without_inventing_events ... ok
+test repeated_exports_preserve_every_saved_event_and_exclude_transport_and_credentials ... ok
+test export_reports_output_write_failures ... ok
+test invalid_selectors_and_corrupt_logs_fail_without_partial_stdout ... ok
+test last_is_workspace_scoped_and_id_flag_takes_precedence ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/session_fork.rs (target/debug/deps/session_fork-073008638c81f474)
+
+running 6 tests
+test incomplete_tool_groups_and_invalid_positions_leave_no_new_session ... ok
+test torn_tail_does_not_change_the_requested_durable_prefix_or_source_bytes ... ok
+test malformed_tool_sequences_are_refused_before_a_destination_is_created ... ok
+test last_and_exact_id_select_the_source_and_require_an_explicit_boundary ... ok
+test completed_tool_group_forks_and_both_sessions_resume_independently ... ok
+test child_sessions_and_existing_destinations_are_refused ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/session_objective.rs (target/debug/deps/session_objective-b16f5ee1d5f8c719)
+
+running 3 tests
+test an_ordinary_prompt_creates_no_objective_even_when_it_mentions_a_goal ... ok
+test an_explicit_goal_is_identical_after_process_restart_and_queries_do_not_write ... ok
+test an_explicit_budget_is_persisted_displayed_and_enforced_by_the_cli ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/session_record_search.rs (target/debug/deps/session_record_search-b47cf543a9be723e)
+
+running 4 tests
+test original_records_and_positions_survive_repeated_compactions_without_mutation ... ok
+test invalid_queries_and_corruption_fail_while_a_torn_tail_warns ... ok
+test search_covers_live_records_and_summaries_and_excludes_metadata_and_identifiers ... ok
+test last_is_workspace_scoped_and_exact_id_overrides_the_selector ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/session_search.rs (target/debug/deps/session_search-674e6ca1fdd98152)
+
+running 3 tests
+test missing_or_empty_search_text_and_cursors_outside_the_results_fail ... ok
+test title_and_later_prompt_fragments_preserve_workspace_and_child_exclusions ... ok
+test filtering_precedes_the_listing_cap_and_pages_matching_sessions_once_in_activity_order ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+     Running tests/skills.rs (target/debug/deps/skills-8daabd22d3be9aba)
+
+running 1 test
+test discovered_skills_can_be_searched_and_loaded_with_configured_bounds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running tests/subagent.rs (target/debug/deps/subagent-55a1be575fe6fb99)
+
+running 1 test
+test synchronous_children_return_reads_and_cannot_escape_their_allowlist ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.73s
+
+     Running tests/terminal_accessible.rs (target/debug/deps/terminal_accessible-cfe6d19852559991)
+
+running 1 test
+test accessible_sessions_append_labelled_output_without_terminal_controls ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.69s
+
+     Running tests/terminal_approval.rs (target/debug/deps/terminal_approval-9fa1d3a287eed647)
+
+running 1 test
+test terminal_permission_requests_are_displayed_and_resolved ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests/terminal_ascii.rs (target/debug/deps/terminal_ascii-17e18ba2e8d3ca6a)
+
+running 1 test
+test ascii_setting_uses_ascii_decorations_in_terminal_sessions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.84s
+
+     Running tests/terminal_cancellation.rs (target/debug/deps/terminal_cancellation-1de87fc4dbb1f713)
+
+running 1 test
+test cancellation_saves_the_visible_answer_and_one_boundary_across_resume ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+     Running tests/terminal_draft.rs (target/debug/deps/terminal_draft-f7e672d6231e6622)
+
+running 8 tests
+test alt_enter_sends_one_two_line_prompt_with_an_exact_newline_to_the_provider ... ok
+test redo_restores_unicode_drafts_and_carets_in_a_real_terminal ... ok
+test pasted_multiline_drafts_show_each_edited_line_and_its_terminal_caret ... ok
+test long_drafts_scroll_with_the_caret_in_a_real_terminal ... ok
+test history_search_restores_an_older_prompt_by_its_middle_word_without_submitting ... ok
+test undo_restores_unicode_drafts_and_carets_in_a_real_terminal ... ok
+test workspace_path_completion_submits_one_quoted_path_containing_spaces ... ok
+test external_editor_reloads_the_draft_and_restores_the_terminal_on_success_and_failure ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.25s
+
+     Running tests/terminal_help.rs (target/debug/deps/terminal_help-d7b92afe3d526820)
+
+running 2 tests
+test line_input_help_reports_the_active_mode ... ok
+test every_help_binding_has_a_terminal_action_including_cancellation_and_paste ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.33s
+
+     Running tests/terminal_high_contrast.rs (target/debug/deps/terminal_high_contrast-651f6c5cedc14b7c)
+
+running 1 test
+test high_contrast_draws_explicit_pairs_and_no_color_suppresses_them ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+
+     Running tests/terminal_menu.rs (target/debug/deps/terminal_menu-51e740b577cbff82)
+
+running 3 tests
+test completion_and_model_menus_fit_a_short_terminal_and_close_cleanly ... ok
+test an_unknown_tagged_model_can_be_picked_and_sent_while_invalid_ids_are_refused ... ok
+test discovered_custom_slash_command_can_be_completed_and_expanded_in_a_terminal ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+     Running tests/terminal_process_death.rs (target/debug/deps/terminal_process_death-b919103a0dc9ff44)
+
+running 1 test
+test sigkill_preserves_a_replayable_partial_answer_without_completing_the_turn ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/terminal_provider_failure.rs (target/debug/deps/terminal_provider_failure-91136c8d4a160512)
+
+running 1 test
+test provider_failure_saves_the_visible_answer_and_boundary_across_resume ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running tests/terminal_question.rs (target/debug/deps/terminal_question-7a1c959e87b6a1b1)
+
+running 1 test
+test structured_questions_collect_terminal_answers_for_the_next_provider_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests/terminal_replay.rs (target/debug/deps/terminal_replay-3a4c4812b5d5309e)
+
+running 9 tests
+test four_row_compact_mode_message_matches_provider_traffic ... ok
+test draft_resize_grids ... FAILED
+test fenced_code_continuations_are_stable_while_streaming_and_when_finished ... ok
+test long_draft_grids ... FAILED
+test completion_selection_survives_resize_and_ignored_keys_but_resets_on_edit ... ok
+test twelve_column_text_grids_and_scrollback ... ok
+test short_menu_grids ... FAILED
+test settled_help_preserves_every_command_description_in_scrollback_at_40_and_80_columns ... ok
+test full_transcript_scrolls_tools_and_replies_and_preserves_the_draft_and_caret ... ok
+
+failures:
+
+---- draft_resize_grids stdout ----
+
+thread 'draft_resize_grids' (2662057) panicked at crates/rune/tests/terminal_replay.rs:278:5:
+assertion `left == right` failed
+  left: "narrow-draft: 32x24, caret 31,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|replay-fixture | auto | ctx ~4.8|\n03|> 234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\ngrown-draft: 80x24, caret 63,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|replay-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nshrunk-draft: 20x24, caret 19,3\n00|session ************|\n01|ctrl-c cancel  /help|\n02|replay-fixture | aut|\n03|> 456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\ngrown-again: 80x24, caret 63,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|replay-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\n"
+ right: "narrow-draft: 32x24, caret 31,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|replay-fixture | auto | ctx ~4.7|\n03|> 234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\ngrown-draft: 80x24, caret 63,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|replay-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nshrunk-draft: 20x24, caret 19,3\n00|session ************|\n01|ctrl-c cancel  /help|\n02|replay-fixture | aut|\n03|> 456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\ngrown-again: 80x24, caret 63,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|replay-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- long_draft_grids stdout ----
+
+thread 'long_draft_grids' (2662063) panicked at crates/rune/tests/terminal_replay.rs:161:5:
+assertion `left == right` failed
+  left: "end: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nleft: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nedited: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nhome: 80x24, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nend-again: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.8k (request bytes) (123.1k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\n"
+ right: "end: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nleft: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nedited: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nhome: 80x24, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\nend-again: 80x24, caret 79,3\n00|session ************|\n01|ctrl-c cancel  /help commands  esc clear|\n02|draft-fixture | auto | ctx ~4.7k (request bytes) (123.2k left)|\n03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|\n04||\n05||\n06||\n07||\n08||\n09||\n10||\n11||\n12||\n13||\n14||\n15||\n16||\n17||\n18||\n19||\n20||\n21||\n22||\n23||\n"
+
+---- short_menu_grids stdout ----
+
+thread 'short_menu_grids' (2662152) panicked at crates/rune/tests/terminal_replay.rs:170:5:
+assertion `left == right` failed
+  left: "completion-last: 32x8, caret 3,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.8k|\n03|> /|\n04|  /history [here|session-id|clea|\n05|  /help|\n06|> /quit|\n07|  13-15 of 15|\ncompletion-closed: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.8k|\n03|>|\n04||\n05||\n06||\n07||\nmodel-last: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.8k|\n03|>|\n04|models from chat_completions|\n05|> menu-model-15|\n06|  15-15 of 15|\n07|type to narrow, up/down choose,|\nmodel-closed: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.8k|\n03|>|\n04||\n05||\n06||\n07||\n"
+ right: "completion-last: 32x8, caret 3,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.7k|\n03|> /|\n04|  /history [here|session-id|clea|\n05|  /help|\n06|> /quit|\n07|  13-15 of 15|\ncompletion-closed: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.7k|\n03|>|\n04||\n05||\n06||\n07||\nmodel-last: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.7k|\n03|>|\n04|models from chat_completions|\n05|> menu-model-15|\n06|  15-15 of 15|\n07|type to narrow, up/down choose,|\nmodel-closed: 32x8, caret 2,3\n00|session ************|\n01|ctrl-c cancel  /help commands  e|\n02|menu-model-01 | auto | ctx ~4.7k|\n03|>|\n04||\n05||\n06||\n07||\n"
+
+
+failures:
+    draft_resize_grids
+    long_draft_grids
+    short_menu_grids
+
+test result: FAILED. 6 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.75s
+
+error: test failed, to rerun pass `-p rune --test terminal_replay`
+xtask: `cargo test --workspace` failed

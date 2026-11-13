@@ -9,7 +9,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -160,12 +159,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -186,7 +180,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
                   "menu-resize": (80, 24), "completion-resize": (80, 24), "code": (32, 24),
                   "transcript": (80, 24), "compact": (80, 4),
                   "help-40": (40, 24), "help-80": (80, 24)}[scenario]
-    master, slave = pty.openpty()
+    master, slave = open_terminal()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     try:
         child = subprocess.Popen(
@@ -222,12 +216,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             fcntl.ioctl(master, termios.TIOCSWINSZ,
                         struct.pack("HHHH", rows, cols, 0, 0))
         if keys:
-            os.write(master, keys)
+            write_terminal(master, keys, transcript)
         wait_for(expected, start)
-        deadline = time.monotonic() + 10
-        while select.select([master], [], [], 0.15)[0]:
-            assert time.monotonic() < deadline, "terminal never finished drawing"
-            transcript.extend(os.read(master, 65536))
+        drain_terminal(master, transcript, quiet=0.15)
         captures.append({"stage": stage, "cols": cols, "rows": rows,
                          "bytes": list(transcript[offset:])})
         offset = len(transcript)
@@ -239,7 +230,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             # At 12 columns the hint is deliberately clipped to this prefix.
             wait_for("ctrl-c cance")
         if scenario.startswith("help-"):
-            capture("help-settled", b"/help\r")
+            capture("help-settled", b"/help\r", "ordinary keys.\r\n")
             assert not prompts, prompts
         elif scenario == "resize":
             draft = "0123456789" * 5 + "VISIBLE-END"
@@ -248,7 +239,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("grown-draft", expected=draft, size=(80, 24))
             capture("shrunk-draft", expected="VISIBLE-END", size=(20, 24))
             capture("grown-again", expected=draft, size=(80, 24))
-            os.write(master, b"\x03")
+            write_terminal(master, b"\x03", transcript)
             wait_for("\x1b[?25h", offset)
         elif scenario == "compact":
             capture("compact-draft", b"narrow height", "> narrow height")
@@ -269,9 +260,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("completion-grown", size=(80, 24))
             # F2 has no binding and must leave the selection alone.
             capture("completion-ignored", b"\x1bOQ")
-            capture("completion-accepted", b"\t")
+            capture("completion-accepted", b"\t", "\x1b[7G\x1b[?25h")
             # Editing must still reset the selection for the narrowed list.
-            capture("completion-edited", b"\x03/" + b"\x1b[B" * 9 + b"m", "> /model")
+            capture("completion-edited", b"\x03/" + b"\x1b[B" * 9 + b"m", "\x1b[5G\x1b[?25h")
             capture("completion-cleared", b"\x03")
             assert not prompts, prompts
         elif scenario == "code":
@@ -287,7 +278,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("recorded", b"inspect\r", "REPLY-40\r\n")
             assert len(prompts) == 2, prompts
             assert "TOOL-30" in prompts[1], prompts[1]
-            capture("draft", "draft 界 tail".encode() + b"\x1b[D" * 6)
+            capture("draft", "draft 界 tail".encode() + b"\x1b[D" * 6, "\x1b[9G\x1b[?25h")
             capture("opened", b"\x0f", "Esc/Ctrl-O")
             capture("page-down", b"\x1b[6~", "\x1b[24;1H")
             capture("end", b"\x1b[F", "\x1b[24;1H")
@@ -315,18 +306,22 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             capture("submitted", b"\r", "REPLY-40\r\n")
             assert prompts[2] == "draft Z界 tail", prompts
             capture("live-started", b"live\r", "LIVE-PARTIAL")
-            capture("live-draft", b"live draft" + b"\x1b[D" * 4)
+            capture("live-draft", b"live draft" + b"\x1b[D" * 4, "\x1b[9G\x1b[?25h")
             capture("live-opened", b"\x0f", "Esc/Ctrl-O")
             capture("live-end", b"\x1b[F", "\x1b[24;1H")
             transcript_live_step.set()
-            assert transcript_live_finished.wait(10), "provider did not finish"
+            viewer_end = len(transcript)
+            wait_for_condition(child, master, transcript, transcript_live_finished.is_set,
+                               "provider to finish")
             # The provider finished while the snapshot owned the terminal.
             # No streaming frame may overwrite its rows or footer.
+            assert len(transcript) == viewer_end, "live output painted over the viewer"
             assert not select.select([master], [], [], 0.2)[0], "live output painted over the viewer"
             capture("live-closed", b"\x1b", "LIVE-PARTIAL LIVE-END\r\n")
             capture("live-edited", b"Z", "live dZraft")
-            os.write(master, b"\x03")
-            wait_for("\x1b[?25h", len(transcript))
+            cleared_at = len(transcript)
+            write_terminal(master, b"\x03", transcript)
+            wait_for("\x1b[?25h", cleared_at)
             capture("new-session", b"/new\r", "started session")
             capture("empty", b"\x0f", "Esc/Ctrl-O")
             capture("empty-closed", b"\x1b", "\x1b[?1049l")
@@ -335,15 +330,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r034-") as directory:
             # Wait for the committed ending, rather than an intermediate frame.
             capture("finished-answer", b"long-word\r", "END-LONG-W\r\nORD\r\n")
             assert prompts == ["long-word"], prompts
-        os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        write_terminal(master, b"/quit\r", transcript)
+        assert wait_for_exit(child, master, transcript, 10) == 0
         assert not errors, errors
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
-        child.wait(timeout=10)
-        os.close(master)
+        wait_for_exit(child, master, transcript, 10)
+        close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

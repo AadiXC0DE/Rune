@@ -5,7 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
 import select
 import struct
 import subprocess
@@ -70,12 +69,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
     server.daemon_threads = True
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    environment = child_environment({
-        key: value for key, value in os.environ.items()
-        if not key.startswith("RUNE_") and key.lower() not in {
-            "http_proxy", "https_proxy", "all_proxy",
-        }
-    })
+    environment = fixture_environment()
     environment.update({
         "HOME": directory,
         "XDG_CONFIG_HOME": str(root / "config"),
@@ -105,7 +99,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
 
     def launch(cols, *args):
         global child, master, transcript
-        master, slave = pty.openpty()
+        master, slave = open_terminal()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, cols, 0, 0))
         try:
             child = subprocess.Popen(
@@ -130,22 +124,29 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
                 transcript.extend(os.read(master, 65536))
 
     def drain():
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.15)
-            if not readable:
-                return
-            transcript.extend(os.read(master, 65536))
-        raise AssertionError("terminal never settled")
+        drain_terminal(master, transcript, timeout=2)
 
     def capture(stage, cols):
         captures.append({"stage": stage, "cols": cols, "bytes": list(transcript)})
 
     def stop():
         global child, master
-        os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
-        os.close(master)
+        write_terminal(master, b"/quit\r", transcript)
+        try:
+            status = wait_for_exit(child, master, transcript, 10)
+        except AssertionError:
+            # The helper drained the master while it waited and still saw no
+            # exit, so this is a genuine hang rather than a full PTY. Report
+            # whether the process is still alive before re-raising the tail.
+            print(
+                "[fixture] /quit sent but the session did not exit within 10s; "
+                f"alive={child.poll() is None}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        assert status == 0, transcript.decode(errors="replace")
+        close_terminal(master)
         master = None
         child = None
 
@@ -168,16 +169,16 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         capture("resume-last-before-input", 80)
         assert len(requests) == 1, "replay must not request another reply"
         assert log.read_bytes() == original_log, "replay must not append messages"
-        os.write(master, b"draft")
+        write_terminal(master, b"draft", transcript)
         wait_for("> draft")
         drain()
         capture("resume-last-draft", 80)
         assert len(requests) == 1
-        os.write(master, b"\x03")
+        write_terminal(master, b"\x03", transcript)
         drain()
         start = len(transcript)
-        os.write(master, b"continue saved prompt\r")
-        wait_for("CONTINUED-REPLY", start)
+        write_terminal(master, b"continue saved prompt\r", transcript)
+        wait_for("CONTINUED-REPLY\r\n", start)
         drain()
         assert [message for message in requests[-1]["messages"]
                 if message["role"] != "system"] == [
@@ -211,9 +212,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r038-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
-            child.wait(timeout=10)
+            if master is not None:
+                wait_for_exit(child, master, transcript, 10)
+            else:
+                child.wait(timeout=10)
         if master is not None:
-            os.close(master)
+            close_terminal(master)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=10)

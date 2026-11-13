@@ -22,10 +22,13 @@ struct Capture {
 }
 
 fn record(script: &str, scenario: Option<&str>) -> Vec<u8> {
+    // The shared fixture plumbing carries `wait_for_exit`, which the replay
+    // scripts use to shut the PTY child down without wedging on a full buffer.
+    let program = format!("{}\n{script}", include_str!("fixture_support.py"));
     let mut command = std::process::Command::new("python3");
     command.args([
         "-c",
-        &support::python_script(script),
+        &support::python_script(&program),
         env!("CARGO_BIN_EXE_rune"),
     ]);
     if let Some(scenario) = scenario {

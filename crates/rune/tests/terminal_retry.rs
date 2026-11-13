@@ -10,7 +10,11 @@ fn two_provider_failures_show_pending_and_active_retries_in_one_status_row() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_retry.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_retry.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()

@@ -5,8 +5,6 @@ import http.server
 import json
 import os
 import pathlib
-import pty
-import select
 import signal
 import struct
 import subprocess
@@ -187,6 +185,7 @@ def run_fixture(scenario, terminal=False):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, **options)
 
         child, master = None, None
+        transcript = bytearray()
         try:
             if scenario != "pending":
                 action = "reject" if scenario == "rejected" else "approve"
@@ -203,36 +202,59 @@ def run_fixture(scenario, terminal=False):
                 args.append("--offline")
             started = time.monotonic()
             if terminal:
-                master, slave = pty.openpty()
+                master, slave = open_terminal()
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-                child = subprocess.Popen([sys.argv[1], *args], stdin=slave, stdout=slave, stderr=slave,
-                                         cwd=root, env=environment, preexec_fn=controlling_terminal)
-                os.close(slave)
-                transcript = bytearray()
+                try:
+                    child = subprocess.Popen([sys.argv[1], *args], stdin=slave, stdout=slave, stderr=slave,
+                                             cwd=root, env=environment, preexec_fn=controlling_terminal)
+                finally:
+                    os.close(slave)
 
-                def wait_for(marker):
-                    deadline = time.monotonic() + 10
+                def pump(timeout):
+                    return _pump(master, transcript, timeout)
+
+                def wait_for(marker, timeout=10):
+                    deadline = time.monotonic() + timeout
                     while marker not in transcript:
-                        assert child.poll() is None, (child.returncode, transcript)
-                        assert time.monotonic() < deadline, transcript
-                        if select.select([master], [], [], 0.05)[0]:
-                            transcript.extend(os.read(master, 65536))
+                        assert child.poll() is None, (
+                            f"session exited (status {child.returncode}) before printing {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, (
+                            f"waited {timeout}s for the terminal to print {marker!r}:\n"
+                            + transcript.decode(errors="replace")
+                        )
+                        pump(min(remaining, 0.1))
 
                 wait_for(b"ctrl-c cancel")
-                os.write(master, b"echo through MCP\r")
+                write_terminal(master, b"echo through MCP\r", transcript)
                 if scenario == "cancel":
+                    # Keep draining the terminal while the call is in flight.
+                    # The process writes its repaints to the PTY whether or not
+                    # anyone reads them, so on a platform with a small PTY
+                    # buffer (macOS) a driver that only sleeps here lets the
+                    # buffer fill, blocks the process mid-frame, and the Enter
+                    # never reaches the turn: tools/call never gets logged.
+                    # Pumping lets the call be dispatched at all.
                     deadline = time.monotonic() + 10
                     while "tools/call" not in (root / "local.jsonl").read_text():
                         assert time.monotonic() < deadline, transcript
-                        time.sleep(0.02)
+                        pump(0.02)
                     cancelled = time.monotonic()
-                    os.write(master, b"\x03")
-                    wait_for(b"[cancelled]")
+                    write_terminal(master, b"\x03", transcript)
+                    wait_for(b"[cancelled]\r\n")
                     assert time.monotonic() - cancelled < 2, transcript
                 else:
-                    wait_for(b"MCP_FIXTURE_PASSED")
-                os.write(master, b"/quit\r")
-                assert child.wait(timeout=5) == 0, transcript
+                    # Wait for the committed reply, not the streamed delta: an
+                    # Enter sent mid-turn is queued as steering, so /quit would
+                    # never reach command handling.
+                    wait_for(b"MCP_FIXTURE_PASSED\r\n")
+                write_terminal(master, b"/quit\r", transcript)
+                assert wait_for_exit(child, master, transcript, 10) == 0, (
+                    f"session exited with status {child.returncode}:\n"
+                    + transcript.decode(errors="replace")
+                )
                 stdout, stderr = bytes(transcript), b""
             else:
                 prompt = b"echo through MCP\n" + (b"no\n" if scenario == "policy" else b"")
@@ -280,11 +302,12 @@ def run_fixture(scenario, terminal=False):
                 else:
                     raise AssertionError(f"MCP child {pid} survived CLI exit ({scenario})")
         finally:
-            if child is not None and child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                wait_for_exit(child, master, transcript, 5)
             if master is not None:
-                os.close(master)
+                close_terminal(master)
             for pid_file in root.glob("*.pid"):
                 try:
                     os.kill(int(pid_file.read_text()), signal.SIGKILL)

@@ -222,6 +222,10 @@ jobs:
           # capture puts those lines in the job log as they happen, so a run
           # that stalls at a deadline (rather than unwinding) still explains
           # which side stalled and how far the other side had got.
+          # The subprocess fixtures print a line per phase and report every
+          # subprocess deadline, including the child's last output. Turning off
+          # libtest capture puts that in the job log even when a fixture fails
+          # by timing out rather than by asserting.
           RUST_TEST_NOCAPTURE: '1'
         run: cargo test --workspace
 

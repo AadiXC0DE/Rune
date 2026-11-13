@@ -20,11 +20,17 @@ fn interactive_resume_replays_saved_exchanges_once_before_input() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
-            &support::python_script(include_str!("terminal_resume.py")),
+            &support::python_script(concat!(
+                include_str!("fixture_support.py"),
+                "\n",
+                include_str!("terminal_resume.py")
+            )),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()
         .expect("python3 is required for the Unix terminal resume regression");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "terminal resume regression failed:\n{}\n{}",
