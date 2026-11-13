@@ -268,6 +268,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         send(b"y")
         settled_reply("FIXTURE_REPLY_6", start)
         assert side_effect.read_bytes() == b"xxx"
+        # A `y` that arrived before the menu was drawn went to the turn's draft,
+        # which answers nothing; it is cleared before the next prompt.
+        send(b"\x15")
 
         # `p` shows the exact rule, saves it on yes, and the call runs.
         start = len(transcript)
