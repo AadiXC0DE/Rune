@@ -110,7 +110,7 @@ class AdapterCase(unittest.TestCase):
             "fix the bug",
         ])
         self.assertEqual(cc["env"]["ANTHROPIC_BASE_URL"], PROXY + "/anthropic")
-        self.assertEqual(cc["env"]["ANTHROPIC_AUTH_TOKEN"], KEY)
+        self.assertEqual(cc["env"]["ANTHROPIC_API_KEY"], KEY)
         self.assertEqual(cc["env"]["CLAUDE_CONFIG_DIR"], "/tmp/home/.claude")
         for var in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):

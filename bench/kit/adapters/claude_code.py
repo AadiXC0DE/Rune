@@ -26,7 +26,9 @@ def prepare(ctx):
         "env": {
             "CLAUDE_CONFIG_DIR": str(ctx["home"]) + "/.claude",
             "ANTHROPIC_BASE_URL": ctx["proxy_url"] + "/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": ctx["key"],
+            # Sent as x-api-key, which every Anthropic-compatible route takes;
+            # OpenCode's refuses the bearer form ANTHROPIC_AUTH_TOKEN sends.
+            "ANTHROPIC_API_KEY": ctx["key"],
             "ANTHROPIC_DEFAULT_OPUS_MODEL": m,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": m,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": m,
