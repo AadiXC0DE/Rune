@@ -181,7 +181,12 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         Check::skipped("update", "not checked: the release lookup is not built yet"),
         Check::skipped("clock", "not checked: the release lookup is not built yet"),
         check_terminal(),
-        check_config_layers(settings),
+        windows_configuration(
+            check_config_layers(settings),
+            cfg!(windows),
+            rune_core::paths::home_directory().as_deref(),
+            &paths.config_root,
+        ),
     ];
     let listed = if !settings.provider.is_configured() || settings.offline {
         None
@@ -775,6 +780,29 @@ fn check_limits(settings: &Settings) -> Check {
 }
 
 /// Reports whether a legacy state directory exists.
+/// On Windows, a configuration that passed but still lives in the layout
+/// used before the Windows folders becomes a warning that says where new
+/// installs keep it.
+fn windows_configuration(
+    configuration: Check,
+    windows: bool,
+    home: Option<&Utf8Path>,
+    config_root: &Utf8Path,
+) -> Check {
+    let Some(home) = home.filter(|_| windows && configuration.outcome == Outcome::Ok) else {
+        return configuration;
+    };
+    let legacy = home.join(".config").join("rune");
+    if config_root != legacy {
+        return configuration;
+    }
+    Check::warn(
+        "configuration",
+        format!("configuration is in {legacy}; new installs use %APPDATA%\\rune"),
+    )
+    .with_hint("move the folder to %APPDATA%\\rune to use the Windows location")
+}
+
 fn check_legacy_layout() -> Check {
     let home = std::env::var("HOME").ok();
     let legacy = Paths::legacy_dir(home.as_deref());
@@ -892,6 +920,35 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn the_old_layout_on_windows_is_a_warning() {
+        let home = Utf8Path::new("/home/ada");
+        let legacy = home.join(".config").join("rune");
+        let ok = || Check::ok("configuration", "every layer parsed");
+        let warned = windows_configuration(ok(), true, Some(home), &legacy);
+        assert_eq!(warned.outcome, Outcome::Warn);
+        assert!(
+            warned
+                .detail
+                .ends_with("; new installs use %APPDATA%\\rune"),
+            "{}",
+            warned.detail
+        );
+        assert_eq!(
+            warned.hint.as_deref(),
+            Some("move the folder to %APPDATA%\\rune to use the Windows location")
+        );
+        assert_eq!(
+            windows_configuration(ok(), false, Some(home), &legacy).outcome,
+            Outcome::Ok
+        );
+        let appdata = Utf8Path::new("/appdata/rune");
+        assert_eq!(
+            windows_configuration(ok(), true, Some(home), appdata).outcome,
+            Outcome::Ok
+        );
     }
 
     #[test]

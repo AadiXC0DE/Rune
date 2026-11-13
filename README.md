@@ -1033,6 +1033,18 @@ Five layers, highest first: command-line flags, `RUNE_*` environment variables,
 the project file `.rune.toml`, the user file at `$XDG_CONFIG_HOME/rune/config.toml`,
 then built-in defaults.
 
+The default locations:
+
+| | Configuration | State (sessions, usage, credentials) | Data (skills, themes) |
+|---|---|---|---|
+| Linux and macOS | `~/.config/rune` | `~/.local/state/rune` | `~/.local/share/rune` |
+| Windows | `%APPDATA%\rune` | `%LOCALAPPDATA%\rune` | `%LOCALAPPDATA%\rune\data` |
+
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` move them on every
+system, and `RUNE_HOME` moves the state. On Windows, any `XDG_*` variable or an
+existing `~/.config/rune` keeps the first layout, so an earlier setup is not
+moved; `rune doctor` says where new installs keep it.
+
 Set `RUNE_CONFIG` to use a different user configuration file. Workspace edits
 and provider selections read and write that file. An empty or unset value uses
 the default path.
