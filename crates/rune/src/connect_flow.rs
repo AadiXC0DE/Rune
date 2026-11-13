@@ -156,10 +156,7 @@ fn read_credential(prompt: &str) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         return read_line(prompt);
     }
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{prompt}");
-    let _ = out.flush();
-    let read = rune_term::input::read_secret();
+    let read = rune_term::input::read_secret(prompt);
     // Enter was not echoed either, so the line the prompt is on is ended here.
     println!();
     match read {

@@ -1317,14 +1317,14 @@ pub fn secret_event(secret: &mut String, event: Event) -> SecretStep {
     }
 }
 
-/// Reads one line from the terminal without showing it.
+/// Writes `prompt`, then reads one line from the terminal without showing it.
 ///
 /// A credential that is echoed stays on screen and in the terminal's
 /// scrollback. Raw mode keeps the terminal from echoing, and bracketed paste
 /// delivers a pasted key in one piece, so a line break copied with it does not
 /// end the read. Returns `None` when input ends before anything is typed, and
 /// an interrupted error for Control-C.
-pub fn read_secret() -> std::io::Result<Option<String>> {
+pub fn read_secret(prompt: &str) -> std::io::Result<Option<String>> {
     /// Puts the terminal back however the read ends.
     struct Restore;
     impl Drop for Restore {
@@ -1344,6 +1344,14 @@ pub fn read_secret() -> std::io::Result<Option<String>> {
         modes.raw = true;
         modes.bracketed_paste = true;
     });
+    // The prompt is written once echo is off, so nothing typed after it can
+    // appear on screen.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        out.write_all(prompt.as_bytes())?;
+        out.flush()?;
+    }
     let mut secret = String::new();
     loop {
         match secret_event(&mut secret, crossterm::event::read()?) {
