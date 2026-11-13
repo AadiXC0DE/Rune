@@ -506,7 +506,7 @@ fn guidance_with(
                 .to_owned(),
         ),
         ("windows", _) => Some(
-            "Windows has no command sandbox in this version; commands run under the permission mode only"
+            "Windows has no command sandbox in this version; commands run under the permission mode only, with --allow-unsandboxed or allow_unsandboxed = true (the Windows default)"
                 .to_owned(),
         ),
         ("linux", Support::Unsupported { .. }) => Some(format!(
@@ -1604,7 +1604,7 @@ mod tests {
         let guidance = guidance_with("windows", &support, "", None, false).expect("guidance");
         assert_eq!(
             guidance,
-            "Windows has no command sandbox in this version; commands run under the permission mode only"
+            "Windows has no command sandbox in this version; commands run under the permission mode only, with --allow-unsandboxed or allow_unsandboxed = true (the Windows default)"
         );
         #[cfg(windows)]
         {
