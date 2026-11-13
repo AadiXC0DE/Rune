@@ -25,7 +25,7 @@
 <meta name="twitter:title" content="Rune, a tiny coding agent in Rust">
 <meta name="twitter:description" content="One 5.45 MiB binary, sandboxed, model agnostic. The page runs the real harness as WebAssembly.">
 
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b0b0a'/><path d='M8 8h10a6 6 0 0 1 0 12h-4l6 8' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b0b0a'/><path d='M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5' fill='none' stroke='%23ffb454' stroke-width='3'/></svg>">
 <link rel="preload" href="fonts/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/plex-mono-600.woff2" as="font" type="font/woff2" crossorigin>
 
@@ -54,6 +54,7 @@
   :root {
     --bg: #0b0b0a;
     --bg-raised: #121210;
+    --bg-card: #0f0f0d;
     --line: #23221e;
     --line-lit: #3a372f;
     --text: #ece8df;
@@ -61,6 +62,9 @@
     --faint: #858073;
     --accent: #ffb454;
     --accent-ink: #ffb454;
+    --accent-rgb: 255 180 84;
+    --dot: rgb(236 232 223 / .09);
+    --glow: rgb(255 180 84 / .16);
     --warn: #e58a5c;
     --ok: #9ece6a;
 
@@ -72,7 +76,8 @@
     --term-faint: #7f7a6e;
 
     --gutter: clamp(1.25rem, 4vw, 3rem);
-    --width: 1120px;
+    --width: 1180px;
+    --ease: cubic-bezier(.16, 1, .3, 1);
     color-scheme: dark;
   }
 
@@ -80,6 +85,7 @@
     :root {
       --bg: #f6f6f3;
       --bg-raised: #ffffff;
+      --bg-card: #fbfbf9;
       --line: #e3e2dc;
       --line-lit: #c9c7bd;
       --text: #1a1916;
@@ -88,6 +94,8 @@
       /* Amber is too light to read on a light page, so text takes a darker
          shade of it and the glyph keeps the brand colour. */
       --accent-ink: #9a5b00;
+      --dot: rgb(26 25 22 / .12);
+      --glow: rgb(255 180 84 / .22);
       --warn: #b4461d;
       --ok: #3f7a1c;
       color-scheme: light;
@@ -95,7 +103,8 @@
   }
 
   *, *::before, *::after { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; scroll-padding-top: 5rem; }
+  html { -webkit-text-size-adjust: 100%; scroll-padding-top: 5rem; scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
   body {
     margin: 0;
     background: var(--bg);
@@ -105,6 +114,7 @@
     line-height: 1.65;
     -webkit-font-smoothing: antialiased;
     font-feature-settings: "calt" 0;
+    overflow-x: clip;
   }
   a { color: inherit; text-decoration: none; }
   a:hover { color: var(--accent-ink); }
@@ -113,46 +123,129 @@
   code { font-family: inherit; }
 
   .wrap { max-width: var(--width); margin: 0 auto; padding: 0 var(--gutter); }
+  .label {
+    display: inline-block;
+    font-size: .72rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    margin: 0 0 1rem;
+  }
 
   /* ---------- top ---------- */
 
+  .top {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 78%, transparent);
+    -webkit-backdrop-filter: saturate(1.4) blur(12px);
+    backdrop-filter: saturate(1.4) blur(12px);
+    border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  }
   .top .wrap {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    height: 64px;
+    height: 60px;
     font-size: .86rem;
   }
-  .brand { display: flex; align-items: center; gap: .6rem; font-weight: 600; letter-spacing: .01em; }
+  .brand { display: flex; align-items: center; gap: .6rem; font-weight: 600; letter-spacing: .01em; font-size: .95rem; }
   .brand svg { display: block; }
-  .top nav { display: flex; gap: 1.6rem; color: var(--dim); }
+  .top nav { display: flex; align-items: center; gap: 1.6rem; color: var(--dim); }
+  .top nav .button { color: var(--text); }
+
+  .button {
+    display: inline-flex;
+    align-items: center;
+    gap: .5rem;
+    border: 1px solid var(--line-lit);
+    padding: .38rem .8rem;
+    transition: border-color .2s, color .2s, background-color .2s;
+  }
+  .button:hover { border-color: var(--accent-ink); color: var(--accent-ink); }
+  .button.solid { background: var(--accent); border-color: var(--accent); color: #0b0b0a; font-weight: 600; }
+  .button.solid:hover { background: transparent; color: var(--accent-ink); border-color: var(--accent-ink); }
 
   /* ---------- hero ---------- */
 
+  .hero { position: relative; isolation: isolate; }
+  /* A field of dots behind the hero, the same grid the mark is drawn on. */
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: -60px 0 0;
+    z-index: -1;
+    background-image: radial-gradient(var(--dot) 1px, transparent 1.6px);
+    background-size: 22px 22px;
+    -webkit-mask-image: radial-gradient(ellipse 70% 75% at 72% 42%, #000 15%, transparent 72%);
+    mask-image: radial-gradient(ellipse 70% 75% at 72% 42%, #000 15%, transparent 72%);
+  }
   .hero .wrap {
     display: grid;
-    grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr);
-    gap: clamp(2rem, 5vw, 4.5rem);
+    grid-template-columns: minmax(0, 1.18fr) minmax(0, .82fr);
+    gap: clamp(2rem, 5vw, 4rem);
     align-items: center;
-    padding-top: clamp(2.5rem, 7vw, 5.5rem);
-    padding-bottom: clamp(1rem, 3vw, 2rem);
+    min-height: min(820px, calc(100svh - 60px));
+    padding-top: clamp(2.5rem, 6vw, 4.5rem);
+    padding-bottom: clamp(2.5rem, 6vw, 4.5rem);
   }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: .6rem;
+    border: 1px solid var(--line-lit);
+    background: color-mix(in srgb, var(--bg-raised) 80%, transparent);
+    padding: .3rem .75rem .3rem .6rem;
+    font-size: .76rem;
+    color: var(--dim);
+    margin-bottom: 1.6rem;
+    transition: border-color .2s, color .2s;
+  }
+  .tag:hover { border-color: var(--accent-ink); color: var(--text); }
+  .tag b { color: var(--text); font-weight: 500; }
+  .live {
+    width: 7px;
+    height: 7px;
+    background: var(--ok);
+    box-shadow: 0 0 0 0 rgb(158 206 106 / .6);
+    animation: ping 2.2s var(--ease) infinite;
+  }
+  @keyframes ping { 70%, 100% { box-shadow: 0 0 0 7px rgb(158 206 106 / 0); } }
   h1 {
-    font-size: clamp(2.05rem, 4.4vw, 3.55rem);
-    line-height: 1.08;
-    letter-spacing: -.035em;
+    font-size: clamp(2.2rem, 4.5vw, 3.7rem);
+    line-height: 1.02;
+    letter-spacing: -.045em;
     font-weight: 600;
     margin: 0 0 1.4rem;
     text-wrap: balance;
   }
-  h1 em { font-style: normal; color: var(--accent-ink); }
-  .lede { color: var(--dim); font-size: 1.02rem; max-width: 46ch; margin: 0 0 2rem; text-wrap: pretty; }
+  h1 em {
+    font-style: normal;
+    color: var(--accent-ink);
+    white-space: nowrap;
+  }
+  @supports (-webkit-background-clip: text) {
+    @media (prefers-color-scheme: dark) {
+      h1 em {
+        background: linear-gradient(100deg, #ffd08a 0%, var(--accent) 45%, #ff8f3d 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+    }
+  }
+  .lede { color: var(--dim); font-size: 1.05rem; max-width: 46ch; margin: 0 0 2.1rem; text-wrap: pretty; }
 
   .install {
+    position: relative;
     border: 1px solid var(--line-lit);
     background: var(--bg-raised);
-    max-width: 34rem;
+    max-width: 36rem;
+    box-shadow: 0 24px 60px -36px rgb(0 0 0 / .6);
+    transition: border-color .25s;
   }
+  .install:focus-within, .install:hover { border-color: color-mix(in srgb, var(--accent-ink) 55%, var(--line-lit)); }
   .install [role="tablist"] {
     display: flex;
     border-bottom: 1px solid var(--line);
@@ -160,6 +253,7 @@
     letter-spacing: .08em;
   }
   .install [role="tab"] {
+    position: relative;
     appearance: none;
     background: none;
     border: 0;
@@ -172,15 +266,24 @@
   }
   .install [role="tab"]:hover { color: var(--text); }
   .install [role="tab"][aria-selected="true"] { color: var(--accent-ink); }
+  .install [role="tab"][aria-selected="true"]::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    background: var(--accent);
+  }
   .line {
     display: flex;
     align-items: center;
     gap: .75rem;
-    padding: .9rem .95rem;
+    padding: .95rem .95rem;
     font-size: .93rem;
   }
   .line[hidden] { display: none; }
-  .line .ps { color: var(--faint); user-select: none; }
+  .line .ps, .ps { color: var(--faint); user-select: none; }
   .line code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .copy {
     appearance: none;
@@ -198,33 +301,87 @@
   .copy:hover { color: var(--accent-ink); border-color: var(--accent-ink); }
   .copy:active { transform: translateY(1px); }
   .copy[data-done] { color: var(--ok); border-color: var(--ok); }
-  .meta { margin: 1rem 0 0; font-size: .8rem; color: var(--faint); }
+  .meta { margin: 1.1rem 0 0; font-size: .8rem; color: var(--faint); }
   .meta b { color: var(--dim); font-weight: 500; }
 
-  .glyph { position: relative; aspect-ratio: 1; width: 100%; max-width: 440px; justify-self: end; }
+  .glyph { position: relative; aspect-ratio: 1; width: 100%; max-width: 500px; justify-self: end; }
+  .glyph::before {
+    content: "";
+    position: absolute;
+    inset: 12%;
+    background: radial-gradient(closest-side, var(--glow), transparent);
+    filter: blur(30px);
+    z-index: -1;
+  }
   .glyph canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: pan-y; }
+  .corner { position: absolute; width: 14px; height: 14px; border-color: var(--line-lit); border-style: solid; border-width: 0; }
+  .corner.tl { top: 0; left: 0; border-top-width: 1px; border-left-width: 1px; }
+  .corner.tr { top: 0; right: 0; border-top-width: 1px; border-right-width: 1px; }
+  .corner.bl { bottom: 0; left: 0; border-bottom-width: 1px; border-left-width: 1px; }
+  .corner.br { bottom: 0; right: 0; border-bottom-width: 1px; border-right-width: 1px; }
+  .glyph figcaption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1.9rem;
+    display: flex;
+    justify-content: space-between;
+    font-size: .7rem;
+    letter-spacing: .08em;
+    color: var(--faint);
+  }
+
+  /* ---------- numbers ---------- */
+
+  .stats { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--bg-card); }
+  .stats dl {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin: 0;
+  }
+  .stats dl > div { padding: 1.7rem 1.4rem 1.6rem; border-left: 1px solid var(--line); }
+  .stats dl > div:first-child { border-left: 0; padding-left: 0; }
+  .stats dt {
+    font-size: clamp(1.7rem, 3vw, 2.4rem);
+    font-weight: 600;
+    letter-spacing: -.04em;
+    line-height: 1.1;
+    margin-bottom: .35rem;
+  }
+  .stats dt small { font-size: .5em; letter-spacing: 0; color: var(--dim); font-weight: 500; margin-left: .2em; }
+  .stats dd { margin: 0; font-size: .8rem; color: var(--dim); max-width: 26ch; }
+  .stats code { white-space: nowrap; }
+
+  /* ---------- sections ---------- */
+
+  section { padding: clamp(3.5rem, 8vw, 6.5rem) 0; }
+  h2 {
+    font-size: clamp(1.6rem, 3vw, 2.35rem);
+    line-height: 1.12;
+    letter-spacing: -.035em;
+    font-weight: 600;
+    margin: 0 0 .9rem;
+    text-wrap: balance;
+  }
+  .sub { color: var(--dim); max-width: 62ch; margin: 0 0 2.4rem; text-wrap: pretty; }
+  .head { display: flex; align-items: end; justify-content: space-between; gap: 1rem 3rem; flex-wrap: wrap; }
+  .head .sub { margin-bottom: 2.4rem; }
 
   /* ---------- demo ---------- */
 
-  section { padding: clamp(2.75rem, 6vw, 4.75rem) 0; }
-  h2 {
-    font-size: clamp(1.35rem, 2.3vw, 1.8rem);
-    line-height: 1.2;
-    letter-spacing: -.02em;
-    font-weight: 600;
-    margin: 0 0 .8rem;
-    text-wrap: balance;
+  .frame {
+    position: relative;
+    padding: 1px;
+    background: linear-gradient(180deg, rgb(var(--accent-rgb) / .55), var(--term-line) 35%, var(--term-line));
+    box-shadow: 0 40px 120px -50px rgb(var(--accent-rgb) / .35), 0 30px 80px -40px rgb(0 0 0 / .6);
   }
-  .sub { color: var(--dim); max-width: 64ch; margin: 0 0 2rem; text-wrap: pretty; }
 
   .term {
     position: relative;
     background: var(--term-bg);
     color: var(--term-text);
-    border: 1px solid var(--term-line);
     font-size: 13.5px;
     line-height: 1.6;
-    box-shadow: 0 30px 80px -40px rgb(0 0 0 / .55);
   }
   .term-bar {
     display: flex;
@@ -366,34 +523,132 @@
   .endpoint .note { color: var(--term-faint); }
   .endpoint button { justify-self: start; }
 
-  .demo-foot { margin: 1rem 0 0; font-size: .8rem; color: var(--faint); max-width: 80ch; }
+  .demo-foot { margin: 1.2rem 0 0; font-size: .8rem; color: var(--faint); max-width: 80ch; }
 
   /* ---------- principles ---------- */
 
-  .points {
+  .cards {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 2.6rem clamp(2rem, 6vw, 5rem);
-    margin: 0;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
   }
-  .points div { max-width: 46ch; }
-  .points dt { font-weight: 600; margin: 0 0 .35rem; }
-  .points dd { margin: 0; color: var(--dim); font-size: .92rem; }
-  .points code { color: var(--text); }
+  .card {
+    position: relative;
+    background: var(--bg-card);
+    padding: 1.6rem 1.5rem 1.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: .7rem;
+    overflow: hidden;
+  }
+  /* A soft light follows the pointer across a card. */
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(420px circle at var(--mx, 50%) var(--my, -200px), rgb(var(--accent-rgb) / .085), transparent 60%);
+    opacity: 0;
+    transition: opacity .3s;
+    pointer-events: none;
+  }
+  .card:hover::before { opacity: 1; }
+  .card.wide { grid-column: span 2; }
+  .card.full { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .7rem 2rem; }
+  .card.full h3 { grid-column: 1 / -1; }
+  .card.full .pills { margin: 0; padding: 0; justify-content: end; }
+  .card h3 { font-size: 1rem; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  .card h3 .n { color: var(--accent-ink); font-weight: 500; margin-right: .6rem; font-size: .8rem; }
+  .card p { margin: 0; color: var(--dim); font-size: .9rem; text-wrap: pretty; }
+  .card code { color: var(--text); white-space: nowrap; }
+  .card .shot {
+    margin: auto 0 0;
+    padding: .8rem .9rem;
+    background: var(--term-bg);
+    color: var(--term-dim);
+    border: 1px solid var(--term-line);
+    font-size: .74rem;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .shot .cmd { color: var(--term-text); }
+  .shot .ok { color: #9ece6a; }
+  .shot .amber { color: var(--accent); }
+
+  .gauges { display: grid; gap: .9rem; margin: .4rem 0 .2rem; }
+  .gauge { display: grid; grid-template-columns: 11ch 1fr auto; gap: .9rem; align-items: center; font-size: .78rem; color: var(--dim); }
+  .gauge .bar { height: 8px; background: var(--line); position: relative; overflow: hidden; }
+  .gauge .bar i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: var(--v);
+    background: repeating-linear-gradient(90deg, var(--accent) 0 6px, transparent 6px 8px);
+    transform-origin: left;
+  }
+  .gauge b { color: var(--text); font-weight: 500; }
+  .card p.note { font-size: .74rem; color: var(--faint); }
+  details { font-size: .82rem; color: var(--faint); }
+  details summary { cursor: pointer; color: var(--dim); list-style: none; width: fit-content; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "+ "; color: var(--accent-ink); }
+  details[open] summary::before { content: "\2212 "; }
+  details summary:hover { color: var(--accent-ink); }
+  details p { margin-top: .7rem !important; font-size: .82rem !important; }
+
+  .pills { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: auto; padding-top: .4rem; }
+  .pills span { border: 1px solid var(--line-lit); padding: .12rem .55rem; font-size: .74rem; color: var(--dim); }
+  .pills span.on { border-color: var(--accent-ink); color: var(--accent-ink); }
+  kbd {
+    font: inherit;
+    font-size: .74rem;
+    border: 1px solid var(--line-lit);
+    border-bottom-width: 2px;
+    padding: .05rem .4rem;
+    color: var(--text);
+  }
+  .keys { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; margin-top: auto; padding-top: .4rem; font-size: .78rem; color: var(--dim); }
 
   /* ---------- start ---------- */
 
-  .steps {
-    margin: 0;
-    padding: 1.1rem 1.2rem;
-    border: 1px solid var(--line);
-    background: var(--bg-raised);
-    font-size: .9rem;
-    line-height: 2;
-    overflow-x: auto;
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.2rem; counter-reset: step; }
+  .steps li { counter-increment: step; border-top: 1px solid var(--line-lit); padding-top: 1.1rem; }
+  .steps li::before { content: "0" counter(step); display: block; color: var(--accent-ink); font-size: .78rem; letter-spacing: .1em; margin-bottom: .7rem; }
+  .steps .line { border: 1px solid var(--line); background: var(--bg-raised); padding: .7rem .8rem; font-size: .86rem; }
+  .steps p { margin: .7rem 0 0; color: var(--dim); font-size: .86rem; }
+
+  /* ---------- closing ---------- */
+
+  .closing { position: relative; overflow: hidden; border-top: 1px solid var(--line); padding-bottom: 0; }
+  .closing .wrap { display: grid; justify-items: center; text-align: center; }
+  .closing h2 { font-size: clamp(2rem, 5vw, 3.5rem); }
+  .closing .sub { margin-left: auto; margin-right: auto; }
+  .closing .actions { display: flex; flex-wrap: wrap; justify-content: center; gap: .8rem; }
+  .closing .actions .button { padding: .6rem 1.1rem; }
+  .wordmark {
+    margin-top: clamp(3rem, 7vw, 5rem);
+    font-size: clamp(7rem, 31vw, 24rem);
+    font-weight: 600;
+    letter-spacing: -.07em;
+    line-height: .74;
+    text-align: center;
+    user-select: none;
+    color: var(--line);
+    height: .6em;
+    overflow: hidden;
   }
-  .steps .ps { color: var(--faint); user-select: none; }
-  .steps .c { color: var(--faint); }
+  @supports (-webkit-background-clip: text) {
+    .wordmark {
+      background-image: radial-gradient(rgb(var(--accent-rgb) / .7) 1.5px, transparent 2px);
+      background-size: 7px 7px;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      -webkit-mask-image: linear-gradient(180deg, #000 20%, transparent 100%);
+      mask-image: linear-gradient(180deg, #000 20%, transparent 100%);
+    }
+  }
 
   /* ---------- footer ---------- */
 
@@ -415,33 +670,57 @@
   /* The hero rises once as the page opens. Later sections rise as they are
      scrolled into view where the browser can tie an animation to scrolling,
      and are simply present where it cannot, so nothing waits on a script. */
-  @keyframes rise { from { opacity: 0; transform: translateY(14px); } }
+  @keyframes rise { from { opacity: 0; transform: translateY(16px); } }
+  @keyframes fill { from { transform: scaleX(0); } }
   @media (prefers-reduced-motion: no-preference) {
-    .hero .rise { animation: rise .8s cubic-bezier(.16, 1, .3, 1) both; }
-    .hero .rise:nth-child(2) { animation-delay: .07s; }
-    .hero .rise:nth-child(3) { animation-delay: .14s; }
-    .hero .rise:nth-child(4) { animation-delay: .21s; }
+    .hero .rise { animation: rise .9s var(--ease) both; }
+    .hero .rise:nth-child(2) { animation-delay: .06s; }
+    .hero .rise:nth-child(3) { animation-delay: .12s; }
+    .hero .rise:nth-child(4) { animation-delay: .18s; }
+    .hero .rise:nth-child(5) { animation-delay: .24s; }
+    .gauge .bar i { animation: fill 1.4s var(--ease) both; animation-delay: .2s; }
     @supports (animation-timeline: view()) {
-      section:not(.hero) .rise {
+      main > :not(.hero) .rise {
         animation: rise linear both;
         animation-timeline: view();
         animation-range: entry 0% entry 35%;
       }
+      .gauge .bar i {
+        animation: fill linear both;
+        animation-timeline: view();
+        animation-range: entry 10% cover 40%;
+      }
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .running::after { animation: none; }
+    .running::after, .live { animation: none; }
   }
 
   /* ---------- small screens ---------- */
 
+  @media (max-width: 960px) {
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card.wide { grid-column: span 2; }
+    .stats dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stats dl > div { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; }
+    .stats dl > div:nth-child(-n+2) { border-top: 0; }
+    .stats dl > div:nth-child(even) { border-left: 1px solid var(--line); padding-left: 1.4rem; }
+  }
   @media (max-width: 860px) {
-    .hero .wrap { grid-template-columns: minmax(0, 1fr); }
-    .glyph { justify-self: center; max-width: 300px; order: -1; margin-bottom: -1rem; }
-    .points { grid-template-columns: minmax(0, 1fr); }
+    .hero .wrap { grid-template-columns: minmax(0, 1fr); min-height: 0; padding-top: 1.5rem; }
+    .glyph { justify-self: center; max-width: 280px; order: -1; margin-bottom: 1rem; }
+    .glyph figcaption { display: none; }
     .top nav a.optional { display: none; }
-    .term { margin: 0 calc(var(--gutter) * -1); border-left: 0; border-right: 0; }
+    .frame { margin: 0 calc(var(--gutter) * -1); padding: 1px 0; }
     .endpoint { grid-template-columns: minmax(0, 1fr); }
+    .steps { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 620px) {
+    .cards { grid-template-columns: minmax(0, 1fr); }
+    .card.wide { grid-column: auto; }
+    .card.full { grid-template-columns: minmax(0, 1fr); }
+    .card.full .pills { justify-content: start; }
+    .gauge { grid-template-columns: 9ch 1fr auto; gap: .6rem; }
   }
 </style>
 </head>
@@ -450,14 +729,15 @@
 <header class="top">
   <div class="wrap">
     <a class="brand" href="/" aria-label="Rune home">
-      <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 8h10a6 6 0 0 1 0 12h-4l6 8" fill="none" stroke="#ffb454" stroke-width="3"/></svg>
+      <svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5" fill="none" stroke="#ffb454" stroke-width="3"/></svg>
       rune
     </a>
     <nav>
       <a href="#demo">demo</a>
+      <a class="optional" href="#why">why</a>
       <a class="optional" href="#start">install</a>
       <a class="optional" href="https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md">commands</a>
-      <a href="https://github.com/AadiXC0DE/Rune">source</a>
+      <a class="button" href="https://github.com/AadiXC0DE/Rune">source</a>
     </nav>
   </div>
 </header>
@@ -467,6 +747,7 @@
   <section class="hero" style="padding:0">
     <div class="wrap">
       <div>
+        <a class="tag rise" href="#demo"><i class="live" aria-hidden="true"></i><span><b>Try it below.</b> The real harness runs in this tab.</span></a>
         <h1 class="rise">A coding agent in one <em>5.45&nbsp;MiB</em> binary.</h1>
         <p class="lede rise">Native Rust, sandboxed, and model agnostic. Startup work budgets are enforced in CI, and every rule it applies names the file that set it.</p>
         <div class="install rise">
@@ -490,15 +771,36 @@
         </div>
         <p class="meta rise"><b>5.45 MiB</b> binary &nbsp;/&nbsp; <b>2 ms</b> version work ceiling &nbsp;/&nbsp; Apache-2.0</p>
       </div>
-      <div class="glyph" aria-hidden="true"><canvas id="glyph"></canvas></div>
+      <figure class="glyph" aria-hidden="true" style="margin:0">
+        <canvas id="glyph"></canvas>
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <figcaption><span>&#x16A6; thurisaz</span><span>37 &times; 37</span></figcaption>
+      </figure>
     </div>
   </section>
 
+  <div class="stats">
+    <div class="wrap">
+      <dl>
+        <div><dt>5.45<small>MiB</small></dt><dd>stripped release binary, audited on x86_64 Linux</dd></div>
+        <div><dt>2<small>ms</small></dt><dd>startup work ceiling for <code>--version</code>, checked on every pull request</dd></div>
+        <div><dt>6<small>KiB</small></dt><dd>ceiling on the system prompt sent each turn</dd></div>
+        <div><dt>0</dt><dd>accounts, telemetry, or runtimes to install</dd></div>
+      </dl>
+    </div>
+  </div>
+
   <section id="demo">
     <div class="wrap">
-      <h2>This is Rune, running in the page.</h2>
-      <p class="sub">The same Rust as the binary, compiled to WebAssembly: the turn loop, the tools, and the permission rules, in <span data-harness-size>one module</span>. The files live in the tab. Watch it fix a bug, then type your own request.</p>
+      <div class="head">
+        <div>
+          <span class="label rise">Live demo</span>
+          <h2 class="rise">This is Rune, running in the page.</h2>
+        </div>
+        <p class="sub rise">The same Rust as the binary, compiled to WebAssembly: the turn loop, the tools, and the permission rules, in <span data-harness-size>one module</span>. The files live in the tab. Watch it fix a bug, then type your own request.</p>
+      </div>
 
+      <div class="frame">
       <div class="term" id="term">
         <div class="term-bar">
           <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -548,6 +850,7 @@
           <div class="status" data-status>scripted | ask | ctx 0% | ~/tally</div>
         </div>
       </div>
+      </div>
 
       <p class="demo-foot">The binary runs commands in a real sandboxed shell; a tab cannot start programs, so here commands run in a small shell over the same files. The permission prompt is the harness asking, and the turn waits for your answer.</p>
     </div>
@@ -555,27 +858,87 @@
 
   <section id="why">
     <div class="wrap">
+      <span class="label rise">Why Rune</span>
       <h2 class="rise">Small on purpose, and held there.</h2>
-      <p class="sub rise">Each of these is enforced by a test or a build step, not a promise.</p>
-      <dl class="points">
-        <div class="rise"><dt>A budget, not an aspiration</dt><dd>Every pull request checks an 8 MiB binary size ceiling and startup work ceilings of 2 ms for <code>--version</code> and <code>--help</code>. Work uses the baseline-subtracted minimum-of-31, clamped to zero: the baseline is system <code>true</code> on Unix and an empty Rust executable on Windows. If no baseline is available, the budget fails because startup work ceilings cannot be enforced. Budget output also reports raw process latency minimum, median and p95. It assembles the system prompt from the checkout and checks it against a 6 KiB per-turn ceiling. The build fails when a ceiling is crossed.</dd></div>
-        <div class="rise"><dt>Commands run in a sandbox</dt><dd>Seatbelt on macOS, bubblewrap on Linux. Writes stay in the workspace, credential files cannot be read, and <code>rune doctor</code> says what your machine enforces.</dd></div>
-        <div class="rise"><dt>Every decision names its source</dt><dd>A limit, a rule, a setting: <code>rune permissions</code> and <code>rune config --explain</code> answer which file decided, rather than restating the value.</dd></div>
-        <div class="rise"><dt>Steer a turn while it runs</dt><dd>Type while the model works and the correction reaches it at the next step. Escape twice cancels, and the session carries on.</dd></div>
-        <div class="rise"><dt>Any model, no account</dt><dd>Anthropic, OpenAI, OpenCode, or any OpenAI-compatible endpoint, hosted or on your machine. No telemetry. <code>--offline</code> blocks provider and web requests, skips remote MCP checks and restricts sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.</dd></div>
-        <div class="rise"><dt>One harness, several hosts</dt><dd>The terminal, <code>rune ask</code> in a script, an editor over the Agent Client Protocol, a Rust library, and the tab above.</dd></div>
-      </dl>
+      <p class="sub rise">Each of these is enforced by a test or a build step, not a promise. The snippets are the binary's own output.</p>
+      <div class="cards">
+        <article class="card wide rise">
+          <h3><span class="n">01</span>A budget, not an aspiration</h3>
+          <p>Every pull request measures the binary, the startup work, and the prompt, and the build fails when a ceiling is crossed.</p>
+          <div class="gauges" role="list" aria-label="Measured size against each ceiling">
+            <div class="gauge" role="listitem"><span>binary</span><span class="bar"><i style="--v:68.1%"></i></span><span><b>5.45</b> / 8 MiB</span></div>
+            <div class="gauge" role="listitem"><span>prompt</span><span class="bar"><i style="--v:19.8%"></i></span><span><b>1.2</b> / 6 KiB</span></div>
+          </div>
+          <p class="note">Binary: the audited stripped build for x86_64 Linux. Prompt: as assembled in a fresh git repository.</p>
+          <details>
+            <summary>how it is measured</summary>
+            <p>Every pull request checks an 8 MiB binary size ceiling and startup work ceilings of 2 ms for <code>--version</code> and <code>--help</code>. Work uses the baseline-subtracted minimum-of-31, clamped to zero: the baseline is system <code>true</code> on Unix and an empty Rust executable on Windows. If no baseline is available, the budget fails because startup work ceilings cannot be enforced. Budget output also reports raw process latency minimum, median and p95. It assembles the system prompt from the checkout and checks it against a 6 KiB per-turn ceiling. The build fails when a ceiling is crossed.</p>
+          </details>
+        </article>
+        <article class="card rise">
+          <h3><span class="n">02</span>Commands run in a sandbox</h3>
+          <p>Seatbelt on macOS, bubblewrap on Linux. Writes stay in the workspace, credential files cannot be read, and <code>rune doctor</code> says what your machine enforces.</p>
+<pre class="shot"><span class="cmd">$ rune doctor</span>
+<span class="ok">ok</span>  sandbox  seatbelt restricts every process the command starts
+<span class="ok">ok</span>  network  commands have no network access (default)</pre>
+        </article>
+        <article class="card rise">
+          <h3><span class="n">03</span>Every decision names its source</h3>
+          <p>A limit, a rule, a setting: <code>rune permissions</code> and <code>rune config --explain</code> answer which file decided, rather than restating the value.</p>
+<pre class="shot"><span class="cmd">$ rune permissions --explain shell:pwd</span>
+shell `pwd`: <span class="ok">allowed</span> (allow: matched `shell pwd` at the default layer); <span class="amber">source: built in</span></pre>
+        </article>
+        <article class="card rise">
+          <h3><span class="n">04</span>Steer a turn while it runs</h3>
+          <p>Type while the model works and the correction reaches it at the next step. Escape twice cancels, and the session carries on.</p>
+          <div class="keys"><span><kbd>type</kbd> steer</span><span><kbd>esc</kbd> <kbd>esc</kbd> cancel</span></div>
+        </article>
+        <article class="card rise">
+          <h3><span class="n">05</span>Any model, no account</h3>
+          <p>Anthropic, OpenAI, OpenCode, or any OpenAI-compatible endpoint, hosted or on your machine. No telemetry. <code>--offline</code> blocks provider and web requests, skips remote MCP checks and restricts sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.</p>
+          <div class="pills"><span>anthropic</span><span>openai</span><span>opencode</span><span>openai-compatible</span><span class="on">localhost</span></div>
+        </article>
+        <article class="card full rise">
+          <h3><span class="n">06</span>One harness, several hosts</h3>
+          <p>The terminal, <code>rune ask</code> in a script, an editor over the Agent Client Protocol, a Rust library, and the tab above.</p>
+          <div class="pills"><span>terminal</span><span>rune ask</span><span>acp editors</span><span>rust library</span><span class="on">this tab</span></div>
+        </article>
+      </div>
     </div>
   </section>
 
   <section id="start">
     <div class="wrap">
+      <span class="label rise">Install</span>
       <h2 class="rise">Start in three commands.</h2>
       <p class="sub rise">A fresh install has no provider, so <code>connect</code> lists them and asks for what it needs.</p>
-<pre class="steps rise"><span class="ps">$ </span>brew install aadixc0de/tap/rune   <span class="c"># or cargo install, see above</span>
-<span class="ps">$ </span>rune connect                      <span class="c"># choose a provider and paste its key</span>
-<span class="ps">$ </span>rune                              <span class="c"># start a session in this directory</span></pre>
+      <ol class="steps">
+        <li class="rise">
+          <div class="line"><span class="ps">$</span><code id="step-install">brew install aadixc0de/tap/rune</code><button class="copy" data-copy="step-install">copy</button></div>
+          <p>Or <code>cargo install</code>, see above.</p>
+        </li>
+        <li class="rise">
+          <div class="line"><span class="ps">$</span><code id="step-connect">rune connect</code><button class="copy" data-copy="step-connect">copy</button></div>
+          <p>Choose a provider and paste its key.</p>
+        </li>
+        <li class="rise">
+          <div class="line"><span class="ps">$</span><code id="step-run">rune</code><button class="copy" data-copy="step-run">copy</button></div>
+          <p>Start a session in this directory.</p>
+        </li>
+      </ol>
     </div>
+  </section>
+
+  <section class="closing">
+    <div class="wrap">
+      <h2 class="rise">Put it in your terminal.</h2>
+      <p class="sub rise">Apache-2.0, no account, no telemetry. Bring any model, keep every rule in a file you can read.</p>
+      <div class="actions rise">
+        <a class="button solid" href="https://github.com/AadiXC0DE/Rune">Read the source</a>
+        <a class="button" href="https://github.com/AadiXC0DE/Rune/releases">Releases</a>
+      </div>
+    </div>
+    <div class="wordmark" aria-hidden="true">rune</div>
   </section>
 
 </main>
@@ -614,24 +977,34 @@
     setTimeout(() => { button.textContent = 'copy'; delete button.dataset.done; }, 1600);
   }));
 
+  // The light on each card follows the pointer.
+  document.querySelectorAll('.card').forEach((card) => card.addEventListener('pointermove', (event) => {
+    const rect = card.getBoundingClientRect();
+    card.style.setProperty('--mx', `${event.clientX - rect.left}px`);
+    card.style.setProperty('--my', `${event.clientY - rect.top}px`);
+  }));
 </script>
 
 <script>
-// The mark, drawn as a field of dots. Dots on the glyph light up along the
-// stroke when the page opens, drift gently while it is open, and part around
-// the pointer. Under reduced motion it is drawn once and left still.
+// The mark, drawn as a field of dots: the rune thurisaz, a stave and a thorn
+// that also reads as "run", and a cursor. Dots on the glyph light up along the
+// stroke when the page opens, drift gently while it is open, part around the
+// pointer, and the cursor blinks. Under reduced motion it is drawn once and
+// left still.
 (() => {
   const canvas = document.getElementById('glyph');
   if (!canvas || !canvas.getContext) return;
   const context = canvas.getContext('2d');
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const N = 37;
-  const PATH = 'M8 8h10a6 6 0 0 1 0 12h-4l6 8';
+  const PATH = 'M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5';
 
-  // Ink per dot, sampled by drawing the mark once at grid resolution, and the
-  // position along the stroke where each lit dot sits, for the reveal.
+  // Ink per dot, sampled by drawing the mark once at grid resolution, the
+  // position along the stroke where each lit dot sits, for the reveal, and
+  // which dots belong to the cursor.
   const ink = new Float32Array(N * N);
   const along = new Float32Array(N * N).fill(1);
+  const cursor = new Uint8Array(N * N);
   (() => {
     const scale = 4;
     const off = document.createElement('canvas');
@@ -659,9 +1032,9 @@
     svg.setAttribute('d', PATH);
     const total = svg.getTotalLength();
     const samples = [];
-    for (let i = 0; i <= 160; i++) {
-      const point = svg.getPointAtLength((total * i) / 160);
-      samples.push([point.x, point.y, i / 160]);
+    for (let i = 0; i <= 200; i++) {
+      const point = svg.getPointAtLength((total * i) / 200);
+      samples.push([point.x, point.y, i / 200]);
     }
     for (let i = 0; i < N * N; i++) {
       if (ink[i] < 0.08) continue;
@@ -672,6 +1045,7 @@
         const d = (sx - px) ** 2 + (sy - py) ** 2;
         if (d < best) { best = d; along[i] = t; }
       }
+      cursor[i] = px > 19.5 && py > 24 ? 1 : 0;
     }
   })();
 
@@ -709,6 +1083,8 @@
     pointer.y += (pointer.ty - pointer.y) * 0.18;
     const reach = pitch * 7;
     const base = dark.matches ? [236, 232, 223] : [26, 25, 22];
+    // The cursor blinks like a terminal's once the mark has been drawn.
+    const blink = reduce || t < 1.6 ? 1 : (Math.floor((t - 1.6) * 1.8) % 2 ? 0.12 : 1);
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, size, size);
     for (let y = 0; y < N; y++) {
@@ -725,7 +1101,7 @@
           cy += (dy / distance) * near * pitch * 0.9;
         }
         const reveal = reduce ? 1 : Math.min(1, Math.max(0, (t - 0.15 - along[i] * 0.9) / 0.35));
-        const lit = ink[i] * reveal;
+        const lit = ink[i] * reveal * (cursor[i] ? blink : 1);
         const drift = reduce ? 0 : Math.sin(t * 1.1 + x * 0.42 + y * 0.27) * 0.12;
         if (lit > 0.04) {
           const a = Math.min(1, lit * (0.88 + drift) + near * 0.3);
@@ -744,25 +1120,34 @@
     }
   }
 
+  // Full frame rate while the pointer moves or the mark is being drawn; once
+  // idle, a redraw only when the cursor changes phase.
   let running = false;
   let visible = true;
+  let blinkTimer = 0;
   let idleSince = performance.now();
   function frame(now) {
     draw(now);
     const settled = Math.abs(pointer.tx - pointer.x) < 0.5 && Math.abs(pointer.ty - pointer.y) < 0.5;
-    if (settled && now - idleSince > 20000 && pointer.tx < 0) { running = false; return; }
+    if (settled && now - idleSince > 4000 && pointer.tx < 0) {
+      running = false;
+      if (!reduce && visible) blinkTimer = setInterval(() => draw(performance.now()), 278);
+      return;
+    }
     if (!settled) idleSince = now;
     if (visible) requestAnimationFrame(frame);
     else running = false;
   }
   function wake() {
     idleSince = performance.now();
+    clearInterval(blinkTimer);
     if (reduce) { draw(performance.now()); return; }
     if (!running && visible) { running = true; requestAnimationFrame(frame); }
   }
   new IntersectionObserver(([entry]) => {
     visible = entry.isIntersecting;
     if (visible) wake();
+    else clearInterval(blinkTimer);
   }).observe(canvas);
   wake();
 })();

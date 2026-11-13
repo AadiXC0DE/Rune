@@ -8,7 +8,8 @@ python3 -m http.server 8099 --directory site
 
 | Path | What it is |
 |---|---|
-| `index.html` | The page: markup, styles, and the small scripts for the install tabs and the mark |
+| `index.html` | The page: markup, styles, and the small scripts for the install tabs, the cards and the mark |
+| `og.png` | The share image, 1200 by 630, with the mark drawn in dots |
 | `robots.txt` | Crawler access and the canonical sitemap URL |
 | `sitemap.xml` | The site's single canonical page; demo and install are sections on it |
 | `llms.txt` | A short overview linking the page's sections and repository documentation |
@@ -104,6 +105,17 @@ under `prefers-color-scheme`. The terminal stays dark in both. One accent,
 square corners throughout, and motion that stops under
 `prefers-reduced-motion`: the mark is drawn once and left still, and sections
 appear without rising.
+
+The mark is the rune thurisaz, a stave and a thorn that also reads as a run
+arrow, followed by a cursor. One path draws it everywhere, on a 32 unit grid:
+`M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5`, stroked 3 units wide in
+`#ffb454`. The favicon, the header, the dot field in the hero and `og.png` all
+use it; change them together. The hero draws it as 37 by 37 dots, and the
+cursor blinks once the mark is drawn.
+
+Every number on the page is one the build checks or that can be reproduced:
+the binary and startup figures come from the budget audit, and the prompt
+gauge is `rune prompt --show` in a fresh git repository.
 
 Run the demo's permission/composer UI regressions from the repository root:
 
