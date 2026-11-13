@@ -1,0 +1,8 @@
+{
+  "description": "No note telling an ask run it is non-interactive.",
+  "env": {
+    "RUNE_EXPERIMENT": "run_note=off"
+  },
+  "flags": [],
+  "files": {}
+}
