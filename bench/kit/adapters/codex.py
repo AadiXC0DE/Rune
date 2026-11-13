@@ -27,5 +27,7 @@ def prepare(ctx):
             "-c", provider, "-m", ctx["model"], "--", ctx["prompt"],
         ],
         "env": {"CODEX_HOME": str(ctx["home"]) + "/.codex", "BENCH_KEY": ctx["key"]},
-        "files": {},
+        # Codex refuses to start when CODEX_HOME does not exist; an empty
+        # configuration creates it and changes no default.
+        "files": {".codex/config.toml": ""},
     }

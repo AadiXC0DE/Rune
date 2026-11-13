@@ -196,6 +196,23 @@ class Redactor:
         return text
 
 
+# Certificate bundles a Python without its own store can verify with.
+SYSTEM_BUNDLES = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
+
+
+def tls_context():
+    """A verifying context. A Python installed without a certificate store (the python.org
+    macOS build until its certificate script is run) loads the system bundle instead, so the
+    upstream is still verified rather than refused or trusted blindly."""
+    context = ssl.create_default_context()
+    if context.cert_store_stats().get("x509_ca", 0) == 0:
+        for bundle in SYSTEM_BUNDLES:
+            if os.path.isfile(bundle):
+                context.load_verify_locations(cafile=bundle)
+                break
+    return context
+
+
 class State:
     def __init__(self, args, prices):
         self.upstream = urllib.parse.urlsplit(args.upstream)
@@ -418,7 +435,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = http.client.HTTPSConnection(
                     target.hostname,
                     target.port,
-                    context=ssl.create_default_context(),
+                    context=tls_context(),
                     timeout=600,
                 )
             else:

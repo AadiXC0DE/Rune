@@ -57,7 +57,7 @@ class AdapterCase(unittest.TestCase):
     def test_prepare_puts_the_proxy_model_and_key_where_each_harness_reads_them(self):
         fx = self.prepared("fx")
         self.assertEqual(fx["argv"], [
-            "/usr/bin/tool", "ask", "--json", "--full-access", "--no-save", "--provider", "bench",
+            "/usr/bin/tool", "ask", "--json", "--full-access", "--no-save",
             "--model", MODEL, "--", "fix the bug",
         ])
         self.assertEqual(fx["env"], {"BENCH_KEY": KEY, "FX_AUTO_UPGRADE": "0"})
@@ -129,6 +129,7 @@ class AdapterCase(unittest.TestCase):
             "-c", override, "-m", MODEL, "--", "fix the bug",
         ])
         self.assertEqual(cx["env"], {"CODEX_HOME": "/tmp/home/.codex", "BENCH_KEY": KEY})
+        self.assertEqual(cx["files"], {".codex/config.toml": ""})
 
         ms = self.prepared("mini-swe-agent")
         self.assertEqual(ms["argv"], [

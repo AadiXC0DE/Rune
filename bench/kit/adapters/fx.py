@@ -10,7 +10,7 @@ NAME = "fx"
 BIN = "fx"
 VERSION_CMD = ["--version"]
 HELP_CMD = ["ask", "--help"]
-HELP_FLAGS = ["--json", "--full-access", "--no-save", "--provider", "--model"]
+HELP_FLAGS = ["--json", "--full-access", "--no-save", "--model"]
 DIALECTS = ["chat"]
 VERIFIED = False
 
@@ -31,7 +31,9 @@ def prepare(ctx):
     }
     return {
         "argv": [
-            ctx["bin"], "ask", "--json", "--full-access", "--no-save", "--provider", "bench",
+            # The provider comes from .fx/settings.json below; `ask` has no
+            # provider flag since fx 0.0.16.
+            ctx["bin"], "ask", "--json", "--full-access", "--no-save",
             "--model", ctx["model"], "--", ctx["prompt"],
         ],
         "env": {"BENCH_KEY": ctx["key"], "FX_AUTO_UPGRADE": "0"},

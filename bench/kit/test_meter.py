@@ -1,5 +1,6 @@
 import http.client
 import json
+import ssl
 import os
 import subprocess
 import sys
@@ -109,6 +110,16 @@ class MeterTests(MeterCase):
         self.assertEqual(self.last()["headers"]["x-opencode-session"], "run-1")
         self.via_meter("POST", "/anthropic/v1/messages", {"model": "m", "stream": True})
         self.assertEqual(self.last()["headers"]["x-opencode-session"], "run-1")
+
+    def test_the_tls_context_verifies_with_some_certificate_authority(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("meter_module", METER)
+        meter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(meter)
+        context = meter.tls_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
 
     def test_include_usage_is_added_only_when_missing(self):
         self.start()
