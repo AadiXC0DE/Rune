@@ -33,6 +33,11 @@ jobs:
       - name: Test Node bindings
         run: node --test bindings/node/test.mjs
 
+      - name: Test the npm launcher and the package manifests
+        run: |
+          node --test packaging/npm/test.mjs
+          python3 packaging/render-manifests.py --self-test
+
       - name: Install the pinned toolchain
         run: rustup show
 

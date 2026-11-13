@@ -1,0 +1,21 @@
+{
+  "name": "@rune-sh/cli",
+  "version": "0.0.0",
+  "description": "Installs and runs the rune coding agent harness.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AadiXC0DE/Rune.git",
+    "directory": "packaging/npm"
+  },
+  "bin": {
+    "rune": "bin/rune.js"
+  },
+  "files": [
+    "bin/rune.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
