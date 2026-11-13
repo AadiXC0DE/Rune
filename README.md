@@ -23,6 +23,20 @@ with that.
 
 ## Install
 
+On Linux and macOS, one line installs the latest release after checking it
+against the release's `SHA256SUMS` (into `~/.local/bin`; `--dir` or
+`RUNE_INSTALL_DIR` choose another directory, and it never uses `sudo`):
+
+```sh
+curl -fsSL https://rune.heyaadi.com/install.sh | sh
+```
+
+On Windows, in PowerShell (into `%LOCALAPPDATA%\Programs\rune`):
+
+```powershell
+irm https://rune.heyaadi.com/install.ps1 | iex
+```
+
 Homebrew:
 
 ```sh
@@ -110,6 +124,13 @@ git clone https://github.com/AadiXC0DE/Rune
 cd Rune
 cargo build --release
 ./target/release/rune doctor
+```
+
+Or with Cargo, from the repository (the crates.io name `rune` belongs to another
+project):
+
+```sh
+cargo install --git https://github.com/AadiXC0DE/Rune --locked rune
 ```
 
 Then connect a provider. There is no default: a fresh install has none, and any

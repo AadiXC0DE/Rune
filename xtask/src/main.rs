@@ -440,7 +440,29 @@ fn web_package_dirs(root: &Path) -> Result<Vec<String>, String> {
 ///
 /// An optional argument names the copy to check, so a caller can point at a
 /// copy outside the working tree.
+/// The scripts the site serves as byte copies of their source.
+const SITE_COPIES: &[(&str, &str)] = &[
+    ("scripts/install.sh", "site/install.sh"),
+    ("scripts/install.ps1", "site/install.ps1"),
+];
+
+/// Fails, naming the first, when a site copy differs from its source.
+fn verify_site_copies(root: &Path) -> Result<(), String> {
+    for (source, copy) in SITE_COPIES {
+        let read = |path: &str| {
+            std::fs::read(root.join(path)).map_err(|err| format!("could not read {path}: {err}"))
+        };
+        if read(source)? != read(copy)? {
+            return Err(format!(
+                "{copy} is stale; copy {source} to it and commit the result"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_web(extra: &[String]) -> Result<(), String> {
+    verify_site_copies(&workspace_root()?)?;
     let placed = match extra {
         [] => web_module_path()?,
         [path] => PathBuf::from(path),
@@ -1859,6 +1881,29 @@ mod tests {
         assert_eq!(perf_failures(rss * 126 / 100, cpu, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu * 1.26, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu, frame * 1.26).len(), 1);
+    }
+
+    #[test]
+    fn a_stale_site_copy_is_named() {
+        let root = std::env::temp_dir().join(format!("rune-site-copies-{}", std::process::id()));
+        for (source, copy) in SITE_COPIES {
+            for path in [source, copy] {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                std::fs::write(&path, "same\n").expect("write");
+            }
+        }
+        assert_eq!(verify_site_copies(&root), Ok(()));
+        std::fs::write(root.join("site/install.ps1"), "older\n").expect("write");
+        let stale = verify_site_copies(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            stale,
+            Err(
+                "site/install.ps1 is stale; copy scripts/install.ps1 to it and commit the result"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

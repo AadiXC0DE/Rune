@@ -67,6 +67,9 @@ jobs:
           RUNE_REQUIRE_LINUX_SANDBOX: '1'
         run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
 
+      - name: Test the one-line installer against a local release
+        run: python3 .github/scripts/test-install-script.py
+
       - name: Check PTY replay prerequisites
         run: python3 -c "import fcntl, pty, termios"
 
@@ -251,6 +254,10 @@ jobs:
           # which side stalled and how far the other side had got.
           RUST_TEST_NOCAPTURE: '1'
         run: cargo test --workspace
+
+      - name: Test the PowerShell installer against a local release
+        if: runner.os == 'Windows'
+        run: python .github/scripts/test-install-script.py --powershell
 
       - name: Stage native release with artifact size and startup measurements
         if: github.event_name == 'workflow_dispatch'
