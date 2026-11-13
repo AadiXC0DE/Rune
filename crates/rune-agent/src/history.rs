@@ -494,6 +494,13 @@ impl History {
         seq
     }
 
+    /// Adds a user turn built from parts, such as text followed by images.
+    pub fn push_user_parts(&mut self, parts: Vec<ContentPart>) -> u64 {
+        let seq = self.take_seq();
+        self.turns.push(Turn::new(seq, Role::User, parts));
+        seq
+    }
+
     /// Adds a note from the harness to the conversation.
     ///
     /// Joins the last turn when it is a user turn, so two user turns never

@@ -595,6 +595,14 @@ struct SessionHost {
     echo_as: Mutex<Option<String>>,
     /// Saves the idle draft while it is typed, when keys are read.
     autosave: Mutex<Option<crate::draft::Autosave>>,
+    /// Images attached in this session, put into every request.
+    images: crate::attachments::SessionImages,
+    /// The id the next attached image gets.
+    next_image: std::sync::atomic::AtomicU64,
+    /// Whether the model accepts images, when its catalog entry said.
+    model_vision: Mutex<Option<bool>>,
+    /// The image files of the prompt just submitted.
+    pending_images: Mutex<Vec<std::path::PathBuf>>,
     /// Whether this turn has shown a hint already.
     hint_shown: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
@@ -3936,6 +3944,18 @@ impl SessionHost {
         self.commit_lines(&[styled(&dim, &format!("hint: {text}"))]);
     }
 
+    /// Why an image cannot be attached now, when it cannot.
+    fn image_refusal(&self) -> Option<String> {
+        let refused =
+            !self.dialect.capabilities().images || *lock_value(&self.model_vision) == Some(false);
+        refused.then(|| {
+            format!(
+                "{} does not accept images; /model switches to one that does",
+                self.model_name()
+            )
+        })
+    }
+
     /// Forgets the saved draft: it was sent, or the session is ending.
     fn clear_draft(&self) {
         if let Some(autosave) = lock_value(&self.autosave).as_mut() {
@@ -4544,6 +4564,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // picker can name the address and the provider without the credential that
     // travels beside the endpoint.
     let endpoint_url = config.endpoint.base_url.clone();
+    let session_images = crate::attachments::SessionImages::default();
     let provider_name = config.settings.provider.to_string();
 
     let (initial_context, context_source) = recorder.resumed_context();
@@ -4668,7 +4689,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         recorder: Some(Arc::clone(&recorder)),
         endpoint: Mutex::new(config.endpoint),
         compat,
-        dialect: config.dialect,
+        dialect: Box::new(crate::attachments::SharedImages {
+            dialect: config.dialect,
+            data: Arc::clone(&session_images),
+        }),
         model: Mutex::new(config.settings.model.clone()),
         instructions: Mutex::new(opening.instructions),
         stable_instructions_len: std::sync::atomic::AtomicUsize::new(opening.stable_len),
@@ -4780,6 +4804,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         hint_shown: std::sync::atomic::AtomicBool::new(false),
         echo_as: Mutex::new(None),
         autosave: Mutex::new(None),
+        images: Arc::clone(&session_images),
+        next_image: std::sync::atomic::AtomicU64::new(1),
+        model_vision: Mutex::new(None),
+        pending_images: Mutex::new(Vec::new()),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -5151,6 +5179,12 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         None => note("nothing to retry".to_owned()),
                     },
                     Handled::Connect(provider) => return Ok(Step::Connect(provider)),
+                    Handled::Image(path) => note(attach_image_command(
+                        &host,
+                        reader,
+                        &config.workspace,
+                        &path,
+                    )),
                     Handled::Init => {
                         let exists = config.workspace.join("AGENTS.md").exists();
                         let go = !exists
@@ -5478,6 +5512,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         let resolved =
                             crate::model_limits::resolve(&settings, &config.paths, &model, None);
                         host.set_model(&model, resolved.context_window, resolved.max_output, None);
+                        lock_value(&host.model_vision).take();
                         note(format!("model set to {}", host.model_name()));
                     }
                     Handled::Effort(requested) => note(set_effort(&host, requested.as_deref())),
@@ -5569,6 +5604,24 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             }
             Input::Prompt(text) => {
                 let retry_text = text.clone();
+                // Images are read before anything is sent, so a bad file
+                // keeps the draft and sends nothing.
+                let image_files = std::mem::take(&mut *lock_value(&host.pending_images));
+                let attached = if image_files.is_empty() {
+                    None
+                } else {
+                    let count = u64::try_from(image_files.len()).unwrap_or(u64::MAX);
+                    let first = host
+                        .next_image
+                        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                    match crate::attachments::Attachments::read_from(&image_files, first) {
+                        Ok(attached) => Some(attached),
+                        Err(err) => {
+                            reader.replace(&text);
+                            return report(&host, sink, &error_note(&err));
+                        }
+                    }
+                };
                 // Held for the whole arm, so every way the turn ends puts the
                 // session model back.
                 let pending = lock_value(&host.pending_model).take();
@@ -5671,7 +5724,23 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         text: PLAN_MODE_NOTE.to_owned(),
                     });
                 }
-                history.push_user(composed);
+                match &attached {
+                    Some(attached) => {
+                        lock_value(&host.images).extend(
+                            attached
+                                .data()
+                                .iter()
+                                .map(|(id, data)| (*id, Arc::clone(data))),
+                        );
+                        let mut parts =
+                            vec![rune_net::message::ContentPart::Text { text: composed }];
+                        parts.extend(attached.parts());
+                        history.push_user_parts(parts);
+                    }
+                    None => {
+                        history.push_user(composed);
+                    }
+                }
                 host.transcript
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7408,6 +7477,7 @@ fn question_key(
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
         | KeyAction::Help
+        | KeyAction::PasteImage
         | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue
@@ -8488,6 +8558,7 @@ fn await_submission(
         let draft = reader.line().to_owned();
         let caret = reader.cursor_byte();
         reader.set_menu_open(!rows.is_empty());
+        reader.set_images_allowed(host.image_refusal().is_none());
         // A size that has not settled yet is drawn once it has, so the wait
         // for a key ends then.
         let mut wait = host.resize_wait();
@@ -8533,6 +8604,23 @@ fn await_submission(
         if key == KeyAction::Help {
             show_key_overlay(reader, host, out)?;
             continue;
+        }
+        if key == KeyAction::PasteImage {
+            if let Some(refusal) = host.image_refusal() {
+                host.commit_lines(&[refusal]);
+            } else if let Some(path) = crate::clipboard::read_image(
+                &host.usage_paths.clone().unwrap_or_else(Paths::from_process),
+                &host.session_id_name(),
+            ) {
+                let bytes = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+                reader.attach_image(path, bytes);
+            }
+            continue;
+        }
+        if reader.take_image_refusal()
+            && let Some(refusal) = host.image_refusal()
+        {
+            host.commit_lines(&[refusal]);
         }
         if key == KeyAction::ModeCycle {
             let line = cycle_mode(host);
@@ -8624,6 +8712,11 @@ fn await_submission(
             autosave.observe(reader.line());
         }
         let had_draft = !reader.line().is_empty();
+        let images: Vec<std::path::PathBuf> = reader
+            .images()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
         let step = idle_key(
             commands,
             key,
@@ -8663,6 +8756,7 @@ fn await_submission(
                 host.on_chip
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 host.clear_draft();
+                *lock_value(&host.pending_images) = images;
                 if let Input::Prompt(text) = &input {
                     for path in mentions(text) {
                         host.touch(&path);
@@ -9044,6 +9138,7 @@ fn idle_key(
         | KeyAction::ModeCycle
         | KeyAction::TogglePlan
         | KeyAction::Help
+        | KeyAction::PasteImage
         | KeyAction::ExpandChip
         | KeyAction::PullQueued
         | KeyAction::Queue => Idle::Stay,
@@ -9257,6 +9352,7 @@ fn confirm_choice(
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
                 | KeyAction::Help
+                | KeyAction::PasteImage
                 | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
@@ -9351,6 +9447,7 @@ fn run_picker(
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
             | KeyAction::Help
+            | KeyAction::PasteImage
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -9421,6 +9518,7 @@ fn search_prompt_history(
                 | KeyAction::ModeCycle
                 | KeyAction::TogglePlan
                 | KeyAction::Help
+                | KeyAction::PasteImage
                 | KeyAction::ExpandChip
                 | KeyAction::PullQueued
                 | KeyAction::Queue => {
@@ -10696,6 +10794,7 @@ fn choose_model(
     // travels with the choice is the one the endpoint reported for it rather
     // than a number invented for it.
     let entry = catalog.models.iter().find(|model| model.id == chosen);
+    *lock_value(&host.model_vision) = known_vision(entry);
     let resolved = crate::model_limits::resolve(settings, paths, &chosen, entry);
     host.set_model(
         &chosen,
@@ -11713,6 +11812,7 @@ fn resolve_context_window(host: &SessionHost, settings: &Settings, paths: &Paths
         model.is_some_and(|model| model.capabilities.vision),
         std::sync::atomic::Ordering::Relaxed,
     );
+    *lock_value(&host.model_vision) = known_vision(model);
     if let Some(prices) = model
         .and_then(|model| model.prices)
         .or_else(|| crate::provider_setup::cached_prices(settings, paths))
@@ -11866,6 +11966,7 @@ fn choose_theme(
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
             | KeyAction::Help
+            | KeyAction::PasteImage
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -12038,6 +12139,49 @@ fn next_tip(state_root: &Utf8Path) -> &'static str {
     tip_at(index)
 }
 
+/// Whether a model takes images, when its catalog entry says: an entry that
+/// only names the model leaves every capability at its unknown default.
+fn known_vision(model: Option<&rune_net::catalog::ModelMetadata>) -> Option<bool> {
+    model
+        .map(|model| model.capabilities)
+        .filter(|capabilities| *capabilities != rune_net::catalog::Capabilities::unknown())
+        .map(|capabilities| capabilities.vision)
+}
+
+/// Runs `/image <path>`: puts the file in the draft as an image chip.
+fn attach_image_command(
+    host: &SessionHost,
+    reader: &mut rune_term::input::KeyReader,
+    workspace: &Utf8Path,
+    path: &str,
+) -> String {
+    if path.is_empty() {
+        return "usage: /image <path>".to_owned();
+    }
+    if let Some(refusal) = host.image_refusal() {
+        return refusal;
+    }
+    let resolved = if Utf8Path::new(path).is_absolute() {
+        Utf8PathBuf::from(path)
+    } else {
+        workspace.join(path)
+    };
+    let Ok(meta) = std::fs::metadata(&resolved).map(|meta| (meta.is_file(), meta.len())) else {
+        return format!("{path} does not exist");
+    };
+    let image = resolved.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp"
+        )
+    });
+    if !meta.0 || !image {
+        return format!("{path} is not a PNG, JPEG, GIF or WebP image");
+    }
+    reader.attach_image(resolved.into_std_path_buf(), meta.1);
+    String::new()
+}
+
 /// The prompt `/init` sends, as a normal turn.
 const INIT_PROMPT: &str =
     "Write an AGENTS.md file at the repository root for coding agents working here. Find out,
@@ -12148,6 +12292,7 @@ fn pick_index(
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
             | KeyAction::Help
+            | KeyAction::PasteImage
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {
@@ -12621,6 +12766,8 @@ enum Handled {
     Retry,
     /// Ask the model to write `AGENTS.md`.
     Init,
+    /// Attach an image file to the next message.
+    Image(String),
     /// Connect a provider or replace its key, inside the session.
     Connect(Option<String>),
 }
@@ -13140,6 +13287,7 @@ fn handle_command<W: std::io::Write>(
         "terminal-setup" => Ok(Handled::TerminalSetup),
         "retry" => Ok(Handled::Retry),
         "init" => Ok(Handled::Init),
+        "image" => Ok(Handled::Image(arguments.trim().to_owned())),
         "connect" | "login" => Ok(Handled::Connect(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -15910,6 +16058,26 @@ mod tests {
         std::fs::write(root.join("tip-index"), "not a number").expect("write");
         assert_eq!(next_tip(&root), TIPS[0]);
         assert_eq!(tip_at(TIPS.len()), TIPS[0]);
+    }
+
+    #[test]
+    fn vision_is_known_only_from_a_described_model() {
+        let named = rune_net::catalog::ModelMetadata::new("listed-only");
+        assert_eq!(known_vision(Some(&named)), None);
+        let mut described = rune_net::catalog::ModelMetadata::new("described");
+        described.capabilities.vision = true;
+        assert_eq!(known_vision(Some(&described)), Some(true));
+        described.capabilities.vision = false;
+        described.capabilities.reasoning = true;
+        assert_eq!(known_vision(Some(&described)), Some(false));
+        assert_eq!(known_vision(None), None);
+        let host = test_host();
+        assert_eq!(host.image_refusal(), None);
+        *lock_value(&host.model_vision) = Some(false);
+        assert_eq!(
+            host.image_refusal().as_deref(),
+            Some("test does not accept images; /model switches to one that does")
+        );
     }
 
     #[test]
@@ -25470,6 +25638,10 @@ mod tests {
             hint_shown: std::sync::atomic::AtomicBool::new(false),
             echo_as: Mutex::new(None),
             autosave: Mutex::new(None),
+            images: crate::attachments::SessionImages::default(),
+            next_image: std::sync::atomic::AtomicU64::new(1),
+            model_vision: Mutex::new(None),
+            pending_images: Mutex::new(Vec::new()),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,

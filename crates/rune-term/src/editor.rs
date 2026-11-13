@@ -37,12 +37,77 @@ pub struct Chip {
     pub marker: String,
     /// The pasted text the marker stands for.
     pub text: String,
+    /// What the chip holds.
+    pub kind: ChipKind,
+}
+
+/// What a chip stands for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ChipKind {
+    /// Pasted text.
+    Paste,
+    /// An image file attached to the message.
+    Image {
+        /// The file.
+        path: std::path::PathBuf,
+        /// Its size.
+        bytes: u64,
+    },
+}
+
+/// The size an image marker shows: `420 KB`, or `1.2 MB` from one MiB.
+#[must_use]
+pub fn image_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        let tenths = bytes.saturating_mul(10) / MIB;
+        format!("{}.{} MB", tenths / 10, tenths % 10)
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
 }
 
 /// Returns the byte ranges of text shaped like a chip marker:
 /// `[pasted #N: N lines]` or `[pasted #N: N characters]`.
 #[must_use]
 pub fn marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = paste_marker_spans(text);
+    spans.extend(image_marker_spans(text));
+    spans.sort_by_key(|span| span.start);
+    spans
+}
+
+/// The spans of `[image #N: name size]` markers.
+fn image_marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    const OPEN: &str = "[image #";
+    let mut spans = Vec::new();
+    let mut from = 0usize;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find(OPEN)) {
+        let start = from.saturating_add(found);
+        let rest = text
+            .get(start.saturating_add(OPEN.len())..)
+            .unwrap_or_default();
+        let id = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let close = rest.find(']');
+        match close {
+            Some(close)
+                if id > 0 && rest.get(id..).is_some_and(|after| after.starts_with(": ")) =>
+            {
+                let end = start
+                    .saturating_add(OPEN.len())
+                    .saturating_add(close)
+                    .saturating_add(1);
+                spans.push(start..end);
+                from = end;
+            }
+            _ => from = start.saturating_add(1),
+        }
+    }
+    spans
+}
+
+/// The spans of `[pasted #N: ...]` markers.
+fn paste_marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     const OPEN: &str = "[pasted #";
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
     let mut spans = Vec::new();
@@ -764,6 +829,108 @@ impl Composer {
         &self.chips
     }
 
+    /// Puts an image chip at the cursor, `[image #{n}: {name} {size}]`, `n`
+    /// counting this draft's images from 1, with a space before it when the
+    /// cursor follows other text. Returns the marker.
+    pub fn attach_image(&mut self, path: std::path::PathBuf, bytes: u64) -> String {
+        let number = self
+            .image_chips()
+            .iter()
+            .filter_map(|chip| {
+                chip.marker
+                    .strip_prefix("[image #")?
+                    .split(':')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let marker = format!("[image #{number}: {name} {}]", image_size(bytes));
+        let before = char_slice(&self.text, 0, self.cursor).chars().last();
+        let spaced = if before.is_some_and(|ch| !ch.is_whitespace()) {
+            format!(" {marker}")
+        } else {
+            marker.clone()
+        };
+        self.insert(&spaced);
+        Arc::make_mut(&mut self.chips).push(Chip {
+            id: self.next_chip,
+            marker: marker.clone(),
+            text: format!("[image #{number}]"),
+            kind: ChipKind::Image { path, bytes },
+        });
+        self.next_chip = self.next_chip.saturating_add(1);
+        marker
+    }
+
+    /// The image chips in the draft, in the order they appear.
+    fn image_chips(&self) -> Vec<&Chip> {
+        let mut found: Vec<(usize, &Chip)> = self
+            .chips
+            .iter()
+            .filter(|chip| matches!(chip.kind, ChipKind::Image { .. }))
+            .filter_map(|chip| self.text.find(&chip.marker).map(|at| (at, chip)))
+            .collect();
+        found.sort_by_key(|(at, _)| *at);
+        found.into_iter().map(|(_, chip)| chip).collect()
+    }
+
+    /// The draft's image files, in order, with their sizes and markers.
+    #[must_use]
+    pub fn images(&self) -> Vec<(std::path::PathBuf, u64, String)> {
+        self.image_chips()
+            .into_iter()
+            .filter_map(|chip| match &chip.kind {
+                ChipKind::Image { path, bytes } => {
+                    Some((path.clone(), *bytes, chip.marker.clone()))
+                }
+                ChipKind::Paste => None,
+            })
+            .collect()
+    }
+
+    /// Removes the image chip with this marker from the draft, as one edit.
+    /// Returns whether it was there.
+    pub fn remove_marker(&mut self, marker: &str) -> bool {
+        let Some(at) = self.text.find(marker) else {
+            return false;
+        };
+        self.record();
+        let mut end = at.saturating_add(marker.len());
+        // A space put before the marker goes with it; else one after it.
+        let begin = if at > 0 && self.text.get(at.saturating_sub(1)..at) == Some(" ") {
+            at.saturating_sub(1)
+        } else {
+            if self.text.get(end..end.saturating_add(1)) == Some(" ") {
+                end = end.saturating_add(1);
+            }
+            at
+        };
+        let first = self
+            .text
+            .get(..begin)
+            .map_or(0, |head| head.chars().count());
+        let removed = self
+            .text
+            .get(begin..end)
+            .map_or(0, |gone| gone.chars().count());
+        self.text.replace_range(begin..end, "");
+        self.cursor = if self.cursor <= first {
+            self.cursor
+        } else if self.cursor >= first.saturating_add(removed) {
+            self.cursor.saturating_sub(removed)
+        } else {
+            first
+        };
+        self.prune();
+        true
+    }
+
     /// Returns the character range of the chip marker that contains `at` or
     /// ends at it.
     #[must_use]
@@ -795,7 +962,11 @@ impl Composer {
                 continue;
             }
             out.push_str(self.text.get(at..range.start).unwrap_or_default());
-            out.push_str(&chip.text);
+            match &chip.kind {
+                ChipKind::Paste => out.push_str(&chip.text),
+                // The image travels as its own part; the text names it.
+                ChipKind::Image { .. } => out.push_str(&chip.text),
+            }
             at = range.end;
         }
         out.push_str(self.text.get(at..).unwrap_or_default());
@@ -808,7 +979,12 @@ impl Composer {
         let Some((start, end, index)) = self.chip_touching() else {
             return false;
         };
-        let Some(text) = self.chips.get(index).map(|chip| chip.text.clone()) else {
+        let Some(text) = self
+            .chips
+            .get(index)
+            .filter(|chip| chip.kind == ChipKind::Paste)
+            .map(|chip| chip.text.clone())
+        else {
             return false;
         };
         self.last_yank = None;
@@ -970,6 +1146,7 @@ impl Composer {
             id: self.next_chip,
             marker: marker.to_owned(),
             text: text.to_owned(),
+            kind: ChipKind::Paste,
         });
         self.next_chip = self.next_chip.saturating_add(1);
     }
@@ -1344,6 +1521,32 @@ fn common_prefix<'a>(items: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_chip_expands_to_its_reference() {
+        let mut composer = Composer::new();
+        composer.insert("look");
+        let marker = composer.attach_image(std::path::PathBuf::from("/tmp/shot.png"), 430_080);
+        assert_eq!(marker, "[image #1: shot.png 420 KB]");
+        assert_eq!(composer.text(), "look [image #1: shot.png 420 KB]");
+        assert_eq!(composer.expanded(), "look [image #1]");
+        let second = composer.attach_image(std::path::PathBuf::from("/tmp/b.gif"), 1_300_000);
+        assert_eq!(second, "[image #2: b.gif 1.2 MB]");
+        let listed: Vec<String> = composer
+            .images()
+            .into_iter()
+            .map(|(path, _, _)| path.display().to_string())
+            .collect();
+        assert_eq!(listed, ["/tmp/shot.png", "/tmp/b.gif"]);
+        assert!(composer.remove_marker(&marker));
+        assert_eq!(composer.images().len(), 1);
+        assert_eq!(composer.expanded(), "look [image #2]");
+        // An image chip is not turned back into text.
+        assert!(!composer.expand_chip_at_caret());
+        let spans = marker_spans("a [image #3: x.png 1 KB] b");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans.first().cloned(), Some(2..24));
+    }
 
     /// Returns the byte offsets that start a cluster in `text`.
     fn boundaries(text: &str) -> Vec<usize> {

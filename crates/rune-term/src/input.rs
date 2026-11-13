@@ -63,6 +63,68 @@ impl Burst {
     }
 }
 
+/// The image files a paste names, with their sizes, when every word of it is
+/// one: a dropped path as terminals write it (`my\\ shot.png`, quoted, or a
+/// `file://` URL). Anything else is text.
+#[must_use]
+pub fn image_paths(text: &str) -> Option<Vec<(std::path::PathBuf, u64)>> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (None, ' ') => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut found = Vec::new();
+    for word in words {
+        let path = word
+            .strip_prefix("file://")
+            .map_or_else(|| word.clone(), |rest| rest.replace("%20", " "));
+        let path = std::path::PathBuf::from(path);
+        let image = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp"
+                )
+            });
+        let meta = std::fs::metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        if !image {
+            return None;
+        }
+        found.push((path, meta.len()));
+    }
+    (!found.is_empty()).then_some(found)
+}
+
 /// Describes the bindings used by this reader and the session's input modes.
 /// Line input leaves editing to the terminal instead of the Rune composer.
 /// The rebindable keys come from the action table and the keymap in use.
@@ -225,6 +287,8 @@ pub enum KeyAction {
     TogglePlan,
     /// Show the key overlay.
     Help,
+    /// Attach the image on the clipboard.
+    PasteImage,
     /// Replace the paste chip at the caret with its text.
     ExpandChip,
 }
@@ -375,6 +439,10 @@ pub struct KeyReader {
     keymap: Keymap,
     context: Context,
     burst_enabled: bool,
+    /// Whether pasted image paths become attachments.
+    images_allowed: bool,
+    /// Whether an image paste was refused since the session last asked.
+    image_refused: bool,
     burst: Burst,
 }
 
@@ -418,6 +486,8 @@ impl KeyReader {
             // quickly by a test harness would otherwise look like a paste.
             burst_enabled: cfg!(windows)
                 || std::env::var_os("RUNE_PASTE_BURST").is_some_and(|value| value == "1"),
+            images_allowed: true,
+            image_refused: false,
             burst: Burst::default(),
         }
     }
@@ -435,6 +505,8 @@ impl KeyReader {
             keymap: Keymap::defaults(),
             context: Context::Menu,
             burst_enabled: false,
+            images_allowed: true,
+            image_refused: false,
             burst: Burst::default(),
         }
     }
@@ -494,6 +566,35 @@ impl KeyReader {
     #[must_use]
     pub fn expanded_line(&self) -> String {
         self.composer.expanded()
+    }
+
+    /// Puts an image chip at the caret.
+    pub fn attach_image(&mut self, path: std::path::PathBuf, bytes: u64) {
+        self.composer.attach_image(path, bytes);
+    }
+
+    /// The draft's image files, in order, with their sizes and markers.
+    #[must_use]
+    pub fn images(&self) -> Vec<(std::path::PathBuf, u64, String)> {
+        self.composer.images()
+    }
+
+    /// Removes one image chip by its marker.
+    pub fn remove_image(&mut self, marker: &str) -> bool {
+        self.composer.remove_marker(marker)
+    }
+
+    /// Says whether pasted image paths may become attachments: false while
+    /// the model does not accept images.
+    pub const fn set_images_allowed(&mut self, allowed: bool) {
+        self.images_allowed = allowed;
+    }
+
+    /// Returns true once after an image paste was refused.
+    pub const fn take_image_refusal(&mut self) -> bool {
+        let refused = self.image_refused;
+        self.image_refused = false;
+        refused
     }
 
     /// Replaces the paste chip at or before the caret with its text, as one
@@ -827,6 +928,17 @@ impl KeyReader {
     /// other control characters are dropped, because the line is drawn back to
     /// the terminal and a pasted sequence would act on it.
     pub fn paste(&mut self, text: &str) {
+        // A dropped or pasted image file becomes an attachment.
+        if let Some(paths) = image_paths(text) {
+            if self.images_allowed {
+                for (path, bytes) in paths {
+                    self.composer.attach_image(path, bytes);
+                }
+            } else {
+                self.image_refused = true;
+            }
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         // A large paste is drawn as a chip; the submitted line is expanded.
         self.composer
@@ -960,6 +1072,7 @@ impl KeyReader {
                 KeyAction::ExpandChip
             }
             "transcript" => KeyAction::Transcript,
+            "paste_image" => KeyAction::PasteImage,
             "external_editor" => KeyAction::ExternalEditor,
             // An open menu keeps the key, so it never changes the mode behind it.
             "mode_cycle" if self.menu_open => KeyAction::Ignored,
@@ -1551,6 +1664,8 @@ mod tests {
             keymap: Keymap::defaults(),
             context: Context::Menu,
             burst_enabled: false,
+            images_allowed: true,
+            image_refused: false,
             burst: Burst::default(),
         }
     }
@@ -2315,6 +2430,66 @@ mod tests {
         assert_eq!(reader.apply(back_tab), KeyAction::Ignored);
         reader.set_menu_open(false);
         assert_eq!(reader.apply(back_tab), KeyAction::ModeCycle);
+    }
+
+    fn image_fixture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").expect("image");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_pasted_image_path_attaches() {
+        let (_dir, path) = image_fixture("shot.png");
+        let mut pasted = reader();
+        pasted.replace("see");
+        pasted.paste(&format!("{}\n", path.display()));
+        assert_eq!(pasted.images().len(), 1);
+        assert!(
+            pasted.line().starts_with("see [image #1: shot.png 0 KB]"),
+            "{}",
+            pasted.line()
+        );
+        let mut refused = reader();
+        refused.set_images_allowed(false);
+        refused.paste(&path.display().to_string());
+        assert!(refused.images().is_empty());
+        assert!(refused.take_image_refusal());
+        assert!(!refused.take_image_refusal());
+    }
+
+    #[test]
+    fn an_escaped_dropped_path_attaches() {
+        let (_dir, path) = image_fixture("my shot.PNG");
+        let escaped = path.display().to_string().replace(' ', "\\ ");
+        let mut pasted = reader();
+        pasted.paste(&escaped);
+        assert_eq!(pasted.images().len(), 1, "{}", pasted.line());
+        let mut quoted = reader();
+        quoted.paste(&format!("'{}'", path.display()));
+        assert_eq!(quoted.images().len(), 1);
+        let mut url = reader();
+        url.paste(&format!(
+            "file://{}",
+            path.display().to_string().replace(' ', "%20")
+        ));
+        assert_eq!(url.images().len(), 1);
+    }
+
+    #[test]
+    fn a_pasted_text_path_stays_text() {
+        let (dir, _path) = image_fixture("shot.png");
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "notes").expect("text");
+        let mut pasted = reader();
+        pasted.paste(&text.display().to_string());
+        assert!(pasted.images().is_empty());
+        assert_eq!(pasted.line(), text.display().to_string());
+        let missing = dir.path().join("gone.png");
+        let mut absent = reader();
+        absent.paste(&missing.display().to_string());
+        assert!(absent.images().is_empty());
     }
 
     #[test]

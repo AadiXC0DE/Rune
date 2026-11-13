@@ -6,7 +6,7 @@ completion-last: 32x8, caret 3,4
 04|> /|
 05|  /terminal-setup|
 06|> /quit|
-07|  34-35 of 35|
+07|  35-36 of 36|
 completion-closed: 32x8, caret 2,4
 00|tip: @ mentions a file; tab comp|
 01|letes it|

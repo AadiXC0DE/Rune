@@ -226,6 +226,12 @@ pub const ACTIONS: &[ActionInfo] = &[
         "cycle ask, auto and plan",
     ),
     action(
+        "paste_image",
+        Context::Editor,
+        &["ctrl+v", "alt+v"],
+        "attach the image on the clipboard",
+    ),
+    action(
         "help",
         Context::Editor,
         &["?"],

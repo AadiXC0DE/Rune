@@ -301,6 +301,7 @@ pub fn pick_styled(
             | KeyAction::ModeCycle
             | KeyAction::TogglePlan
             | KeyAction::Help
+            | KeyAction::PasteImage
             | KeyAction::ExpandChip
             | KeyAction::PullQueued
             | KeyAction::Queue => {}

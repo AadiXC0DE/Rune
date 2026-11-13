@@ -133,6 +133,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "put the last reply, a code block or the conversation on the clipboard",
     },
     Builtin {
+        name: "image",
+        arguments: "<path>",
+        summary: "attach an image file to the next message",
+    },
+    Builtin {
         name: "diff",
         arguments: "[path]",
         summary: "show the changes this session made",

@@ -233,6 +233,162 @@ fn utf16le_with_bom(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// The commands that read an image from the clipboard into `file`, first
+/// choice first: `pngpaste` or `osascript` on macOS; `wl-paste` under
+/// Wayland; `xclip` under X11; PowerShell on Windows. A Linux command that
+/// lists the clipboard's types comes before the one that reads the image.
+#[must_use]
+pub fn image_commands(
+    os: Os,
+    env: &dyn Fn(&str) -> Option<String>,
+    file: &str,
+) -> Vec<Vec<String>> {
+    let set = |name: &str| env(name).is_some_and(|value| !value.is_empty());
+    let command = |parts: &[&str]| parts.iter().map(|part| (*part).to_owned()).collect();
+    match os {
+        Os::Mac => vec![
+            command(&["pngpaste", file]),
+            vec![
+                "osascript".to_owned(),
+                "-e".to_owned(),
+                format!("set f to open for access POSIX file \"{file}\" with write permission"),
+                "-e".to_owned(),
+                "write (the clipboard as \u{ab}class PNGf\u{bb}) to f".to_owned(),
+                "-e".to_owned(),
+                "close access f".to_owned(),
+            ],
+        ],
+        Os::Windows => vec![vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            format!(
+                "$i = Get-Clipboard -Format Image; if ($i) {{ $i.Save('{file}', [System.Drawing.Imaging.ImageFormat]::Png) }}"
+            ),
+        ]],
+        Os::Linux => {
+            let mut commands = Vec::new();
+            if set("WAYLAND_DISPLAY") {
+                commands.push(command(&["wl-paste", "--list-types"]));
+                commands.push(command(&["wl-paste", "--type", "image/png"]));
+            }
+            if set("DISPLAY") {
+                commands.push(command(&[
+                    "xclip",
+                    "-selection",
+                    "clipboard",
+                    "-t",
+                    "TARGETS",
+                    "-o",
+                ]));
+                commands.push(command(&[
+                    "xclip",
+                    "-selection",
+                    "clipboard",
+                    "-t",
+                    "image/png",
+                    "-o",
+                ]));
+            }
+            commands
+        }
+    }
+}
+
+/// Runs one command without a shell, stdin closed, for at most three seconds,
+/// keeping at most `cap` bytes of its output.
+fn capture(command: &[String], cap: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let (program, arguments) = command.split_first()?;
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stdout)
+            .take(u64::try_from(cap).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let bytes = reader.join().ok()?;
+                return status.success().then_some(bytes);
+            }
+            Ok(None) if started.elapsed() < NATIVE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Reads an image from the clipboard into
+/// `<state root>/attachments/<session id>/clip-{n}.png` (directory 0700,
+/// file 0600) and returns its path, or `None` when the clipboard holds no
+/// image a tool here can read.
+#[must_use]
+pub fn read_image(paths: &rune_core::paths::Paths, session_id: &str) -> Option<std::path::PathBuf> {
+    let directory = paths.state_root.join("attachments").join(session_id);
+    rune_core::paths::create_dir_private(&directory).ok()?;
+    let number = std::fs::read_dir(&directory)
+        .map_or(0, Iterator::count)
+        .saturating_add(1);
+    let file = directory.join(format!("clip-{number}.png"));
+    let os = Os::current();
+    let env = |name: &str| std::env::var(name).ok();
+    let commands = image_commands(os, &env, file.as_str());
+    let cap = crate::attachments::MAX_IMAGE_BYTES;
+    let mut index = 0;
+    while let Some(command) = commands.get(index) {
+        index = index.saturating_add(1);
+        if !command.first().is_some_and(|program| on_path(program)) {
+            continue;
+        }
+        let lists_types = command
+            .iter()
+            .any(|part| part == "--list-types" || part == "TARGETS");
+        let Some(output) = capture(command, cap) else {
+            continue;
+        };
+        if lists_types {
+            // The next command reads the image only when the clipboard has one.
+            if !String::from_utf8_lossy(&output)
+                .lines()
+                .any(|line| line.trim() == "image/png")
+            {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        // Tools that print the image to standard output leave the file to us.
+        let bytes = if output.is_empty() {
+            std::fs::read(&file).ok()?
+        } else {
+            output
+        };
+        if rune_tools::vision::image_media_type(&bytes).is_some() {
+            if !file.exists() {
+                rune_core::paths::write_private_bytes(&file, &bytes).ok()?;
+            }
+            return Some(file.into_std_path_buf());
+        }
+    }
+    let _ = std::fs::remove_file(&file);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -320,6 +476,35 @@ mod tests {
                 .hint()
                 .is_some_and(|hint| hint.starts_with("install "))
         );
+    }
+
+    #[test]
+    fn the_candidate_commands_follow_the_platform() {
+        let none = |_: &str| None;
+        let mac = image_commands(Os::Mac, &none, "/s/clip-1.png");
+        assert_eq!(mac[0], ["pngpaste", "/s/clip-1.png"]);
+        assert_eq!(mac[1][0], "osascript");
+        assert!(mac[1][2].contains("POSIX file \"/s/clip-1.png\""));
+        assert!(image_commands(Os::Linux, &none, "f").is_empty());
+        let wayland = |name: &str| (name == "WAYLAND_DISPLAY").then(|| "wayland-0".to_owned());
+        assert_eq!(
+            image_commands(Os::Linux, &wayland, "f"),
+            [
+                vec!["wl-paste".to_owned(), "--list-types".to_owned()],
+                vec![
+                    "wl-paste".to_owned(),
+                    "--type".to_owned(),
+                    "image/png".to_owned()
+                ],
+            ]
+        );
+        let x11 = |name: &str| (name == "DISPLAY").then(|| ":0".to_owned());
+        let commands = image_commands(Os::Linux, &x11, "f");
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains(&"TARGETS".to_owned()));
+        let windows = image_commands(Os::Windows, &none, "C:\\clip.png");
+        assert_eq!(windows[0][0], "powershell.exe");
+        assert!(windows[0][3].contains("Get-Clipboard -Format Image"));
     }
 
     #[test]
