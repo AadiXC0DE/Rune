@@ -43,6 +43,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(s["pass_hat_k"], 0.5)
         self.assertEqual(s["k"], 2)
 
+    def test_verify_passed_counts_tampered_runs_that_pass_pass_at_1_does_not(self):
+        rows = [row("h", "a", 1, False, tampered=True, verify_exit=0), row("h", "b", 1, True),
+                row("h", "c", 1, False)]
+        s = stats(rows)
+        self.assertEqual((s["passed"], s["verify_passed"]), (1, 2))
+        self.assertAlmostEqual(s["verify_rate"], 2 / 3)
+        self.assertEqual(s["tampered"], 1)
+
     def test_bootstrap_is_deterministic_and_brackets_the_estimate(self):
         rows = [row("h", "t%d" % i, 1, i % 3 != 0) for i in range(9)]
         a, b = stats(rows), stats(rows)

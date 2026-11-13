@@ -33,7 +33,9 @@ FAIRNESS = [
     "With a session header, the meter sets it to a fresh random value for every run, so no run "
     "shares a provider session or cache with another run or harness.",
     "A run that changes a protected path (the visible tests) fails even when verify passes. "
-    "Caches written by running the tests, such as __pycache__, do not count.",
+    "Caches written by running the tests, such as __pycache__, do not count. Protected paths are "
+    "restored before verify, so Verify passed counts every run whose fix passes the original and "
+    "hidden tests, test edits or not.",
 ]
 
 
@@ -111,6 +113,7 @@ def by_task(rows):
 def harness_stats(name, rows, seed, resamples):
     runs = len(rows)
     passed = sum(1 for r in rows if r["passed"])
+    verified = sum(1 for r in rows if r["verify_exit"] == 0)
     groups = by_task(rows)
     ordered_tasks = [groups[t] for t in sorted(groups)]
     ci = bootstrap(ordered_tasks, pass_rate, seed, resamples)
@@ -128,6 +131,8 @@ def harness_stats(name, rows, seed, resamples):
         "ci95": list(ci) if ci else None,
         "k": k,
         "pass_hat_k": pass_hat,
+        "verify_passed": verified,
+        "verify_rate": verified / runs if runs else None,
         "false_success": sum(1 for r in rows if r["false_success"]),
         "tampered": sum(1 for r in rows if r["tampered"]),
         "timed_out": sum(1 for r in rows if r["timed_out"]),
@@ -262,14 +267,15 @@ def render_md(header, ranked, pairs, per_task, baseline, baseline_missing):
     out.append("- Fairness notes:")
     out += ["  - " + note for note in header["fairness"]]
     out.append("")
-    head = ["Rank", "Harness", "Runs", "pass@1", "95% CI", "pass^k", "False success", "Tampered",
+    head = ["Rank", "Harness", "Runs", "pass@1", "95% CI", "pass^k", "Verify passed", "False success",
+            "Tampered",
             "Timeouts", "Median wall", "p90 wall", "Median requests", "Median input", "Mean input",
             "Median cached", "Median output", "Cache share", "Cost per run", "Cost per solved"]
     body = []
     for i, s in enumerate(ranked, 1):
         body.append([
             str(i), s["harness"], str(s["runs"]), pct(s["pass_at_1"]), interval(s["ci95"]),
-            pct(s["pass_hat_k"]), str(s["false_success"]), str(s["tampered"]), str(s["timed_out"]),
+            pct(s["pass_hat_k"]), pct(s["verify_rate"]), str(s["false_success"]), str(s["tampered"]), str(s["timed_out"]),
             secs(s["median_wall_s"]), secs(s["p90_wall_s"]), count(s["median_requests"]),
             count(s["median_input_tokens"]), count(s["mean_input_tokens"]),
             count(s["median_cached_tokens"]), count(s["median_output_tokens"]),

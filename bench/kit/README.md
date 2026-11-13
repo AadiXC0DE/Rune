@@ -122,4 +122,6 @@ These are copied into the header of every report.
   another run or harness.
 - A run that changes a protected path (the visible tests) fails even when verify passes, and
   `tampered.txt` in its log names the files. Caches that running the tests writes, such as
-  `__pycache__` and `.pytest_cache`, do not count.
+  `__pycache__` and `.pytest_cache`, do not count. Protected paths are restored before verify, so
+  the report's Verify passed column counts every run whose fix passes the original and hidden tests,
+  test edits or not.
