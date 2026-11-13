@@ -133,6 +133,15 @@ project):
 cargo install --git https://github.com/AadiXC0DE/Rune --locked rune
 ```
 
+Shell completion, generated from the command table:
+
+```sh
+rune completion bash > ~/.local/share/bash-completion/completions/rune
+rune completion zsh > "${fpath[1]}/_rune"
+rune completion fish > ~/.config/fish/completions/rune.fish
+rune completion powershell >> $PROFILE   # in PowerShell
+```
+
 Then connect a provider. There is no default: a fresh install has none, and any
 command that needs one says so and names how to connect it.
 

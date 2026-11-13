@@ -694,7 +694,7 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         name: "completion",
         aliases: &[],
         summary: "Generate shell completion from the command table",
-        usage: "rune completion bash",
+        usage: "rune completion <bash|zsh|fish|powershell>",
         flags: &[],
         requirements: Requirements::NONE,
         supports_json: false,

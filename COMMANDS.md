@@ -298,7 +298,7 @@ Remove the installed binary and, on request, local state
 | `--keep-state` | Leave the state directory in place. |
 | `--yes` | Confirm removal of the state directory. |
 | `--json` | Emit JSON. |
-### `rune completion bash`
+### `rune completion <bash|zsh|fish|powershell>`
 
 Generate shell completion from the command table
 

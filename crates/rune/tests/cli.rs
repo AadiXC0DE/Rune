@@ -206,18 +206,31 @@ fn completion_prints_only_a_script_without_loading_paths_or_config() {
 fn completion_rejects_missing_unsupported_and_extra_shell_arguments() {
     for args in [
         &["completion"][..],
-        &["completion", "fish"][..],
+        &["completion", "tcsh"][..],
         &["completion", "bash", "extra"][..],
     ] {
         let output = run(args);
         assert_eq!(output.status, Some(1), "{args:?}");
         assert!(output.stdout.is_empty(), "{}", output.stdout);
-        assert!(output.stderr.contains("shell"), "{}", output.stderr);
-        assert!(output.stderr.contains("rune completion bash"));
+        assert!(
+            output
+                .stderr
+                .contains("expected one supported shell: bash, zsh, fish or powershell"),
+            "{}",
+            output.stderr
+        );
+        assert!(
+            output
+                .stderr
+                .contains("use rune completion zsh, for example")
+        );
     }
     let help = run(&["completion", "--help"]);
     assert_eq!(help.status, Some(0));
-    assert!(help.stdout.contains("rune completion bash"));
+    assert!(
+        help.stdout
+            .contains("rune completion <bash|zsh|fish|powershell>")
+    );
 }
 
 #[test]
