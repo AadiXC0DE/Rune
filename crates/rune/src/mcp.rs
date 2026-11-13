@@ -845,6 +845,56 @@ pub fn run(
     Ok(report)
 }
 
+/// One server as `rune doctor` reports it.
+pub struct DoctorServer {
+    /// The server name.
+    pub name: String,
+    /// Tools it offered, or why it did not connect.
+    pub outcome: std::result::Result<usize, (ErrorCode, String)>,
+}
+
+/// Connects every enabled user server and approved project server, as
+/// `rune mcp check` does, for `rune doctor`. Servers that are disabled,
+/// unapproved or skipped offline are left out.
+///
+/// # Errors
+///
+/// Fails when the configured servers cannot be read.
+pub fn doctor_servers(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+) -> Result<Vec<DoctorServer>> {
+    let workspace = trust::canonical_workspace(workspace);
+    let mut warnings = Vec::new();
+    let entries = all_entries(&workspace, settings, &mut warnings)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trust = TrustStore::load(&paths.trust_file())?;
+    let mut servers = Vec::new();
+    for (name, entry, source) in entries {
+        let scope = Scope {
+            workspace: &workspace,
+            trust: &trust,
+            settings,
+            paths,
+            checking: true,
+        };
+        let server = inspect(&name, &entry, source, scope);
+        let outcome = match server.status {
+            "connected" => Ok(server.check.map_or(0, |check| check.tools.len())),
+            "failed" => Err(server.startup_error.map_or(
+                (ErrorCode::Internal, "the server did not start".to_owned()),
+                |error| (error.code, error.message),
+            )),
+            _ => continue,
+        };
+        servers.push(DoctorServer { name, outcome });
+    }
+    Ok(servers)
+}
+
 fn unknown_server(name: &str) -> RuneError {
     RuneError::new(ErrorCode::NotFound, format!("no MCP server named `{name}`"))
 }

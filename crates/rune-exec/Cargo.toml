@@ -17,7 +17,7 @@ camino = { workspace = true }
 # Resource ceilings and Linux PTYs use safe rustix syscall wrappers, keeping
 # the unsafe surface to the one child setup `pre_exec` call.
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 
 # Linux PTYs reuse rustix rather than adding a terminal runtime dependency.
 [target.'cfg(target_os = "linux")'.dependencies]

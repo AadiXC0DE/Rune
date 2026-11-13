@@ -110,6 +110,38 @@ fn a_user_server_connects_without_trust() {
 }
 
 #[test]
+fn doctor_lists_a_user_mcp_server() {
+    use support::CommandExt as _;
+    let workspace =
+        UserWorkspace::new("[mcp_servers.local]\ncommand = \"python3\"\nargs = [\"{script}\"]\n");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["doctor", "--json", "--offline"])
+        .current_dir(workspace.dir.path().join("repo"))
+        .isolated_env()
+        .with_external_programs()
+        .env("RUNE_HOME", workspace.dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", workspace.dir.path().join("config"))
+        .env("XDG_DATA_HOME", workspace.dir.path().join("data"))
+        .env("RUNE_CONFIG", workspace.dir.path().join("user.toml"))
+        .output()
+        .expect("run rune");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    let mcp = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"] == "mcp")
+        .expect("mcp check");
+    assert_eq!(mcp["outcome"], "ok", "{report}");
+    assert!(
+        mcp["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("1 servers connected, ")),
+        "{report}"
+    );
+}
+
+#[test]
 fn user_servers_win_name_clashes() {
     let workspace =
         UserWorkspace::new("[mcp_servers.github]\ncommand = \"python3\"\nargs = [\"{script}\"]\n");

@@ -27,6 +27,7 @@ mod rename;
 pub use rename::rename_no_replace;
 
 pub mod command;
+pub mod disk;
 pub mod sandbox;
 pub mod session;
 

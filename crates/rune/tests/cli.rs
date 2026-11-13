@@ -937,22 +937,28 @@ fn usage_period_flag_filters_the_ledger_to_seven_days() {
 }
 
 #[test]
-fn doctor_passes_on_a_clean_setup() {
+fn doctor_names_the_missing_provider_and_exits_one() {
     let out = run(&["doctor"]);
     assert_eq!(
         out.status,
-        Some(0),
+        Some(1),
         "stdout: {}\nstderr: {}",
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("ok "), "{}", out.stdout);
+    assert!(out.stdout.contains("ok      version"), "{}", out.stdout);
+    assert!(out.stdout.contains("problem provider"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("        fix: run rune connect"),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
 fn doctor_json_is_parseable_and_names_every_check() {
     let out = run(&["doctor", "--json"]);
-    assert_eq!(out.status, Some(0));
+    assert_eq!(out.status, Some(1));
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     let checks = value["checks"].as_array().expect("checks array");
     assert!(!checks.is_empty());
@@ -966,7 +972,7 @@ fn doctor_json_is_parseable_and_names_every_check() {
 }
 
 #[test]
-fn doctor_reports_an_unconfigured_provider_as_unknown_not_failed() {
+fn doctor_reports_an_unconfigured_provider_as_a_problem() {
     let out = run(&["doctor", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid json");
     let checks = value["checks"].as_array().expect("checks array");
@@ -974,7 +980,7 @@ fn doctor_reports_an_unconfigured_provider_as_unknown_not_failed() {
         .iter()
         .find(|check| check["name"] == "provider")
         .expect("provider check");
-    assert_eq!(provider["outcome"], "unknown");
+    assert_eq!(provider["outcome"], "fail");
     assert!(
         provider["hint"]
             .as_str()
@@ -3125,4 +3131,104 @@ fn sessions_prune_dry_run_lists_old_sessions() {
     assert!(!paths.session_dir(&gone).exists());
     let kept: SessionId = "pruneold0001".parse().expect("id");
     assert!(paths.session_dir(&kept).exists());
+}
+
+/// Runs `rune doctor --json` against a chat-completions provider at `base`.
+fn doctor_against(base: &str, extra: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = Command::new(binary())
+        .args(["doctor", "--json"])
+        .args(extra)
+        .env("RUNE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", base)
+        .env("RUNE_MODEL", "doctor-model")
+        .env("RUNE_API_KEY_ENV", "RUNE_DOCTOR_TEST_KEY")
+        .env("RUNE_DOCTOR_TEST_KEY", "wrong-key")
+        .output()
+        .expect("run binary");
+    let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "doctor printed no report:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), report)
+}
+
+fn check_named<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} check: {report}"))
+}
+
+#[test]
+fn doctor_reports_a_refused_key() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let server = std::thread::spawn(move || {
+        // Every request the doctor makes is refused.
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            let body = r#"{"error":{"message":"invalid api key"}}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if String::from_utf8_lossy(&buffer[..read]).contains("x-stop") {
+                break;
+            }
+        }
+    });
+    let (code, report) = doctor_against(&format!("http://127.0.0.1:{port}/v1"), &[]);
+    assert_eq!(code, Some(1), "{report}");
+    let provider = check_named(&report, "provider");
+    assert_eq!(provider["outcome"], "fail", "{report}");
+    assert!(
+        provider["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("refused the key from $RUNE_DOCTOR_TEST_KEY")),
+        "{report}"
+    );
+    assert_eq!(provider["hint"], "run rune connect");
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port))
+        .and_then(|mut stream| stream.write_all(b"GET / HTTP/1.1\r\nx-stop: 1\r\n\r\n"));
+    let _ = server.join();
+}
+
+#[test]
+fn doctor_offline_contacts_nothing() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("address").port();
+    let (_, report) = doctor_against(&format!("http://127.0.0.1:{port}/v1"), &["--offline"]);
+    assert!(
+        listener.accept().is_err(),
+        "the doctor opened a connection offline"
+    );
+    for name in ["update", "clock", "provider"] {
+        assert_eq!(
+            check_named(&report, name)["outcome"],
+            "unknown",
+            "{name}: {report}"
+        );
+    }
+    assert!(
+        check_named(&report, "network")["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.ends_with("offline mode")),
+        "{report}"
+    );
 }

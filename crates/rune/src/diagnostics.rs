@@ -1,8 +1,8 @@
 //! Diagnostic commands.
 //!
-//! These answer "why is this not working" without starting a model turn and
-//! without opening a network connection. Every check emits a stable code and a
-//! marker indicating whether it passed, warned, or failed.
+//! These answer "why is this not working" without starting a model turn.
+//! Every check emits a stable name and a marker saying whether it passed,
+//! warned, failed or could not run, with one line on how to fix it.
 
 use std::fmt::Write as _;
 
@@ -120,38 +120,114 @@ impl Report {
             self.version, self.workspace, self.config_root, self.state_root
         );
         for check in &self.checks {
-            let marker = match check.outcome {
-                Outcome::Ok => "ok  ",
-                Outcome::Warn => "warn",
-                Outcome::Fail => "fail",
-                Outcome::Unknown => "?   ",
-            };
-            let _ = writeln!(out, "{marker} {:<24} {}", check.name, check.detail);
+            let _ = writeln!(
+                out,
+                "{} {:<14} {}",
+                marker(check.outcome),
+                check.name,
+                check.detail
+            );
             if let Some(hint) = &check.hint {
-                let _ = writeln!(out, "     {:24} {hint}", "");
+                let _ = writeln!(out, "        fix: {hint}");
             }
         }
         out
     }
 }
 
-/// Runs every local check.
+/// The text marker of an outcome.
+const fn marker(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Ok => "ok     ",
+        Outcome::Warn => "warning",
+        Outcome::Fail => "problem",
+        Outcome::Unknown => "skipped",
+    }
+}
+
+impl Check {
+    /// Builds a check that could not run, saying why.
+    fn skipped(name: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_owned(),
+            outcome: Outcome::Unknown,
+            detail: detail.into(),
+            hint: None,
+            code: None,
+        }
+    }
+}
+
+/// How long the provider's model list may take.
+const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Runs every check, in a stable order.
 ///
-/// Performs no network access and starts no model turn, so it completes even
-/// when the machine is offline.
+/// Only `update`, `clock`, `provider`, `reviewer` and `mcp` contact anything,
+/// each with its own timeout; with `--offline` they are skipped and no
+/// connection is opened.
 #[must_use]
 pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
-    let checks = vec![
+    let mut checks = vec![
+        Check::ok("version", crate::version::version_line()),
         check_workspace(workspace),
         check_state_root(paths),
-        check_config_layers(settings),
-        check_provider(settings),
-        check_limits(settings),
         check_legacy_layout(),
-        check_network(settings),
-        check_certificates(&rune_net::roots::Roots::from_environment()),
-        check_sandbox(settings),
+        // The release lookup these read lands with the upgrade command.
+        Check::skipped("update", "not checked: the release lookup is not built yet"),
+        Check::skipped("clock", "not checked: the release lookup is not built yet"),
+        check_terminal(),
+        check_config_layers(settings),
     ];
+    let listed = if !settings.provider.is_configured() || settings.offline {
+        None
+    } else {
+        Some(crate::provider_setup::fetch_catalog(
+            settings,
+            paths,
+            PROVIDER_TIMEOUT,
+        ))
+    };
+    let ids: Option<Vec<String>> = listed.as_ref().and_then(|listed| {
+        listed.as_ref().ok().map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect()
+        })
+    });
+    checks.push(provider_check(settings, listed.as_ref()));
+    checks.push(check_limits(settings));
+    checks.extend(reviewer_check(settings, ids.as_deref()));
+    checks.push(check_sandbox(settings));
+    checks.push(network_check(settings));
+    checks.push(git_check());
+    checks.push(checkpoints_check(crate::checkpoint::store_size(
+        paths, workspace,
+    )));
+    checks.extend(mcp_checks(settings, paths, workspace));
+    checks.push(Check::ok(
+        "shell",
+        format!(
+            "commands run through {}",
+            rune_exec::command::default_shell()
+        ),
+    ));
+    checks.push(disk_check(
+        rune_exec::disk::free_bytes(&paths.state_root).or_else(|| {
+            paths
+                .state_root
+                .parent()
+                .and_then(rune_exec::disk::free_bytes)
+        }),
+        directory_size(&paths.sessions_dir()),
+        paths,
+    ));
+    checks.push(proxy_check(&|name| std::env::var(name).ok()));
+    checks.push(check_certificates(
+        &rune_net::roots::Roots::from_environment(),
+    ));
 
     Report {
         version: crate::version::version_line(),
@@ -160,6 +236,397 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         state_root: paths.state_root.to_string(),
         checks,
     }
+}
+
+/// What every check looks at and how to fix its common failure: the source
+/// of the troubleshooting page.
+#[must_use]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read by the generated troubleshooting page")
+)]
+pub fn catalogue() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("version", "the running binary", "nothing to fix"),
+        (
+            "workspace",
+            "the directory rune runs in",
+            "run rune from a directory",
+        ),
+        (
+            "state root",
+            "where sessions and settings are kept",
+            "make the directory writable",
+        ),
+        (
+            "legacy state",
+            "an older state layout",
+            "move what you need into the state root",
+        ),
+        (
+            "update",
+            "whether a newer release exists",
+            "run rune upgrade",
+        ),
+        (
+            "clock",
+            "the system clock against the network",
+            "correct the system clock",
+        ),
+        (
+            "terminal",
+            "colours, keys and clipboard of this terminal",
+            "use a terminal with the missing feature",
+        ),
+        (
+            "configuration",
+            "every configuration layer",
+            "fix or remove the named key",
+        ),
+        (
+            "provider",
+            "the endpoint, the key and the model",
+            "run rune connect",
+        ),
+        (
+            "limits",
+            "limits changed from their defaults",
+            "run rune limits to see each source",
+        ),
+        (
+            "reviewer",
+            "the model auto mode reviews actions with",
+            "set review_model to a served model",
+        ),
+        (
+            "sandbox",
+            "what can restrict commands on this host",
+            "install the named sandbox helper",
+        ),
+        (
+            "network",
+            "whether commands may use the network",
+            "set shell_network or use /network",
+        ),
+        (
+            "git",
+            "git, which undo of command changes needs",
+            "install git",
+        ),
+        (
+            "checkpoints",
+            "the checkpoint store for this workspace",
+            "run rune sessions prune",
+        ),
+        (
+            "mcp",
+            "every enabled MCP server",
+            "fix the server or run rune mcp login",
+        ),
+        ("shell", "the shell commands run through", "set SHELL"),
+        ("disk", "free space where sessions are kept", "free space"),
+        (
+            "proxy",
+            "proxy variables in the environment",
+            "unset a proxy that is wrong",
+        ),
+        (
+            "certificates",
+            "the certificate roots requests trust",
+            "set SSL_CERT_FILE",
+        ),
+    ]
+}
+
+/// The terminal as its environment describes it; probing it would write to
+/// a screen the report is being printed on.
+fn check_terminal() -> Check {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Check::skipped("terminal", "standard output is not a terminal");
+    }
+    let env = rune_term::probe::TerminalEnv::from_lookup(|name| std::env::var(name).ok());
+    Check::ok(
+        "terminal",
+        rune_term::probe::TerminalCaps::from_env(env).summary(),
+    )
+}
+
+/// The provider: configured, reachable, accepting the key and listing the
+/// model. `listed` is the model list request, when one was made.
+fn provider_check(
+    settings: &Settings,
+    listed: Option<&rune_core::error::Result<rune_net::catalog::Catalog>>,
+) -> Check {
+    if !settings.provider.is_configured() {
+        return Check::fail(
+            "provider",
+            ErrorCode::AuthenticationRequired,
+            "no provider connected",
+        )
+        .with_hint("run rune connect");
+    }
+    if settings.model.trim().is_empty() {
+        return Check::warn(
+            "provider",
+            format!("{} connected but no model is selected", settings.provider),
+        )
+        .with_hint("choose one from rune models");
+    }
+    let base_url = crate::provider_setup::configured_base_url(settings).unwrap_or_default();
+    let Some(listed) = listed else {
+        return Check::skipped("provider", "not checked: offline mode");
+    };
+    match listed {
+        Err(err)
+            if matches!(
+                err.code(),
+                ErrorCode::AuthenticationRequired | ErrorCode::PermissionDenied
+            ) =>
+        {
+            let source = settings.api_key_env.as_deref().map_or_else(
+                || "the stored credential".to_owned(),
+                |name| format!("${name}"),
+            );
+            Check::fail(
+                "provider",
+                err.code(),
+                format!("the endpoint refused the key from {source}"),
+            )
+            .with_hint("run rune connect")
+        }
+        Err(err) => Check::fail(
+            "provider",
+            err.code(),
+            format!("{base_url} is not reachable: {}", err.message()),
+        )
+        .with_hint("check base_url, the network and proxy variables"),
+        Ok(catalog)
+            if !catalog
+                .models
+                .iter()
+                .any(|model| model.id == settings.model) =>
+        {
+            Check::warn(
+                "provider",
+                format!("model {} is not listed by the endpoint", settings.model),
+            )
+            .with_hint("choose one from rune models")
+        }
+        Ok(_) => Check::ok(
+            "provider",
+            format!(
+                "{} at {base_url}, key accepted, model {} listed",
+                settings.provider, settings.model
+            ),
+        ),
+    }
+}
+
+/// The reviewing model, in auto mode only, checked against the listed models.
+fn reviewer_check(settings: &Settings, listed: Option<&[String]>) -> Option<Check> {
+    if settings.permission_mode != config::PermissionMode::Auto {
+        return None;
+    }
+    let Some(model) = crate::auto_review::reviewer_model(settings) else {
+        return Some(Check::skipped("reviewer", "no model to review with"));
+    };
+    if listed.is_some_and(|ids| !ids.contains(&model)) {
+        return Some(
+            Check::warn(
+                "reviewer",
+                format!("auto mode reviews actions with {model}, which the endpoint does not list"),
+            )
+            .with_hint("set review_model to a model this endpoint serves"),
+        );
+    }
+    Some(Check::ok(
+        "reviewer",
+        format!("auto mode reviews actions with {model}"),
+    ))
+}
+
+/// Whether commands may use the network.
+fn network_check(settings: &Settings) -> Check {
+    let mut detail = if settings.shell_network {
+        format!(
+            "commands have network access ({})",
+            settings.source_of("shell_network")
+        )
+    } else {
+        "commands have no network access (default)".to_owned()
+    };
+    if settings.offline {
+        detail.push_str("; offline mode");
+    }
+    Check::ok("network", detail)
+}
+
+/// Git, which undoing command changes relies on.
+fn git_check() -> Check {
+    match std::process::Command::new("git")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            Check::ok(
+                "git",
+                text.trim().trim_start_matches("git version ").to_owned(),
+            )
+        }
+        _ => Check::warn(
+            "git",
+            "git is not installed; changes made by commands cannot be undone",
+        )
+        .with_hint("install git"),
+    }
+}
+
+/// The checkpoint store for this workspace.
+fn checkpoints_check(size: Option<u64>) -> Check {
+    match size {
+        None => Check::ok("checkpoints", "checkpoint store for this workspace: none yet"),
+        Some(bytes) if bytes > 1024 * 1024 * 1024 => Check::warn(
+            "checkpoints",
+            format!("checkpoint store for this workspace: {}", readable_size(bytes)),
+        )
+        .with_hint(
+            "old sessions' checkpoints are removed automatically above 1 GiB; run rune sessions prune to remove sessions",
+        ),
+        Some(bytes) => Check::ok(
+            "checkpoints",
+            format!("checkpoint store for this workspace: {}", readable_size(bytes)),
+        ),
+    }
+}
+
+/// Every enabled MCP server, connected once: one line for the servers that
+/// connected and one problem per server that did not.
+fn mcp_checks(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Vec<Check> {
+    let servers = match crate::mcp::doctor_servers(settings, paths, workspace) {
+        Ok(servers) => servers,
+        Err(err) => {
+            return vec![
+                Check::fail("mcp", err.code(), err.message().to_owned())
+                    .with_hint("fix the [mcp_servers] configuration"),
+            ];
+        }
+    };
+    if servers.is_empty() {
+        return vec![Check::ok("mcp", "no MCP servers")];
+    }
+    let connected: Vec<usize> = servers
+        .iter()
+        .filter_map(|server| server.outcome.as_ref().ok().copied())
+        .collect();
+    let mut checks = vec![Check::ok(
+        "mcp",
+        format!(
+            "{} servers connected, {} tools",
+            connected.len(),
+            connected.iter().sum::<usize>()
+        ),
+    )];
+    for server in &servers {
+        if let Err((code, message)) = &server.outcome {
+            let hint = if *code == ErrorCode::AuthenticationRequired {
+                format!("run rune mcp login {}", server.name)
+            } else {
+                format!("run rune mcp check {} for details", server.name)
+            };
+            checks.push(
+                Check::fail(&format!("mcp {}", server.name), *code, message.clone())
+                    .with_hint(hint),
+            );
+        }
+    }
+    checks
+}
+
+/// Free space where sessions are kept, and what the sessions take.
+fn disk_check(free: Option<u64>, sessions: u64, paths: &Paths) -> Check {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    let Some(free) = free else {
+        return Check::skipped("disk", "the free space could not be read");
+    };
+    let detail = format!(
+        "{} free; sessions use {}",
+        readable_size(free),
+        readable_size(sessions)
+    );
+    let fix = format!("free space; sessions are under {}", paths.state_root);
+    if free < 100 * MIB {
+        Check::fail("disk", ErrorCode::IoFailure, detail).with_hint(fix)
+    } else if free < GIB {
+        Check::warn("disk", detail).with_hint(fix)
+    } else {
+        Check::ok("disk", detail)
+    }
+}
+
+/// The proxy variables set, with any credentials in them hidden.
+fn proxy_check(env: &dyn Fn(&str) -> Option<String>) -> Check {
+    let mut shown = Vec::new();
+    for name in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"] {
+        for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+            if let Some(value) = env(&spelling).filter(|value| !value.is_empty()) {
+                shown.push(format!("{spelling}={}", hide_credentials(&value)));
+            }
+        }
+    }
+    if shown.is_empty() {
+        Check::ok("proxy", "no proxy variables")
+    } else {
+        Check::ok("proxy", shown.join(", "))
+    }
+}
+
+/// `http://user:secret@proxy:8080` becomes `http://***@proxy:8080`.
+fn hide_credentials(url: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .map_or(("", url), |(scheme, rest)| (scheme, rest));
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let Some((_, host)) = authority.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    let prefix = if scheme.is_empty() {
+        String::new()
+    } else {
+        format!("{scheme}://")
+    };
+    format!("{prefix}***@{host}{path}")
+}
+
+/// The bytes the files under `dir` take.
+fn directory_size(dir: &Utf8Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => camino::Utf8PathBuf::from_path_buf(entry.path())
+                .map_or(0, |path| directory_size(&path)),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// A byte count in the largest whole unit: `512 B`, `3 KiB`, `12 MiB`.
+fn readable_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes;
+    let mut unit = 0_usize;
+    while value >= 1024 && unit < 3 {
+        value /= 1024;
+        unit = unit.saturating_add(1);
+    }
+    format!("{value} {}", UNITS.get(unit).copied().unwrap_or("GiB"))
 }
 
 /// Reports which certificate roots provider and MCP requests trust.
@@ -284,32 +751,6 @@ fn check_config_layers(settings: &Settings) -> Check {
     }
 }
 
-/// Reports the provider state without contacting it.
-fn check_provider(settings: &Settings) -> Check {
-    if !settings.provider.is_configured() {
-        return Check {
-            name: "provider".to_owned(),
-            outcome: Outcome::Unknown,
-            detail: "no provider connected".to_owned(),
-            hint: Some("run `rune connect` to choose an endpoint".to_owned()),
-            code: Some(ErrorCode::AuthenticationRequired),
-        };
-    }
-
-    if settings.model.trim().is_empty() {
-        return Check::warn(
-            "provider",
-            format!("{} connected but no model is selected", settings.provider),
-        )
-        .with_hint("set the provider entry in the `models` table, or pass `--model <id>`");
-    }
-
-    Check::ok(
-        "provider",
-        format!("{} with model {}", settings.provider, settings.model),
-    )
-}
-
 /// Reports limits that were overridden away from their defaults.
 fn check_limits(settings: &Settings) -> Check {
     let overridden: Vec<String> = LimitName::all()
@@ -338,26 +779,6 @@ fn check_legacy_layout() -> Check {
             .with_hint("move any state you need into the current state root")
     } else {
         Check::ok("legacy state", "no earlier layout found")
-    }
-}
-
-/// Reports the network policy in effect.
-fn check_network(settings: &Settings) -> Check {
-    if !settings.provider.is_configured() {
-        return Check {
-            name: "network".to_owned(),
-            outcome: Outcome::Unknown,
-            detail: "not checked, no provider connected".to_owned(),
-            hint: None,
-            code: None,
-        };
-    }
-    Check {
-        name: "network".to_owned(),
-        outcome: Outcome::Unknown,
-        detail: "not checked, run a request to verify connectivity".to_owned(),
-        hint: None,
-        code: None,
     }
 }
 
@@ -470,13 +891,23 @@ mod tests {
     }
 
     #[test]
-    fn report_passes_on_a_clean_setup() {
+    fn a_clean_setup_has_no_unexpected_problems() {
         let dir = TempDir::new().expect("tempdir");
         let workspace = Utf8Path::from_path(dir.path()).expect("utf8");
         let paths = paths_for(&dir);
         let settings = config::load(None, None, &EnvironmentOverrides::default());
         let report = run(&settings, &paths, workspace);
-        assert_eq!(report.exit_code(), 0, "{}", report.render());
+        // Only the missing provider, and a missing sandbox helper on a host
+        // without one, are problems on a clean setup.
+        for check in &report.checks {
+            if check.outcome == Outcome::Fail {
+                assert!(
+                    matches!(check.name.as_str(), "provider" | "sandbox"),
+                    "{}",
+                    report.render()
+                );
+            }
+        }
     }
 
     #[test]
@@ -597,10 +1028,10 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_provider_reports_unknown_not_failure() {
+    fn an_unconfigured_provider_is_a_problem() {
         let settings = config::load(None, None, &EnvironmentOverrides::default());
-        let check = check_provider(&settings);
-        assert_eq!(check.outcome, Outcome::Unknown);
+        let check = provider_check(&settings, None);
+        assert_eq!(check.outcome, Outcome::Fail);
         assert_eq!(check.code, Some(ErrorCode::AuthenticationRequired));
         assert!(
             check
@@ -617,9 +1048,107 @@ mod tests {
             provider: config::Provider::Anthropic,
             ..Settings::default()
         };
-        let check = check_provider(&settings);
+        let check = provider_check(&settings, None);
         assert_eq!(check.outcome, Outcome::Warn);
         assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn markers_read_ok_warning_problem_skipped() {
+        let report = Report {
+            version: "v".to_owned(),
+            workspace: "/w".to_owned(),
+            config_root: "/c".to_owned(),
+            state_root: "/s".to_owned(),
+            checks: vec![
+                Check::ok("git", "2.47"),
+                Check::warn("disk", "low").with_hint("free space"),
+                Check::fail("provider", ErrorCode::AuthenticationRequired, "refused"),
+                Check::skipped("update", "not checked"),
+            ],
+        };
+        let text = report.render();
+        assert!(text.contains("ok      git            2.47\n"), "{text}");
+        assert!(
+            text.contains("warning disk           low\n        fix: free space\n"),
+            "{text}"
+        );
+        assert!(text.contains("problem provider       refused\n"), "{text}");
+        assert!(
+            text.contains("skipped update         not checked\n"),
+            "{text}"
+        );
+        assert_eq!(report.exit_code(), 1);
+        let json = serde_json::to_value(&report).expect("json");
+        let outcomes: Vec<&str> = json["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .map(|check| check["outcome"].as_str().expect("outcome"))
+            .collect();
+        assert_eq!(outcomes, ["ok", "warn", "fail", "unknown"]);
+    }
+
+    #[test]
+    fn proxy_credentials_are_hidden() {
+        let env = |name: &str| match name {
+            "HTTPS_PROXY" => Some("http://user:secret@proxy:8080".to_owned()),
+            "no_proxy" => Some("localhost".to_owned()),
+            _ => None,
+        };
+        let check = proxy_check(&env);
+        assert_eq!(
+            check.detail,
+            "HTTPS_PROXY=http://***@proxy:8080, no_proxy=localhost"
+        );
+        assert!(!check.detail.contains("secret"));
+        assert_eq!(proxy_check(&|_| None).detail, "no proxy variables");
+        assert_eq!(hide_credentials("proxy:3128"), "proxy:3128");
+    }
+
+    #[test]
+    fn disk_thresholds() {
+        const MIB: u64 = 1024 * 1024;
+        let paths = Paths::resolve(None, None, None, None, Some("/state"));
+        assert_eq!(disk_check(Some(2048 * MIB), 0, &paths).outcome, Outcome::Ok);
+        assert_eq!(
+            disk_check(Some(500 * MIB), 0, &paths).outcome,
+            Outcome::Warn
+        );
+        let full = disk_check(Some(50 * MIB), 3 * MIB, &paths);
+        assert_eq!(full.outcome, Outcome::Fail);
+        assert_eq!(full.detail, "50 MiB free; sessions use 3 MiB");
+        assert!(
+            full.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("sessions are under"))
+        );
+        assert_eq!(disk_check(None, 0, &paths).outcome, Outcome::Unknown);
+        assert_eq!(
+            checkpoints_check(None).detail,
+            "checkpoint store for this workspace: none yet"
+        );
+        assert_eq!(
+            checkpoints_check(Some(2 * 1024 * MIB)).outcome,
+            Outcome::Warn
+        );
+    }
+
+    #[test]
+    fn catalogue_covers_every_check_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let workspace = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths_for(&dir);
+        let settings = config::load(None, None, &EnvironmentOverrides::default());
+        let report = run(&settings, &paths, workspace);
+        let names: Vec<&str> = catalogue().iter().map(|(name, _, _)| *name).collect();
+        for check in &report.checks {
+            assert!(
+                names.contains(&check.name.as_str()),
+                "{} is not catalogued",
+                check.name
+            );
+        }
     }
 
     #[test]

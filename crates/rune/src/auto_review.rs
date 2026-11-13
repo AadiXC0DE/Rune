@@ -57,6 +57,19 @@ pub fn build(
     Ok(Some(Box::new(reviewer)))
 }
 
+/// The model `auto` mode reviews actions with, when one can be chosen.
+#[must_use]
+pub fn reviewer_model(settings: &Settings) -> Option<String> {
+    let base_url = crate::provider_setup::configured_base_url(settings)?;
+    let kind = reviewer_for(
+        settings.review_model.as_deref(),
+        vendor_review_model(settings.provider.as_str(), &base_url),
+        settings.model.trim(),
+    );
+    let model = kind.model();
+    (!model.is_empty()).then(|| model.to_owned())
+}
+
 /// Chooses the reviewer's model, effort and endpoint for [`build`].
 fn configure(
     settings: &Settings,
