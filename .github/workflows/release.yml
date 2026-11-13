@@ -38,6 +38,10 @@ jobs:
       RUNE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
       CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
       CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+      # An App Store Connect API key, for notarisation.
+      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +104,24 @@ jobs:
             cargo xtask release "$RELEASE_CHANNEL" "$version" "${{ matrix.target }}"
           fi
 
+      # Apple checks a signed binary and records a ticket that Gatekeeper fetches
+      # online; a bare binary cannot be stapled. Notarisation does not change the
+      # archive, so its checksum stands.
+      - name: Notarise the signed binary
+        if: env.CERTIFICATE_P12 != '' && env.APPLE_NOTARY_KEY_P8 != '' && env.APPLE_NOTARY_KEY_ID != '' && env.APPLE_NOTARY_ISSUER_ID != ''
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          work="$RUNNER_TEMP/notarize"; mkdir -p "$work"
+          tar -xzf "target/dist/rune-$TARGET/"rune-*.tar.gz -C "$work"
+          ditto -c -k --keepParent "$work/rune" "$RUNNER_TEMP/rune-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/rune-notarize.zip" --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --timeout 20m
+          rm -f "$RUNNER_TEMP/notary.p8"
+
       - name: Say what was produced
         run: |
           set -eu
@@ -121,7 +143,7 @@ jobs:
         if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/rune-release.keychain-db" || true
-          rm -f "$RUNNER_TEMP/rune-signing.p12"
+          rm -f "$RUNNER_TEMP/rune-signing.p12" "$RUNNER_TEMP/notary.p8"
 
   # Static musl archives for Linux, each built on a runner of its own
   # architecture and checked in Alpine and Debian before it is published.
@@ -260,6 +282,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CERTIFICATE_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           # The tag comes from the archives themselves, so the release can only be
@@ -267,7 +292,9 @@ jobs:
           version=$(basename "$(ls release/rune-*-aarch64-apple-darwin.tar.gz | head -1)" | sed 's/^rune-\(.*\)-aarch64-apple-darwin\.tar\.gz$/\1/')
           test -n "$version"
 
-          if [ -n "$CERTIFICATE_P12" ]; then
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$APPLE_NOTARY_KEY_P8" ] && [ -n "$APPLE_NOTARY_KEY_ID" ] && [ -n "$APPLE_NOTARY_ISSUER_ID" ]; then
+            note="The macOS archives are signed with this repository's Developer ID certificate and notarised by Apple."
+          elif [ -n "$CERTIFICATE_P12" ]; then
             note="These macOS archives are signed with this repository's Developer ID certificate."
           else
             note="These archives are **not signed**: no Developer ID certificate is configured for this repository, which requires a paid Apple Developer Program membership. Installing through Homebrew is unaffected, because the download does not carry the quarantine flag. A tarball downloaded by hand does, and Gatekeeper will refuse an unsigned binary."

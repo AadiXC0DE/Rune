@@ -48,6 +48,14 @@ def check():
     upload = publish.find("gh release upload")
     if attest < 0 or upload < 0 or attest > upload:
         fail("the provenance attestation does not come before the upload")
+    notarise = re.search(r"- name: Notarise the signed binary\n\s+if: (.*)\n", job("macos"))
+    if not notarise:
+        fail("the macos job does not notarise")
+    for secret in ("APPLE_NOTARY_KEY_P8", "APPLE_NOTARY_KEY_ID", "APPLE_NOTARY_ISSUER_ID"):
+        if f"env.{secret} != ''" not in notarise.group(1):
+            fail(f"notarisation is not guarded by {secret}")
+        if re.search(rf"echo[^\n]*\${{?{secret}", WORKFLOW):
+            fail(f"{secret} is printed")
     for permission in ("id-token: write", "attestations: write"):
         if permission not in publish:
             fail(f"publish lacks `{permission}`")
