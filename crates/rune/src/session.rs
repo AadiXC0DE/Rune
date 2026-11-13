@@ -224,23 +224,33 @@ struct LazyRows {
     finished: Vec<String>,
     /// Bytes of the source those rows cover.
     covered: usize,
+    /// The width those rows were wrapped at.
+    width: usize,
 }
 
 /// Returns the rows for a growing string, wrapping only what is new.
 fn rows_for(lazy: &mut LazyRows, text: &str, width: usize) -> Vec<String> {
-    // Text that shrank means the lane was cleared, so the cached rows describe
-    // a response that is gone.
-    if text.len() < lazy.covered {
+    // Text that shrank, or a new width, leaves the cached rows describing
+    // something no longer on screen.
+    if text.len() < lazy.covered || lazy.width != width {
         lazy.finished.clear();
         lazy.covered = 0;
+        lazy.width = width;
     }
 
     // Everything up to the last newline is final. A newline is a hard break, so
     // no later text can change how the text before it wraps, and the wrap for
     // that prefix is computed once no matter how many deltas follow it.
     let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
-    if sealed != lazy.covered {
-        lazy.finished = rune_term::width::wrap(text.get(..sealed).unwrap_or_default(), width);
+    if sealed > lazy.covered {
+        // Only the newly sealed lines are wrapped. The rows so far end in the
+        // empty row their final newline wraps to, which the new lines start on.
+        let added =
+            rune_term::width::wrap(text.get(lazy.covered..sealed).unwrap_or_default(), width);
+        if lazy.covered > 0 {
+            lazy.finished.pop();
+        }
+        lazy.finished.extend(added);
         lazy.covered = sealed;
     }
 
@@ -586,6 +596,8 @@ struct SessionHost {
     transcript_history_len: std::sync::atomic::AtomicUsize,
     /// Prevents streaming frames from painting over the transcript or editor.
     transcript_open: std::sync::atomic::AtomicBool,
+    /// Viewer rows of collapsed entries, kept between openings.
+    viewer_cache: transcript::SharedBodies,
     /// Rows committed while the transcript or editor held the screen, put in
     /// scrollback once it is given back.
     withheld: Mutex<Vec<String>>,
@@ -4797,6 +4809,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         results: Mutex::new(Some(history.result_store().clone())),
         transcript_history_len: std::sync::atomic::AtomicUsize::new(history.len()),
         transcript_open: std::sync::atomic::AtomicBool::new(false),
+        viewer_cache: transcript::SharedBodies::default(),
         withheld: Mutex::new(Vec::new()),
         hints: Mutex::new(crate::hints::Hints::load(&config.paths.state_root)),
         hint_shown: std::sync::atomic::AtomicBool::new(false),
@@ -8146,7 +8159,11 @@ fn view_with(
     );
     let mut signature = viewer_signature(host);
     let live = fixed.is_none();
-    let mut details = transcript::ToolDetails::new(fixed.unwrap_or_else(|| viewer_entries(host)));
+    let mut details = match fixed {
+        Some(entries) => transcript::ToolDetails::new(entries),
+        None => transcript::ToolDetails::new(viewer_entries(host))
+            .with_cache(Arc::clone(&host.viewer_cache)),
+    };
     let style = host.diff_style();
     let display = |width: u16| Display {
         width: usize::from(width),
@@ -25999,6 +26016,7 @@ mod tests {
             results: Mutex::new(None),
             transcript_history_len: std::sync::atomic::AtomicUsize::new(0),
             transcript_open: std::sync::atomic::AtomicBool::new(false),
+            viewer_cache: transcript::SharedBodies::default(),
             withheld: Mutex::new(Vec::new()),
             hints: Mutex::new(crate::hints::Hints::load(Utf8Path::new(
                 "/nonexistent/rune-test-state",

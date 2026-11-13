@@ -18,6 +18,10 @@ import time
 
 SAMPLES = 11
 MARKER = b"/ commands"
+# Every terminal answers the primary device attributes query; the startup
+# probe waits for that answer, so the PTY gives it as a terminal would.
+DEVICE_ATTRIBUTES_QUERY = b"\x1b[c"
+DEVICE_ATTRIBUTES_REPLY = b"\x1b[?62;22c"
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -48,6 +52,7 @@ def sample(binary, environment, cwd):
     )
     os.close(slave)
     seen = bytearray()
+    answered = False
     try:
         deadline = started + 10
         while MARKER not in seen:
@@ -59,6 +64,9 @@ def sample(binary, environment, cwd):
                     seen.extend(os.read(master, 65536))
                 except OSError:
                     break
+                if not answered and DEVICE_ATTRIBUTES_QUERY in seen:
+                    os.write(master, DEVICE_ATTRIBUTES_REPLY)
+                    answered = True
         elapsed = (time.monotonic() - started) * 1000
         os.write(master, b"\x04")
         deadline = time.monotonic() + 5

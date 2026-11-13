@@ -432,7 +432,58 @@ pub struct ToolDetails {
     expanded: Vec<bool>,
     expansions: Vec<Option<Expansion>>,
     selected: Option<usize>,
+    cache: Option<SharedBodies>,
 }
+
+/// The rows of collapsed viewer entries, kept between openings of the viewer
+/// so that only entries added since the last opening are rendered.
+///
+/// Each body is stored with the entry it was rendered from and is used again
+/// only while the entry at that position is equal, so a transcript that was
+/// replaced (a new session, a compaction) renders afresh by itself.
+#[derive(Debug, Default)]
+pub struct BodyCache {
+    display: Option<Display>,
+    bodies: Vec<(Entry, Vec<String>)>,
+    renders: usize,
+}
+
+impl BodyCache {
+    /// How many entry bodies were rendered rather than reused.
+    #[must_use]
+    pub const fn renders(&self) -> usize {
+        self.renders
+    }
+
+    /// The rows of `entry` at `index`, rendered by `render` when not kept.
+    fn body(
+        &mut self,
+        index: usize,
+        entry: &Entry,
+        display: Display,
+        render: impl FnOnce() -> Vec<String>,
+    ) -> Vec<String> {
+        if self.display != Some(display) {
+            self.display = Some(display);
+            self.bodies.clear();
+        }
+        if let Some((kept, rows)) = self.bodies.get(index)
+            && kept == entry
+        {
+            return rows.clone();
+        }
+        let rows = render();
+        self.renders = self.renders.saturating_add(1);
+        self.bodies.truncate(index);
+        if self.bodies.len() == index {
+            self.bodies.push((entry.clone(), rows.clone()));
+        }
+        rows
+    }
+}
+
+/// A body cache shared by the viewer's openings.
+pub type SharedBodies = std::sync::Arc<std::sync::Mutex<BodyCache>>;
 
 impl ToolDetails {
     /// Starts with every entry collapsed and nothing selected.
@@ -441,6 +492,13 @@ impl ToolDetails {
         let mut details = Self::default();
         details.replace(entries);
         details
+    }
+
+    /// Renders collapsed entries through `cache`, reusing the rows it holds.
+    #[must_use]
+    pub fn with_cache(mut self, cache: SharedBodies) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Replaces the entries, keeping each unchanged entry's state by index.
@@ -584,6 +642,11 @@ impl ToolDetails {
         let push = |out: &mut Vec<String>, text: &str| {
             out.extend(text.trim_end().lines().map(str::to_owned));
         };
+        let mut cache = self.cache.as_ref().map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         for (index, entry) in self.entries.iter().enumerate() {
             if index > 0 {
                 out.push(String::new());
@@ -613,16 +676,18 @@ impl ToolDetails {
                 tool_lines: usize::MAX,
                 ..display
             };
+            // A collapsed body depends on the entry and the display alone.
+            if !expanded && let Some(cache) = cache.as_mut() {
+                let rows = cache.body(index, entry, full, || {
+                    let mut body = String::new();
+                    collapsed_body(entry, full, &mut body);
+                    body.trim_end().lines().map(str::to_owned).collect()
+                });
+                out.extend(rows);
+                continue;
+            }
             match (entry.speaker, expanded, self.expansions[index].as_ref()) {
-                (Speaker::Reasoning, false, _) => {
-                    let first = first_line(&sanitize(&entry.text));
-                    render_entry(
-                        &Entry::reasoning(format!("thought: {first}")),
-                        full,
-                        &Lanes::default(),
-                        &mut body,
-                    );
-                }
+                (_, false, _) => collapsed_body(entry, full, &mut body),
                 (Speaker::Tool, true, Some(Expansion::Text(text))) => {
                     render_entry(&Entry::tool(text), full, &Lanes::default(), &mut body);
                 }
@@ -642,6 +707,22 @@ impl ToolDetails {
             selected: selected_row,
             starts,
         }
+    }
+}
+
+/// Renders a collapsed viewer entry: one `thought:` row for reasoning, the
+/// recorded text for everything else.
+fn collapsed_body(entry: &Entry, display: Display, body: &mut String) {
+    if entry.speaker == Speaker::Reasoning {
+        let first = first_line(&sanitize(&entry.text));
+        render_entry(
+            &Entry::reasoning(format!("thought: {first}")),
+            display,
+            &Lanes::default(),
+            body,
+        );
+    } else {
+        render_entry(entry, display, &Lanes::default(), body);
     }
 }
 
@@ -1559,6 +1640,71 @@ mod tests {
         assert_eq!(render_draft_at("> ", &draft, 38, 40).1, (1, 2));
         assert_eq!(render_draft_at("> ", &draft, 0, 40).1, (0, 2));
         assert!(rows.iter().all(|row| str_width(row) <= 40));
+    }
+
+    fn renders(cache: &SharedBodies) -> usize {
+        cache
+            .lock()
+            .map(|cache| cache.renders())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_viewer_renders_only_new_entries() {
+        let cache = SharedBodies::default();
+        let mut entries = vec![
+            Entry::user("one"),
+            Entry::assistant("A1"),
+            Entry::tool("read a.txt"),
+        ];
+        let display = Display::default();
+        let first = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 3);
+        entries.push(Entry::assistant("A2"));
+        let second = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 4, "only the new entry is rendered");
+        assert_eq!(second, ToolDetails::new(entries.clone()).rows(display));
+        assert!(second.rows.starts_with(&first.rows));
+
+        // A changed entry renders again, and so does everything after it.
+        entries[1] = Entry::assistant("A1 changed");
+        let changed = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 7);
+        assert_eq!(changed, ToolDetails::new(entries).rows(display));
+    }
+
+    #[test]
+    fn a_width_change_invalidates_the_viewer_cache() {
+        let cache = SharedBodies::default();
+        let entries = vec![Entry::assistant("word ".repeat(30)), Entry::user("two")];
+        let narrow = Display {
+            width: 40,
+            ..Display::default()
+        };
+        let wide = Display {
+            width: 100,
+            ..Display::default()
+        };
+        let details = ToolDetails::new(entries.clone()).with_cache(std::sync::Arc::clone(&cache));
+        let _ = details.rows(narrow);
+        assert_eq!(renders(&cache), 2);
+        let rows = details.rows(wide);
+        assert_eq!(renders(&cache), 4);
+        assert_eq!(rows, ToolDetails::new(entries.clone()).rows(wide));
+        let ascii = Display {
+            ascii: true,
+            ..wide
+        };
+        let _ = details.rows(ascii);
+        assert_eq!(renders(&cache), 6, "an ASCII change renders again too");
+        let _ = details.rows(ascii);
+        assert_eq!(renders(&cache), 6);
     }
 
     #[test]

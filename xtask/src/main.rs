@@ -70,6 +70,11 @@ mod perf_baseline {
     pub const LONG_TURN_PEAK_RSS_BYTES: u64 = 20_238_000;
     pub const LONG_TURN_CPU_SECONDS: f64 = 2.98;
     pub const FIRST_FRAME_MEDIAN_MS: f64 = 52.5;
+    // Rendering, median of three runs on macOS arm64 (Apple M-series), 2026-11-13.
+    pub const STREAM_CPU_SECONDS: f64 = 0.328;
+    pub const STREAM_TERMINAL_BYTES: f64 = 324_742.0;
+    pub const VIEWER_FIRST_FRAME_MS: f64 = 74.75;
+    pub const SESSION_MAX_RSS_KIB: f64 = 21_296.0;
     /// A measurement more than this fraction above its baseline fails.
     pub const ALLOWED_REGRESSION: f64 = 0.25;
 }
@@ -813,6 +818,99 @@ fn measure_first_frame(binary: &Path) -> Result<f64, String> {
         .ok_or_else(|| "first frame output has no median_ms".to_owned())
 }
 
+/// One rendering measurement: its script and the fields it reports.
+struct RenderMeasure {
+    name: &'static str,
+    script: &'static str,
+}
+
+/// The rendering measurements, each a script appended to the shared harness.
+const RENDER_MEASURES: &[RenderMeasure] = &[
+    RenderMeasure {
+        name: "stream",
+        script: include_str!("../perf/stream.py"),
+    },
+    RenderMeasure {
+        name: "viewer",
+        script: include_str!("../perf/viewer.py"),
+    },
+    RenderMeasure {
+        name: "memory",
+        script: include_str!("../perf/memory.py"),
+    },
+];
+
+/// Runs one rendering measurement and returns the JSON object it prints.
+fn measure_render(binary: &Path, measure: &RenderMeasure) -> Result<serde_json::Value, String> {
+    let program = format!("{}\n{}", include_str!("../perf/harness.py"), measure.script);
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(program)
+        .arg(binary)
+        .output()
+        .map_err(|err| format!("could not run python3: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} measurement failed: {}{}",
+            measure.name,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.lines().last().unwrap_or_default().trim())
+        .map_err(|err| format!("{} output is not JSON: {err}", measure.name))
+}
+
+/// The rendering values and their baselines, in the order they are printed.
+fn render_values(
+    results: &[(&'static str, serde_json::Value)],
+) -> Result<Vec<(&'static str, f64, f64)>, String> {
+    let field = |measure: &str, key: &str| {
+        results
+            .iter()
+            .find(|(name, _)| *name == measure)
+            .and_then(|(_, value)| value.get(key))
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("{measure} output has no {key}"))
+    };
+    Ok(vec![
+        (
+            "stream cpu_seconds",
+            field("stream", "cpu_seconds")?,
+            perf_baseline::STREAM_CPU_SECONDS,
+        ),
+        (
+            "stream terminal_bytes",
+            field("stream", "terminal_bytes")?,
+            perf_baseline::STREAM_TERMINAL_BYTES,
+        ),
+        (
+            "viewer first_frame_ms",
+            field("viewer", "first_frame_ms")?,
+            perf_baseline::VIEWER_FIRST_FRAME_MS,
+        ),
+        (
+            "memory max_rss_kib",
+            field("memory", "max_rss_kib")?,
+            perf_baseline::SESSION_MAX_RSS_KIB,
+        ),
+    ])
+}
+
+/// The rendering values more than the allowed fraction above their baselines.
+fn render_failures(values: &[(&'static str, f64, f64)]) -> Vec<String> {
+    let limit = 1.0 + perf_baseline::ALLOWED_REGRESSION;
+    let percent = (perf_baseline::ALLOWED_REGRESSION * 100.0).round();
+    values
+        .iter()
+        .filter(|(_, value, baseline)| *value > baseline * limit)
+        .map(|(name, value, baseline)| {
+            format!("{name}: {value} is more than {percent}% above the baseline {baseline}")
+        })
+        .collect()
+}
+
 /// Measures long-turn memory and CPU and the time to the first frame.
 ///
 /// `--steps N` (not in the help) runs only the long turn at another length
@@ -854,11 +952,27 @@ fn perf(extra: &[String]) -> Result<(), String> {
         "first frame  median of 11 {frame:.1} ms (baseline {:.1} ms)",
         perf_baseline::FIRST_FRAME_MEDIAN_MS
     );
+    let mut results = Vec::new();
+    for measure in RENDER_MEASURES {
+        results.push((measure.name, measure_render(&binary, measure)?));
+    }
+    let values = render_values(&results)?;
+    for (name, value, baseline) in &values {
+        println!("{name:<22} {value} (baseline {baseline})");
+    }
+    if let Some(reopen) = results
+        .iter()
+        .find(|(name, _)| *name == "viewer")
+        .and_then(|(_, value)| value.get("reopen_ms"))
+    {
+        println!("viewer reopen_ms       {reopen} (not gated)");
+    }
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         println!("no baseline for this host; numbers printed only");
         return Ok(());
     }
-    let failures = perf_failures(usage.peak_rss_bytes, usage.cpu_seconds, frame);
+    let mut failures = perf_failures(usage.peak_rss_bytes, usage.cpu_seconds, frame);
+    failures.extend(render_failures(&values));
     if failures.is_empty() {
         Ok(())
     } else {
@@ -1745,6 +1859,46 @@ mod tests {
         assert_eq!(perf_failures(rss * 126 / 100, cpu, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu * 1.26, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu, frame * 1.26).len(), 1);
+    }
+
+    #[test]
+    fn render_gates_fail_only_above_a_quarter_over_the_baseline() {
+        let values = [
+            ("viewer first_frame_ms", 125.0, 100.0),
+            ("stream cpu_seconds", 0.2, 0.3),
+        ];
+        assert!(render_failures(&values).is_empty());
+        let over = render_failures(&[("viewer first_frame_ms", 125.5, 100.0)]);
+        assert_eq!(
+            over,
+            ["viewer first_frame_ms: 125.5 is more than 25% above the baseline 100"]
+        );
+        let results = [
+            (
+                "stream",
+                serde_json::json!({"cpu_seconds": 0.3, "terminal_bytes": 10}),
+            ),
+            (
+                "viewer",
+                serde_json::json!({"first_frame_ms": 70.0, "reopen_ms": 9.0}),
+            ),
+            ("memory", serde_json::json!({"max_rss_kib": 20000})),
+        ];
+        let named: Vec<&str> = render_values(&results)
+            .expect("values")
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "stream cpu_seconds",
+                "stream terminal_bytes",
+                "viewer first_frame_ms",
+                "memory max_rss_kib"
+            ]
+        );
+        assert!(render_values(&results[..2]).is_err());
     }
 
     #[test]
