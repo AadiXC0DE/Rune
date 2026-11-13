@@ -794,6 +794,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapse_tool_calls: Option<bool>,
 
+    /// Whether a session opens with the version line and a tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<bool>,
+
     /// Columns an East Asian ambiguous character occupies, 1 or 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ambiguous_width: Option<i64>,
@@ -1094,6 +1098,8 @@ pub struct Settings {
     pub offline: bool,
     /// Whether tool call groups are collapsed.
     pub collapse_tool_calls: bool,
+    /// Whether a session opens with the version line and a tip.
+    pub banner: bool,
     /// Columns an East Asian ambiguous character occupies, 1 or 2.
     pub ambiguous_width: u8,
     /// Whether session titles are generated.
@@ -1178,6 +1184,7 @@ impl Default for Settings {
             auto_upgrade: true,
             offline: false,
             collapse_tool_calls: true,
+            banner: true,
             ambiguous_width: 1,
             session_titles: true,
             checkpoints: true,
@@ -1414,6 +1421,7 @@ impl Settings {
             ),
             ("auto_upgrade", self.auto_upgrade.to_string()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
+            ("banner", self.banner.to_string()),
             ("ambiguous_width", self.ambiguous_width.to_string()),
             ("session_titles", self.session_titles.to_string()),
             ("checkpoints", self.checkpoints.to_string()),
@@ -1713,6 +1721,7 @@ const PROFILE_ONLY_KEYS: &[&str] = &[
     "auto_upgrade",
     "offline",
     "collapse_tool_calls",
+    "banner",
     "ambiguous_width",
     "session_titles",
     "checkpoints",
@@ -1757,6 +1766,7 @@ pub const USER_KEYS: &[&str] = &[
     "ascii",
     "auto_upgrade",
     "collapse_tool_calls",
+    "banner",
     "ambiguous_width",
     "session_titles",
     "checkpoints",
@@ -1799,6 +1809,7 @@ pub const SCALAR_KEYS: &[&str] = &[
     "ascii",
     "auto_upgrade",
     "collapse_tool_calls",
+    "banner",
     "ambiguous_width",
     "session_titles",
     "checkpoints",
@@ -1839,6 +1850,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         | "ascii"
         | "auto_upgrade"
         | "collapse_tool_calls"
+        | "banner"
         | "terminal_title"
         | "session_titles"
         | "checkpoints"
@@ -2045,6 +2057,7 @@ pub const SETTING_HELP: &[(&str, &str)] = &[
         "collapse_tool_calls",
         "Collapse groups of tool calls in the transcript.",
     ),
+    ("banner", "Open a session with the version line and a tip."),
     (
         "ambiguous_width",
         "Columns an East Asian ambiguous character takes, 1 or 2.",
@@ -2810,6 +2823,10 @@ fn apply_user(settings: &mut Settings, user: &UserConfig, layer: Layer) {
         settings.collapse_tool_calls = collapse;
         settings.sources.record("collapse_tool_calls", layer);
     }
+    if let Some(banner) = user.banner {
+        settings.banner = banner;
+        settings.sources.record("banner", layer);
+    }
     if let Some(columns) = user.ambiguous_width {
         match u8::try_from(columns) {
             Ok(columns @ (1 | 2)) => {
@@ -3485,6 +3502,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "auto_upgrade": settings.auto_upgrade,
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
+        "banner": settings.banner,
         "ambiguous_width": settings.ambiguous_width,
         "session_titles": settings.session_titles,
         "additional_directories": settings.additional_directories,

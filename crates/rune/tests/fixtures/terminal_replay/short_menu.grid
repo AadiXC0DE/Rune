@@ -1,36 +1,36 @@
-completion-last: 32x8, caret 3,3
-00|session ************|
-01|up/down select   tab complete|
-02|menu-model-01 | auto|
-03|> /|
-04|  /terminal-setup|
-05|> /quit|
-06|  33-34 of 34|
-07||
-completion-closed: 32x8, caret 2,3
-00|session ************|
-01|/ commands   @ files|
-02|menu-model-01 | auto|
-03|>|
-04||
+completion-last: 32x8, caret 3,4
+00|tip: @ mentions a file; tab comp|
+01|letes it|
+02|up/down select   tab complete|
+03|menu-model-01 | auto|
+04|> /|
+05|  /terminal-setup|
+06|> /quit|
+07|  34-35 of 35|
+completion-closed: 32x8, caret 2,4
+00|tip: @ mentions a file; tab comp|
+01|letes it|
+02|/ commands   @ files|
+03|menu-model-01 | auto|
+04|>|
 05||
 06||
 07||
-model-last: 32x8, caret 2,3
-00|session ************|
-01|up/down select   tab complete|
-02|menu-model-01 | auto|
-03|>|
-04|  menu-model-14|
-05|> menu-model-15|
-06|  14-15 of 15|
-07||
-model-closed: 32x8, caret 2,3
-00|session ************|
-01|/ commands   @ files|
-02|menu-model-01 | auto|
-03|>|
-04||
+model-last: 32x8, caret 2,4
+00|tip: @ mentions a file; tab comp|
+01|letes it|
+02|up/down select   tab complete|
+03|menu-model-01 | auto|
+04|>|
+05|  menu-model-14|
+06|> menu-model-15|
+07|  14-15 of 15|
+model-closed: 32x8, caret 2,4
+00|tip: @ mentions a file; tab comp|
+01|letes it|
+02|/ commands   @ files|
+03|menu-model-01 | auto|
+04|>|
 05||
 06||
 07||

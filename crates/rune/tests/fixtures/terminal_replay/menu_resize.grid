@@ -1,60 +1,60 @@
-model-open: 80x24, caret 2,3
+model-open: 80x24, caret 2,5
 00|session ************|
-01|up/down select   tab complete   esc close|
-02|replay-model-01 | auto | ctx ~###k (request bytes)|
-03|>|
-04|models from chat_completions|
-05|> replay-model-01 (current)|
-06|  replay-model-02|
-07|  replay-model-03|
-08|  replay-model-04|
-09|  replay-model-05|
-10|  replay-model-06|
-11|  replay-model-07|
-12|  replay-model-08|
-13|  replay-model-09|
-14|  replay-model-10|
-15|  1-10 of 15|
-16|type to narrow, up/down choose, enter accept, esc cancel|
-17||
-18||
+01|rune <version> · replay-model-01 · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|up/down select   tab complete   esc close|
+04|replay-model-01 | auto | ctx ~###k (request bytes)|
+05|>|
+06|models from chat_completions|
+07|> replay-model-01 (current)|
+08|  replay-model-02|
+09|  replay-model-03|
+10|  replay-model-04|
+11|  replay-model-05|
+12|  replay-model-06|
+13|  replay-model-07|
+14|  replay-model-08|
+15|  replay-model-09|
+16|  replay-model-10|
+17|  1-10 of 15|
+18|type to narrow, up/down choose, enter accept, esc cancel|
 19||
 20||
 21||
 22||
 23||
-model-shrunk: 32x8, caret 2,2
-00|up/down select   tab complete|
-01|replay-model-01 | auto|
-02|>|
-03|> replay-model-01 (current)|
-04|  replay-model-02|
-05|  1-2 of 15|
-06||
+model-shrunk: 32x8, caret 2,3
+00|session ************|
+01|up/down select   tab complete|
+02|replay-model-01 | auto|
+03|>|
+04|> replay-model-01 (current)|
+05|  replay-model-02|
+06|  1-2 of 15|
 07||
-model-down: 32x8, caret 2,2
-00|up/down select   tab complete|
-01|replay-model-01 | auto|
-02|>|
-03|  replay-model-01 (current)|
-04|> replay-model-02|
-05|  1-2 of 15|
-06||
+model-down: 32x8, caret 2,3
+00|session ************|
+01|up/down select   tab complete|
+02|replay-model-01 | auto|
+03|>|
+04|  replay-model-01 (current)|
+05|> replay-model-02|
+06|  1-2 of 15|
 07||
-model-closed: 32x8, caret 2,2
-00|/ commands   @ files|
-01|replay-model-01 | auto|
-02|>|
-03||
+model-closed: 32x8, caret 2,3
+00|session ************|
+01|/ commands   @ files|
+02|replay-model-01 | auto|
+03|>|
 04||
 05||
 06||
 07||
-closed-grown: 80x24, caret 2,2
-00|/ commands   @ files   shift-tab mode   ctrl-j newline|
-01|replay-model-01 | auto | ctx ~###k (request bytes)|
-02|>|
-03||
+closed-grown: 80x24, caret 2,3
+00|session ************|
+01|/ commands   @ files   shift-tab mode   ctrl-j newline|
+02|replay-model-01 | auto | ctx ~###k (request bytes)|
+03|>|
 04||
 05||
 06||

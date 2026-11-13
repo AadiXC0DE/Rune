@@ -591,6 +591,8 @@ struct SessionHost {
     withheld: Mutex<Vec<String>>,
     /// The one-time hints used and shown.
     hints: Mutex<crate::hints::Hints>,
+    /// What the next submitted prompt is echoed as, when not its own text.
+    echo_as: Mutex<Option<String>>,
     /// Whether this turn has shown a hint already.
     hint_shown: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
@@ -4765,6 +4767,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         withheld: Mutex::new(Vec::new()),
         hints: Mutex::new(crate::hints::Hints::load(&config.paths.state_root)),
         hint_shown: std::sync::atomic::AtomicBool::new(false),
+        echo_as: Mutex::new(None),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -4864,13 +4867,30 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .id()
         );
+        let about = config.settings.banner.then(|| {
+            version_row(
+                crate::version::VERSION,
+                &host.model_name(),
+                host.mode().label(),
+                &config.workspace,
+                rune_core::paths::home_directory().as_deref(),
+                host.ascii,
+            )
+        });
         let mut opening = if config.accessible {
-            transcript::accessible_lines(&[
-                Entry::notice(banner),
-                Entry::notice("accessible mode: enter one line per prompt; /exit quits"),
-            ])
+            let mut entries = vec![Entry::notice(banner)];
+            entries.extend(about.map(Entry::notice));
+            entries.push(Entry::notice(
+                "accessible mode: enter one line per prompt; /exit quits",
+            ));
+            transcript::accessible_lines(&entries)
         } else {
-            vec![banner]
+            let dim = host.theme().sgr(Slot::Dim, host.depth);
+            let tip = (about.is_some() && keyed).then(|| next_tip(&config.paths.state_root));
+            // One row: the line is a summary, cut rather than wrapped.
+            let width = usize::from(host.width());
+            let about = about.map(|about| shorten(&about, width, host.ascii));
+            intro_rows(banner, about, tip, &dim)
         };
         let notices: Vec<Entry> = theme_warning
             .iter()
@@ -5103,6 +5123,21 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                         None => note("nothing to retry".to_owned()),
                     },
                     Handled::Connect(provider) => return Ok(Step::Connect(provider)),
+                    Handled::Init => {
+                        let exists = config.workspace.join("AGENTS.md").exists();
+                        let go = !exists
+                            || confirm_choice(
+                                reader,
+                                &host,
+                                &sink.stream,
+                                "AGENTS.md exists; ask the model to update it?",
+                            )?;
+                        if go {
+                            *lock_value(&host.echo_as) = Some("/init".to_owned());
+                            return Ok(Step::Retry(INIT_PROMPT.to_owned()));
+                        }
+                        note("AGENTS.md left as it is".to_owned());
+                    }
                     Handled::TerminalSetup if host.accessible => {
                         note("terminal setup needs the interactive terminal".to_owned());
                     }
@@ -5511,7 +5546,10 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 // The submitted line is committed to the flow before the turn
                 // runs, so what the user typed stays on screen once the reply
                 // replaces the region it was typed in.
-                let echo = host.echo_rows(&text);
+                let shown = lock_value(&host.echo_as)
+                    .take()
+                    .unwrap_or_else(|| text.clone());
+                let echo = host.echo_rows(&shown);
                 // The typed line is committed and an empty input row is drawn
                 // under it, so the caret has its own row from the moment the
                 // line is submitted rather than only once streaming starts.
@@ -11857,6 +11895,83 @@ fn connect_in_session(
 /// Said when `/connect` changed nothing.
 const CONNECTION_UNCHANGED: &str = "connection unchanged";
 
+/// One tip per session start, in turn. Each names a feature that exists.
+const TIPS: &[&str] = &[
+    "@ mentions a file; tab completes it",
+    "tab queues a message while a turn runs; enter steers it",
+    "ctrl-o opens the full transcript; / searches it",
+    "shift-tab cycles ask, auto and plan",
+    "! runs a shell command; # adds a note to AGENTS.md",
+    "/copy code copies the last code block",
+    "? on an empty prompt shows every key",
+];
+
+/// The opening line under `session {id}`: version, model, mode and the
+/// workspace with the home directory as `~`.
+fn version_row(
+    version: &str,
+    model: &str,
+    mode: &str,
+    workspace: &Utf8Path,
+    home: Option<&Utf8Path>,
+    ascii: bool,
+) -> String {
+    let place = home
+        .and_then(|home| workspace.strip_prefix(home).ok())
+        .map_or_else(
+            || workspace.to_string(),
+            |rest| {
+                if rest.as_str().is_empty() {
+                    "~".to_owned()
+                } else {
+                    format!("~/{rest}")
+                }
+            },
+        );
+    let dot = if ascii { "-" } else { "\u{b7}" };
+    format!("rune {version} {dot} {model} {dot} {mode} {dot} {place}")
+}
+
+/// The opening rows: `session {id}`, then, with the banner on, the version
+/// line and a tip, both in `dim`.
+fn intro_rows(session: String, about: Option<String>, tip: Option<&str>, dim: &str) -> Vec<String> {
+    let mut rows = vec![session];
+    rows.extend(about.map(|about| styled(dim, &about)));
+    rows.extend(tip.map(|tip| styled(dim, &format!("tip: {tip}"))));
+    rows
+}
+
+/// The tip at `index`, rotating through the list.
+fn tip_at(index: usize) -> &'static str {
+    TIPS.get(index.checked_rem(TIPS.len()).unwrap_or_default())
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Shows the next tip: `<state root>/tip-index` holds the next index (missing
+/// or unreadable counts as 0) and is moved on by one. Errors are ignored.
+fn next_tip(state_root: &Utf8Path) -> &'static str {
+    let path = state_root.join("tip-index");
+    let index = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let _ = std::fs::create_dir_all(state_root);
+    let _ = std::fs::write(&path, index.saturating_add(1).to_string());
+    tip_at(index)
+}
+
+/// The prompt `/init` sends, as a normal turn.
+const INIT_PROMPT: &str =
+    "Write an AGENTS.md file at the repository root for coding agents working here. Find out,
+by reading files and running only read-only commands, and include only what you verified:
+1. How to build, test, lint and format, as exact commands, and how to run one test.
+2. The layout: the main directories and what each holds, in one line each.
+3. Conventions the code follows that a newcomer would get wrong (error handling, naming,
+   test placement), each with a file that shows it.
+Keep it under 60 lines, plain Markdown, no marketing, no guesses. If AGENTS.md exists,
+keep what is still true and correct the rest. Create or update it with a file tool.";
+
 /// What `/tasks` says when the shell holds no running command.
 const NO_TASKS: &str = "no commands are running";
 
@@ -12427,6 +12542,8 @@ enum Handled {
     TerminalSetup,
     /// Send the last failed or interrupted message again.
     Retry,
+    /// Ask the model to write `AGENTS.md`.
+    Init,
     /// Connect a provider or replace its key, inside the session.
     Connect(Option<String>),
 }
@@ -12945,6 +13062,7 @@ fn handle_command<W: std::io::Write>(
         "tasks" => Ok(Handled::Tasks),
         "terminal-setup" => Ok(Handled::TerminalSetup),
         "retry" => Ok(Handled::Retry),
+        "init" => Ok(Handled::Init),
         "connect" | "login" => Ok(Handled::Connect(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -15661,6 +15779,60 @@ mod tests {
         // One hint per turn.
         assert!(written.contains("hint: @ mentions a file"), "{written}");
         assert!(!written.contains("ctrl-o opens"), "{written}");
+    }
+
+    #[test]
+    fn banner_rows_show_version_model_mode_and_workspace() {
+        let row = version_row(
+            "1.2.3",
+            "gpt-test",
+            "auto",
+            Utf8Path::new("/home/me/src/app"),
+            Some(Utf8Path::new("/home/me")),
+            false,
+        );
+        assert_eq!(
+            row,
+            "rune 1.2.3 \u{b7} gpt-test \u{b7} auto \u{b7} ~/src/app"
+        );
+        let elsewhere = version_row(
+            "1",
+            "m",
+            "ask",
+            Utf8Path::new("/srv/x"),
+            Some(Utf8Path::new("/home/me")),
+            true,
+        );
+        assert_eq!(elsewhere, "rune 1 - m - ask - /srv/x");
+        let rows = intro_rows("session abc".to_owned(), Some(row), Some("a tip"), "");
+        assert_eq!(rows[0], "session abc");
+        assert!(rows[1].starts_with("rune 1.2.3"));
+        assert_eq!(rows[2], "tip: a tip");
+    }
+
+    #[test]
+    fn banner_false_keeps_only_the_session_row() {
+        assert_eq!(
+            intro_rows("session abc".to_owned(), None, None, ""),
+            ["session abc"]
+        );
+    }
+
+    #[test]
+    fn tips_rotate_by_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let first = next_tip(&root);
+        let second = next_tip(&root);
+        assert_eq!(first, TIPS[0]);
+        assert_eq!(second, TIPS[1]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("tip-index")).expect("index"),
+            "2"
+        );
+        std::fs::write(root.join("tip-index"), "not a number").expect("write");
+        assert_eq!(next_tip(&root), TIPS[0]);
+        assert_eq!(tip_at(TIPS.len()), TIPS[0]);
     }
 
     #[test]
@@ -25219,6 +25391,7 @@ mod tests {
                 "/nonexistent/rune-test-state",
             ))),
             hint_shown: std::sync::atomic::AtomicBool::new(false),
+            echo_as: Mutex::new(None),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,

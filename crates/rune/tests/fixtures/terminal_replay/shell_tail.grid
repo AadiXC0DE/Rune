@@ -1,19 +1,19 @@
-shell-finished: 80x24, caret 2,12
+shell-finished: 80x24, caret 2,14
 00|session ************|
-01||
-02|▌ tail|
+01|rune <version> · replay-fixture · full access · <workspace>|
+02|tip: @ mentions a file; tab completes it|
 03||
-04|[changes made by commands cannot be undone here (no git repository)]|
+04|▌ tail|
 05||
-06|  ✓ shell for i in 1 2 3 4; d…-$i; sleep 0.3; done                exit 0 · <t>|
+06|[changes made by commands cannot be undone here (no git repository)]|
 07||
-08|SHELL-DONE|
-09|  <t>|
-10|/ commands   @ files   shift-tab mode   ctrl-j newline|
-11|replay-fixture | full access | ctx ~###k (request bytes)|
-12|>|
-13||
-14||
+08|  ✓ shell for i in 1 2 3 4; d…-$i; sleep 0.3; done                exit 0 · <t>|
+09||
+10|SHELL-DONE|
+11|  <t>|
+12|/ commands   @ files   shift-tab mode   ctrl-j newline|
+13|replay-fixture | full access | ctx ~###k (request bytes)|
+14|>|
 15||
 16||
 17||

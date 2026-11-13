@@ -187,6 +187,21 @@ fn screen_snapshot(stage: &str, cols: u16, rows: u16, grid: &Grid) -> String {
         if let Some(id) = line.strip_prefix("session ") {
             line = "session ".to_owned() + &"*".repeat(id.len());
         }
+        // The opening line names the release and the fixture's temporary
+        // workspace, both of which change; model and mode stay exact.
+        if let Some(rest) = line.strip_prefix("rune ")
+            && rest.starts_with(|ch: char| ch.is_ascii_digit())
+        {
+            let after = rest.split_once(' ').map_or("", |(_, after)| after);
+            let masked = format!("rune <version> {after}");
+            let parts: Vec<&str> = masked.splitn(4, " \u{b7} ").collect();
+            line = match parts.as_slice() {
+                [_, model, mode, _] => {
+                    format!("rune <version> \u{b7} {model} \u{b7} {mode} \u{b7} <workspace>")
+                }
+                _ => masked,
+            };
+        }
         // An approval names the fixture's temporary directory.
         if line.starts_with("  in /") {
             "  in <dir>".clone_into(&mut line);

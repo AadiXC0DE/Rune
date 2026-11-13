@@ -1,13 +1,13 @@
-narrow-draft: 32x24, caret 3,5
+narrow-draft: 32x24, caret 3,8
 00|session ************|
-01|/ commands   @ files|
-02|replay-fixture | auto|
-03|> 012345678901234567890123456789|
-04|  01234567890123456789VISIBLE-EN|
-05|  D|
-06||
-07||
-08||
+01|rune <version> · replay-fixture · …|
+02|tip: @ mentions a file; tab comp|
+03|letes it|
+04|/ commands   @ files|
+05|replay-fixture | auto|
+06|> 012345678901234567890123456789|
+07|  01234567890123456789VISIBLE-EN|
+08|  D|
 09||
 10||
 11||
@@ -23,14 +23,14 @@ narrow-draft: 32x24, caret 3,5
 21||
 22||
 23||
-grown-draft: 80x24, caret 63,3
+grown-draft: 80x24, caret 63,6
 00|session ************|
-01|/ commands   @ files   shift-tab mode   ctrl-j newline|
-02|replay-fixture | auto | ctx ~###k (request bytes)|
-03|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
-04||
-05||
-06||
+01|rune <version> · replay-fixture · …|
+02|tip: @ mentions a file; tab comp|
+03|letes it|
+04|/ commands   @ files   shift-tab mode   ctrl-j newline|
+05|replay-fixture | auto | ctx ~###k (request bytes)|
+06|> 01234567890123456789012345678901234567890123456789VISIBLE-END|
 07||
 08||
 09||

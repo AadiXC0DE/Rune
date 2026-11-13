@@ -1,16 +1,16 @@
-failure-reported: 80x24, caret 2,9
+failure-reported: 80x24, caret 2,11
 00|session ************|
-01||
-02|▌ fail|
+01|rune <version> · replay-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
 03||
-04|error: the endpoint returned HTTP 401: invalid api key|
-05|  the provider refused the credential; run `rune connect` to store a new key|
-06|chat_completions refused the credential; /connect stores a new key|
-07|/ commands   @ files   shift-tab mode   ctrl-j newline|
-08|replay-fixture | auto | ctx ~###k (request bytes)|
-09|>|
-10||
-11||
+04|▌ fail|
+05||
+06|error: the endpoint returned HTTP 401: invalid api key|
+07|  the provider refused the credential; run `rune connect` to store a new key|
+08|chat_completions refused the credential; /connect stores a new key|
+09|/ commands   @ files   shift-tab mode   ctrl-j newline|
+10|replay-fixture | auto | ctx ~###k (request bytes)|
+11|>|
 12||
 13||
 14||

@@ -1,24 +1,24 @@
-edit-finished: 80x24, caret 2,17
+edit-finished: 80x24, caret 2,19
 00|session ************|
-01||
-02|▌ edit|
+01|rune <version> · replay-fixture · full access · <workspace>|
+02|tip: @ mentions a file; tab completes it|
 03||
-04|  ✓ edit_file app.txt                                                     +2 -1|
-05|    2   - beta|
-06|      2 + BETA|
-07|      3 + beta two|
-08||
-09|EDIT-DONE|
+04|▌ edit|
+05||
+06|  ✓ edit_file app.txt                                                     +2 -1|
+07|    2   - beta|
+08|      2 + BETA|
+09|      3 + beta two|
 10||
-11|[files changed with no check since; asked for one before finishing]|
+11|EDIT-DONE|
 12||
-13|EDIT-CHECKED|
-14|  1 file +2 -1 · unverified · <t>|
-15|/ commands   @ files   shift-tab mode   ctrl-j newline|
-16|replay-fixture | full access | ctx ~###k (request bytes)|
-17|>|
-18||
-19||
+13|[files changed with no check since; asked for one before finishing]|
+14||
+15|EDIT-CHECKED|
+16|  1 file +2 -1 · unverified · <t>|
+17|/ commands   @ files   shift-tab mode   ctrl-j newline|
+18|replay-fixture | full access | ctx ~###k (request bytes)|
+19|>|
 20||
 21||
 22||

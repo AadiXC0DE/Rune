@@ -173,6 +173,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "list commands and active keyboard bindings",
     },
     Builtin {
+        name: "init",
+        arguments: "",
+        summary: "ask the model to write AGENTS.md for this repository",
+    },
+    Builtin {
         name: "retry",
         arguments: "",
         summary: "send the last failed or interrupted message again",
