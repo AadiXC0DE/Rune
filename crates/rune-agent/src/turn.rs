@@ -545,6 +545,16 @@ pub trait Host {
     /// execution. This notification cannot change the tool result.
     fn post_tool(&self, _result: &CallResult) {}
 
+    /// Credential values to replace in tool output before the model, the
+    /// journal or a hook sees it: the active key and the values of the
+    /// variables withheld from commands.
+    fn secrets(&self) -> Vec<String> {
+        rune_net::redact::known_secrets(
+            &self.endpoint().credential,
+            &self.context().environment.withheld,
+        )
+    }
+
     /// Runs pre-tool hooks for a call; the default maps `pre_tool`.
     fn pre_tool_outcome(&self, call: &PreparedCall) -> Result<PreToolOutcome> {
         Ok(self
@@ -3697,6 +3707,24 @@ fn note_changes(
 }
 
 /// Reports execution and preserves a cancellation for calls still pending.
+/// Replaces known credential values in what a tool returned.
+fn redact_output(mut output: ToolOutput, secrets: &[String]) -> ToolOutput {
+    if secrets.is_empty() {
+        return output;
+    }
+    let redact = |text: &mut String| {
+        if let std::borrow::Cow::Owned(clean) = rune_net::redact::redact_credentials(text, secrets)
+        {
+            *text = clean;
+        }
+    };
+    redact(&mut output.text);
+    if let Some(full) = output.full_text.as_mut() {
+        redact(full);
+    }
+    output
+}
+
 fn finish_call(
     call: &PreparedCall,
     host: &dyn Host,
@@ -3705,7 +3733,7 @@ fn finish_call(
     cancelled: &mut bool,
 ) -> CallResult {
     let output = match execution {
-        Ok(output) => output,
+        Ok(output) => redact_output(output, &host.secrets()),
         Err(err) if matches!(err.code(), ErrorCode::Cancelled) => {
             *cancelled = true;
             return CallResult {

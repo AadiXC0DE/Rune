@@ -4,6 +4,38 @@
 //! credential. A credential reaching standard output or a log file is treated as
 //! a defect, so this runs on the way out rather than at each call site.
 
+/// What a known credential value is replaced with in tool output.
+pub const REDACTED_CREDENTIAL: &str = "[redacted credential]";
+
+/// Shortest credential value replaced by [`redact_credentials`]; a shorter
+/// value would also match ordinary words.
+pub const MIN_CREDENTIAL_BYTES: usize = 8;
+
+/// Replaces every occurrence of each of `secrets` in `text` with
+/// [`REDACTED_CREDENTIAL`]. Values shorter than [`MIN_CREDENTIAL_BYTES`] are
+/// left alone. The match is on the raw text, so a value the terminal would
+/// wrap across two rows is still found.
+#[must_use]
+pub fn redact_credentials<'a>(text: &'a str, secrets: &[String]) -> std::borrow::Cow<'a, str> {
+    let mut out = std::borrow::Cow::Borrowed(text);
+    for secret in secrets {
+        if secret.len() >= MIN_CREDENTIAL_BYTES && out.contains(secret.as_str()) {
+            out = std::borrow::Cow::Owned(out.replace(secret.as_str(), REDACTED_CREDENTIAL));
+        }
+    }
+    out
+}
+
+/// The credential values a process knows: `credential` and the values of the
+/// `withheld` variables in its environment.
+#[must_use]
+pub fn known_secrets(credential: &str, withheld: &[String]) -> Vec<String> {
+    std::iter::once(credential.to_owned())
+        .chain(withheld.iter().filter_map(|name| std::env::var(name).ok()))
+        .filter(|value| value.len() >= MIN_CREDENTIAL_BYTES)
+        .collect()
+}
+
 /// Shortest run of credential-looking characters replaced wholesale.
 const MIN_SECRET_RUN: usize = 16;
 
@@ -225,6 +257,21 @@ fn placeholder() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_credentials_are_replaced_and_short_values_kept() {
+        let secrets = vec!["sk-live-0123456789".to_owned(), "short".to_owned()];
+        let text = "key=sk-live-0123456789\nagain sk-live-0123456789 and short words";
+        let redacted = redact_credentials(text, &secrets);
+        assert_eq!(
+            redacted,
+            "key=[redacted credential]\nagain [redacted credential] and short words"
+        );
+        assert!(matches!(
+            redact_credentials("nothing here", &secrets),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn secret_headers_are_recognised() {

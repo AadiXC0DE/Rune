@@ -3398,3 +3398,57 @@ fn doctor_provider_offline_refuses_a_public_endpoint() {
         out.stdout
     );
 }
+
+/// The key never reaches a trace file: not in the request headers, and not in
+/// a tool result that printed it.
+#[test]
+fn traces_redact_the_key() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let key = "sk-trace-credential-0123456789";
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("key.txt"), format!("{key}\n")).expect("key.txt");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("c1", "read_file", r#"{"path":"key.txt"}"#),
+        Turn::text("done"),
+    ]);
+    let trace = root.join("trace");
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", root.join("home"))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", provider.base_url())
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_TRACE_TEST_KEY")
+        .env("RUNE_TRACE_TEST_KEY", key)
+        .current_dir(&workspace)
+        .arg("--trace")
+        .arg(&trace)
+        .args(["ask", "Read key.txt."])
+        .output()
+        .expect("ask");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut files = 0;
+    for entry in std::fs::read_dir(&trace).expect("trace directory") {
+        let text = std::fs::read_to_string(entry.expect("entry").path()).expect("trace file");
+        assert!(!text.contains(key), "{text}");
+        files += 1;
+    }
+    assert_eq!(files, 4);
+    assert!(
+        provider.requests()[1]
+            .body
+            .contains("[redacted credential]")
+    );
+}
