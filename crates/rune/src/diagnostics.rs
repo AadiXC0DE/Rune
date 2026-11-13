@@ -863,11 +863,12 @@ pub fn limits_json(settings: &Settings) -> serde_json::Value {
 pub fn limits_text(settings: &Settings) -> String {
     let mut out = String::from("limit                             value        unit     source\n");
     for row in settings.limits.describe() {
+        // Padding applies to strings; a value's own Display ignores the width.
         let _ = writeln!(
             out,
             "{:<33} {:<12} {:<8} {}",
             row.name.as_str(),
-            row.value,
+            row.value.to_string(),
             row.unit.suffix(),
             row.source.map_or("default", |layer| layer.as_str()),
         );
@@ -884,7 +885,10 @@ pub fn config_text(settings: &Settings) -> String {
         let _ = writeln!(
             out,
             "{:<33} {:<20} {:<12} {}",
-            row.key, row.value, row.source, row.help
+            row.key,
+            row.value,
+            row.source.as_str(),
+            row.help
         );
     }
     out
@@ -1247,6 +1251,41 @@ mod tests {
             assert!(text.contains(name.as_str()), "missing {name:?}");
         }
         assert!(text.contains("default"));
+    }
+
+    /// Every row whose value fits starts its source column where the header
+    /// names it; a wider value is followed by one space and the source.
+    fn assert_source_column(text: &str, source: &str) {
+        let mut lines = text.lines();
+        let header = lines.next().expect("header");
+        let column = header.find("source").expect("source heading");
+        for line in lines {
+            let (before, after) = line.split_at(column);
+            if before.ends_with(' ') {
+                assert!(after.starts_with(source), "source misplaced: {line:?}");
+            } else {
+                assert!(
+                    after.contains(&format!(" {source}")),
+                    "no gap before the source: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn limits_text_puts_each_value_in_its_column() {
+        assert_source_column(&limits_text(&Settings::default()), "default");
+    }
+
+    #[test]
+    fn config_text_puts_each_source_in_its_column() {
+        let text = config_text(&Settings::default());
+        assert_source_column(&text, "default");
+        // The source is padded too, so the help column lines up after it.
+        assert!(
+            text.contains(" default      Provider requests are sent to"),
+            "{text}"
+        );
     }
 
     #[test]
