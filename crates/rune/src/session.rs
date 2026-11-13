@@ -593,6 +593,8 @@ struct SessionHost {
     hints: Mutex<crate::hints::Hints>,
     /// What the next submitted prompt is echoed as, when not its own text.
     echo_as: Mutex<Option<String>>,
+    /// Saves the idle draft while it is typed, when keys are read.
+    autosave: Mutex<Option<crate::draft::Autosave>>,
     /// Whether this turn has shown a hint already.
     hint_shown: std::sync::atomic::AtomicBool,
     /// The line being typed while a turn runs, with the caret's display column.
@@ -3934,6 +3936,13 @@ impl SessionHost {
         self.commit_lines(&[styled(&dim, &format!("hint: {text}"))]);
     }
 
+    /// Forgets the saved draft: it was sent, or the session is ending.
+    fn clear_draft(&self) {
+        if let Some(autosave) = lock_value(&self.autosave).as_mut() {
+            autosave.clear();
+        }
+    }
+
     /// Records that a hinted feature was used, so its hint stops.
     fn hint_used(&self, hint: crate::hints::Hint) {
         lock_value(&self.hints).used(hint);
@@ -4481,6 +4490,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // Pins added from here on reach the model as updates, not in the prefix.
     history.freeze_pins();
     let results_notice = attach_results(&mut history, &config.paths, &recorder.id());
+    let takeover_notice = recorder.takeover_notice();
 
     // Opened once. A history that failed to load is not fatal: recall is a
     // convenience, and losing it must not cost the session.
@@ -4537,14 +4547,15 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     let provider_name = config.settings.provider.to_string();
 
     let (initial_context, context_source) = recorder.resumed_context();
-    let (transcript, initial_totals) = if let Some(id) = &config.resume {
+    let (transcript, initial_totals, interrupted) = if let Some(id) = &config.resume {
         let state = session_log::inspect(&config.paths, id)?;
         (
             resumed_entries(&history, &state),
             Totals::from_saved(&state),
+            interrupted_prompt(&state),
         )
     } else {
-        (Vec::new(), Totals::default())
+        (Vec::new(), Totals::default(), None)
     };
     let session_id = recorder.id();
     let recorder = Arc::new(Mutex::new(recorder));
@@ -4690,7 +4701,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         steering: SteeringQueue::from_limits(&limits),
         queued: Mutex::new(std::collections::VecDeque::new()),
         model_ids: Mutex::new(Vec::new()),
-        last_failed: Mutex::new(None),
+        last_failed: Mutex::new(interrupted.map(|text| (text, Recovery::None))),
         plan: Mutex::new(None),
         plan_visible: std::sync::atomic::AtomicBool::new(terminal_height() >= PLAN_PIN_MIN_HEIGHT),
         files: crate::file_index::SharedIndex::default(),
@@ -4768,6 +4779,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         hints: Mutex::new(crate::hints::Hints::load(&config.paths.state_root)),
         hint_shown: std::sync::atomic::AtomicBool::new(false),
         echo_as: Mutex::new(None),
+        autosave: Mutex::new(None),
         typed: Mutex::new((String::new(), 0)),
         provider_order: config.settings.provider_order.clone(),
         provider_strict: config.settings.provider_strict,
@@ -4855,6 +4867,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     }
     crate::provider_setup::refresh_catalog_in_background(&config.settings, &config.paths);
 
+    // A draft a session in this workspace could not send comes back.
+    let draft_path = crate::draft::path(&config.paths, &config.workspace);
+    let restored_notice = if keyed && !config.accessible {
+        *lock_value(&host.autosave) = Some(crate::draft::Autosave::new(draft_path.clone()));
+        crate::draft::take(&draft_path).map(|text| {
+            if reader.line().is_empty() {
+                reader.replace(&text);
+            }
+            crate::draft::RESTORED
+        })
+    } else {
+        None
+    };
+
     // The session identifier is announced up front so a resumed-or-new session
     // can be named later without consulting the listing. It goes through the
     // renderer like everything else, so the rows it occupies are known to the
@@ -4898,6 +4924,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             .chain(project_hook_warnings.iter())
             .map(Entry::warning)
             .chain(results_notice.iter().map(Entry::notice))
+            .chain(takeover_notice.iter().map(Entry::notice))
+            .chain(restored_notice.iter().map(|text| Entry::notice(*text)))
             .collect();
         opening.extend(host.entry_rows(&notices));
         // Replay only for an interactive resume. These settled rows enter the
@@ -5340,6 +5368,8 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                                     let results = attach_results(&mut resumed, &config.paths, &key);
                                     history = resumed;
                                     let entries = resumed_entries(&history, &state);
+                                    *lock_value(&host.last_failed) = interrupted_prompt(&state)
+                                        .map(|text| (text, Recovery::None));
                                     *lock_value(&host.results) =
                                         Some(history.result_store().clone());
                                     host.transcript_history_len
@@ -8276,7 +8306,34 @@ fn resumed_entries(history: &History, state: &rune_session::store::SessionState)
             entries.push(Entry::notice("interrupted"));
         }
     }
+    if interrupted_prompt(state).is_some() {
+        entries.push(Entry::notice(INTERRUPTED_LAST_TURN));
+    }
     entries
+}
+
+/// Said on resume when the session's last turn never finished.
+const INTERRUPTED_LAST_TURN: &str =
+    "the last turn was interrupted before it finished; /retry runs it again";
+
+/// The prompt of the session's last turn when that turn was interrupted
+/// rather than finished, cancelled or failed: what `/retry` sends again.
+fn interrupted_prompt(state: &rune_session::store::SessionState) -> Option<String> {
+    use rune_session::event::SessionEvent;
+    let mut prompt = None;
+    let mut interrupted = false;
+    for frame in rune_session::replay::replay_events(&state.events) {
+        match &frame.event {
+            SessionEvent::UserMessage { text } => prompt = Some(text.clone()),
+            SessionEvent::TurnInterrupted { .. } => interrupted = true,
+            SessionEvent::TurnFinished { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. }
+            | SessionEvent::TurnStarted { .. } => interrupted = false,
+            _ => {}
+        }
+    }
+    prompt.filter(|_| interrupted)
 }
 
 /// Projects recorded messages in order, keeping tool arguments and result bodies.
@@ -8442,6 +8499,14 @@ fn await_submission(
         if mention.as_ref().is_some_and(|menu| menu.matches.is_none()) {
             wait = Some(wait.map_or(INDEX_POLL, |wait| wait.min(INDEX_POLL)));
         }
+        // A draft change not yet saved is saved once its interval has passed,
+        // even when no further key arrives.
+        if let Some(due) = lock_value(&host.autosave)
+            .as_mut()
+            .and_then(|autosave| autosave.due_in(reader.line()))
+        {
+            wait = Some(wait.map_or(due, |wait| wait.min(due)));
+        }
         reader.set_context(rune_term::keys::Context::Editor);
         let key = match wait {
             Some(wait) => reader.poll_key(wait),
@@ -8455,6 +8520,9 @@ fn await_submission(
                 .is_some_and(|(_, until)| std::time::Instant::now() >= *until)
             {
                 flash = None;
+            }
+            if let Some(autosave) = lock_value(&host.autosave).as_mut() {
+                autosave.observe(reader.line());
             }
             continue;
         };
@@ -8524,6 +8592,10 @@ fn await_submission(
             continue;
         }
         if key == KeyAction::Suspend {
+            // A stopped session is often killed; its draft is kept first.
+            if let Some(autosave) = lock_value(&host.autosave).as_mut() {
+                autosave.flush(reader.line());
+            }
             suspend_session(host, out)?;
             continue;
         }
@@ -8547,6 +8619,9 @@ fn await_submission(
         {
             lock_value(&host.last_failed).take();
             continue;
+        }
+        if let Some(autosave) = lock_value(&host.autosave).as_mut() {
+            autosave.observe(reader.line());
         }
         let had_draft = !reader.line().is_empty();
         let step = idle_key(
@@ -8581,11 +8656,13 @@ fn await_submission(
             Idle::Leave => {
                 host.on_chip
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                host.clear_draft();
                 return Ok(None);
             }
             Idle::Submit(input) => {
                 host.on_chip
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                host.clear_draft();
                 if let Input::Prompt(text) = &input {
                     for path in mentions(text) {
                         host.touch(&path);
@@ -25392,6 +25469,7 @@ mod tests {
             ))),
             hint_shown: std::sync::atomic::AtomicBool::new(false),
             echo_as: Mutex::new(None),
+            autosave: Mutex::new(None),
             typed: Mutex::new((String::new(), 0)),
             provider_order: Vec::new(),
             provider_strict: false,

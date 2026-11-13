@@ -25,6 +25,7 @@ mod config_edit;
 mod connect_flow;
 mod context_watch;
 mod diagnostics;
+mod draft;
 mod file_index;
 mod help;
 mod helper_usage;
@@ -99,6 +100,7 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_OK);
     }
 
+    install_crash_hook(launch.command.as_str());
     match run(&launch) {
         Ok(code) => code,
         Err(err) => {
@@ -234,6 +236,9 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         Command::Keys => run_keys(&paths, &output_flags),
         Command::Config => run_config(&settings, &paths, &workspace, launch, &output_flags),
         Command::Prompt => run_prompt(&settings, launch, &output_flags),
+        Command::Sessions if launch.args.first().map(String::as_str) == Some("prune") => {
+            run_prune(&paths, launch, &output_flags)
+        }
         Command::Sessions => run_sessions(&paths, launch, &workspace, &output_flags),
         Command::Tree => run_tree(&paths, launch, &workspace, &output_flags),
         Command::Session => run_session(&paths, launch, &workspace, &output_flags),
@@ -749,6 +754,64 @@ fn run_interactive(
 fn picker_terminal() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Writes `<state root>/last-crash.txt` and says where it is when the process
+/// panics. The previous hook runs first, so the terminal is already restored.
+fn install_crash_hook(command: &'static str) {
+    let previous = std::panic::take_hook();
+    let written = std::sync::atomic::AtomicBool::new(false);
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        // A panic on another thread while this one runs writes nothing more.
+        if written.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned());
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        let paths = Paths::from_process();
+        match write_crash(&paths, command, &message, &location) {
+            Ok(path) => eprintln!(
+                "rune crashed: {}\ndetails are in {path}; include that file in a bug report",
+                rune_net::redact::redact(&message)
+            ),
+            Err(_) => eprintln!("rune crashed: {}", rune_net::redact::redact(&message)),
+        }
+    }));
+}
+
+/// Writes the crash record, private to the user, with secrets redacted.
+fn write_crash(
+    paths: &Paths,
+    command: &str,
+    message: &str,
+    location: &str,
+) -> std::io::Result<Utf8PathBuf> {
+    let path = paths.state_root.join("last-crash.txt");
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let time = session_log::timestamp(millis).unwrap_or_default();
+    let text = format!(
+        "{}\ntime {time}\ncommand {command}\n\n{}\nat {location}\n\nbacktrace:\n{}\n",
+        version::version_line(),
+        rune_net::redact::redact(message),
+        std::backtrace::Backtrace::force_capture()
+    );
+    std::fs::create_dir_all(&paths.state_root)?;
+    rune_core::paths::write_private(&path, &text)
+        .map_err(|err| std::io::Error::other(err.message().to_owned()))?;
+    Ok(path)
 }
 
 /// Lets the user choose a saved session before the session starts.
@@ -2007,6 +2070,124 @@ fn run_permissions(
     Ok(ExitCode::from(EXIT_OK))
 }
 
+/// Removes old sessions on request: those last updated more than
+/// `--older-than` days ago, never the `--keep` most recent, never a child of a
+/// kept session, and never one another process holds open. Nothing prunes
+/// automatically.
+fn run_prune(paths: &Paths, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    let number = |name: &str| -> Result<Option<u64>> {
+        launch
+            .flag(name)
+            .map(|raw| {
+                raw.parse::<u64>().map_err(|_| {
+                    RuneError::invalid_field(
+                        name.trim_start_matches('-'),
+                        format!("`{raw}` is not a whole number"),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let Some(days) = number("--older-than")? else {
+        return Err(RuneError::new(
+            ErrorCode::MissingField,
+            "--older-than is required; nothing is pruned automatically",
+        )
+        .with_hint("rune sessions prune --older-than 30 --dry-run lists what would go"));
+    };
+    let keep = usize::try_from(number("--keep")?.unwrap_or(0)).unwrap_or(usize::MAX);
+    let dry_run = launch.has_flag("--dry-run");
+    let mut sessions = session_log::list_scoped(paths, None);
+    sessions.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms()));
+    let kept: std::collections::BTreeSet<String> = sessions
+        .iter()
+        .take(keep)
+        .map(|summary| summary.id.clone())
+        .collect();
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis()),
+    )
+    .unwrap_or(u64::MAX);
+    let cutoff = now.saturating_sub(days.saturating_mul(86_400_000));
+    let mut removed = Vec::new();
+    let mut bytes = 0_u64;
+    let mut lines = Vec::new();
+    for summary in &sessions {
+        if summary.updated_at_ms() >= cutoff
+            || kept.contains(&summary.id)
+            || summary
+                .parent
+                .as_ref()
+                .is_some_and(|parent| kept.contains(parent))
+        {
+            continue;
+        }
+        // A session another process has open is left alone.
+        match rune_session::store::SessionStore::open_with_deadline(&summary.dir, 0) {
+            Ok(store) => drop(store),
+            Err(_) => continue,
+        }
+        let size = directory_size(&summary.dir);
+        if !dry_run {
+            std::fs::remove_dir_all(&summary.dir)?;
+            if let Some(workspace) = &summary.workspace {
+                let _ = checkpoint::remove_session(paths, Utf8Path::new(workspace), &summary.id);
+            }
+        }
+        bytes = bytes.saturating_add(size);
+        lines.push(format!(
+            "{} {}  {}  {}",
+            if dry_run { "would remove" } else { "removed" },
+            summary.id,
+            summary.title.as_deref().unwrap_or("untitled"),
+            summary.updated_at.as_deref().unwrap_or("-"),
+        ));
+        removed.push(summary.id.clone());
+    }
+    if output.json {
+        println!(
+            "{}",
+            serde_json::json!({ "removed": removed, "bytes": bytes, "dry_run": dry_run })
+        );
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
+        println!("{} sessions, {}", removed.len(), readable_size(bytes));
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// The bytes the files under `dir` take.
+fn directory_size(dir: &Utf8Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => {
+                Utf8PathBuf::from_path_buf(entry.path()).map_or(0, |path| directory_size(&path))
+            }
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// A byte count in the largest whole unit: `512 B`, `3 KiB`, `12 MiB`.
+fn readable_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes;
+    let mut unit = 0_usize;
+    while value >= 1024 && unit < 3 {
+        value /= 1024;
+        unit = unit.saturating_add(1);
+    }
+    format!("{value} {}", UNITS.get(unit).copied().unwrap_or("GiB"))
+}
+
 /// Lists the sessions stored for this workspace.
 fn run_sessions(
     paths: &Paths,
@@ -2686,6 +2867,35 @@ fn report_error(err: &RuneError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crash_hook_writes_a_private_redacted_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("utf8");
+        let paths = Paths::resolve(None, None, None, None, Some(root.join("state").as_str()));
+        let secret = "sk-abc123def456ghi789jkl012mno345pqr";
+        let path = write_crash(
+            &paths,
+            "interactive",
+            &format!("boom with {secret} inside"),
+            "src/x.rs:7",
+        )
+        .expect("written");
+        assert_eq!(path, paths.state_root.join("last-crash.txt"));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.starts_with(&version::version_line()), "{text}");
+        assert!(text.contains("\ncommand interactive\n"), "{text}");
+        assert!(text.contains("\nat src/x.rs:7\n"), "{text}");
+        assert!(text.contains("\nbacktrace:\n"), "{text}");
+        assert!(text.contains("\ntime 20"), "{text}");
+        assert!(!text.contains(secret), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn the_session_subcommands_are_dispatched_before_an_identifier_is_parsed() {

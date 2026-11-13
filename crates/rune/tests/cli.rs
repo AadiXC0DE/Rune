@@ -3035,3 +3035,94 @@ fn an_invalid_keys_file_fails_with_the_path() {
         output.stderr
     );
 }
+
+#[test]
+fn sessions_prune_requires_older_than() {
+    let out = run(&["sessions", "prune"]);
+    assert_ne!(out.status, Some(0), "{}", out.stdout);
+    assert!(
+        out.stderr
+            .contains("--older-than is required; nothing is pruned automatically"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn sessions_prune_dry_run_lists_old_sessions() {
+    use camino::Utf8PathBuf;
+    use rune_core::{id::SessionId, paths::Paths};
+    use rune_session::{SessionEvent, SessionStore};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("canonical tempdir"))
+        .expect("utf-8 path");
+    let paths = Paths {
+        state_root: root.join("state"),
+        config_root: root.join("config/rune"),
+        data_root: root.join("data/rune"),
+    };
+    // One recent session and two from long ago, the older one older still.
+    for (raw, age) in [
+        ("prunenew0001", None),
+        ("pruneold0001", Some(2_000)),
+        ("pruneold0002", Some(1_000)),
+    ] {
+        let id: SessionId = raw.parse().expect("session id");
+        let store = SessionStore::create(&paths, &id).expect("create session");
+        store
+            .append(SessionEvent::UserMessage {
+                text: format!("prompt {raw}"),
+            })
+            .expect("save message");
+        drop(store);
+        if let Some(stamp) = age {
+            let log = paths.session_dir(&id).join("events.jsonl");
+            let text = std::fs::read_to_string(&log).expect("log");
+            let mut rewritten = String::new();
+            for line in text.lines() {
+                let mut frame: serde_json::Value = serde_json::from_str(line).expect("frame");
+                frame["timestamp_ms"] = serde_json::json!(stamp);
+                rewritten.push_str(&frame.to_string());
+                rewritten.push('\n');
+            }
+            std::fs::write(&log, rewritten).expect("rewrite");
+        }
+    }
+    let prune = |args: &[&str]| {
+        let out = Command::new(binary())
+            .args(["sessions", "prune"])
+            .args(args)
+            .env("RUNE_HOME", &paths.state_root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .output()
+            .expect("run binary");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let listed = prune(&["--older-than", "30", "--dry-run"]);
+    assert!(listed.contains("would remove pruneold0001"), "{listed}");
+    assert!(listed.contains("would remove pruneold0002"), "{listed}");
+    assert!(!listed.contains("prunenew0001"), "{listed}");
+    assert!(listed.contains("2 sessions, "), "{listed}");
+    // Nothing was removed.
+    for raw in ["prunenew0001", "pruneold0001", "pruneold0002"] {
+        let id: SessionId = raw.parse().expect("id");
+        assert!(paths.session_dir(&id).exists(), "{raw}");
+    }
+    // Keeping the two most recent leaves only the oldest to remove.
+    let value: serde_json::Value =
+        serde_json::from_str(&prune(&["--older-than", "30", "--keep", "2", "--json"]))
+            .expect("json");
+    assert_eq!(value["removed"], serde_json::json!(["pruneold0002"]));
+    assert_eq!(value["dry_run"], false);
+    let gone: SessionId = "pruneold0002".parse().expect("id");
+    assert!(!paths.session_dir(&gone).exists());
+    let kept: SessionId = "pruneold0001".parse().expect("id");
+    assert!(paths.session_dir(&kept).exists());
+}

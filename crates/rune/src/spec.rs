@@ -342,9 +342,23 @@ pub const SESSIONS: &[CommandSpec] = &[
         name: "sessions",
         aliases: &[],
         summary: "List sessions",
-        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]",
+        usage: "rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>] | rune sessions prune --older-than <days> [--keep <n>] [--dry-run] [--json]",
         flags: &[
             flag("--all", "Include sessions from every workspace."),
+            option(
+                "--older-than",
+                "days",
+                "With prune: remove sessions last updated more than this many days ago.",
+            ),
+            option(
+                "--keep",
+                "n",
+                "With prune: never remove the n most recently updated sessions.",
+            ),
+            flag(
+                "--dry-run",
+                "With prune: list what would be removed and remove nothing.",
+            ),
             option(
                 "--search",
                 "text",

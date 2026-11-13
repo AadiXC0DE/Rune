@@ -537,6 +537,24 @@ impl Recorder {
         self.store.title()
     }
 
+    /// The notice for a session another process left open and died holding,
+    /// when the lock was taken over from it.
+    #[must_use]
+    pub fn takeover_notice(&self) -> Option<String> {
+        self.store.took_over().map(|holder| {
+            let on = holder
+                .host
+                .as_ref()
+                .map(|host| format!(" on {host}"))
+                .unwrap_or_default();
+            format!(
+                "session {} was left open by pid {}{on}, which is no longer running; continuing",
+                self.store.id(),
+                holder.pid
+            )
+        })
+    }
+
     /// Writes the session's event log as JSON lines, as `rune session export`
     /// does.
     ///
@@ -1129,7 +1147,7 @@ pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<
 }
 
 /// The result a replayed call is given when the log holds none for it.
-const INTERRUPTED_CALL: &str = "the session stopped before this call returned, so it has no result";
+const INTERRUPTED_CALL: &str = rune_net::normalize::NOT_RUN;
 
 /// Builds a conversation from a stored log.
 #[must_use]

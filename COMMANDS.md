@@ -106,13 +106,16 @@ Aliases:
 
 ## Sessions and local records
 
-### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>]`
+### `rune sessions [--all] [--search <text>] [--limit <n>] [--cursor <c>] | rune sessions prune --older-than <days> [--keep <n>] [--dry-run] [--json]`
 
 List sessions
 
 | Flag | Description |
 |---|---|
 | `--all` | Include sessions from every workspace. |
+| `--older-than <days>` | With prune: remove sessions last updated more than this many days ago. |
+| `--keep <n>` | With prune: never remove the n most recently updated sessions. |
+| `--dry-run` | With prune: list what would be removed and remove nothing. |
 | `--search <text>` | Match a case-insensitive literal fragment in titles or user messages. |
 | `--limit <n>` | Page size, 1 to 100. |
 | `--cursor <c>` | Continue from a previous page. |

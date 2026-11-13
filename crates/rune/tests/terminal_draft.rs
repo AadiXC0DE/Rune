@@ -504,3 +504,21 @@ fn up_moves_between_wrapped_rows_at_forty_columns() {
         assert_eq!(caret.col, column, "{stage}: {screen}");
     }
 }
+
+#[test]
+fn an_unsent_draft_survives_a_kill() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &support::python_script(include_str!("terminal_draft_kill.py")),
+            env!("CARGO_BIN_EXE_rune"),
+        ])
+        .output()
+        .expect("python3 is required for the Unix draft survival test");
+    assert!(
+        output.status.success(),
+        "draft survival failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

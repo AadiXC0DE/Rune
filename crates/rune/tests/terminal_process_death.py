@@ -187,6 +187,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
             assert replay.count(line) == 1, replay
         assert replay.count("[interrupted]") == 1, replay
         assert "STREAM-04" not in replay, replay
+        # The last turn never finished, so the resumed session offers /retry.
+        assert "the last turn was interrupted before it finished; /retry runs it again" in replay, replay
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[interrupted]", start)
@@ -210,6 +212,8 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         replay = transcript.decode(errors="replace")
         for text in [*partial.splitlines(), "AFTER_RESUME_OK", "[interrupted]"]:
             assert replay.count(text) == 1, replay
+        # A later turn finished, so nothing is offered again.
+        assert "the last turn was interrupted" not in replay, replay
         start = len(transcript)
         os.write(master, b"after-resume\r")
         wait_for("AFTER_RESUME_OK", start)

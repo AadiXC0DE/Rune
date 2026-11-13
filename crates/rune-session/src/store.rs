@@ -221,6 +221,8 @@ pub struct SessionStore {
     log: File,
     /// The writer lock, held until drop clears the holder record and unlocks it.
     lock: File,
+    /// The holder a clean exit would have cleared, when one was left behind.
+    took_over: Option<LockHolder>,
     projection: std::cell::RefCell<Projection>,
 }
 
@@ -272,7 +274,7 @@ impl SessionStore {
     /// line into a log that can no longer be read at all.
     pub fn open_with_deadline(dir: &Utf8Path, deadline_ms: u64) -> Result<Self> {
         let id = id_from_dir(dir)?;
-        let lock = acquire_lock(dir, &id, deadline_ms)?;
+        let (lock, took_over) = acquire_lock(dir, &id, deadline_ms)?;
 
         let log_path = dir.join(EVENTS_FILE);
         if !log_path.exists() {
@@ -295,6 +297,7 @@ impl SessionStore {
             dir: dir.to_path_buf(),
             log,
             lock,
+            took_over,
             projection: std::cell::RefCell::new(Projection {
                 frames: u64::try_from(state.events.len()).unwrap_or(u64::MAX),
                 bytes,
@@ -315,6 +318,14 @@ impl SessionStore {
     #[must_use]
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Returns the writer that left this session open without exiting
+    /// cleanly, when the lock was taken over from one. The system releases a
+    /// lock when its holder dies, so a record left behind names a dead holder.
+    #[must_use]
+    pub const fn took_over(&self) -> Option<&LockHolder> {
+        self.took_over.as_ref()
     }
 
     /// Returns the session directory.
@@ -629,7 +640,11 @@ pub fn ensure_lock_file(dir: &Utf8Path) -> Result<()> {
 }
 
 /// Takes the advisory writer lock, waiting at most `deadline_ms`.
-fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File> {
+fn acquire_lock(
+    dir: &Utf8Path,
+    id: &SessionId,
+    deadline_ms: u64,
+) -> Result<(File, Option<LockHolder>)> {
     ensure_lock_file(dir)?;
     let path = dir.join(LOCK_FILE);
 
@@ -656,8 +671,14 @@ fn acquire_lock(dir: &Utf8Path, id: &SessionId, deadline_ms: u64) -> Result<File
     loop {
         match file.try_lock() {
             Ok(()) => {
+                // Read before it is overwritten: a record a clean exit did not
+                // clear names a writer that died holding the lock.
+                let left = std::fs::read_to_string(dir.join(HOLDER_FILE))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<LockHolder>(&text).ok())
+                    .filter(|holder| holder.pid != std::process::id());
                 record_holder(dir)?;
-                return Ok(file);
+                return Ok((file, left));
             }
             Err(TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
@@ -1179,6 +1200,32 @@ mod tests {
             EventSeq::FIRST
         );
         assert_eq!(load_read_only(store.dir()).expect("read").len(), 1);
+    }
+
+    #[test]
+    fn a_leftover_holder_record_is_reported_as_taken_over() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (paths, store) = store_in(&root);
+        let dir = paths.session_dir(&store.id());
+        store.append(user("first writer")).expect("append");
+        drop(store);
+        // A clean exit leaves the record empty: nothing was taken over.
+        let clean = SessionStore::open_with_deadline(&dir, 0).expect("open");
+        assert_eq!(clean.took_over(), None);
+        drop(clean);
+        // A writer that died left its record behind.
+        let dead = LockHolder {
+            pid: std::process::id().wrapping_add(1),
+            host: Some("box".to_owned()),
+            since_ms: 1,
+        };
+        paths::write_private(
+            &dir.join(HOLDER_FILE),
+            &serde_json::to_string(&dead).expect("json"),
+        )
+        .expect("record");
+        let next = SessionStore::open_with_deadline(&dir, 0).expect("open");
+        assert_eq!(next.took_over(), Some(&dead));
     }
 
     #[test]
