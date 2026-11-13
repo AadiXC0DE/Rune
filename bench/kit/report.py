@@ -32,6 +32,8 @@ FAIRNESS = [
     "Tokens and cost come from the meter, never from a harness's own report.",
     "With a session header, the meter sets it to a fresh random value for every run, so no run "
     "shares a provider session or cache with another run or harness.",
+    "A run that changes a protected path (the visible tests) fails even when verify passes. "
+    "Caches written by running the tests, such as __pycache__, do not count.",
 ]
 
 

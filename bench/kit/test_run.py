@@ -148,6 +148,41 @@ class RunnerCase(unittest.TestCase):
         self.assertFalse(rows[0]["passed"])
         self.assertEqual(rows[0]["verify_exit"], 0)
 
+    def guarded_tests_task(self, solution_files):
+        task = self.dir / "tasks" / "guarded-tests"
+        shutil.copytree(str(TASKS / "value-file"), str(task))
+        (task / "repo" / "tests").mkdir()
+        (task / "repo" / "tests" / "check.txt").write_text("keep\n")
+        data = json.loads((task / "task.json").read_text())
+        data["protected"] = ["tests"]
+        (task / "task.json").write_text(json.dumps(data))
+        for rel, text in solution_files.items():
+            target = task / "solution" / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        return self.dir / "tasks"
+
+    def test_caches_written_by_running_the_tests_are_not_tampering(self):
+        tasks = self.guarded_tests_task({
+            "tests/__pycache__/check.cpython-313.pyc": "x",
+            "tests/.pytest_cache/v/cache/lastfailed": "{}",
+        })
+        proc, rows, out = self.do_run("oracle", tasks=tasks)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(rows[0]["tampered"])
+        self.assertTrue(rows[0]["passed"])
+        self.assertEqual(rows[0]["files_changed"], 1)
+        self.assertFalse((out / "logs" / "oracle" / "guarded-tests-t1" / "tampered.txt").exists())
+
+    def test_an_edited_test_file_is_tampering_and_is_named(self):
+        tasks = self.guarded_tests_task({"tests/check.txt": "changed\n"})
+        proc, rows, out = self.do_run("oracle", tasks=tasks)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(rows[0]["tampered"])
+        self.assertFalse(rows[0]["passed"])
+        named = (out / "logs" / "oracle" / "guarded-tests-t1" / "tampered.txt").read_text()
+        self.assertEqual(named, "tests/check.txt\n")
+
     def test_rune_adapter_builds_the_documented_command(self):
         sys.path.insert(0, str(HERE / "adapters"))
         try:

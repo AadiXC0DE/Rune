@@ -196,7 +196,7 @@ class Runner:
             info.mkdir(parents=True, exist_ok=True)
             (info / "exclude").write_text("\n".join(kit.EXCLUDES) + "\n")
 
-            before = {p: kit.tree_digest(workspace / p) for p in task.protected}
+            before = {p: kit.tree_files(workspace / p) for p in task.protected}
             meter, port = self.start_meter(logdir, harness, task.name, trial, tmp)
             found = self.command(module)
             prefix = list(found[0]) if found else []
@@ -228,8 +228,11 @@ class Runner:
             stop_process(meter)
             meter = None
 
-            after = {p: kit.tree_digest(workspace / p) for p in task.protected}
-            row["tampered"] = any(before[p] != after[p] for p in task.protected)
+            after = {p: kit.tree_files(workspace / p) for p in task.protected}
+            tampered = kit.changed_files(before, after)
+            row["tampered"] = bool(tampered)
+            if tampered:
+                (logdir / "tampered.txt").write_text("\n".join(tampered) + "\n")
             for p in task.protected:
                 target = workspace / p
                 if target.is_dir() and not target.is_symlink():

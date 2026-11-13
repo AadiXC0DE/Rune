@@ -120,3 +120,6 @@ These are copied into the header of every report.
   random value, replacing any the harness sent. OpenCode Go needs `x-opencode-session` and routes
   and caches by it, so every harness reaches it the same way and no run shares a cache with
   another run or harness.
+- A run that changes a protected path (the visible tests) fails even when verify passes, and
+  `tampered.txt` in its log names the files. Caches that running the tests writes, such as
+  `__pycache__` and `.pytest_cache`, do not count.

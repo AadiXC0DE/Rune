@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import signal
-import struct
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -26,6 +25,10 @@ EXCLUDES = [
     ".goose/",
     ".pi/",
     "node_modules/",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    "target/",
 ]
 COUNTERS = (
     "input_tokens",
@@ -91,30 +94,41 @@ def discover(root, only=None, split="all"):
     return tasks
 
 
-def tree_digest(path):
-    """SHA-256 over sorted (relative path, NUL, 8-byte length, bytes); None when absent."""
+# Caches that running a task's own tests writes beside them. They are skipped when protected
+# paths are compared, so running the visible tests never counts as editing them.
+GENERATED_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+GENERATED_SUFFIXES = (".pyc", ".pyo")
+
+
+def tree_files(path):
+    """Each file under path (relative path, "" for a file itself) with its SHA-256; None when absent."""
     path = Path(path)
     if not path.exists() and not path.is_symlink():
         return None
     if path.is_file():
-        files = [("", path)]
+        found = [("", path)]
     else:
-        files = []
+        found = []
         for base, dirs, names in os.walk(str(path)):
-            dirs.sort()
+            dirs[:] = sorted(d for d in dirs if d not in GENERATED_DIRS)
             for name in names:
                 full = Path(base) / name
+                if name.endswith(GENERATED_SUFFIXES):
+                    continue
                 if full.is_file() and not full.is_symlink():
-                    files.append((full.relative_to(path).as_posix(), full))
-        files.sort(key=lambda item: item[0])
-    digest = hashlib.sha256()
-    for rel, full in files:
-        data = full.read_bytes()
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(struct.pack("<Q", len(data)))
-        digest.update(data)
-    return digest.hexdigest()
+                    found.append((full.relative_to(path).as_posix(), full))
+    return {rel: hashlib.sha256(full.read_bytes()).hexdigest() for rel, full in found}
+
+
+def changed_files(before, after):
+    """Paths, joined to their protected root, that were added, removed or changed."""
+    changed = set()
+    for root in before:
+        old, new = before[root] or {}, after.get(root) or {}
+        for rel in set(old) | set(new):
+            if old.get(rel) != new.get(rel):
+                changed.add("/".join(part for part in (root.rstrip("/"), rel) if part))
+    return sorted(changed)
 
 
 def minimal_env(home, tmpdir):
