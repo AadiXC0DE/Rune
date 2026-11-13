@@ -590,9 +590,10 @@ pub fn call_tool(
     cancellation.check()?;
     context.check_cancelled()?;
     match result {
+        // The server's text is data for the model, never instructions to it.
         Ok(outcome) => Ok(ToolOutput {
             produced_bytes: outcome.text.len() as u64,
-            text: outcome.text,
+            text: format!("{}\n{}", rune_tools::web::EXTERNAL_CONTENT, outcome.text),
             is_error: outcome.is_error,
             plan_update: None,
             full_text: None,
