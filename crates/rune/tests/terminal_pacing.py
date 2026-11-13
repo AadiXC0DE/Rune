@@ -155,6 +155,8 @@ with tempfile.TemporaryDirectory(prefix="rune-pacing-") as directory:
             result["bytes"] = list(transcript)
         else:
             close = wait_for(b"\x1b[?2026l", end)
+            # The frames are counted through this mark, so the time is too.
+            result["elapsed_ms"] = (time.monotonic() - written) * 1000
             result["bytes"] = list(transcript[start:close + len(b"\x1b[?2026l")])
         os.write(master, b"\x15\x04")
         assert drain_wait(child, master, 10, transcript) == 0
