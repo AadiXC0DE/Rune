@@ -148,6 +148,15 @@
       "output": 10.0,
       "source": "https://platform.claude.com/docs/en/about-claude/pricing.md",
       "fetched": "2026-11-10"
+    },
+    "deepseek-v4.1-flash": {
+      "input": 0.3,
+      "cached_input": 0.006,
+      "cache_write": 0.3,
+      "output": 1.2,
+      "route": "https://opencode.ai/zen/v1 (OpenCode Zen; no off-peak price)",
+      "source": "https://models.dev/api.json, provider opencode",
+      "fetched": "2026-11-13"
     }
   }
 }
