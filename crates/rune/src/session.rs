@@ -4449,6 +4449,20 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
     // Every width measured from here on, the first frame included, has to agree
     // with how the terminal draws ambiguous characters.
     rune_term::width::set_ambiguous_width(config.settings.ambiguous_width);
+    // A console that does not take terminal sequences would print them as
+    // text, so it gets the line interface.
+    #[cfg(windows)]
+    let console_notice: Option<&str> = if !config.accessible
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && !rune_term::modes::enable_virtual_terminal()
+    {
+        config.accessible = true;
+        Some(CONSOLE_WITHOUT_SEQUENCES)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let console_notice: Option<&str> = None;
     let mut limits = config.settings.limits.clone();
     let model_limits = crate::model_limits::resolve(
         &config.settings,
@@ -4965,6 +4979,7 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
             .chain(results_notice.iter().map(Entry::notice))
             .chain(takeover_notice.iter().map(Entry::notice))
             .chain(restored_notice.iter().map(|text| Entry::notice(*text)))
+            .chain(console_notice.iter().map(|text| Entry::notice(*text)))
             .collect();
         opening.extend(host.entry_rows(&notices));
         // Replay only for an interactive resume. These settled rows enter the
@@ -12390,6 +12405,10 @@ fn pick_index(
         }
     }
 }
+
+/// What a Windows console without terminal sequences is told at the start.
+#[cfg(windows)]
+const CONSOLE_WITHOUT_SEQUENCES: &str = "this console does not support terminal sequences; using line mode (Windows Terminal gives the full interface)";
 
 /// What `/rewind` says when the session has no user message yet.
 const NOTHING_TO_REWIND: &str = "nothing to rewind yet";

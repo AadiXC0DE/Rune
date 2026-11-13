@@ -585,6 +585,9 @@ fn column(out: &mut String, col: u16) {
 /// The standard library's handle is line buffered and would split a frame at
 /// every line break, so a frame passed to `write_all` would reach the terminal
 /// in pieces.
+///
+/// On Windows the standard library writes to a console as UTF-16, so the
+/// console code page never changes what Rune's own output shows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerminalOutput;
 

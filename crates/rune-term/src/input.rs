@@ -205,13 +205,25 @@ Transcript:
 Paste:
   Bracketed paste inserts at the caret without submitting or completing.
   Newlines and tabs stay in the draft; CR/CRLF become LF; other controls
-  are removed. Terminals without bracketed paste send ordinary keys.",
+  are removed. Terminals without bracketed paste send ordinary keys.{}",
         rows(&[Context::Editor]),
         rows(&[Context::Turn]),
         crate::shell::ESCAPE_CANCEL_WINDOW.as_millis(),
         rows(&[Context::Viewer]),
+        WINDOWS_QUIRKS,
     )
 }
+
+/// What Windows Terminal does with keys Rune also uses.
+#[cfg(windows)]
+const WINDOWS_QUIRKS: &str = "
+
+Windows Terminal:
+  alt-enter  Windows Terminal uses it for full screen; unbind it there or use ctrl-g
+  ctrl-v     Windows Terminal pastes with it; alt-v attaches a clipboard image";
+
+#[cfg(not(windows))]
+const WINDOWS_QUIRKS: &str = "";
 
 /// Spells a key file name the way help writes keys: `ctrl+r` is `Ctrl-R`.
 fn key_label(name: &str) -> String {
@@ -1157,7 +1169,9 @@ impl KeyReader {
             (KeyCode::Char('t'), false, true) => KeyAction::CycleReasoning,
             (KeyCode::Tab, _, _) if menu => KeyAction::Complete,
             (KeyCode::Esc, _, _) if menu => KeyAction::Escape,
-            (KeyCode::Backspace, _, _) => {
+            // Ctrl-H is the traditional backspace, and some consoles send it
+            // for the Backspace key.
+            (KeyCode::Backspace, _, _) | (KeyCode::Char('h'), true, _) => {
                 self.composer.delete_back();
                 KeyAction::Ignored
             }
@@ -1411,6 +1425,22 @@ mod tests {
 
     fn control(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn control_h_deletes_the_character_before_the_caret() {
+        let mut reader = KeyReader::new();
+        reader.replace("abc");
+        reader.apply(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(reader.line(), "ab");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_help_names_the_terminal_quirks() {
+        let help = render_bindings_help(true, &Keymap::default());
+        assert!(help.contains("alt-enter  Windows Terminal uses it for full screen"));
+        assert!(help.contains("ctrl-v     Windows Terminal pastes with it"));
     }
 
     #[test]

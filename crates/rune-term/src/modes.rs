@@ -183,6 +183,15 @@ pub fn push_keyboard(protocol: crate::probe::KeyProtocol) {
     });
 }
 
+/// Turns on virtual terminal processing for the console's output, and says
+/// whether the console accepts terminal sequences. A legacy console that does
+/// not would print every sequence as text.
+#[cfg(windows)]
+#[must_use]
+pub fn enable_virtual_terminal() -> bool {
+    crossterm::ansi_support::supports_ansi()
+}
+
 /// Asks the terminal to report focus changes, and records it, so every way
 /// out turns the reports off again.
 pub fn enable_focus() {

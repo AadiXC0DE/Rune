@@ -1154,6 +1154,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_terminal_and_legacy_console_depths() {
+        let windows_terminal = |name: &str| (name == "WT_SESSION").then(|| "abc".to_owned());
+        assert_eq!(
+            detect_depth("auto", true, windows_terminal),
+            ColorDepth::TrueColor
+        );
+        assert_eq!(detect_depth("auto", true, |_| None), ColorDepth::Ansi16);
+    }
+
+    #[test]
     fn a_missing_slot_inherits_the_default() {
         let theme = Theme::parse(r##"{"type":"dark","colors":{"editor.foreground":"#ff0000"}}"##)
             .expect("theme");

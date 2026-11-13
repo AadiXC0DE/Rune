@@ -192,8 +192,8 @@ jobs:
   cross-platform:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Tracked in issue 13; make these gate once both are green.
-    continue-on-error: true
+    # Windows gates every push; macOS runs here only on demand and does not gate.
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
