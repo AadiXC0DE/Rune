@@ -19,8 +19,11 @@ import time
 
 # A duration no other process uses, so the command is found by its own
 # command line: inside a sandbox's process namespace `$$` is not its host pid.
-COMMAND = "echo $$ > pid.txt; exec sleep 31.4159"
-COMMAND_LINE = r"^sleep 31\.4159$"
+# The digits come from this script's pid, so scenarios running side by side
+# never find, or kill, each other's command.
+MARKER = f"31.{os.getpid() % 100000:05d}"
+COMMAND = f"echo $$ > pid.txt; exec sleep {MARKER}"
+COMMAND_LINE = "^sleep " + MARKER.replace(".", "\\.") + "$"
 PARTIAL = "HOLD_PARTIAL_TEXT"
 errors = []
 requests = []
@@ -267,7 +270,11 @@ with tempfile.TemporaryDirectory(prefix="rune-interrupt-") as directory:
             assert drain_wait(child, master, 10, transcript) == 0
     finally:
         for leftover in running():
-            os.kill(leftover, signal.SIGKILL)
+            # It may have exited since it was listed.
+            try:
+                os.kill(leftover, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         if child.poll() is None:
             child.kill()
             child.wait()
