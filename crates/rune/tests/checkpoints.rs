@@ -390,3 +390,81 @@ fn session_restore_puts_back_a_command_made_change() {
     assert_eq!(restore[0]["direction"], "turn");
     assert_eq!(restore[0]["turn"], 1);
 }
+
+/// Every file Rune leaves under its state root is readable by the user only:
+/// files 0600 (git's read-only objects 0400) and directories 0700, the
+/// checkpoint store included.
+#[cfg(unix)]
+#[test]
+fn every_state_file_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !git_present() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let workspace = workspace(root);
+    let provider = ScriptedProvider::start(vec![
+        Turn::call(
+            "call_1",
+            "shell",
+            r#"{"action": "run", "command": "echo x > made-by-command"}"#,
+        ),
+        Turn::call(
+            "call_2",
+            "write_file",
+            r#"{"path": "written.txt", "content": "y\n"}"#,
+        ),
+        Turn::text("done"),
+        // The reminder to check a turn that changed files.
+        Turn::text("checked"),
+    ]);
+    let output = rune(
+        root,
+        &workspace,
+        &provider.base_url(),
+        &[
+            "--permission-mode",
+            "full-access",
+            "--allow-unsandboxed",
+            "ask",
+            "--json",
+            "--checkpoints",
+            "--",
+            "go",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut open = Vec::new();
+    let mut stack = vec![root.join("state")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("state directory") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).expect("metadata");
+            let mode = metadata.permissions().mode() & 0o777;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            // Git keeps its objects read-only, so 0400 is as private as 0600.
+            let private = if metadata.is_dir() {
+                mode == 0o700
+            } else {
+                mode == 0o600 || mode == 0o400
+            };
+            if !private {
+                open.push(format!("{:o} {}", mode, path.display()));
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    assert!(open.is_empty(), "files not private:\n{}", open.join("\n"));
+}

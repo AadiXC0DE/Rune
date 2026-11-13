@@ -122,6 +122,7 @@ impl Shadow {
                         format!("checkpoint store {} belongs to {recorded}", shadow.git_dir),
                     ));
                 }
+                shadow.make_private()?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 paths.ensure_roots()?;
@@ -148,11 +149,15 @@ impl Shadow {
     /// Initialises a new shadow directory and its configuration.
     fn create(&self) -> Result<()> {
         paths::create_dir_private(&self.git_dir)?;
+        // Shared as 0600, so git writes every file readable by the user alone,
+        // and without the template, whose sample hooks are world-readable.
         run_git(
             &[
                 "init".to_owned(),
                 "--bare".to_owned(),
                 "--quiet".to_owned(),
+                format!("--shared={PRIVATE_SHARING}"),
+                "--template=".to_owned(),
                 self.git_dir.to_string(),
             ],
             &self.workspace,
@@ -160,8 +165,10 @@ impl Shadow {
             DEFAULT_DEADLINE,
         )?;
         let hooks = self.hooks_dir();
-        std::fs::create_dir_all(&hooks)?;
+        paths::create_dir_private(&hooks)?;
+        paths::create_dir_private(&self.git_dir.join("info"))?;
         let settings = [
+            ("core.sharedRepository", PRIVATE_SHARING),
             ("core.bare", "false"),
             ("core.hooksPath", hooks.as_str()),
             ("core.fsmonitor", "false"),
@@ -535,6 +542,8 @@ impl Shadow {
             "core.fsmonitor=false".to_owned(),
             "-c".to_owned(),
             "gc.auto=0".to_owned(),
+            "-c".to_owned(),
+            format!("core.sharedRepository={PRIVATE_SHARING}"),
         ];
         argv.extend(args.iter().map(|arg| (*arg).to_owned()));
         run_git_named(
@@ -549,7 +558,63 @@ impl Shadow {
     fn hooks_dir(&self) -> Utf8PathBuf {
         self.git_dir.join("no-hooks")
     }
+
+    /// Takes group and other access off a store made before stores were
+    /// private, once: a store that records the private sharing is left alone.
+    fn make_private(&self) -> Result<()> {
+        // The store's own file, not the override every git call carries.
+        let shared = run_git(
+            &[
+                "config".to_owned(),
+                "--file".to_owned(),
+                self.git_dir.join("config").to_string(),
+                "--get".to_owned(),
+                "core.sharedRepository".to_owned(),
+            ],
+            &self.workspace,
+            &environment(None),
+            DEFAULT_DEADLINE,
+        )
+        .unwrap_or_default();
+        if String::from_utf8_lossy(&shared).trim() == PRIVATE_SHARING {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut stack = vec![self.git_dir.clone()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir)? {
+                    let path = entry?.path();
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_symlink() {
+                        continue;
+                    }
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o077 != 0 {
+                        std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(mode & 0o700),
+                        )?;
+                    }
+                    if metadata.is_dir()
+                        && let Ok(path) = Utf8PathBuf::from_path_buf(path)
+                    {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+        self.git(
+            &["config", "core.sharedRepository", PRIVATE_SHARING],
+            DEFAULT_DEADLINE,
+        )?;
+        Ok(())
+    }
 }
+
+/// How the checkpoint store is shared: with the user alone.
+const PRIVATE_SHARING: &str = "0600";
 
 /// One checkpoint as the session log records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1751,6 +1816,43 @@ mod tests {
             std::fs::read_to_string(&script).expect("read"),
             "#!/bin/sh\necho two\n"
         );
+    }
+
+    #[test]
+    fn a_store_from_before_private_stores_is_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !git_present() {
+            return;
+        }
+        let fixture = fixture();
+        let shadow = open(&fixture);
+        shadow.snapshot("s", "turn 1 start").expect("snapshot");
+        let config = shadow.git_dir.join("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        shadow
+            .git(
+                &["config", "--unset", "core.sharedRepository"],
+                DEFAULT_DEADLINE,
+            )
+            .expect("unset");
+        let reopened = open(&fixture);
+        let mode = std::fs::metadata(&config)
+            .expect("config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let shared = real_git(
+            &fixture.workspace,
+            &[
+                "config",
+                "--file",
+                reopened.git_dir.join("config").as_str(),
+                "--get",
+                "core.sharedRepository",
+            ],
+        );
+        assert_eq!(String::from_utf8_lossy(&shared).trim(), PRIVATE_SHARING);
     }
 
     #[test]
