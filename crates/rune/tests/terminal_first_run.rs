@@ -24,6 +24,16 @@ fn scenario(name: &str) {
 }
 
 #[test]
+fn a_first_start_connects_by_choosing_in_pickers() {
+    scenario("first");
+}
+
+#[test]
+fn escape_at_the_first_picker_leaves_without_writing() {
+    scenario("leave");
+}
+
+#[test]
 fn each_start_shows_the_next_tip() {
     scenario("tips");
 }

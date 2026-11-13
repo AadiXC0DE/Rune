@@ -168,8 +168,10 @@ with tempfile.TemporaryDirectory(prefix="rune-copy-") as directory:
             os.write(master, b"/diff\r")
             wait_for("\x1b[?1049h", start)
             wait_for("b/app.txt", start)
+            closed = len(transcript)
             os.write(master, b"q")
-            wait_for("\x1b[?1049l", start)
+            wait_for("\x1b[?1049l", closed)
+            wait_for("/ commands", closed)
         os.write(master, b"/quit\r")
         assert drain_wait(child, master, 15, transcript) == 0
         assert not errors, errors

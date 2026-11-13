@@ -700,11 +700,18 @@ fn run_interactive(
     settings.require_valid_user_config()?;
     let mut settings = settings.clone();
     if settings.provider == Provider::Unconfigured && interactive_stdin() && !launch.accessible {
-        let entry = connect_flow::choose_provider()?;
+        // A terminal gets the guided flow; a pipe the numbered prompts.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            if connect_flow::run_interactive_first(paths, &settings)?.is_none() {
+                return Ok(ExitCode::from(EXIT_OK));
+            }
+        } else {
+            let entry = connect_flow::choose_provider()?;
+            connect_flow::run(paths, &settings, entry)?;
+        }
         // The flow writes the selection itself, so the only thing left is to
         // read it back rather than patch the values in by hand: the session then
         // runs on exactly what a later run would load.
-        connect_flow::run(paths, &settings, entry)?;
         settings = config::load(
             Some(&workspace.join(".rune.toml")),
             Some(&paths.config_file(std::env::var("RUNE_CONFIG").ok().as_deref())),

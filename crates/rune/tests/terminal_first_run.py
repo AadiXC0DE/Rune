@@ -19,7 +19,8 @@ import time
 prompts = []
 errors = []
 scenario = sys.argv[2]
-assert scenario in {"tips", "init"}, scenario
+assert scenario in {"tips", "init", "first", "leave"}, scenario
+authorizations = []
 
 
 def chunk(delta, finish=None):
@@ -33,6 +34,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        authorizations.append(self.headers.get("Authorization"))
         body = json.dumps({"data": [{"id": "first-fixture"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -94,6 +96,10 @@ with tempfile.TemporaryDirectory(prefix="rune-first-run-") as directory:
         "NO_COLOR": "1",
         "TERM": "xterm-256color",
     })
+    if scenario in {"first", "leave"}:
+        # Nothing is configured: the first start connects.
+        for key in ["RUNE_PROVIDER", "RUNE_BASE_URL", "RUNE_MODEL", "RUNE_API_KEY_ENV"]:
+            environment.pop(key)
 
     def start():
         master, slave = pty.openpty()
@@ -123,7 +129,53 @@ with tempfile.TemporaryDirectory(prefix="rune-first-run-") as directory:
         assert drain_wait(child, master, 15, transcript) == 0
         os.close(master)
 
-    if scenario == "tips":
+    if scenario == "first":
+        child, master, transcript = start()
+        try:
+            wait_for(child, master, transcript, "esc leaves without changing anything.")
+            wait_for(child, master, transcript, "choose a provider")
+            time.sleep(0.2)
+            os.write(master, b"chat")
+            wait_for(child, master, transcript, "chat_completions")
+            time.sleep(0.2)
+            os.write(master, b"\r")
+            wait_for(child, master, transcript, "endpoint (as in https://host/v1)")
+            time.sleep(0.2)
+            os.write(master, f"http://127.0.0.1:{server.server_port}/v1\r".encode())
+            wait_for(child, master, transcript, "(hidden):")
+            begin = len(transcript)
+            os.write(master, b"fixture-key\r")
+            wait_for(child, master, transcript, "choose a model from chat_completions", begin)
+            assert b"fixture-key" not in transcript, "the key was echoed"
+            time.sleep(0.2)
+            os.write(master, b"\r")
+            wait_for(child, master, transcript, "ok: chat_completions answered with 1 model(s)", begin)
+            wait_for(child, master, transcript, "/ commands", begin)
+            assert authorizations and authorizations[-1] == "Bearer fixture-key", authorizations
+            begin = len(transcript)
+            os.write(master, b"/status\r")
+            wait_for(child, master, transcript, "first-fixture", begin)
+            quit(child, master, transcript)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                drain_wait(child, master, 10, bytearray())
+    elif scenario == "leave":
+        child, master, transcript = start()
+        before = config_file.read_text()
+        try:
+            wait_for(child, master, transcript, "choose a provider")
+            time.sleep(0.2)
+            os.write(master, b"\x1b")
+            assert drain_wait(child, master, 15, transcript) == 0
+            assert config_file.read_text() == before, "esc changed the configuration"
+            assert not (root / "state" / "credentials.json").exists()
+            os.close(master)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                drain_wait(child, master, 10, bytearray())
+    elif scenario == "tips":
         tips = []
         for _ in range(2):
             child, master, transcript = start()
