@@ -43,6 +43,27 @@ Homebrew:
 brew install aadixc0de/tap/rune
 ```
 
+Each release publishes these archives, each with a `.sha256` sidecar, and one
+`SHA256SUMS` listing them all:
+
+| Target | Archive |
+|---|---|
+| macOS on Apple silicon | `rune-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS on Intel | `rune-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux on x86_64 | `rune-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux on aarch64 | `rune-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| Windows on x86_64 | `rune-<version>-x86_64-pc-windows-msvc.zip` |
+
+With `SHA256SUMS` in the same folder as the archives you downloaded:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing    # macOS
+sha256sum -c SHA256SUMS --ignore-missing        # Linux
+```
+
+On Windows, compare `(Get-FileHash -Algorithm SHA256 <archive>).Hash` with the
+archive's line in `SHA256SUMS`.
+
 From a release archive on Linux or macOS: download the `.tar.gz` for your
 target and its `.sha256` sidecar from the same release. Set `archive` to its
 absolute path and `prefix` to a writable installation directory, for example:

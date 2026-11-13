@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  signed-release:
+  macos:
     runs-on: macos-latest
     timeout-minutes: 25
     # Both architectures are built here rather than one per manual dispatch: the
@@ -162,8 +162,48 @@ jobs:
           path: target/dist/rune-${{ matrix.target }}/*
           if-no-files-found: error
 
-  publish-release:
-    needs: [signed-release, linux-static]
+  # The Windows archive, built natively and checked by extracting it and
+  # replacing a running copy, as an upgrade would.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python for the archive check
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Package the Windows archive
+        shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION:-$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)}"
+          test -n "$version"
+          cargo xtask release "$RELEASE_CHANNEL" "$version" x86_64-pc-windows-msvc
+
+      - name: Extract the archive and replace a running copy
+        shell: bash
+        run: python .github/scripts/test-windows-release.py target/dist/*/*.zip
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-windows-x86_64-pc-windows-msvc
+          path: target/dist/rune-x86_64-pc-windows-msvc/*
+          if-no-files-found: error
+
+  # Everything lands in a draft release; the owner publishes it by hand. A
+  # failed leg stops this job, so a release is never missing an archive.
+  publish:
+    needs: [macos, linux-static, windows]
     if: inputs.channel == 'stable'
     runs-on: ubuntu-latest
     permissions:
@@ -210,10 +250,16 @@ jobs:
             note="These archives are **not signed**: no Developer ID certificate is configured for this repository, which requires a paid Apple Developer Program membership. Installing through Homebrew is unaffected, because the download does not carry the quarantine flag. A tarball downloaded by hand does, and Gatekeeper will refuse an unsigned binary."
           fi
 
-          note="$note Linux archives are static musl builds for x86_64 and aarch64 and are not signed."
+          printf '%s\n\n%s\n' "$note" \
+            "Linux archives are static musl builds for x86_64 and aarch64. The Windows archive is not signed." > notes.md
 
-          if gh release view "v$version" > /dev/null 2>&1; then
-            gh release upload "v$version" release/* --clobber
+          if draft=$(gh release view "v$version" --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$draft" = true ]; then
+              gh release upload "v$version" release/* --clobber
+            else
+              echo "::error::v$version is already published; bump the version before releasing again"
+              exit 1
+            fi
           else
-            gh release create "v$version" release/* --title "Rune v$version" --generate-notes --notes "$note"
+            gh release create "v$version" release/* --draft --title "Rune v$version" --generate-notes --notes-file notes.md
           fi
