@@ -75,8 +75,10 @@ jobs:
       - name: Test the one-line installer against a local release
         run: python3 .github/scripts/test-install-script.py
 
-      - name: Check the release workflow's shape
-        run: python3 .github/scripts/test-release-workflow.py
+      - name: Check the release workflow's shape and the formula it renders
+        run: |
+          python3 .github/scripts/test-release-workflow.py
+          python3 .github/scripts/render-formula.py --self-test
 
       - name: Check PTY replay prerequisites
         run: python3 -c "import fcntl, pty, termios"
