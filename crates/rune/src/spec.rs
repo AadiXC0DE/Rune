@@ -658,8 +658,12 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         name: "upgrade",
         aliases: &[],
         summary: "Replace the installed binary with a verified artifact",
-        usage: "rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]",
+        usage: "rune upgrade [--check] [--json] | rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]",
         flags: &[
+            flag(
+                "--check",
+                "Report whether a newer release exists and change nothing.",
+            ),
             option("--from", "path", "Artifact to install."),
             option("--checksum", "hex", "Published checksum of that artifact."),
             option(

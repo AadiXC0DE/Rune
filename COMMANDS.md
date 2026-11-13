@@ -278,12 +278,13 @@ Check the local setup, or one provider with a short round trip
 |---|---|
 | `--provider <name>` | Send one short tool round trip to this provider and report what works. |
 | `--json` | Emit JSON. |
-### `rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
+### `rune upgrade [--check] [--json] | rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
 
 Replace the installed binary with a verified artifact
 
 | Flag | Description |
 |---|---|
+| `--check` | Report whether a newer release exists and change nothing. |
 | `--from <path>` | Artifact to install. |
 | `--checksum <hex>` | Published checksum of that artifact. |
 | `--target <path>` | Binary to replace. Defaults to the running one. |

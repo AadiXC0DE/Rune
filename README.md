@@ -141,6 +141,14 @@ regular executable member, and stages it beside the target before replacement.
 Rune's ZIP decoder accepts the single-member Deflate format emitted by release
 staging, without ZIP64, extra fields, comments, encryption, or data descriptors.
 
+To upgrade, `rune upgrade` downloads the latest release for this platform,
+checks it against the release's `SHA256SUMS` (and, on macOS, its signature when
+it is signed) and replaces the running binary; `rune upgrade --check` only says
+whether a newer release exists. A copy installed by Homebrew, Scoop or npm is
+left to that tool. Interactive sessions look for a newer release once a day and
+say so once; `auto_upgrade = "off"` turns that off, and `auto_upgrade =
+"install"` installs it when the session ends.
+
 From source:
 
 ```sh

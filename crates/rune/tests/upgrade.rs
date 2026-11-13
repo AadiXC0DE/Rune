@@ -312,3 +312,177 @@ fn conventional_tar_record_padding_is_accepted() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(std::fs::read(dir.path().join(MEMBER)).unwrap(), b"new");
 }
+
+/// Every published target, so the release served below fits whatever host
+/// runs the test.
+const TARGETS: [&str; 5] = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+];
+
+/// A release server: `/release.json`, the archive and `SHA256SUMS`, which lists
+/// `listed` as the archive's digest. Returns its base address.
+fn release_server(version: &str, archive: Vec<u8>, listed: &str) -> String {
+    use std::io::{BufRead as _, BufReader};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("address").port()
+    );
+    let names: Vec<String> = TARGETS
+        .iter()
+        .map(|target| {
+            let extension = if target.contains("windows") {
+                "zip"
+            } else {
+                "tar.gz"
+            };
+            format!("rune-{version}-{target}.{extension}")
+        })
+        .collect();
+    let assets: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "browser_download_url": format!("{base}/archive")}))
+        .chain(std::iter::once(
+            serde_json::json!({"name": "SHA256SUMS", "browser_download_url": format!("{base}/SHA256SUMS")}),
+        ))
+        .collect();
+    let document =
+        serde_json::json!({"tag_name": format!("v{version}"), "assets": assets}).to_string();
+    let mut sums = String::new();
+    for name in &names {
+        sums.push_str(listed);
+        sums.push_str("  ");
+        sums.push_str(name);
+        sums.push('\n');
+    }
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                    break;
+                }
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or_default();
+            let body: &[u8] = match path {
+                "/release.json" => document.as_bytes(),
+                "/archive" => &archive,
+                "/SHA256SUMS" => sums.as_bytes(),
+                _ => b"",
+            };
+            let status = if body.is_empty() {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+        }
+    });
+    base
+}
+
+fn upgrade_latest(root: &std::path::Path, base: &str, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rune"))
+        .arg("upgrade")
+        .args(extra)
+        .arg("--target")
+        .arg(root.join(MEMBER))
+        .env("RUNE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("RUNE_RELEASES_API", format!("{base}/release.json"))
+        .output()
+        .expect("run upgrade")
+}
+
+fn release_archive() -> Vec<u8> {
+    if cfg!(windows) {
+        // The Windows archive is a zip; its fixture is not built here.
+        return Vec::new();
+    }
+    gzip(&tar(MEMBER, b"#!/bin/sh\necho rune 9.9.9\n"))
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_installs_a_verified_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join(MEMBER);
+    std::fs::write(&target, b"original").expect("seed target");
+    let archive = release_archive();
+    let base = release_server("9.9.9", archive.clone(), &checksum(&archive));
+    let output = upgrade_latest(dir.path(), &base, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("upgraded rune 0."), "{stdout}");
+    assert!(stdout.contains(" to 9.9.9 ("), "{stdout}");
+    assert_eq!(
+        std::fs::read(&target).expect("installed"),
+        b"#!/bin/sh\necho rune 9.9.9\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_refuses_a_bad_digest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join(MEMBER);
+    std::fs::write(&target, b"original").expect("seed target");
+    let archive = release_archive();
+    let base = release_server("9.9.9", archive, &"0".repeat(64));
+    let output = upgrade_latest(dir.path(), &base, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not match SHA256SUMS; nothing was installed"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&target).expect("kept"), b"original");
+    assert!(staging_entries(dir.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_check_reports_without_writing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join(MEMBER);
+    std::fs::write(&target, b"original").expect("seed target");
+    let archive = release_archive();
+    let base = release_server("9.9.9", archive.clone(), &checksum(&archive));
+    let output = upgrade_latest(dir.path(), &base, &["--check"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("rune 9.9.9 is available (this is 0."),
+        "{stdout}"
+    );
+    let json = upgrade_latest(dir.path(), &base, &["--check", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(value["latest"], "9.9.9");
+    assert_eq!(value["newer"], true);
+    assert_eq!(std::fs::read(&target).expect("kept"), b"original");
+    let older = release_server("0.0.1", archive.clone(), &checksum(&archive));
+    let latest = upgrade_latest(dir.path(), &older, &[]);
+    assert!(latest.status.success(), "{latest:?}");
+    assert!(
+        String::from_utf8_lossy(&latest.stdout).ends_with(" is the latest release\n"),
+        "{latest:?}"
+    );
+    assert_eq!(std::fs::read(&target).expect("kept"), b"original");
+}

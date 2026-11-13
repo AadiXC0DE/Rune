@@ -20,6 +20,10 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
 
     println!("cargo:rustc-env=RUNE_COMMIT={commit}");
+    // The target triple names this build's release archive.
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=RUNE_TARGET={target}");
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=RUNE_CHANNEL");
 

@@ -18,7 +18,7 @@ use rune_agent::turn::{self, Event, Host, StopReason};
 use rune_context::mcp::Client as McpClient;
 use rune_context::prompt::{self, Prompt};
 use rune_core::budget::BudgetSet;
-use rune_core::config::{Effort, PermissionMode, Settings};
+use rune_core::config::{AutoUpgrade, Effort, PermissionMode, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::SessionId;
 use rune_core::paths::Paths;
@@ -6132,12 +6132,42 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
         }
     };
 
+    // A newer release is named once, from the last check or from the one
+    // started now in the background; a terminal session only, never offline.
+    let looks_for_upgrades =
+        keyed && !config.settings.offline && config.settings.auto_upgrade != AutoUpgrade::Off;
+    let mut upgrade_check = looks_for_upgrades
+        .then(|| crate::upgrade::start_check(&config.paths))
+        .flatten();
+    let mut upgrade_notice = looks_for_upgrades
+        .then(|| crate::upgrade::recorded_latest(&config.paths))
+        .flatten()
+        .and_then(|latest| crate::upgrade::notice(&latest));
+    let mut upgrade_named = false;
+
     let reason = if keyed {
         // Each keystroke redraws the prompt, so the line and the cursor follow
         // what was typed rather than waiting for the terminal to decide the
         // line is finished.
         let mut reason = ExitReason::EndOfInput;
         loop {
+            if !upgrade_named {
+                if upgrade_notice.is_none()
+                    && upgrade_check
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    upgrade_notice = upgrade_check
+                        .take()
+                        .and_then(|check| check.join().ok().flatten())
+                        .and_then(|latest| crate::upgrade::notice(&latest));
+                }
+                if let Some(text) = upgrade_notice.take() {
+                    upgrade_named = true;
+                    let dim = host.theme().sgr(Slot::Dim, host.depth);
+                    host.commit_lines(&[styled(&dim, &text)]);
+                }
+            }
             // A message queued during the last turn starts the next one by
             // itself. A turn that failed or was interrupted has already put
             // the queue back in the draft, so nothing is left here then.

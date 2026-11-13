@@ -786,9 +786,9 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ascii: Option<bool>,
 
-    /// Whether automatic update checks run.
+    /// Whether a newer release is looked for, and installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_upgrade: Option<bool>,
+    pub auto_upgrade: Option<AutoUpgrade>,
 
     /// Whether tool call groups are collapsed in the transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1090,8 +1090,8 @@ pub struct Settings {
     pub statusline: Vec<String>,
     /// Whether terminal decorations use only ASCII.
     pub ascii: bool,
-    /// Whether automatic update checks run.
-    pub auto_upgrade: bool,
+    /// Whether a newer release is looked for, and installed.
+    pub auto_upgrade: AutoUpgrade,
     /// Whether provider requests are refused, web backends disabled, remote MCP
     /// checks skipped and sandboxed shell networking denied. This is not a
     /// process-wide network filter; hosts must enforce each path's policy.
@@ -1181,7 +1181,7 @@ impl Default for Settings {
             terminal_title: true,
             statusline: STATUSLINE_FIELDS.map(str::to_owned).to_vec(),
             ascii: false,
-            auto_upgrade: true,
+            auto_upgrade: AutoUpgrade::Notify,
             offline: false,
             collapse_tool_calls: true,
             banner: true,
@@ -1419,7 +1419,7 @@ impl Settings {
                     .clone()
                     .unwrap_or_else(|| "default".to_owned()),
             ),
-            ("auto_upgrade", self.auto_upgrade.to_string()),
+            ("auto_upgrade", self.auto_upgrade.as_str().to_owned()),
             ("collapse_tool_calls", self.collapse_tool_calls.to_string()),
             ("banner", self.banner.to_string()),
             ("ambiguous_width", self.ambiguous_width.to_string()),
@@ -1512,7 +1512,7 @@ pub struct EnvironmentOverrides {
     /// ASCII terminal decorations.
     pub ascii: Option<bool>,
     /// Automatic updates.
-    pub auto_upgrade: Option<bool>,
+    pub auto_upgrade: Option<AutoUpgrade>,
     /// Additional directories.
     pub additional_directories: Vec<Utf8PathBuf>,
     /// Limit overrides in `name=value` form.
@@ -1571,6 +1571,13 @@ impl EnvironmentOverrides {
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
         let mut lookup = move |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
         let mut invalid_booleans = Vec::new();
+        let auto_upgrade = lookup("RUNE_AUTO_UPGRADE").and_then(|raw| {
+            let parsed = AutoUpgrade::parse(&raw);
+            if parsed.is_none() {
+                invalid_booleans.push(("RUNE_AUTO_UPGRADE", raw));
+            }
+            parsed
+        });
         let mut boolean = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &'static str| {
             let raw = lookup(key)?;
             let parsed = parse_bool(&raw);
@@ -1591,7 +1598,7 @@ impl EnvironmentOverrides {
             fast_mode: boolean(&mut lookup, "RUNE_FAST_MODE"),
             theme: lookup("RUNE_THEME"),
             ascii: boolean(&mut lookup, "RUNE_ASCII"),
-            auto_upgrade: boolean(&mut lookup, "RUNE_AUTO_UPGRADE"),
+            auto_upgrade,
             additional_directories: Vec::new(),
             limits: Vec::new(),
             provider_order: lookup("RUNE_PROVIDER_ORDER"),
@@ -1669,6 +1676,67 @@ pub const MOTION_VALUES: [&str; 2] = ["full", "reduced"];
 
 /// The accepted `reasoning` values, the default first.
 pub const REASONING_VALUES: [&str; 3] = ["collapsed", "tail", "full"];
+/// The accepted `auto_upgrade` values, the default first.
+pub const AUTO_UPGRADE_VALUES: [&str; 3] = ["notify", "off", "install"];
+
+/// Whether a newer release is looked for, and what happens when one exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpgrade {
+    /// No check.
+    Off,
+    /// A notice when a newer release exists.
+    #[default]
+    Notify,
+    /// The newer release is installed after the session ends.
+    Install,
+}
+
+impl AutoUpgrade {
+    /// The setting's word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Notify => "notify",
+            Self::Install => "install",
+        }
+    }
+
+    /// Reads a word or a boolean spelling: true is `notify`, false is `off`,
+    /// as the setting meant before it had three values.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "notify" => Some(Self::Notify),
+            "install" => Some(Self::Install),
+            other => parse_bool(other).map(|on| if on { Self::Notify } else { Self::Off }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoUpgrade {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Word(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Flag(true) => Ok(Self::Notify),
+            Raw::Flag(false) => Ok(Self::Off),
+            Raw::Word(word) => Self::parse(&word).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "`{word}` is not an auto_upgrade value; accepted: off, notify, install"
+                ))
+            }),
+        }
+    }
+}
 /// The accepted `hyperlinks` values, the default first.
 pub const HYPERLINK_VALUES: [&str; 3] = ["auto", "on", "off"];
 /// The accepted `notify` values, the default first.
@@ -1848,7 +1916,6 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         | "anonymous"
         | "fast_mode"
         | "ascii"
-        | "auto_upgrade"
         | "collapse_tool_calls"
         | "banner"
         | "terminal_title"
@@ -1867,6 +1934,7 @@ pub fn scalar_kind(key: &str) -> Option<ScalarKind> {
         "color" => ScalarKind::Choice(&COLOR_VALUES),
         "motion" => ScalarKind::Choice(&MOTION_VALUES),
         "reasoning" => ScalarKind::Choice(&REASONING_VALUES),
+        "auto_upgrade" => ScalarKind::Choice(&AUTO_UPGRADE_VALUES),
         "hyperlinks" => ScalarKind::Choice(&HYPERLINK_VALUES),
         "notify" => ScalarKind::Choice(&NOTIFY_VALUES),
         _ => ScalarKind::Text,
@@ -3499,7 +3567,7 @@ pub fn to_status_json(settings: &Settings, workspace: &Utf8Path) -> serde_json::
         "terminal_title": settings.terminal_title,
         "statusline": settings.statusline,
         "ascii": settings.ascii,
-        "auto_upgrade": settings.auto_upgrade,
+        "auto_upgrade": settings.auto_upgrade.as_str(),
         "context": settings.context,
         "collapse_tool_calls": settings.collapse_tool_calls,
         "banner": settings.banner,
@@ -5054,6 +5122,40 @@ max_agent_steps = 50
             assert!(settings.diagnostics.is_empty(), "rejected {raw}");
             assert_eq!(settings.permission_mode, PermissionMode::FullAccess);
         }
+    }
+
+    #[test]
+    fn auto_upgrade_accepts_words_and_booleans() {
+        for (raw, expected) in [
+            ("auto_upgrade = 'off'", AutoUpgrade::Off),
+            ("auto_upgrade = 'notify'", AutoUpgrade::Notify),
+            ("auto_upgrade = 'install'", AutoUpgrade::Install),
+            ("auto_upgrade = true", AutoUpgrade::Notify),
+            ("auto_upgrade = false", AutoUpgrade::Off),
+        ] {
+            let config: UserConfig = toml::from_str(raw).expect(raw);
+            assert_eq!(config.auto_upgrade, Some(expected), "{raw}");
+        }
+        assert!(toml::from_str::<UserConfig>("auto_upgrade = 'weekly'").is_err());
+        assert_eq!(Settings::default().auto_upgrade, AutoUpgrade::Notify);
+        for (raw, expected) in [
+            ("install", AutoUpgrade::Install),
+            ("0", AutoUpgrade::Off),
+            ("yes", AutoUpgrade::Notify),
+        ] {
+            let env = EnvironmentOverrides::from_lookup(|key| {
+                (key == "RUNE_AUTO_UPGRADE").then(|| raw.to_owned())
+            });
+            assert_eq!(env.auto_upgrade, Some(expected), "{raw}");
+        }
+        let env = EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_AUTO_UPGRADE").then(|| "weekly".to_owned())
+        });
+        assert_eq!(env.auto_upgrade, None);
+        assert_eq!(
+            env.invalid_booleans,
+            vec![("RUNE_AUTO_UPGRADE", "weekly".to_owned())]
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ mod spec;
 mod spend;
 mod subagent;
 mod terminal_setup;
+mod upgrade;
 mod version;
 mod vision_client;
 mod web_client;
@@ -308,7 +309,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
         }
         Command::Review => run_review(&settings, &paths, launch, &workspace, &output_flags),
         Command::Bench => run_bench(launch, &output_flags),
-        Command::Upgrade => run_upgrade(launch, &output_flags),
+        Command::Upgrade => run_upgrade(&settings, launch, &output_flags),
         Command::Uninstall => run_uninstall(&paths, launch, &output_flags),
         Command::Reference => run_reference(launch),
         Command::Help | Command::Version | Command::Completion => Ok(ExitCode::from(EXIT_OK)),
@@ -777,6 +778,16 @@ fn run_interactive(
     let stdin = std::io::stdin();
     let input = std::io::BufReader::new(stdin.lock());
     let code = session::run(config, input, rune_term::inline::TerminalOutput)?;
+    // With `auto_upgrade = "install"`, a newer release found by the session's
+    // check is installed once the terminal is back to normal. A failure is
+    // reported and leaves the session's exit status alone.
+    if settings.auto_upgrade == config::AutoUpgrade::Install
+        && !settings.offline
+        && interactive_stdin()
+        && let Some(line) = upgrade::install_after_session(paths)
+    {
+        println!("{line}");
+    }
     Ok(ExitCode::from(code))
 }
 
@@ -1915,7 +1926,10 @@ fn approve_project_hooks(
 ///
 /// The artifact is named by the caller. Nothing here discovers a release on its
 /// own, so an upgrade never contacts a location the user did not name.
-fn run_upgrade(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+fn run_upgrade(settings: &Settings, launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
+    if launch.flag("--from").is_none() && launch.flag("--checksum").is_none() {
+        return run_upgrade_latest(settings, launch, output);
+    }
     let Some(source) = launch.flag("--from") else {
         return Err(RuneError::missing_field("from")
             .with_hint("name the artifact to install, as `--from <path>` or `--from <url>`"));
@@ -1954,6 +1968,62 @@ fn run_upgrade(launch: &Launch, output: &OutputFlags) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("installed {} ({} bytes)", target, artifact.bytes.len());
+    }
+    Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Installs, or with `--check` only reports, the latest published release.
+fn run_upgrade_latest(
+    settings: &Settings,
+    launch: &Launch,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    if settings.offline {
+        return Err(RuneError::new(
+            ErrorCode::Unsupported,
+            "upgrade needs the network; --offline is set",
+        ));
+    }
+    let target = match launch.flag("--target") {
+        Some(raw) => Utf8PathBuf::from(raw),
+        None => install::current_binary()?,
+    };
+    let check = launch.has_flag("--check");
+    if !check && let Some(refusal) = upgrade::managed_by(&target) {
+        return Err(RuneError::new(ErrorCode::Unsupported, refusal));
+    }
+    let current = version::VERSION;
+    let release = upgrade::latest_release(std::time::Duration::from_secs(15))?;
+    let newer = upgrade::is_newer(&release.version, current);
+    if check || !newer {
+        if output.json {
+            let value = serde_json::json!({
+                "current": current,
+                "latest": release.version,
+                "newer": newer,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else if newer {
+            println!("rune {} is available (this is {current})", release.version);
+        } else {
+            println!("rune {current} is the latest release");
+        }
+        return Ok(ExitCode::from(EXIT_OK));
+    }
+    let installed = upgrade::install_release(&release, &target)?;
+    if output.json {
+        let value = serde_json::json!({
+            "previous": current,
+            "installed": installed.version,
+            "target": installed.target,
+            "path": target,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "upgraded rune {current} to {} ({})",
+            installed.version, installed.target
+        );
     }
     Ok(ExitCode::from(EXIT_OK))
 }
