@@ -45,8 +45,25 @@ class Provider(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            prompts.append(request["messages"][-1]["content"])
-            body = chunk({"content": "INIT-ANSWERED"}) + chunk({}, "stop") + b"data: [DONE]\n\n"
+            messages = request["messages"]
+            checking = any(
+                "current_directory tool" in str(message.get("content"))
+                for message in messages
+                if message.get("role") == "user"
+            )
+            usage = ("data: " + json.dumps({"choices": [], "usage": {
+                "prompt_tokens": 40, "completion_tokens": 4,
+            }}) + "\n\n").encode()
+            if checking and messages[-1].get("role") == "tool":
+                body = chunk({"content": "done"}) + chunk({}, "stop") + usage + b"data: [DONE]\n\n"
+            elif checking:
+                call = {"index": 0, "id": "call_1", "type": "function",
+                        "function": {"name": "current_directory", "arguments": "{}"}}
+                body = (chunk({"tool_calls": [call]}) + chunk({}, "tool_calls") + usage
+                        + b"data: [DONE]\n\n")
+            else:
+                prompts.append(messages[-1]["content"])
+                body = chunk({"content": "INIT-ANSWERED"}) + chunk({}, "stop") + b"data: [DONE]\n\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -149,7 +166,8 @@ with tempfile.TemporaryDirectory(prefix="rune-first-run-") as directory:
             assert b"fixture-key" not in transcript, "the key was echoed"
             time.sleep(0.2)
             os.write(master, b"\r")
-            wait_for(child, master, transcript, "ok: chat_completions answered with 1 model(s)", begin)
+            wait_for(child, master, transcript, "with one short tool call", begin)
+            wait_for(child, master, transcript, "ok: first-fixture answered and called a tool", begin)
             wait_for(child, master, transcript, "/ commands", begin)
             assert authorizations and authorizations[-1] == "Bearer fixture-key", authorizations
             begin = len(transcript)

@@ -641,9 +641,16 @@ pub const MAINTENANCE: &[CommandSpec] = &[
     CommandSpec {
         name: "doctor",
         aliases: &[],
-        summary: "Check the local setup without starting a turn",
-        usage: "rune doctor [--json]",
-        flags: &[flag("--json", "Emit JSON.")],
+        summary: "Check the local setup, or one provider with a short round trip",
+        usage: "rune doctor [--provider <name>] [--json]",
+        flags: &[
+            option(
+                "--provider",
+                "name",
+                "Send one short tool round trip to this provider and report what works.",
+            ),
+            flag("--json", "Emit JSON."),
+        ],
         requirements: Requirements::CONFIG,
         supports_json: true,
     },

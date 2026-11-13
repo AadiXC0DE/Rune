@@ -230,7 +230,7 @@ fn run(launch: &Launch) -> Result<ExitCode> {
     }
 
     match launch.command {
-        Command::Doctor => run_doctor(&settings, &paths, &workspace, &output_flags),
+        Command::Doctor => run_doctor(&settings, &paths, &workspace, launch, &output_flags),
         Command::Status => run_status(&settings, &paths, &workspace, &output_flags),
         Command::Limits => run_limits(&settings, &output_flags),
         Command::Keys => run_keys(&paths, &output_flags),
@@ -364,9 +364,40 @@ fn run_doctor(
     settings: &Settings,
     paths: &Paths,
     workspace: &Utf8Path,
+    launch: &Launch,
     output: &OutputFlags,
 ) -> Result<ExitCode> {
+    if launch.provider.is_some() {
+        return run_doctor_provider(settings, paths, workspace, output);
+    }
     let report = diagnostics::run(settings, paths, workspace);
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else {
+        print!("{}", report.render());
+    }
+    let code = report.exit_code();
+    Ok(ExitCode::from(u8::try_from(code).unwrap_or(EXIT_FAILURE)))
+}
+
+/// Runs `doctor --provider`: says what it will send, sends it and reports.
+fn run_doctor_provider(
+    settings: &Settings,
+    paths: &Paths,
+    workspace: &Utf8Path,
+    output: &OutputFlags,
+) -> Result<ExitCode> {
+    let estimate = diagnostics::estimate_line(settings, paths);
+    // The JSON on standard output stays one document.
+    if output.json {
+        eprintln!("{estimate}");
+    } else {
+        println!("{estimate}");
+    }
+    let report = diagnostics::provider_check(settings, paths, workspace)?;
     if output.json {
         println!(
             "{}",

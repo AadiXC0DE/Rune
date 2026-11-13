@@ -3232,3 +3232,169 @@ fn doctor_offline_contacts_nothing() {
         "{report}"
     );
 }
+
+/// Runs `rune` against a scripted chat completions provider in `dir`.
+fn run_scripted(dir: &std::path::Path, base_url: &str, args: &[&str]) -> Output {
+    let output = Command::new(binary())
+        .isolated_env()
+        .env("HOME", dir.join("home"))
+        .env("RUNE_HOME", dir.join("state"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("RUNE_PROVIDER", "chat_completions")
+        .env("RUNE_BASE_URL", base_url)
+        .env("RUNE_MODEL", "scripted")
+        .env("RUNE_API_KEY_ENV", "RUNE_FIXTURE_KEY")
+        .env("RUNE_FIXTURE_KEY", "fixture-key")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run binary");
+    Output {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn doctor_provider_reports_every_check() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(vec![
+        Turn::call("call_1", "current_directory", "{}"),
+        Turn::text("workspace"),
+    ]);
+    let out = run_scripted(
+        dir.path(),
+        &provider.base_url(),
+        &["doctor", "--provider", "chat_completions"],
+    );
+    assert_eq!(out.status, Some(0), "{}\n{}", out.stdout, out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("sending 2 short requests to chat_completions (scripted); estimated cost unknown")
+    );
+    let expected = [
+        format!(
+            "provider   chat_completions (scripted) at {}",
+            provider.base_url()
+        ),
+        "reachable          ok".to_owned(),
+        "authenticated      ok".to_owned(),
+        "tool call parsed   ok".to_owned(),
+        "reasoning replay   not applicable (no reasoning)".to_owned(),
+        "cache fields       seen".to_owned(),
+        "cost               unknown".to_owned(),
+    ];
+    for line in &expected {
+        assert!(
+            lines.contains(&line.as_str()),
+            "missing {line:?} in\n{}",
+            out.stdout
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("usage reported     ok (input ")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("limits             context ")),
+        "{}",
+        out.stdout
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second: serde_json::Value = serde_json::from_str(&requests[1].body).expect("body");
+    let messages = second["messages"].as_array().expect("messages");
+    let answer = messages.last().expect("tool answer");
+    assert_eq!(answer["role"], "tool");
+    let name = dir
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("name");
+    assert!(answer["content"].to_string().contains(name), "{answer}");
+    assert_eq!(second["tools"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn doctor_provider_reports_a_refused_key() {
+    use rune_testkit::scripted::{ScriptedProvider, Turn};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(vec![Turn::http_error(
+        401,
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )]);
+    let out = run_scripted(
+        dir.path(),
+        &provider.base_url(),
+        &["doctor", "--provider", "chat_completions", "--json"],
+    );
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("sending 2 short requests"),
+        "{}",
+        out.stderr
+    );
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["provider"], "chat_completions");
+    assert_eq!(value["model"], "scripted");
+    assert_eq!(value["endpoint"], provider.base_url());
+    assert!(value["cost_usd"].is_null());
+    let checks = value["checks"].as_array().expect("checks");
+    let status = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .map(|check| check["status"].as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
+    assert_eq!(status("reachable"), "ok");
+    assert_eq!(status("authenticated"), "failed");
+    assert_eq!(status("tool call parsed"), "not_applicable");
+    assert_eq!(status("usage reported"), "not_applicable");
+    assert_eq!(provider.request_count(), 1);
+}
+
+#[test]
+fn doctor_without_provider_sends_nothing() {
+    use rune_testkit::scripted::ScriptedProvider;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::start(Vec::new());
+    let out = run_scripted(dir.path(), &provider.base_url(), &["doctor"]);
+    assert!(!out.stdout.contains("sending"), "{}", out.stdout);
+    assert!(out.stdout.contains("provider"), "{}", out.stdout);
+    assert_eq!(provider.request_count(), 0);
+}
+
+#[test]
+fn doctor_provider_offline_refuses_a_public_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_scripted(
+        dir.path(),
+        "https://api.example.com/v1",
+        &["--offline", "doctor", "--provider", "chat_completions"],
+    );
+    assert_eq!(out.status, Some(1), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stdout
+            .contains("reachable          failed: outbound requests are disabled"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("authenticated      not applicable"),
+        "{}",
+        out.stdout
+    );
+}

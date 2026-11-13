@@ -13,6 +13,10 @@ use rune_core::error::ErrorCode;
 use rune_core::paths::Paths;
 use serde::Serialize;
 
+mod round_trip;
+
+pub use round_trip::{estimate_line, provider_check};
+
 /// Outcome of one diagnostic check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,7 +201,7 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
                 .collect()
         })
     });
-    checks.push(provider_check(settings, listed.as_ref()));
+    checks.push(listing_check(settings, listed.as_ref()));
     checks.push(check_limits(settings));
     checks.extend(reviewer_check(settings, ids.as_deref()));
     checks.push(check_sandbox(settings));
@@ -353,7 +357,7 @@ fn check_terminal() -> Check {
 
 /// The provider: configured, reachable, accepting the key and listing the
 /// model. `listed` is the model list request, when one was made.
-fn provider_check(
+fn listing_check(
     settings: &Settings,
     listed: Option<&rune_core::error::Result<rune_net::catalog::Catalog>>,
 ) -> Check {
@@ -1030,7 +1034,7 @@ mod tests {
     #[test]
     fn an_unconfigured_provider_is_a_problem() {
         let settings = config::load(None, None, &EnvironmentOverrides::default());
-        let check = provider_check(&settings, None);
+        let check = listing_check(&settings, None);
         assert_eq!(check.outcome, Outcome::Fail);
         assert_eq!(check.code, Some(ErrorCode::AuthenticationRequired));
         assert!(
@@ -1048,7 +1052,7 @@ mod tests {
             provider: config::Provider::Anthropic,
             ..Settings::default()
         };
-        let check = provider_check(&settings, None);
+        let check = listing_check(&settings, None);
         assert_eq!(check.outcome, Outcome::Warn);
         assert!(check.hint.is_some());
     }

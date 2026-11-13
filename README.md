@@ -118,6 +118,7 @@ command that needs one says so and names how to connect it.
 ```sh
 rune connect                # lists the providers and asks for what it needs
 rune doctor                 # check what your machine supports
+rune doctor --provider NAME # send one short tool call and report what works
 ```
 
 Running `connect` with no argument lists the providers and takes a choice, then

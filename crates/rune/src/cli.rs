@@ -393,6 +393,12 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     {
         launch.resume = Some(classify_resume(token));
     }
+    // `doctor --provider` checks that provider, so it is also the one selected.
+    if launch.command == Command::Doctor
+        && let Some(name) = launch.flag("--provider")
+    {
+        launch.provider = Some(name.to_owned());
+    }
     Ok(launch)
 }
 
@@ -1189,6 +1195,15 @@ mod tests {
             "{:?}",
             err.hint()
         );
+    }
+
+    #[test]
+    fn doctor_provider_also_selects_the_provider() {
+        let launch = parse_list(&["doctor", "--provider", "deepseek"]).expect("parse");
+        assert_eq!(launch.flag("--provider"), Some("deepseek"));
+        assert_eq!(launch.provider.as_deref(), Some("deepseek"));
+        let launch = parse_list(&["doctor"]).expect("parse");
+        assert_eq!(launch.provider, None);
     }
 
     #[test]

@@ -270,12 +270,13 @@ Show the resolved configuration and runtime state
 | Flag | Description |
 |---|---|
 | `--json` | Emit JSON. |
-### `rune doctor [--json]`
+### `rune doctor [--provider <name>] [--json]`
 
-Check the local setup without starting a turn
+Check the local setup, or one provider with a short round trip
 
 | Flag | Description |
 |---|---|
+| `--provider <name>` | Send one short tool round trip to this provider and report what works. |
 | `--json` | Emit JSON. |
 ### `rune upgrade --from <path> --checksum <hex> [--target <path>] [--json]`
 

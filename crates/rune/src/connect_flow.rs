@@ -632,7 +632,7 @@ pub fn run_interactive_first(
             {
                 selection.model = ids.get(index).cloned();
             }
-            format!("ok: {name} answered with {} model(s)", ids.len())
+            None
         }
         Err(err) => {
             let above = [format!("could not list models: {}", err.message())];
@@ -648,13 +648,13 @@ pub fn run_interactive_first(
                 selection.model = Some(model);
             }
             let hint = if err.code() == ErrorCode::AuthenticationRequired {
-                "the key was refused; run /connect in the session to paste another".to_owned()
+                REFUSED_KEY.to_owned()
             } else {
                 err.hint()
                     .unwrap_or("check the endpoint, then run /connect")
                     .to_owned()
             };
-            format!("failed: {}\n{hint}", err.message())
+            Some(format!("failed: {}\n{hint}", err.message()))
         }
     };
     let cleared = inline.clear();
@@ -662,11 +662,51 @@ pub fn run_interactive_first(
     let _ = out.flush();
     drop(reader);
     provider_setup::save_selection(paths, &selection)?;
-    if let Some(model) = &selection.model {
-        println!("model     {model}");
+    match &selection.model {
+        Some(model) => {
+            println!("model     {model}");
+            println!("checking {name} with one short tool call...");
+            let mut checked = probe;
+            checked.model.clone_from(model);
+            println!("{}", round_trip_row(&checked, paths, &name, model));
+        }
+        None => {
+            if let Some(report) = report {
+                println!("{report}");
+            }
+        }
     }
-    println!("{report}");
     Ok(Some(name))
+}
+
+/// What the session says when the endpoint refused the pasted key.
+const REFUSED_KEY: &str = "the key was refused; run /connect in the session to paste another";
+
+/// One short tool round trip with the new connection, as one row and a hint.
+fn round_trip_row(
+    settings: &rune_core::config::Settings,
+    paths: &Paths,
+    name: &str,
+    model: &str,
+) -> String {
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|dir| camino::Utf8PathBuf::from_path_buf(dir).ok())
+        .unwrap_or_else(|| camino::Utf8PathBuf::from("."));
+    match crate::diagnostics::provider_check(settings, paths, &workspace) {
+        Ok(report) => match report.first_failure() {
+            None => format!("ok: {model} answered and called a tool"),
+            Some(check) => {
+                let hint = if check.name == "authenticated" {
+                    REFUSED_KEY.to_owned()
+                } else {
+                    format!("rune doctor --provider {name} shows every check")
+                };
+                format!("failed: {}: {}\n{hint}", check.name, check.detail)
+            }
+        },
+        Err(err) => format!("failed: {}", err.message()),
+    }
 }
 
 #[cfg(test)]
