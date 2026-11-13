@@ -41,6 +41,53 @@ pub fn derive_title(prompt: &str) -> String {
     title
 }
 
+/// The index and text of every user message in the log, in log order.
+/// Corrections sent while a turn ran are user messages too.
+pub fn user_messages(recorder: &Recorder) -> Result<Vec<(usize, String)>> {
+    Ok(recorder
+        .store
+        .read()?
+        .events
+        .into_iter()
+        .filter_map(|frame| match frame.event {
+            SessionEvent::UserMessage { text } => Some(text),
+            _ => None,
+        })
+        .enumerate()
+        .collect())
+}
+
+/// The turn the `message`-th user message started, when it started one. A
+/// correction sent while a turn ran started none.
+pub fn turn_started_by(recorder: &Recorder, message: usize) -> Result<Option<u64>> {
+    let events = recorder.store.read()?.events;
+    let Some(position) = events
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| matches!(frame.event, SessionEvent::UserMessage { .. }))
+        .nth(message)
+        .map(|(position, _)| position)
+    else {
+        return Ok(None);
+    };
+    for frame in events.iter().skip(position.saturating_add(1)) {
+        match frame.event {
+            SessionEvent::TurnStarted { turn } => return Ok(Some(turn)),
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::AssistantContent { .. }
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. }
+            | SessionEvent::TurnInterrupted { .. } => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// One session as a listing shows it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Summary {
@@ -111,6 +158,32 @@ impl Recorder {
             })?;
         let destination = SessionId::generate();
         rune_session::fork::fork(paths, &self.store.id(), &destination, last)?;
+        Ok(destination)
+    }
+
+    /// Copies this session's journal up to just before its `message`-th user
+    /// message (0-based, in log order) into a new session and returns the new
+    /// id. This session is left as it is.
+    pub fn fork_before(&self, paths: &Paths, message: usize) -> Result<SessionId> {
+        let events = self.store.read()?.events;
+        let position = events
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| matches!(frame.event, SessionEvent::UserMessage { .. }))
+            .nth(message)
+            .map(|(position, _)| position)
+            .ok_or_else(|| RuneError::new(ErrorCode::NotFound, "no such message"))?;
+        let before = position
+            .checked_sub(1)
+            .and_then(|previous| events.get(previous))
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::NotFound,
+                    "nothing comes before the first message",
+                )
+            })?;
+        let destination = SessionId::generate();
+        rune_session::fork::fork(paths, &self.store.id(), &destination, before.seq)?;
         Ok(destination)
     }
 
@@ -1755,6 +1828,58 @@ mod tests {
             request["contents"][2]["parts"][0]["functionResponse"]["name"],
             "lookup"
         );
+    }
+
+    #[test]
+    fn fork_before_drops_the_chosen_message_and_after() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let store = SessionStore::create(&paths, &id).expect("store");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: "/work".into(),
+            })
+            .expect("workspace");
+        for (turn, text) in [(1, "one"), (2, "two"), (3, "three")] {
+            for event in [
+                SessionEvent::UserMessage { text: text.into() },
+                SessionEvent::TurnStarted { turn },
+                SessionEvent::AssistantMessage {
+                    turn,
+                    text: format!("A{turn}"),
+                },
+                SessionEvent::TurnFinished { turn },
+            ] {
+                store.append(event).expect("event");
+            }
+        }
+        drop(store);
+        let recorder = Recorder::open(&paths, &id).expect("open");
+        let listed = user_messages(&recorder).expect("messages");
+        assert_eq!(
+            listed,
+            vec![
+                (0, "one".to_owned()),
+                (1, "two".to_owned()),
+                (2, "three".to_owned())
+            ]
+        );
+        assert_eq!(turn_started_by(&recorder, 1).expect("turn"), Some(2));
+        assert_eq!(turn_started_by(&recorder, 5).expect("none"), None);
+        let fork = recorder.fork_before(&paths, 1).expect("fork");
+        let (forked, history) = load(&paths, &fork).expect("load the fork");
+        assert_eq!(
+            user_messages(&forked).expect("forked messages"),
+            vec![(0, "one".to_owned())]
+        );
+        assert_eq!(history.turns().len(), 2);
+        assert_eq!(user_messages(&recorder).expect("source").len(), 3);
+        assert!(recorder.fork_before(&paths, 3).is_err());
+        let first = Recorder::create(&paths, &SessionId::generate()).expect("create");
+        first.user_message("alone").expect("message");
+        let err = first.fork_before(&paths, 0).expect_err("first frame");
+        assert_eq!(err.message(), "nothing comes before the first message");
     }
 
     #[test]

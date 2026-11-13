@@ -2462,7 +2462,6 @@ impl SessionHost {
     }
 
     /// Whether a complete start checkpoint exists for `turn`.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn has_complete_checkpoint(&self, turn: u64) -> bool {
         self.checkpoints.as_ref().is_some_and(|checkpoints| {
             checkpoints
@@ -2473,7 +2472,6 @@ impl SessionHost {
     }
 
     /// Restores the workspace to its state before `turn`, or lists what that would change.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn restore_before_turn(
         &self,
         turn: u64,
@@ -5282,6 +5280,86 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             }
                         }
                     }
+                    Handled::Rewind => {
+                        let listed = session_log::user_messages(&lock_value(&recorder));
+                        let chosen = match listed {
+                            Err(err) => {
+                                note(format!("could not rewind: {}", error_note(&err)));
+                                None
+                            }
+                            Ok(messages) if messages.is_empty() => {
+                                note(NOTHING_TO_REWIND.to_owned());
+                                None
+                            }
+                            Ok(_) if !reader.is_active() => {
+                                note("rewinding needs a terminal to choose in".to_owned());
+                                None
+                            }
+                            Ok(messages) => {
+                                let files = |index: usize| {
+                                    if host.checkpoints.is_none() {
+                                        return RewindFiles::Unavailable;
+                                    }
+                                    match session_log::turn_started_by(
+                                        &lock_value(&recorder),
+                                        index,
+                                    ) {
+                                        Ok(Some(turn)) if host.has_complete_checkpoint(turn) => {
+                                            RewindFiles::Restorable(turn)
+                                        }
+                                        Ok(Some(turn)) => RewindFiles::Incomplete(turn),
+                                        _ => RewindFiles::Unavailable,
+                                    }
+                                };
+                                choose_rewind(reader, &host, &sink.stream, &messages, &files)?
+                            }
+                        };
+                        let chosen = match chosen {
+                            Some(choice) => match choice.files_turn {
+                                Some(turn) => {
+                                    restore_for_rewind(reader, &host, &sink.stream, turn)?
+                                        .then_some((choice.index, choice.text, choice.action))
+                                }
+                                None => Some((choice.index, choice.text, choice.action)),
+                            },
+                            None => None,
+                        };
+                        if let Some((index, text, action)) = chosen {
+                            host.hint_used(crate::hints::Hint::Rewind);
+                            let original = host.session_id_name();
+                            let forked = lock_value(&recorder)
+                                .fork_before(&config.paths, index)
+                                .map_err(|err| error_note(&err))
+                                .and_then(|id| open_saved(&config.paths, id.as_str()));
+                            match forked {
+                                Err(err) => note(format!("could not rewind: {err}")),
+                                Ok((key, loaded, resumed, state)) => {
+                                    loaded.set_workspace(&config.workspace)?;
+                                    let (_, results) = adopt_session(
+                                        &host,
+                                        &recorder,
+                                        &mut history,
+                                        &config.paths,
+                                        &key,
+                                        loaded,
+                                        resumed,
+                                        &state,
+                                    )?;
+                                    is_first_prompt = false;
+                                    if let Some(notice) = results {
+                                        note(format!("{notice}\n"));
+                                    }
+                                    match action {
+                                        RewindAction::Edit => reader.replace(&text),
+                                        RewindAction::Fork => reader.clear(),
+                                    }
+                                    note(format!(
+                                        "forked into session {key} before that message; /resume {original} returns"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     Handled::Undo => return Ok(Step::Restore(RestoreAsk::Undo)),
                     Handled::UndoConfirm => return Ok(Step::Restore(RestoreAsk::UndoConfirm)),
                     Handled::Redo => return Ok(Step::Restore(RestoreAsk::Redo)),
@@ -5393,53 +5471,19 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                             Some(id) if id == previous => note(format!("already in session {id}")),
                             Some(id) => match open_saved(&config.paths, &id) {
                                 Err(err) => note(err),
-                                Ok((key, loaded, mut resumed, state)) => {
-                                    *recorder
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        loaded;
-                                    resumed.freeze_pins();
-                                    let results = attach_results(&mut resumed, &config.paths, &key);
-                                    history = resumed;
-                                    let entries = resumed_entries(&history, &state);
-                                    *lock_value(&host.last_failed) = interrupted_prompt(&state)
-                                        .map(|text| (text, Recovery::None));
-                                    *lock_value(&host.results) =
-                                        Some(history.result_store().clone());
-                                    host.transcript_history_len
-                                        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
-                                    host.transcript
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .clone_from(&entries);
-                                    *host
-                                        .totals
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Totals::from_saved(&state);
-                                    host.set_session_id(key.as_str());
+                                Ok((key, loaded, resumed, state)) => {
+                                    let (entries, results) = adopt_session(
+                                        &host,
+                                        &recorder,
+                                        &mut history,
+                                        &config.paths,
+                                        &key,
+                                        loaded,
+                                        resumed,
+                                        &state,
+                                    )?;
                                     // A resumed session keeps the title it was given.
                                     is_first_prompt = false;
-                                    // Approvals were given for the conversation left behind.
-                                    if let Ok(mut grants) = host.grants.lock() {
-                                        grants.clear();
-                                    }
-                                    let (used, source) = recorder
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .resumed_context();
-                                    host.forget_context();
-                                    if source.is_some() {
-                                        host.context_used
-                                            .store(used, std::sync::atomic::Ordering::Relaxed);
-                                        *host
-                                            .context_source
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                            source;
-                                    } else {
-                                        host.estimate_context(&history)?;
-                                    }
                                     // Replayed only where the opening of a resumed
                                     // session would replay it.
                                     if reader.is_active() || host.accessible {
@@ -5976,6 +6020,9 @@ pub fn run<R: BufRead, W: std::io::Write + Send + 'static>(
                 if tool_calls >= TRANSCRIPT_HINT_CALLS {
                     host.offer_hint(crate::hints::Hint::Transcript);
                 }
+                if lock_value(&recorder).current_turn() >= REWIND_HINT_TURNS {
+                    host.offer_hint(crate::hints::Hint::Rewind);
+                }
                 Ok(Step::Continue)
             }
             Input::Shell(command) => {
@@ -6276,6 +6323,7 @@ fn ends_warming(handled: &Handled) -> bool {
         Handled::Exit
             | Handled::NewSession
             | Handled::Resume(_)
+            | Handled::Rewind
             | Handled::SetModel(_)
             | Handled::PickModel
             | Handled::Compact
@@ -9118,6 +9166,8 @@ struct IdleGestures {
     cleared: Option<String>,
     /// A hint for the activity line.
     hint: Option<&'static str>,
+    /// When an Escape on an empty draft armed the rewind.
+    escape: Option<std::time::Instant>,
 }
 
 fn idle_key(
@@ -9131,6 +9181,9 @@ fn idle_key(
 ) -> Idle {
     if key != KeyAction::Cancel {
         gestures.interrupts.clear();
+    }
+    if key != KeyAction::Escape {
+        gestures.escape = None;
     }
     match key {
         KeyAction::Suspend
@@ -9166,7 +9219,24 @@ fn idle_key(
         // Escape only clears the line, keeping it for Up. A turn that ends
         // between two presses hands the second to this prompt, where leaving
         // would end the session the user only meant to stop a turn in.
+        // Two presses on an empty draft with no menu open rewind.
+        KeyAction::Escape if reader.line().is_empty() && rows.is_empty() => {
+            let armed = gestures
+                .escape
+                .take()
+                .is_some_and(|at| at.elapsed() <= rune_term::shell::ESCAPE_CANCEL_WINDOW);
+            *selected = 0;
+            if armed {
+                return Idle::Submit(Input::Command {
+                    name: "rewind".to_owned(),
+                    arguments: String::new(),
+                });
+            }
+            gestures.escape = Some(std::time::Instant::now());
+            Idle::Stay
+        }
         KeyAction::Escape => {
+            gestures.escape = None;
             if !reader.line().is_empty() {
                 gestures.cleared = Some(reader.expanded_line());
             }
@@ -12078,6 +12148,7 @@ const TIPS: &[&str] = &[
     "@ mentions a file; tab completes it",
     "tab queues a message while a turn runs; enter steers it",
     "ctrl-o opens the full transcript; / searches it",
+    "esc twice on an empty prompt rewinds to an earlier message",
     "shift-tab cycles ask, auto and plan",
     "! runs a shell command; # adds a note to AGENTS.md",
     "/copy code copies the last code block",
@@ -12274,8 +12345,9 @@ fn pick_index(
         match key {
             KeyAction::Suspend => suspend_session(host, out)?,
             KeyAction::Submit | KeyAction::Complete => {
-                if let Some(choice) = picker.selected() {
-                    return Ok(items.iter().position(|item| item == choice));
+                // By position, so two equal rows stay two choices.
+                if picker.selected().is_some() {
+                    return Ok(Some(picker.cursor()));
                 }
             }
             KeyAction::Interrupt | KeyAction::Cancel | KeyAction::Escape => return Ok(None),
@@ -12298,6 +12370,188 @@ fn pick_index(
             | KeyAction::Queue => {
                 picker.set_query(reader.line());
             }
+        }
+    }
+}
+
+/// What `/rewind` says when the session has no user message yet.
+const NOTHING_TO_REWIND: &str = "nothing to rewind yet";
+
+/// The turns after which the double Escape hint is offered.
+const REWIND_HINT_TURNS: u64 = 2;
+
+/// The title of the rewind picker.
+const REWIND_TITLE: &str = "rewind to before which message?";
+
+/// What to do at the message chosen to rewind to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RewindAction {
+    /// Put the message back in the draft.
+    Edit,
+    /// Leave the draft empty.
+    Fork,
+}
+
+/// The first line of `text`, at most `limit` characters, `…` when cut.
+fn first_line_cut(text: &str, limit: usize) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= limit {
+        return first.to_owned();
+    }
+    let mut cut: String = first.chars().take(limit).collect();
+    cut.push('…');
+    cut
+}
+
+/// Whether the files can be restored along with a rewind to a message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RewindFiles {
+    /// The session keeps no checkpoints, or the message started no turn.
+    Unavailable,
+    /// The turn the message started has a complete checkpoint.
+    Restorable(u64),
+    /// The turn's checkpoint is missing or incomplete.
+    Incomplete(u64),
+}
+
+/// The actions offered when only the conversation can go back.
+const REWIND_ACTIONS: [&str; 2] = ["edit and resend", "fork here"];
+
+/// The actions offered when the files can go back too.
+const REWIND_FILE_ACTIONS: [&str; 4] = [
+    "edit and resend (conversation only)",
+    "edit and resend (conversation and files)",
+    "fork here (conversation only)",
+    "fork here (conversation and files)",
+];
+
+/// What was chosen to rewind to.
+struct RewindChoice {
+    /// The message's index in log order.
+    index: usize,
+    /// Its text, as sent.
+    text: String,
+    /// What to do with the draft.
+    action: RewindAction,
+    /// The turn to restore the files to before, when they go back too.
+    files_turn: Option<u64>,
+}
+
+/// The action and whether the files go back too, for a row of the actions.
+const fn rewind_action(with_files_offered: bool, picked: usize) -> (RewindAction, bool) {
+    match (with_files_offered, picked) {
+        (_, 0) => (RewindAction::Edit, false),
+        (true, 1) => (RewindAction::Edit, true),
+        (false, _) | (true, 2) => (RewindAction::Fork, false),
+        (true, _) => (RewindAction::Fork, true),
+    }
+}
+
+/// Lists the user messages newest first, then what to do at the chosen one.
+/// Escape at the actions goes back to the messages; Escape there closes.
+/// Returns the message's index in log order, its text, the action and, when
+/// the files go back too, the turn to restore to before.
+fn choose_rewind(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    messages: &[(usize, String)],
+    files: &dyn Fn(usize) -> RewindFiles,
+) -> Result<Option<RewindChoice>> {
+    let newest_first: Vec<&(usize, String)> = messages.iter().rev().collect();
+    let rows: Vec<String> = newest_first
+        .iter()
+        .map(|(_, text)| first_line_cut(text, 60))
+        .collect();
+    loop {
+        reader.clear();
+        let Some(chosen) = pick_index(reader, host, out, REWIND_TITLE, &rows)? else {
+            reader.clear();
+            return Ok(None);
+        };
+        let Some(&&(index, ref text)) = newest_first.get(chosen) else {
+            reader.clear();
+            return Ok(None);
+        };
+        reader.clear();
+        let restorable = match files(index) {
+            RewindFiles::Restorable(turn) => Some(turn),
+            RewindFiles::Incomplete(turn) => {
+                host.commit_lines(&[format!(
+                    "the files cannot go back with it: {}",
+                    no_checkpoint(turn).message()
+                )]);
+                None
+            }
+            RewindFiles::Unavailable => None,
+        };
+        let actions: Vec<String> = if restorable.is_some() {
+            REWIND_FILE_ACTIONS.map(str::to_owned).to_vec()
+        } else {
+            REWIND_ACTIONS.map(str::to_owned).to_vec()
+        };
+        let title = first_line_cut(text, 40);
+        let Some(picked) = pick_index(reader, host, out, &title, &actions)? else {
+            continue;
+        };
+        reader.clear();
+        let (action, with_files) = rewind_action(restorable.is_some(), picked);
+        return Ok(Some(RewindChoice {
+            index,
+            text: text.clone(),
+            action,
+            files_turn: restorable.filter(|_| with_files),
+        }));
+    }
+}
+
+/// Shows what restoring the files to before `turn` would change and, when
+/// the user agrees, restores them. Returns whether the rewind goes ahead.
+fn restore_for_rewind(
+    reader: &mut rune_term::input::KeyReader,
+    host: &SessionHost,
+    out: &LiveSink,
+    turn: u64,
+) -> Result<bool> {
+    use crate::checkpoint::RestoreReport;
+    let changes = match host.restore_before_turn(turn, true, false) {
+        Ok(RestoreReport::Done(changes)) => changes,
+        Ok(RestoreReport::OutsideChanges(changes)) => {
+            host.commit_lines(&outside_change_lines(&changes));
+            return Ok(false);
+        }
+        Err(err) => {
+            host.commit_lines(&error_lines(&err));
+            return Ok(false);
+        }
+    };
+    if changes.is_empty() {
+        host.commit_lines(&["no files changed since that message".to_owned()]);
+        return Ok(true);
+    }
+    let mut preview = vec![format!("restoring to before turn {turn} would change")];
+    preview.extend(changes.iter().map(crate::checkpoint::FileChange::line));
+    host.commit_lines(&preview);
+    if !confirm_choice(
+        reader,
+        host,
+        out,
+        "restore these files to before that message?",
+    )? {
+        return Ok(false);
+    }
+    match host.restore_before_turn(turn, false, false) {
+        Ok(RestoreReport::Done(_)) => {
+            host.commit_lines(&[format!("restored the workspace to before turn {turn}")]);
+            Ok(true)
+        }
+        Ok(RestoreReport::OutsideChanges(changes)) => {
+            host.commit_lines(&outside_change_lines(&changes));
+            Ok(false)
+        }
+        Err(err) => {
+            host.commit_lines(&error_lines(&err));
+            Ok(false)
         }
     }
 }
@@ -12713,6 +12967,8 @@ enum Handled {
     Permissions(Option<String>),
     /// Copy this conversation into a new session and continue in the copy.
     Fork,
+    /// Fork to before an earlier user message, chosen in a picker.
+    Rewind,
     /// Enter plan mode, optionally with a task for the composer, or leave it.
     Plan(Option<String>),
     /// Show the spend limit, or set it in dollars, or turn it off.
@@ -13145,6 +13401,48 @@ fn open_saved(
     Ok((id, recorder, history, state))
 }
 
+/// Makes a saved session the live one: the recorder, history, transcript,
+/// totals, id and context reading all come from it, and approvals given for
+/// the conversation left behind are dropped. Returns its transcript entries
+/// and the notice about stored results that could not be attached.
+#[allow(clippy::too_many_arguments)]
+fn adopt_session(
+    host: &SessionHost,
+    recorder: &Mutex<Recorder>,
+    history: &mut History,
+    paths: &Paths,
+    key: &SessionId,
+    loaded: Recorder,
+    mut resumed: History,
+    state: &rune_session::store::SessionState,
+) -> Result<(Vec<Entry>, Option<String>)> {
+    *lock_value(recorder) = loaded;
+    resumed.freeze_pins();
+    let results = attach_results(&mut resumed, paths, key);
+    *history = resumed;
+    let entries = resumed_entries(history, state);
+    *lock_value(&host.last_failed) = interrupted_prompt(state).map(|text| (text, Recovery::None));
+    *lock_value(&host.results) = Some(history.result_store().clone());
+    host.transcript_history_len
+        .store(history.len(), std::sync::atomic::Ordering::Relaxed);
+    lock_value(&host.transcript).clone_from(&entries);
+    *lock_value(&host.totals) = Totals::from_saved(state);
+    host.set_session_id(key.as_str());
+    if let Ok(mut grants) = host.grants.lock() {
+        grants.clear();
+    }
+    let (used, source) = lock_value(recorder).resumed_context();
+    host.forget_context();
+    if source.is_some() {
+        host.context_used
+            .store(used, std::sync::atomic::Ordering::Relaxed);
+        *lock_value(&host.context_source) = source;
+    } else {
+        host.estimate_context(history)?;
+    }
+    Ok((entries, results))
+}
+
 /// What the input loop does after handling one line.
 enum Step {
     /// Carry on reading input.
@@ -13254,6 +13552,7 @@ fn handle_command<W: std::io::Write>(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
         "fork" => Ok(Handled::Fork),
+        "rewind" => Ok(Handled::Rewind),
         "permissions" => Ok(Handled::Permissions(
             (!arguments.trim().is_empty()).then(|| arguments.trim().to_owned()),
         )),
@@ -17251,6 +17550,75 @@ mod tests {
         assert_eq!(reader.line(), "");
         assert_eq!(gestures.cleared.as_deref(), Some("draft one"));
         assert_eq!(gestures.hint, None);
+    }
+
+    #[test]
+    fn a_double_escape_on_an_empty_prompt_rewinds() {
+        let commands = command_candidates(&[]);
+        let mut reader = rune_term::input::KeyReader::new();
+        let mut selected = 0;
+        let mut press =
+            |key, reader: &mut rune_term::input::KeyReader, gestures: &mut IdleGestures| {
+                idle_key(&commands, key, reader, &mut selected, &[], &[], gestures)
+            };
+        let mut gestures = IdleGestures::default();
+        assert!(matches!(
+            press(KeyAction::Escape, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+        assert!(matches!(
+            press(KeyAction::Escape, &mut reader, &mut gestures),
+            Idle::Submit(Input::Command { name, arguments }) if name == "rewind" && arguments.is_empty()
+        ));
+
+        // The first press must find the draft empty: clearing a draft does not arm.
+        let mut gestures = IdleGestures::default();
+        reader.replace("draft");
+        press(KeyAction::Escape, &mut reader, &mut gestures);
+        assert_eq!(gestures.cleared.as_deref(), Some("draft"));
+        press(KeyAction::Escape, &mut reader, &mut gestures);
+        assert!(matches!(
+            press(KeyAction::Escape, &mut reader, &mut gestures),
+            Idle::Submit(Input::Command { .. })
+        ));
+
+        // Another key between the presses disarms.
+        let mut gestures = IdleGestures::default();
+        press(KeyAction::Escape, &mut reader, &mut gestures);
+        press(KeyAction::Down, &mut reader, &mut gestures);
+        assert!(matches!(
+            press(KeyAction::Escape, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+
+        // A press after the window arms again.
+        let mut gestures = IdleGestures {
+            escape: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2)),
+            ..IdleGestures::default()
+        };
+        assert!(matches!(
+            press(KeyAction::Escape, &mut reader, &mut gestures),
+            Idle::Stay
+        ));
+        assert!(gestures.escape.is_some());
+    }
+
+    #[test]
+    fn rewind_actions_pair_conversation_and_files() {
+        assert_eq!(rewind_action(false, 0), (RewindAction::Edit, false));
+        assert_eq!(rewind_action(false, 1), (RewindAction::Fork, false));
+        assert_eq!(rewind_action(true, 0), (RewindAction::Edit, false));
+        assert_eq!(rewind_action(true, 1), (RewindAction::Edit, true));
+        assert_eq!(rewind_action(true, 2), (RewindAction::Fork, false));
+        assert_eq!(rewind_action(true, 3), (RewindAction::Fork, true));
+    }
+
+    #[test]
+    fn rewind_rows_keep_the_first_line_and_mark_a_cut() {
+        assert_eq!(first_line_cut("short\nsecond", 60), "short");
+        let long = "x".repeat(61);
+        assert_eq!(first_line_cut(&long, 60), format!("{}…", "x".repeat(60)));
+        assert_eq!(first_line_cut(&"y".repeat(60), 60), "y".repeat(60));
     }
 
     #[test]

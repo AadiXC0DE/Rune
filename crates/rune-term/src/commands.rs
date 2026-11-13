@@ -58,6 +58,11 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "branch this conversation and continue in the branch",
     },
     Builtin {
+        name: "rewind",
+        arguments: "",
+        summary: "go back to before an earlier message",
+    },
+    Builtin {
         name: "permissions",
         arguments: "[mode|delete <n>]",
         summary: "show the mode and saved rules, switch mode, or delete a saved rule",

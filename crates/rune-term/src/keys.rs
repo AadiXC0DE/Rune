@@ -199,7 +199,7 @@ pub const ACTIONS: &[ActionInfo] = &[
         "clear",
         Context::Editor,
         &["esc"],
-        "clear the draft; up brings it back",
+        "clear the draft; up brings it back; twice when empty rewinds",
     ),
     action(
         "history_search",
