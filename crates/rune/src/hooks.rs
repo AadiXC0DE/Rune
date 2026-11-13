@@ -1261,4 +1261,31 @@ mod tests {
         });
         assert!(started.elapsed() < Duration::from_secs(3));
     }
+
+    #[test]
+    fn context_update_and_hook_replies_never_panic() {
+        let seeds = [
+            r#"{"context": "the build is red; fix it first"}"#,
+            r#"{"decision": "deny", "reason": "not on a weekend"}"#,
+            r#"{"decision": "continue", "message": "run the tests again"}"#,
+            r#"{"decision": "rewrite", "arguments": {"command": "ls -la"}}"#,
+            r#"{"append": "note", "replace": null}"#,
+        ];
+        let mut garble =
+            rune_testkit::garble::Garble::new("context_update_and_hook_replies_never_panic");
+        let mut parsed = 0_usize;
+        for seed in seeds {
+            for variant in garble.variants(seed, 5_000) {
+                let Ok(reply) = serde_json::from_slice::<Value>(variant.as_bytes()) else {
+                    continue;
+                };
+                parsed += 1;
+                let _ = parse_user_prompt(Some(reply.clone()));
+                let _ = parse_turn_end(Some(reply.clone()));
+                let _ = serde_json::from_value::<PreToolReply>(reply.clone());
+                let _ = serde_json::from_value::<PostToolReply>(reply);
+            }
+        }
+        assert!(parsed > 500, "only {parsed} variants parsed as JSON");
+    }
 }

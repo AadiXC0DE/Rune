@@ -812,6 +812,27 @@ mod tests {
         assert_eq!(std::fs::read(&target).expect("read"), b"alpha\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_refuses_a_symlinked_parent() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = seed(&outside, "config.txt", "alpha\n");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).expect("symlink");
+        let err = EditFile
+            .call(
+                &json!({
+                    "path": "linked/config.txt",
+                    "old_string": "alpha",
+                    "new_string": "beta"
+                }),
+                &context,
+            )
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"alpha\n");
+    }
+
     #[test]
     fn a_missing_file_is_refused() {
         let (_dir, context) = workspace();

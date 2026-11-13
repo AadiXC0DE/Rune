@@ -9,6 +9,7 @@
 // input is a defect.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+pub mod garble;
 pub mod mock;
 pub mod scenario;
 pub mod scripted;

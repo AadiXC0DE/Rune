@@ -349,6 +349,32 @@ mod tests {
     }
 
     #[test]
+    fn write_file_refuses_a_parent_escape() {
+        let (dir, context) = workspace();
+        let err = WriteFile
+            .call(&json!({ "path": "../x", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        let parent = dir.path().parent().expect("parent");
+        assert!(!parent.join("x").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_a_symlink_out() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = outside.path().join("target.txt");
+        std::fs::write(&target, "outside\n").expect("target");
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.txt")).expect("symlink");
+        let err = WriteFile
+            .call(&json!({ "path": "linked.txt", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"outside\n");
+    }
+
+    #[test]
     fn the_permission_target_is_the_supplied_path() {
         let target = WriteFile.permission_target(&json!({ "path": "src/lib.rs" }));
         assert_eq!(target.as_deref(), Some("src/lib.rs"));

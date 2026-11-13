@@ -1860,6 +1860,33 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_refuses_paths_outside_the_workspace() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let absolute = outside.path().join("absolute.txt");
+        std::fs::write(&absolute, "keep\n").expect("seed");
+        let absolute = absolute.to_str().expect("utf8").to_owned();
+        let escape = format!("rune-patch-escape-{}", std::process::id());
+        for patch in [
+            format!("*** Begin Patch\n*** Add File: ../../{escape}\n+x\n*** End Patch"),
+            format!("*** Begin Patch\n*** Add File: {absolute}.new\n+x\n*** End Patch"),
+            format!("*** Begin Patch\n*** Update File: {absolute}\n-keep\n+changed\n*** End Patch"),
+            format!("*** Begin Patch\n*** Delete File: {absolute}\n*** End Patch"),
+        ] {
+            let error = call(&context, &patch).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace, "{patch}");
+        }
+        assert_eq!(std::fs::read_to_string(&absolute).expect("read"), "keep\n");
+        assert!(!std::path::Path::new(&format!("{absolute}.new")).exists());
+        let grandparent = dir
+            .path()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("up");
+        assert!(!grandparent.join(&escape).exists());
+    }
+
+    #[test]
     fn quoting_follows_the_context() {
         let (dir, context) = workspace();
         seed(
@@ -1965,5 +1992,20 @@ mod tests {
         }
         assert_eq!(intercept("apply_patch_tool <<'EOF'\nx\nEOF"), None);
         assert_eq!(intercept("cd a; apply_patch <<'EOF'\nx\nEOF"), None);
+    }
+
+    #[test]
+    fn apply_patch_parse_never_panics() {
+        let seeds = [
+            "*** Begin Patch\n*** Add File: notes/a.txt\n+first\n+second\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn main\n-old line\n+new line\n context\n*** End Patch\n",
+            "*** Begin Patch\n*** Delete File: old.txt\n*** Update File: a.rs\n*** Move to: b.rs\n@@\n-x\n+y\n*** End of File\n*** End Patch\n",
+        ];
+        let mut garble = rune_testkit::garble::Garble::new("apply_patch_parse_never_panics");
+        for seed in seeds {
+            for variant in garble.variants(seed, 5_000) {
+                let _ = parse(&variant);
+            }
+        }
     }
 }

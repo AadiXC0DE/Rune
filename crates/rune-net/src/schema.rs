@@ -310,4 +310,32 @@ mod tests {
             assert!(matches!(sanitize(&schema, rules, strict), Cow::Borrowed(_)));
         }
     }
+
+    #[test]
+    fn schema_sanitize_never_panics() {
+        let seeds = [
+            r#"{"type": "object", "properties": {"path": {"type": "string"}, "lines": {"type": ["integer", "null"], "minimum": 1}}, "required": ["path"]}"#,
+            r##"{"type": "object", "$defs": {"item": {"type": "string", "enum": ["a", "b"]}}, "properties": {"items": {"type": "array", "items": {"$ref": "#/$defs/item"}}, "choice": {"anyOf": [{"type": "string"}, {"type": "number"}]}}}"##,
+        ];
+        let mut garble = rune_testkit::garble::Garble::new("schema_sanitize_never_panics");
+        let mut parsed = 0_usize;
+        for seed in seeds {
+            for variant in garble.variants(seed, 5_000) {
+                let Ok(schema) = serde_json::from_str::<Value>(&variant) else {
+                    continue;
+                };
+                parsed += 1;
+                for rules in [
+                    SchemaRules::Plain,
+                    SchemaRules::Gemini,
+                    SchemaRules::Moonshot,
+                ] {
+                    for strict in [false, true] {
+                        let _ = sanitize(&schema, rules, strict);
+                    }
+                }
+            }
+        }
+        assert!(parsed > 500, "only {parsed} variants parsed as JSON");
+    }
 }

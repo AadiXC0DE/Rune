@@ -839,4 +839,33 @@ mod tests {
             Some("[note: there is no tool named `Shell`; this ran as `shell`.]")
         );
     }
+
+    #[test]
+    fn repair_resolve_never_panics() {
+        let offered = offered();
+        let seeds = [
+            (
+                "read_file",
+                r#"{"path": "src/main.rs", "start_line": 3, "line_count": 20}"#,
+            ),
+            (
+                "shell",
+                r#"{"action": "run", "command": "cargo test -p rune"}"#,
+            ),
+            (
+                "edit_file",
+                r#"{"path": "a.txt", "old": "one", "new": "two"}"#,
+            ),
+            ("ReadFile", r#"{"file_path": "x", "offset": "4"}"#),
+        ];
+        let mut garble = rune_testkit::garble::Garble::new("repair_resolve_never_panics");
+        for (name, arguments) in seeds {
+            for variant in garble.variants(arguments, 5_000) {
+                let _ = resolve(name, &variant, &offered);
+            }
+            for variant in garble.variants(name, 200) {
+                let _ = resolve(&variant, arguments, &offered);
+            }
+        }
+    }
 }

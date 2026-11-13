@@ -400,6 +400,24 @@ mod tests {
         )
         .expect("a stored login");
         assert_eq!(stored.token().as_deref(), Some("access-1"));
+        // Every token and login file is the user's alone.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut files = 0;
+            for entry in std::fs::read_dir(&directory).expect("token directory") {
+                let entry = entry.expect("entry");
+                let mode = entry.metadata().expect("metadata").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", entry.path().display());
+                files += 1;
+            }
+            assert!(files > 0);
+            let mode = std::fs::metadata(&directory)
+                .expect("directory")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
 
         // Requests carry the stored token; a later 401 costs exactly one refresh.
         let client = rune_context::mcp::Client::new(&rune_core::budget::BudgetSet::new());

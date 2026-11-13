@@ -1331,6 +1331,33 @@ mod tests {
     }
 
     #[test]
+    fn cache_roots_never_include_credential_paths() {
+        // Every entry exists, as a directory, so only the protection refuses it.
+        let directories: Vec<&str> = CREDENTIAL_PATHS
+            .iter()
+            .copied()
+            .chain([".ssh/keys", ".config/rune/cache", ".cache"])
+            .collect();
+        let (_dir, home) = home_with(&directories);
+        let configured: Vec<String> = CREDENTIAL_PATHS
+            .iter()
+            .map(|path| format!("~/{path}"))
+            .chain(["~/.ssh/keys".to_owned(), "~/.config/rune/cache".to_owned()])
+            .collect();
+        let variables =
+            |name: &str| (name == "UV_CACHE_DIR").then(|| home.join(".aws").to_string());
+        let (roots, _) = cache_roots(Some(&configured), Some(&home), &no_variables);
+        assert!(roots.is_empty(), "{roots:?}");
+        let (defaults, _) = cache_roots(None, Some(&home), &variables);
+        assert!(
+            defaults.iter().all(|root| !CREDENTIAL_PATHS
+                .iter()
+                .any(|path| root.path.starts_with(home.join(path)))),
+            "{defaults:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_cache_root_list_allows_none() {
         let (_dir, home) = home_with(&[".cache"]);
         let (roots, refused) = cache_roots(Some(&[]), Some(&home), &no_variables);
@@ -1391,6 +1418,35 @@ mod tests {
             profile.contains(&format!("(allow file-write* (subpath \"{resolved}\"))")),
             "{profile}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_escapes_quotes_in_paths() {
+        let (_dir, dir) = tempdir();
+        // A quote would end the operand early and let the rest of the path
+        // become profile text, so a profile is refused rather than written.
+        let quoted = dir.join("work\") (allow file-write* (subpath \"/");
+        std::fs::create_dir(&quoted).expect("quoted workspace");
+        let policy = SandboxPolicy::new(quoted, Vec::new(), false);
+        let error = MacSandbox::profile(&policy).expect_err("refused");
+        assert!(
+            error
+                .message()
+                .contains("holds a character a sandbox profile cannot carry"),
+            "{error}"
+        );
+        // A parenthesis stays inside the quoted operand.
+        let parens = dir.join("work (copy))");
+        std::fs::create_dir(&parens).expect("workspace");
+        let profile = MacSandbox::profile(&SandboxPolicy::new(parens.clone(), Vec::new(), false))
+            .expect("profile");
+        let resolved = parens.canonicalize_utf8().expect("canonical");
+        assert!(
+            profile.contains(&format!("(subpath \"{resolved}\")")),
+            "{profile}"
+        );
+        assert!(!profile.contains("(subpath \"/\")"), "{profile}");
     }
 
     #[cfg(target_os = "linux")]

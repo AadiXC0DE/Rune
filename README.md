@@ -1401,6 +1401,8 @@ links in the existing CI fast job.
 Early development, and usable for a real session. The command surface,
 configuration, agent loop, tools, permissions, sessions, and terminal interface
 are in place. See [CHANGELOG.md](CHANGELOG.md) for what has landed.
+[SECURITY.md](SECURITY.md) says what the sandbox and the permission rules
+defend against, what they do not, and how to report a problem.
 
 ## Contributing
 
