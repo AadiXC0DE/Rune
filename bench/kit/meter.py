@@ -212,6 +212,12 @@ class State:
         self.counter = 0
         self.closed = False
         self.log = open(args.log, "a", encoding="utf-8")
+        self.set_headers = []
+        for entry in args.set_header:
+            name, sep, value = entry.partition("=")
+            if not sep or not name.strip():
+                raise SystemExit("meter: --set-header takes NAME=VALUE, not %r" % entry)
+            self.set_headers.append((name.strip().lower(), value))
 
     def cap_reached(self):
         with self.lock:
@@ -398,6 +404,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path_out = target.path.rstrip("/") + path_out
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_REQUEST_HEADERS}
+        for name, value in st.set_headers:
+            for existing in [k for k in headers if k.lower() == name]:
+                del headers[existing]
+            headers[name] = value
         headers["host"] = target.netloc
         headers["accept-encoding"] = "identity"
         if body or self.command in ("POST", "PUT", "PATCH"):
@@ -491,6 +501,10 @@ def build_parser():
     parser.add_argument("--record")
     parser.add_argument("--label", action="append", default=[])
     parser.add_argument("--key-env")
+    # A header set on every forwarded request, replacing any the client sent,
+    # so every harness reaches the upstream the same way (OpenCode Go routes
+    # and caches by `x-opencode-session`, and refuses a request without it).
+    parser.add_argument("--set-header", action="append", default=[], metavar="NAME=VALUE")
     return parser
 
 

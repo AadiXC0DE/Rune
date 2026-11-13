@@ -30,6 +30,8 @@ FAIRNESS = [
     "No harness is given the verify command or the hidden tests.",
     "Codex needs the Responses API and is skipped against Chat Completions-only upstreams.",
     "Tokens and cost come from the meter, never from a harness's own report.",
+    "With a session header, the meter sets it to a fresh random value for every run, so no run "
+    "shares a provider session or cache with another run or harness.",
 ]
 
 

@@ -116,3 +116,7 @@ These are copied into the header of every report.
 - No harness is given the verify command or the hidden tests.
 - Codex needs the Responses API and is skipped against Chat Completions-only upstreams.
 - Tokens and cost come from the meter, never from a harness's own report.
+- With `--session-header NAME`, the meter sets that header on every request of a run to a fresh
+  random value, replacing any the harness sent. OpenCode Go needs `x-opencode-session` and routes
+  and caches by it, so every harness reaches it the same way and no run shares a cache with
+  another run or harness.

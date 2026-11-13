@@ -183,6 +183,7 @@ def build_parser():
     p.add_argument("--model")
     p.add_argument("--upstream")
     p.add_argument("--key-env")
+    p.add_argument("--session-header")
     p.add_argument("--out")
     p.add_argument("--only")
     p.add_argument("--max-cost", type=float)
@@ -216,8 +217,8 @@ def main(argv=None):
         return 2
 
     run_args = run.build_parser().parse_args(["--tasks", args.tasks])
-    for key in ("split", "trials", "model", "upstream", "key_env", "out", "only", "max_cost",
-                "jobs", "rune_bin", "resume", "dry_run"):
+    for key in ("split", "trials", "model", "upstream", "key_env", "session_header", "out",
+                "only", "max_cost", "jobs", "rune_bin", "resume", "dry_run"):
         setattr(run_args, key, getattr(args, key))
     adapters = run.Adapters([])
     base = adapters.load("rune")

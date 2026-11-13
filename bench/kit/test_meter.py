@@ -103,6 +103,13 @@ class MeterTests(MeterCase):
         self.via_meter("POST", "/anthropic/v1/messages", {"model": "m", "stream": True})
         self.assertEqual(self.last()["path"], "/v1/messages")
 
+    def test_a_set_header_replaces_the_clients_on_every_request(self):
+        self.start("--set-header", "x-opencode-session=run-1")
+        self.via_meter("POST", "/v1/chat/completions", CHAT, headers={"X-OpenCode-Session": "mine"})
+        self.assertEqual(self.last()["headers"]["x-opencode-session"], "run-1")
+        self.via_meter("POST", "/anthropic/v1/messages", {"model": "m", "stream": True})
+        self.assertEqual(self.last()["headers"]["x-opencode-session"], "run-1")
+
     def test_include_usage_is_added_only_when_missing(self):
         self.start()
         self.via_meter("POST", "/v1/chat/completions", CHAT)

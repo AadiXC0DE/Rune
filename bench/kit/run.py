@@ -18,6 +18,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import uuid
 import sys
 import tempfile
 import threading
@@ -112,6 +113,10 @@ class Runner:
             argv += ["--upstream-anthropic", a.upstream_anthropic]
         if a.key_env:
             argv += ["--key-env", a.key_env]
+        if a.session_header:
+            # A fresh value per run: no run shares a provider session, or its
+            # cache, with another run or another harness.
+            argv += ["--set-header", "%s=%s" % (a.session_header, uuid.uuid4().hex)]
         remaining = self.remaining_cost()
         if remaining is not None:
             argv += ["--max-cost", "%.10f" % remaining]
@@ -426,6 +431,8 @@ def build_parser():
     p.add_argument("--model")
     p.add_argument("--upstream")
     p.add_argument("--upstream-anthropic")
+    p.add_argument("--session-header",
+                   help="header the meter sets to a fresh value for every run, such as x-opencode-session")
     p.add_argument("--key-env")
     p.add_argument("--out")
     p.add_argument("--only")
@@ -554,7 +561,7 @@ def cmd_validate(argv):
     with tempfile.TemporaryDirectory(prefix="rune-kit-validate-") as out:
         args = argparse.Namespace(
             tasks=opts.tasks, trials=1, model="fake", upstream="http://127.0.0.1:%d" % server.server_address[1],
-            upstream_anthropic=None, key_env="RUNE_KIT_VALIDATE_KEY", out=out, timeout=None,
+            upstream_anthropic=None, session_header=None, key_env="RUNE_KIT_VALIDATE_KEY", out=out, timeout=None,
             max_cost=None, jobs=1, keep=False, rune_bin="", prices=str(HERE / "prices.json"),
             split="all", quiet=True, resume=False, dry_run=False,
         )
