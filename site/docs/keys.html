@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Key bindings · Rune</title>
+<meta name="description" content="Every action and the keys it has by default.">
+<link rel="canonical" href="https://rune.heyaadi.com/docs/keys.html">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="Rune home"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5" fill="none" stroke="#ffb454" stroke-width="3"/></svg> rune</a>
+    <nav>
+      <a href="index.html">documentation</a>
+      <a href="commands.html">commands</a>
+      <a href="configuration.html">configuration</a>
+      <a href="providers.html">providers</a>
+      <a href="keys.html" aria-current="page">key bindings</a>
+      <a href="troubleshooting.html">troubleshooting</a>
+      <a href="benchmarks.html">benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<h1>Key bindings</h1>
+<p>The keys each action has when the key file does not name it. <code>rune keys</code> lists the bindings in force.</p>
+<div class="table"><table>
+<thead><tr><th>Action</th><th>Where</th><th>Keys</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>submit</code></td><td>editor</td><td><code>enter</code></td><td>send the draft</td></tr>
+<tr><td><code>newline</code></td><td>editor</td><td><code>shift+enter</code>, <code>ctrl+j</code>, <code>alt+enter</code></td><td>insert a newline</td></tr>
+<tr><td><code>complete</code></td><td>editor</td><td><code>tab</code></td><td>complete a command, value or path</td></tr>
+<tr><td><code>queue</code></td><td>turn</td><td><code>tab</code></td><td>queue the draft for after this turn</td></tr>
+<tr><td><code>pull_queued</code></td><td>turn</td><td><code>alt+up</code></td><td>edit the newest queued message</td></tr>
+<tr><td><code>interrupt</code></td><td>turn</td><td><code>esc</code></td><td>stop the running turn; with text, press twice</td></tr>
+<tr><td><code>clear</code></td><td>editor</td><td><code>esc</code></td><td>clear the draft; up brings it back; twice when empty rewinds</td></tr>
+<tr><td><code>history_search</code></td><td>editor</td><td><code>ctrl+r</code></td><td>search earlier prompts</td></tr>
+<tr><td><code>transcript</code></td><td>editor</td><td><code>ctrl+o</code></td><td>open the transcript, or expand the paste at the caret</td></tr>
+<tr><td><code>external_editor</code></td><td>editor</td><td><code>ctrl+g</code></td><td>edit the draft in VISUAL, EDITOR, or vi</td></tr>
+<tr><td><code>mode_cycle</code></td><td>editor</td><td><code>shift+tab</code></td><td>cycle ask, auto and plan</td></tr>
+<tr><td><code>paste_image</code></td><td>editor</td><td><code>ctrl+v</code>, <code>alt+v</code></td><td>attach the image on the clipboard</td></tr>
+<tr><td><code>help</code></td><td>editor</td><td><code>?</code></td><td>show every key, on an empty draft</td></tr>
+<tr><td><code>toggle_plan</code></td><td>editor</td><td><code>ctrl+t</code></td><td>show or hide the plan above the prompt</td></tr>
+<tr><td><code>word_left</code></td><td>editor</td><td><code>alt+b</code>, <code>ctrl+b</code>, <code>alt+left</code></td><td>move one word left</td></tr>
+<tr><td><code>word_right</code></td><td>editor</td><td><code>alt+f</code>, <code>ctrl+f</code>, <code>alt+right</code></td><td>move one word right</td></tr>
+<tr><td><code>kill_word_back</code></td><td>editor</td><td><code>ctrl+w</code>, <code>alt+backspace</code></td><td>cut the word before the caret</td></tr>
+<tr><td><code>kill_word_forward</code></td><td>editor</td><td><code>alt+d</code></td><td>cut the word after the caret</td></tr>
+<tr><td><code>kill_to_line_end</code></td><td>editor</td><td><code>ctrl+k</code></td><td>cut to the end of the line</td></tr>
+<tr><td><code>kill_to_line_start</code></td><td>editor</td><td><code>ctrl+u</code></td><td>cut to the start of the line</td></tr>
+<tr><td><code>yank</code></td><td>editor</td><td><code>ctrl+y</code></td><td>insert the last cut text</td></tr>
+<tr><td><code>yank_pop</code></td><td>editor</td><td><code>alt+y</code></td><td>cycle earlier cuts after a yank</td></tr>
+<tr><td><code>undo</code></td><td>editor</td><td><code>ctrl+_</code>, <code>ctrl+7</code></td><td>undo a draft edit</td></tr>
+<tr><td><code>redo</code></td><td>editor</td><td><code>alt+r</code></td><td>redo a draft edit</td></tr>
+<tr><td><code>line_start</code></td><td>editor</td><td><code>home</code>, <code>ctrl+a</code></td><td>start of the line; again for the draft</td></tr>
+<tr><td><code>line_end</code></td><td>editor</td><td><code>end</code>, <code>ctrl+e</code></td><td>end of the line; again for the draft</td></tr>
+<tr><td><code>viewer_close</code></td><td>viewer</td><td><code>q</code>, <code>esc</code>, <code>ctrl+o</code>, <code>ctrl+d</code></td><td>close the transcript</td></tr>
+<tr><td><code>approve_once</code></td><td>approval</td><td><code>y</code></td><td>run the action once</td></tr>
+<tr><td><code>approve_session</code></td><td>approval</td><td><code>a</code></td><td>allow the action for this session</td></tr>
+<tr><td><code>approve_always</code></td><td>approval</td><td><code>p</code></td><td>always allow the action in this project</td></tr>
+<tr><td><code>deny</code></td><td>approval</td><td><code>n</code>, <code>esc</code></td><td>deny the action</td></tr>
+<tr><td><code>deny_with_message</code></td><td>approval</td><td><code>tab</code></td><td>deny and tell the model what to do instead</td></tr>
+<tr><td><code>viewer_search</code></td><td>viewer</td><td><code>/</code></td><td>search the transcript</td></tr>
+<tr><td><code>viewer_next</code></td><td>viewer</td><td><code>n</code></td><td>go to the next match</td></tr>
+<tr><td><code>viewer_previous</code></td><td>viewer</td><td><code>shift+n</code></td><td>go to the previous match</td></tr>
+<tr><td><code>viewer_expand</code></td><td>viewer</td><td><code>e</code></td><td>expand or collapse the selected entry</td></tr>
+<tr><td><code>viewer_expand_all</code></td><td>viewer</td><td><code>shift+e</code></td><td>expand every entry, or collapse them all</td></tr>
+<tr><td><code>viewer_pager</code></td><td>viewer</td><td><code>v</code></td><td>open the whole transcript in a pager</td></tr>
+</tbody>
+</table></div>
+</main>
+
+</body>
+</html>

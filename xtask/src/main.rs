@@ -10,6 +10,7 @@ use std::process::{Command, ExitCode};
 
 mod fixture;
 mod macos;
+mod site;
 mod windows;
 
 /// Serial runs per measurement, used for the minimum, median and p95.
@@ -111,6 +112,7 @@ fn main() -> ExitCode {
         "verify-release" => macos::verify_release(&extra),
         "benchmark" => benchmark(&extra),
         "web" => web(),
+        "site" => site(),
         "verify-web" => verify_web(&extra),
         "fixture" => fixture::run(&extra),
         "help" | "--help" | "-h" => {
@@ -152,7 +154,12 @@ fn print_help() {
     println!("  benchmark  print raw size and startup JSON for an existing executable");
     println!("  verify-release  check a signed macOS archive against a trusted identity");
     println!("  web      build the harness for the landing page into site/demo/rune.wasm");
-    println!("  verify-web  fail unless site/demo/rune.wasm matches a fresh build");
+    println!(
+        "  site     generate site/docs, llms.txt, llms-full.txt and the sitemap from the binary"
+    );
+    println!(
+        "  verify-web  fail unless the generated site and site/demo/rune.wasm match their sources"
+    );
     println!("  fixture  copy one traced provider exchange into a conformance fixture");
     println!();
     println!(
@@ -436,33 +443,25 @@ fn web_package_dirs(root: &Path) -> Result<Vec<String>, String> {
     Ok(dirs)
 }
 
-/// Fails unless the committed landing-page module is what the source builds.
-///
-/// An optional argument names the copy to check, so a caller can point at a
-/// copy outside the working tree.
-/// The scripts the site serves as byte copies of their source.
-const SITE_COPIES: &[(&str, &str)] = &[
-    ("scripts/install.sh", "site/install.sh"),
-    ("scripts/install.ps1", "site/install.ps1"),
-];
-
-/// Fails, naming the first, when a site copy differs from its source.
-fn verify_site_copies(root: &Path) -> Result<(), String> {
-    for (source, copy) in SITE_COPIES {
-        let read = |path: &str| {
-            std::fs::read(root.join(path)).map_err(|err| format!("could not read {path}: {err}"))
-        };
-        if read(source)? != read(copy)? {
-            return Err(format!(
-                "{copy} is stale; copy {source} to it and commit the result"
-            ));
-        }
-    }
+/// Generates the documentation pages and the files that list them.
+fn site() -> Result<(), String> {
+    let root = workspace_root()?;
+    let reference = site::reference_json(&root, &target_directory())?;
+    let files = site::generate(&root, &reference)?;
+    site::write(&root, &files)?;
+    println!("generated {} site files from the binary", files.len());
     Ok(())
 }
 
+/// Fails unless the generated site and the committed landing-page module
+/// match their sources.
+///
+/// An optional argument names the module copy to check, so a caller can point
+/// at a copy outside the working tree.
 fn verify_web(extra: &[String]) -> Result<(), String> {
-    verify_site_copies(&workspace_root()?)?;
+    let root = workspace_root()?;
+    let reference = site::reference_json(&root, &target_directory())?;
+    site::verify(&root, &site::generate(&root, &reference)?)?;
     let placed = match extra {
         [] => web_module_path()?,
         [path] => PathBuf::from(path),
@@ -1885,29 +1884,6 @@ mod tests {
         assert_eq!(perf_failures(rss * 126 / 100, cpu, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu * 1.26, frame).len(), 1);
         assert_eq!(perf_failures(rss, cpu, frame * 1.26).len(), 1);
-    }
-
-    #[test]
-    fn a_stale_site_copy_is_named() {
-        let root = std::env::temp_dir().join(format!("rune-site-copies-{}", std::process::id()));
-        for (source, copy) in SITE_COPIES {
-            for path in [source, copy] {
-                let path = root.join(path);
-                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-                std::fs::write(&path, "same\n").expect("write");
-            }
-        }
-        assert_eq!(verify_site_copies(&root), Ok(()));
-        std::fs::write(root.join("site/install.ps1"), "older\n").expect("write");
-        let stale = verify_site_copies(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(
-            stale,
-            Err(
-                "site/install.ps1 is stale; copy scripts/install.ps1 to it and commit the result"
-                    .to_owned()
-            )
-        );
     }
 
     #[test]

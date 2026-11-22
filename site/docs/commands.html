@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Commands · Rune</title>
+<meta name="description" content="Every command and flag the binary accepts.">
+<link rel="canonical" href="https://rune.heyaadi.com/docs/commands.html">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="Rune home"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5" fill="none" stroke="#ffb454" stroke-width="3"/></svg> rune</a>
+    <nav>
+      <a href="index.html">documentation</a>
+      <a href="commands.html" aria-current="page">commands</a>
+      <a href="configuration.html">configuration</a>
+      <a href="providers.html">providers</a>
+      <a href="keys.html">key bindings</a>
+      <a href="troubleshooting.html">troubleshooting</a>
+      <a href="benchmarks.html">benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<h1>Commands</h1>
+<p>Generated from the command table the parser reads, so every entry here is a command the binary accepts.</p>
+<h2>Global flags</h2>
+<p>Accepted anywhere on the command line.</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--model &lt;id&gt;</code></td><td>Override the model for this process.</td></tr>
+<tr><td><code>--provider &lt;name&gt;</code></td><td>Override the provider for this process. Run <code>rune connect</code> to list them.</td></tr>
+<tr><td><code>--effort &lt;level&gt;</code></td><td>Override the reasoning effort: auto, none, minimal, low, medium, high, xhigh, max.</td></tr>
+<tr><td><code>--fast</code></td><td>Request fast mode where the provider supports it.</td></tr>
+<tr><td><code>--no-fast</code></td><td>Disable fast mode for this process.</td></tr>
+<tr><td><code>--permission-mode &lt;mode&gt;</code></td><td>Override the permission mode: ask, auto, full-access.</td></tr>
+<tr><td><code>--limit &lt;name=value&gt;</code></td><td>Override one limit. Repeatable. Use off to disable a limit.</td></tr>
+<tr><td><code>--add-dir &lt;path&gt;</code></td><td>Add a workspace directory for this process. Repeatable.</td></tr>
+<tr><td><code>--no-additional-dirs</code></td><td>Ignore saved additional directories for this process.</td></tr>
+<tr><td><code>--offline</code></td><td>Refuse provider requests except to a model server on this machine, disable web tools, skip remote MCP checks and restrict sandboxed shell networking. Local MCP and unsandboxed commands can still use the network.</td></tr>
+<tr><td><code>--allow-unsandboxed</code></td><td>Run commands where the host has no sandbox backend. Without this, such a host refuses them. Also RUNE_ALLOW_UNSANDBOXED=1.</td></tr>
+<tr><td><code>--network</code></td><td>Let sandboxed shell commands use the network. --offline still wins.</td></tr>
+<tr><td><code>--json</code></td><td>Emit machine-readable output where supported.</td></tr>
+<tr><td><code>--accessible</code></td><td>Use append-only labelled session output and line input for screen readers.</td></tr>
+<tr><td><code>--ascii</code></td><td>Use ASCII terminal decorations, preserving message text.</td></tr>
+<tr><td><code>--theme &lt;name&gt;</code></td><td>Override the theme for this process.</td></tr>
+<tr><td><code>--provider-order &lt;a,b&gt;</code></td><td>Prefer these upstream providers in order.</td></tr>
+<tr><td><code>--provider-strict</code></td><td>Restrict requests to the listed providers.</td></tr>
+<tr><td><code>--trace &lt;dir&gt;</code></td><td>Write each provider request and response, redacted, to this directory.</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help.</td></tr>
+<tr><td><code>-v, --version</code></td><td>Print the version.</td></tr>
+</tbody>
+</table></div>
+<h2>Run</h2>
+<h3><code>rune resume [last|id]</code></h3>
+<p>Resume a saved session, defaulting to the latest in this workspace</p>
+<h3><code>rune ask [flags] &lt;prompt&gt;</code></h3>
+<p>Run one bounded turn without an interactive session</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Print one JSON object instead of Markdown.</td></tr>
+<tr><td><code>--jsonl</code></td><td>Stream bounded JSONL events (takes precedence over --json); the records are listed in the README under Headless runs.</td></tr>
+<tr><td><code>--no-save</code></td><td>Do not create a session.</td></tr>
+<tr><td><code>--checkpoints</code></td><td>Snapshot the workspace before and after the turn so it can be restored with rune session restore.</td></tr>
+<tr><td><code>--image &lt;path&gt;</code></td><td>Attach a PNG, JPEG, GIF, or WebP file. Repeatable; 8 MiB total, at most 16 images.</td></tr>
+<tr><td><code>--max-steps &lt;n&gt;</code></td><td>Stop after this many model steps; the last one answers without tools. 0 means no limit.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Stop the run after this many seconds and report what it did.</td></tr>
+<tr><td><code>--max-cost &lt;usd&gt;</code></td><td>Stop the run once its estimated cost reaches this many dollars.</td></tr>
+<tr><td><code>--goal &lt;objective&gt;</code></td><td>Work toward this objective; it is added to the instructions.</td></tr>
+<tr><td><code>--judge</code></td><td>With --goal, check the result against the objective before finishing.</td></tr>
+<tr><td><code>--context-report</code></td><td>Add a context object to the JSON result: the last request&#39;s estimated tokens by part.</td></tr>
+</tbody>
+</table></div>
+<pre>Exit status:
+  0    the model finished (stop_reason end_turn)
+  1    the run failed: provider_error, refused, content_filter, stalled, or an error before the first request
+  3    a limit ended the run and its output is usable: max_model_turns, max_output_tokens, time_limit, spend_limit, objective_token_budget
+  130  interrupted by SIGINT
+  143  stopped by SIGTERM or SIGHUP</pre>
+<h3><code>rune acp [--log-file &lt;path&gt;]</code></h3>
+<p>Serve the Agent Client Protocol over standard input and output</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--log-file &lt;path&gt;</code></td><td>Write diagnostics to this file.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune review [context]</code></h3>
+<p>Review the pending changes in the workspace</p>
+<ul>
+  <li><code>pr</code>: Same as <code>rune review</code>; reviews pending workspace changes with optional context.</li>
+  <li><code>issue</code>: Same as <code>rune review</code>; reviews pending workspace changes with optional context.</li>
+</ul>
+<h3><code>rune bench &lt;tasks-dir&gt; [--only &lt;ids&gt;] [--trials &lt;n&gt;] [--split &lt;name&gt;] [--jobs &lt;n&gt;] [--logs &lt;dir&gt;] [--json]</code></h3>
+<p>Measure the configured model and harness on coding tasks</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--only &lt;ids&gt;</code></td><td>Run only these comma-separated task identifiers.</td></tr>
+<tr><td><code>--trials &lt;n&gt;</code></td><td>Run each task this many times, 1 to 20.</td></tr>
+<tr><td><code>--split &lt;name&gt;</code></td><td>Run only tasks of this split: dev, heldout or all.</td></tr>
+<tr><td><code>--jobs &lt;n&gt;</code></td><td>Run this many tasks at once, 1 to 16.</td></tr>
+<tr><td><code>--logs &lt;dir&gt;</code></td><td>Keep each run&#39;s stderr and JSON report in this directory.</td></tr>
+<tr><td><code>--json</code></td><td>Print one JSON object with every run and the summary.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune connect [&lt;name&gt;] [--json]</code></h3>
+<p>Connect a model provider, choosing from a list</p>
+<ul>
+  <li><code>login</code>: Same as <code>rune connect</code>; connects a provider, choosing from a list when no name is given.</li>
+  <li><code>setup</code>: Same as <code>rune connect</code>; connects a provider, choosing from a list when no name is given.</li>
+  <li><code>provider</code>: Same as <code>rune connect</code>; connects a provider, choosing from a list when no name is given.</li>
+</ul>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h2>Sessions and local records</h2>
+<h3><code>rune sessions [--all] [--search &lt;text&gt;] [--limit &lt;n&gt;] [--cursor &lt;c&gt;] | rune sessions prune --older-than &lt;days&gt; [--keep &lt;n&gt;] [--dry-run] [--json]</code></h3>
+<p>List sessions</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--all</code></td><td>Include sessions from every workspace.</td></tr>
+<tr><td><code>--older-than &lt;days&gt;</code></td><td>With prune: remove sessions last updated more than this many days ago.</td></tr>
+<tr><td><code>--keep &lt;n&gt;</code></td><td>With prune: never remove the n most recently updated sessions.</td></tr>
+<tr><td><code>--dry-run</code></td><td>With prune: list what would be removed and remove nothing.</td></tr>
+<tr><td><code>--search &lt;text&gt;</code></td><td>Match a case-insensitive literal fragment in titles or user messages.</td></tr>
+<tr><td><code>--limit &lt;n&gt;</code></td><td>Page size, 1 to 100.</td></tr>
+<tr><td><code>--cursor &lt;c&gt;</code></td><td>Continue from a previous page.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune session &lt;last|id&gt; [--search &lt;text&gt; | --record &lt;id|all&gt;] [--json] | rune session --id &lt;id&gt; [--search &lt;text&gt; | --record &lt;id|all&gt;] [--json] | rune session export &lt;last|id&gt; | rune session export --id &lt;id&gt; | rune session fork &lt;last|id&gt; --at &lt;seq&gt; [--json] | rune session fork --id &lt;id&gt; --at &lt;seq&gt; [--json] | rune session migrate &lt;id&gt; | rune session recover &lt;id&gt; | rune session restore &lt;last|id&gt; --turn &lt;n&gt; [--dry-run] [--force] [--json]</code></h3>
+<p>Inspect, search, export, fork, migrate, or recover one session</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--id &lt;id&gt;</code></td><td>Inspect, search, export, or fork this exact session identifier, taking precedence over a positional selector.</td></tr>
+<tr><td><code>--at &lt;seq&gt;</code></td><td>Fork through this inclusive saved event sequence. All tool calls must have results.</td></tr>
+<tr><td><code>--search &lt;text&gt;</code></td><td>Search saved message, tool, and summary records, including compacted context, by a case-insensitive literal fragment. Return original records and sequence positions.</td></tr>
+<tr><td><code>--allow-large</code></td><td>Permit migrating an oversized session.</td></tr>
+<tr><td><code>--turn &lt;n&gt;</code></td><td>Restore the workspace to its state before this turn.</td></tr>
+<tr><td><code>--dry-run</code></td><td>List the files a restore would change and change nothing.</td></tr>
+<tr><td><code>--force</code></td><td>Restore even when files changed outside the session since its last checkpoint.</td></tr>
+<tr><td><code>--record &lt;id|all&gt;</code></td><td>Retrieve exact original messages archived by manual compaction. IDs are stable within the session; all lists every archived record.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON. Export always emits ordered JSONL event records.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune tree [last|id] [--json] | rune tree --id &lt;id&gt; [--json]</code></h3>
+<p>Show the branch structure of a session</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--id &lt;id&gt;</code></td><td>Show the tree of this exact session identifier, taking precedence over a positional selector.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune usage [--period &lt;24h|7d|30d&gt;] [--json] | rune usage export [--period &lt;24h|7d|30d&gt;]</code></h3>
+<p>Report or export token usage recorded on this machine</p>
+<ul>
+  <li><code>cost</code>: Same as <code>rune usage</code>; reports token usage recorded on this machine.</li>
+</ul>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--period &lt;span&gt;</code></td><td>One of 24h, 7d, or 30d. Export defaults to all retained records.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON. Export always emits ordered JSONL usage records.</td></tr>
+</tbody>
+</table></div>
+<h2>Account and configuration</h2>
+<h3><code>rune auth [status|logout] [--json]</code></h3>
+<p>Show or manage stored credentials</p>
+<ul>
+  <li><code>logout</code>: Same as <code>rune auth</code>; without an action, shows connection status. Use <code>rune auth logout</code> to remove the stored credential.</li>
+</ul>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune capabilities [--require-images] [--require-tool-streaming] [--json]</code></h3>
+<p>Check provider capabilities and context provenance before a turn</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--require-images</code></td><td>Require image content support in the dialect.</td></tr>
+<tr><td><code>--require-tool-streaming</code></td><td>Require incremental tool argument streaming.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune models [--refresh] [--explain [&lt;model&gt;]] [--json]</code></h3>
+<p>List the models of the connected provider</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--refresh</code></td><td>Download the published model catalog now.</td></tr>
+<tr><td><code>--explain</code></td><td>Show how requests to this model are shaped, and why.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune mcp list | check [server] | login &lt;server&gt; | logout &lt;server&gt; | import claude-desktop &lt;file&gt;</code></h3>
+<p>Manage MCP servers: mcp list, mcp check, mcp login, mcp logout, mcp import</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON diagnostics without secrets. Import always emits full configuration JSON; save it as <code>.mcp.json</code> at the workspace root.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune permissions [--explain &lt;target&gt; | --simulate &lt;file&gt;] [--json]</code></h3>
+<p>Show the permission mode and rules</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--explain &lt;target&gt;</code></td><td>Explain one tool:target action, such as shell:pwd. JSON includes the outcome, deciding rule and layer.</td></tr>
+<tr><td><code>--simulate &lt;file&gt;</code></td><td>Dry-run a JSON array of {tool, target} calls in order, without execution or approval writes.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune sandbox [explain] [--external-access] [--json] [-- &lt;command&gt;]</code></h3>
+<p>Explain command policy: sandbox [explain] [-- &lt;command&gt;]</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--external-access</code></td><td>Preview an explicit external-access grant to the shell context.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune projects [status|approve|reject|reset]</code></h3>
+<p>Inspect or change workspace trust</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+<tr><td><code>--yes</code></td><td>Approve project hooks and rules without asking.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune config [--explain] [--json] | rune config get &lt;key&gt; [--json] | rune config set &lt;key&gt; &lt;value&gt; | rune config unset &lt;key&gt; | rune config path [--json] | rune config edit</code></h3>
+<p>Show, read or change the configuration and where each value came from</p>
+<ul>
+  <li><code>settings</code>: Same as <code>rune config</code>; shows resolved configuration and value sources.</li>
+</ul>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--explain</code></td><td>Show the source layer of every key.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune keys [--json]</code></h3>
+<p>List the key actions, their keys, and the file that rebinds them</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune limits [--json]</code></h3>
+<p>List every limit with its effective value and source</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune workspace &lt;list|add &lt;path&gt;|remove &lt;path&gt;|clear&gt;</code></h3>
+<p>Manage additional workspace directories</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune prompt [--show | --tools]</code></h3>
+<p>Show the assembled system prompt</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--show</code></td><td>Print the assembled prompt.</td></tr>
+<tr><td><code>--tools</code></td><td>Print each advertised tool schema as one JSON line.</td></tr>
+</tbody>
+</table></div>
+<h2>Diagnostics and maintenance</h2>
+<h3><code>rune status [--json]</code></h3>
+<p>Show the resolved configuration and runtime state</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune doctor [--provider &lt;name&gt;] [--json]</code></h3>
+<p>Check the local setup, or one provider with a short round trip</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--provider &lt;name&gt;</code></td><td>Send one short tool round trip to this provider and report what works.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune upgrade [--check] [--json] | rune upgrade --from &lt;path&gt; --checksum &lt;hex&gt; [--target &lt;path&gt;] [--json]</code></h3>
+<p>Replace the installed binary with a verified artifact</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--check</code></td><td>Report whether a newer release exists and change nothing.</td></tr>
+<tr><td><code>--from &lt;path&gt;</code></td><td>Artifact to install.</td></tr>
+<tr><td><code>--checksum &lt;hex&gt;</code></td><td>Published checksum of that artifact.</td></tr>
+<tr><td><code>--target &lt;path&gt;</code></td><td>Binary to replace. Defaults to the running one.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune uninstall [--target &lt;path&gt;] [--keep-state] [--yes] [--json]</code></h3>
+<p>Remove the installed binary and, on request, local state</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--target &lt;path&gt;</code></td><td>Binary to remove. Defaults to the running one.</td></tr>
+<tr><td><code>--keep-state</code></td><td>Leave the state directory in place.</td></tr>
+<tr><td><code>--yes</code></td><td>Confirm removal of the state directory.</td></tr>
+<tr><td><code>--json</code></td><td>Emit JSON.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune completion &lt;bash|zsh|fish|powershell&gt;</code></h3>
+<p>Generate shell completion from the command table</p>
+<h3><code>rune reference [--json] [--write &lt;path&gt;]</code></h3>
+<p>Print the generated command reference</p>
+<div class="table"><table>
+<thead><tr><th>Flag</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>--json</code></td><td>Print every command, setting, limit, key, preset and doctor check as JSON.</td></tr>
+<tr><td><code>--write &lt;path&gt;</code></td><td>Write the reference to a file.</td></tr>
+</tbody>
+</table></div>
+<h3><code>rune help [command]</code></h3>
+<p>Print help</p>
+<ul>
+  <li><code>-h</code>: Same as <code>rune help</code>.</li>
+  <li><code>--help</code>: Same as <code>rune help</code>.</li>
+</ul>
+<h3><code>rune version</code></h3>
+<p>Print the version</p>
+<ul>
+  <li><code>-v</code>: Same as <code>rune version</code>.</li>
+  <li><code>--version</code>: Same as <code>rune version</code>.</li>
+</ul>
+</main>
+
+</body>
+</html>

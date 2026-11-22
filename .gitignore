@@ -24,7 +24,7 @@ __pycache__/
 bench/results/
 
 # Local documentation and planning notes
-docs/
+/docs/
 /PLAN.md
 /AUDIT.md
 /NEXT-PHASE.md

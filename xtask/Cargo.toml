@@ -20,3 +20,6 @@ rune-core.workspace = true
 rune-testkit.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

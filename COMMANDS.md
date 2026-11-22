@@ -303,12 +303,13 @@ Remove the installed binary and, on request, local state
 
 Generate shell completion from the command table
 
-### `rune reference [--write <path>]`
+### `rune reference [--json] [--write <path>]`
 
 Print the generated command reference
 
 | Flag | Description |
 |---|---|
+| `--json` | Print every command, setting, limit, key, preset and doctor check as JSON. |
 | `--write <path>` | Write the reference to a file. |
 ### `rune help [command]`
 

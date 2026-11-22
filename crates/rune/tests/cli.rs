@@ -261,6 +261,52 @@ fn resume_help_and_reference_document_the_same_usage() {
 }
 
 #[test]
+fn reference_json_lists_every_section() {
+    let out = run(&["reference", "--json"]);
+    assert_eq!(out.status, Some(0), "{}", out.stderr);
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+    let reference: serde_json::Value = serde_json::from_str(&out.stdout).expect("JSON");
+    assert_eq!(reference["version"], env!("CARGO_PKG_VERSION"));
+    for section in [
+        "commands",
+        "global_flags",
+        "settings",
+        "limits",
+        "keys",
+        "presets",
+        "doctor",
+    ] {
+        let entries = reference[section]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{section}` is not a list"));
+        assert!(!entries.is_empty(), "`{section}` is empty");
+    }
+    let commands = reference["commands"].as_array().expect("commands");
+    assert!(
+        commands.iter().any(|command| command["name"] == "reference"
+            && command["flags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|flag| flag["name"] == "--json"))),
+        "the reference command does not list its own --json flag"
+    );
+    for setting in reference["settings"].as_array().expect("settings") {
+        assert!(
+            setting["help"]
+                .as_str()
+                .is_some_and(|help| !help.is_empty()),
+            "{setting}"
+        );
+    }
+    let model = reference["settings"]
+        .as_array()
+        .and_then(|settings| settings.iter().find(|setting| setting["key"] == "model"))
+        .expect("the model setting");
+    assert_eq!(model["env"], "RUNE_MODEL");
+    let doctor = reference["doctor"].as_array().expect("doctor");
+    assert!(doctor.iter().any(|check| check["check"] == "shell"));
+}
+
+#[test]
 fn accepted_aliases_are_documented_in_help_and_reference() {
     let reference = run(&["reference"]);
     assert_eq!(reference.status, Some(0), "{}", reference.stderr);

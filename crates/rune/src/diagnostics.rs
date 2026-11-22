@@ -244,10 +244,6 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
 /// What every check looks at and how to fix its common failure: the source
 /// of the troubleshooting page.
 #[must_use]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the generated troubleshooting page")
-)]
 pub fn catalogue() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("version", "the running binary", "nothing to fix"),

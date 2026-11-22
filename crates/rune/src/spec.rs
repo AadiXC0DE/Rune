@@ -707,10 +707,16 @@ pub const MAINTENANCE: &[CommandSpec] = &[
         name: "reference",
         aliases: &[],
         summary: "Print the generated command reference",
-        usage: "rune reference [--write <path>]",
-        flags: &[option("--write", "path", "Write the reference to a file.")],
+        usage: "rune reference [--json] [--write <path>]",
+        flags: &[
+            flag(
+                "--json",
+                "Print every command, setting, limit, key, preset and doctor check as JSON.",
+            ),
+            option("--write", "path", "Write the reference to a file."),
+        ],
         requirements: Requirements::NONE,
-        supports_json: false,
+        supports_json: true,
     },
     CommandSpec {
         name: "help",

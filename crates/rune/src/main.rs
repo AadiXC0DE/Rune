@@ -2090,14 +2090,20 @@ fn run_keys(paths: &Paths, output_flags: &OutputFlags) -> Result<ExitCode> {
 
 /// Prints or writes the generated command reference.
 fn run_reference(launch: &Launch) -> Result<ExitCode> {
-    let text = reference::render();
-    match launch.flag("--write") {
-        Some(raw) => {
+    let json = (launch.json || launch.has_flag("--json")).then(reference::render_json);
+    match (launch.flag("--write"), json) {
+        (Some(raw), Some(json)) => {
+            let path = Utf8PathBuf::from(raw);
+            rune_core::paths::write_private(&path, &json)?;
+            println!("wrote {path}");
+        }
+        (Some(raw), None) => {
             let path = Utf8PathBuf::from(raw);
             reference::write_to(&path)?;
             println!("wrote {path}");
         }
-        None => print!("{text}"),
+        (None, Some(json)) => print!("{json}"),
+        (None, None) => print!("{}", reference::render()),
     }
     Ok(ExitCode::from(EXIT_OK))
 }
