@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
-use rune_agent::turn::{Event, Host, StopReason, run_turn};
+use rune_agent::turn::{Event, Host, PLAN_MODE_NOTE, StopReason, run_turn};
 use rune_context::mcp::Client;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::config::{Effort, PermissionMode};
@@ -49,8 +49,9 @@ use serde_json::{Value, json};
 use crate::jsonrpc::{FrameError, Id, Message, Request, Response, RpcError, Writer};
 use crate::prompt::Prompt;
 use crate::session::{
-    SessionConfig, Sessions, config_options, kind_for_name, message_chunk, modes, tool_call,
-    tool_call_update, tool_title, usage_update,
+    SessionConfig, Sessions, available_commands_update, config_options, current_mode_update,
+    kind_for_name, message_chunk, modes, plan_update, tool_call, tool_call_update, tool_title,
+    usage_update,
 };
 
 /// Protocol version this server speaks.
@@ -574,7 +575,21 @@ impl<W: Write + Send + 'static> Server<W> {
     fn call(self: &Arc<Self>, request: Request) {
         let id = request.id;
         match self.handle(&request.method, &request.params, Some(id.clone())) {
-            Ok(Some(result)) => self.respond(id, result),
+            Ok(Some(result)) => {
+                // The commands are announced once the client knows the session
+                // they belong to, which for a new session is its response.
+                let opened = match request.method.as_str() {
+                    "session/new" => result.get("sessionId"),
+                    "session/load" => request.params.get("sessionId"),
+                    _ => None,
+                }
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+                self.respond(id, result);
+                if let Some(session) = opened {
+                    self.announce_commands(&session);
+                }
+            }
             // A queued prompt answers itself once it runs.
             Ok(None) => {}
             Err(error) => self.fail(Some(id), error),
@@ -793,15 +808,45 @@ impl<W: Write + Send + 'static> Server<W> {
         Ok(json!({ "configOptions": config_options(session.config()) }))
     }
 
-    /// Answers `session/set_mode`.
+    /// Answers `session/set_mode`, and announces the mode now in force.
     fn set_mode(&self, params: &Value) -> std::result::Result<Value, RpcError> {
         let id = string_field(params, "sessionId")?;
         let mode = string_field(params, "modeId")?;
-        let mut sessions = self.lock_sessions()?;
-        sessions
-            .set_mode(&id, &mode)
-            .map_err(|err| RpcError::from_rune(&err))?;
+        let update = {
+            let mut sessions = self.lock_sessions()?;
+            sessions
+                .set_mode(&id, &mode)
+                .map_err(|err| RpcError::from_rune(&err))?;
+            let session = sessions.get(&id).map_err(|err| RpcError::from_rune(&err))?;
+            current_mode_update(&id, session.config())
+        };
+        self.send(&Message::Notification(update));
         Ok(json!({}))
+    }
+
+    /// Returns the custom commands a session's prompts can start with.
+    ///
+    /// Read again for each use rather than kept, so a command file added
+    /// during a session is offered on the next listing.
+    fn custom_commands(&self, workspace: &Utf8Path) -> Vec<rune_context::commands::Command> {
+        rune_context::commands::discover(workspace, &self.config.paths.config_root)
+            .map(|discovery| discovery.commands)
+            .unwrap_or_default()
+    }
+
+    /// Sends the commands a session's prompts can start with.
+    fn announce_commands(&self, session: &str) {
+        let workspace = match self.lock_sessions() {
+            Ok(sessions) => match sessions.get(session) {
+                Ok(entry) => entry.workspace().to_owned(),
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let commands = self.custom_commands(&workspace);
+        self.send(&Message::Notification(available_commands_update(
+            session, &commands,
+        )));
     }
 
     /// Stops the active turn.
@@ -1040,10 +1085,13 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
             .unwrap_or_default()
     };
 
+    // A custom command is recorded as its expansion, which is what the model
+    // reads, so a loaded session continues from the same conversation.
+    let expanded = expand_command(server, snapshot.context.workspace(), &queued.prompt.text);
     server.record(
         &session,
         SessionEvent::UserMessage {
-            text: queued.prompt.text.clone(),
+            text: expanded.clone(),
         },
     );
     server.send(&Message::Notification(message_chunk(
@@ -1061,7 +1109,12 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         }));
     }
     let mut history = snapshot.history;
-    let prompt_seq = history.push_user(queued.prompt.text.clone());
+    let text = if snapshot.config.planning {
+        format!("{PLAN_MODE_NOTE}\n\n{expanded}")
+    } else {
+        expanded
+    };
+    let prompt_seq = history.push_user(text);
     let host = TurnHost {
         server: Arc::clone(server),
         prompt: queued.prompt,
@@ -1085,6 +1138,7 @@ fn run_one<W: Write + Send + 'static>(server: &Arc<Server<W>>, queued: Queued) {
         answer: Mutex::default(),
         thought: Mutex::default(),
         permission_timeout: OnceLock::new(),
+        proposed: Mutex::default(),
     };
 
     let outcome =
@@ -1249,6 +1303,9 @@ struct TurnHost<W: Write + Send + 'static> {
     thought: Mutex<StreamedStep>,
     /// Deadline failure retained while cancellation stops the tool batch.
     permission_timeout: OnceLock<RuneError>,
+    /// What the call awaiting a decision would change, for its permission
+    /// request.
+    proposed: Mutex<Vec<rune_tools::preview::ProposedChange>>,
 }
 
 impl<W: Write + Send + 'static> TurnHost<W> {
@@ -1288,15 +1345,35 @@ impl<W: Write + Send + 'static> TurnHost<W> {
     /// Asks the client to resolve a call the rules left open.
     fn request_permission(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
         let reference = self.server.next_request.fetch_add(1, Ordering::SeqCst);
+        let workspace = self.context.workspace();
+        let content: Vec<Value> = self
+            .proposed
+            .lock()
+            .map(|proposed| proposed.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|change| {
+                json!({
+                    "type": "diff",
+                    "path": workspace.join(&change.path),
+                    "oldText": change.old_text,
+                    "newText": change.new_text,
+                })
+            })
+            .collect();
+        let mut tool_call = json!({
+            "toolCallId": format!("call-{reference}"),
+            "title": tool_title(name, target),
+            "name": name,
+            "kind": kind_for_name(name),
+            "status": "pending",
+        });
+        if !content.is_empty() {
+            tool_call["content"] = Value::Array(content);
+        }
         let params = json!({
             "sessionId": self.session,
-            "toolCall": {
-                "toolCallId": format!("call-{reference}"),
-                "title": tool_title(name, target),
-                "name": name,
-                "kind": kind_for_name(name),
-                "status": "pending",
-            },
+            "toolCall": tool_call,
             "options": [
                 {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
                 {"optionId": "allow_always", "name": "Allow for this session", "kind": "allow_always"},
@@ -1503,8 +1580,11 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
                     self.context_window,
                 )));
             }
-            Event::PlanUpdated { .. }
-            | Event::CallRepaired { .. }
+            Event::PlanUpdated { update } => {
+                self.server
+                    .send(&Message::Notification(plan_update(&self.session, &update)));
+            }
+            Event::CallRepaired { .. }
             | Event::ToolRewritten { .. }
             | Event::SteeringApplied { .. }
             | Event::VerificationRequested
@@ -1545,7 +1625,43 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
             .call(name, arguments, &self.context)
     }
 
+    fn decide_with_arguments(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        arguments: &Value,
+    ) -> (Outcome, String) {
+        let proposed =
+            rune_tools::preview::proposed_changes(name, arguments, self.context.workspace());
+        if let Ok(mut slot) = self.proposed.lock() {
+            *slot = proposed;
+        }
+        let decision = self.decide(name, target);
+        if let Ok(mut slot) = self.proposed.lock() {
+            slot.clear();
+        }
+        decision
+    }
+
     fn decide(&self, name: &str, target: Option<&str>) -> (Outcome, String) {
+        // Plan mode is enforced before any rule or mode, so no rule, mode or
+        // approval lets a change through while the session is planning.
+        if self.config.planning
+            && name != "update_plan"
+            && !self
+                .server
+                .config
+                .registry
+                .get(name)
+                .is_some_and(rune_tools::Tool::is_read_only)
+        {
+            let decision = rune_policy::decision::Decision::matched(
+                Outcome::Deny,
+                rune_policy::decision::Layer::Session,
+                "plan mode",
+            );
+            return (decision.outcome, decision.explain());
+        }
         let rules = self
             .rules
             .lock()
@@ -1593,6 +1709,27 @@ impl<W: Write + Send + 'static> Host for TurnHost<W> {
     fn steering(&self) -> &SteeringQueue {
         &self.steering
     }
+}
+
+/// Returns the text a prompt sends the model: a custom command's expansion
+/// when the prompt starts with `/name` and a command has that name, else the
+/// prompt itself.
+fn expand_command<W: Write + Send + 'static>(
+    server: &Server<W>,
+    workspace: &Utf8Path,
+    text: &str,
+) -> String {
+    let Some(rest) = text.strip_prefix('/') else {
+        return text.to_owned();
+    };
+    let (name, arguments) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let commands = server.custom_commands(workspace);
+    let Some(command) = commands.iter().find(|command| command.name == name) else {
+        return text.to_owned();
+    };
+    rune_context::commands::split_arguments(arguments)
+        .and_then(|arguments| command.expand(&arguments))
+        .unwrap_or_else(|_| text.to_owned())
 }
 
 /// The streamed text of one step, as the client has been sent it.

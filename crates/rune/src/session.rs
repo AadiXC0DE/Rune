@@ -14,7 +14,7 @@ use crate::session_log::{self, Recorder};
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::{Cancellation, SteeringQueue};
-use rune_agent::turn::{self, Event, Host, StopReason};
+use rune_agent::turn::{self, Event, Host, PLAN_MODE_NOTE, StopReason};
 use rune_context::mcp::Client as McpClient;
 use rune_context::prompt::{self, Prompt};
 use rune_core::budget::BudgetSet;
@@ -4066,7 +4066,7 @@ impl SessionHost {
         let hunks: Vec<Hunk<'_>> = if call.name == "edit_file" {
             let arguments: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_default();
-            pairs = edit_pairs(&arguments);
+            pairs = rune_tools::preview::edit_pairs(&arguments);
             edit_hunks(&pairs, first_changed_line(&output.text))
         } else if let Some(diff) = &output.diff {
             let lines = diff
@@ -8070,7 +8070,7 @@ fn call_diff(
     };
     match name {
         "edit_file" => {
-            let pairs = edit_pairs(&arguments);
+            let pairs = rune_tools::preview::edit_pairs(&arguments);
             if pairs
                 .iter()
                 .all(|(old, new)| old.is_empty() && new.is_empty())
@@ -12915,14 +12915,6 @@ fn record_usage(paths: &Paths, model: &str, outcome: &turn::TurnOutcome, cost: O
     }
 }
 
-/// Sent with a prompt while the session is planning.
-///
-/// Carried in the user turn rather than the instructions, so entering and
-/// leaving plan mode never changes the cached prefix of the request.
-const PLAN_MODE_NOTE: &str = "<plan_mode>The session is in plan mode: changes and \
-commands are refused. Investigate with reads, then record a step-by-step plan with \
-update_plan and explain it. The user will leave plan mode to carry it out.</plan_mode>";
-
 /// A call that is running, as the live region shows it.
 #[derive(Clone, Debug)]
 struct Running {
@@ -14432,7 +14424,10 @@ fn approval_preview(
         )
     };
     match name {
-        "edit_file" => render(&edit_hunks(&edit_pairs(arguments), None)),
+        "edit_file" => render(&edit_hunks(
+            &rune_tools::preview::edit_pairs(arguments),
+            None,
+        )),
         "apply_patch" => {
             let input = arguments
                 .get("input")
@@ -14441,30 +14436,12 @@ fn approval_preview(
             let Ok(patch) = rune_tools::apply_patch::parse(input) else {
                 return Vec::new();
             };
-            let pairs = patch_pairs(&patch);
+            let pairs = rune_tools::preview::patch_pairs(&patch);
             render(&edit_hunks(&pairs, None))
         }
         "write_file" => write_preview(arguments, workspace, width, ascii),
         _ => Vec::new(),
     }
-}
-
-/// The old and new text of each part of a patch: an added file is all new,
-/// a deleted one is not diffed.
-fn patch_pairs(patch: &rune_tools::apply_patch::Patch) -> Vec<(String, String)> {
-    use rune_tools::apply_patch::Section;
-    patch
-        .sections
-        .iter()
-        .flat_map(|section| match section {
-            Section::Add { contents, .. } => vec![(String::new(), contents.clone())],
-            Section::Delete { .. } => Vec::new(),
-            Section::Update { chunks, .. } => chunks
-                .iter()
-                .map(|chunk| (chunk.old_lines().join("\n"), chunk.new_lines().join("\n")))
-                .collect(),
-        })
-        .collect()
 }
 
 /// A `write_file` preview: the diff against the file it replaces, or the head
@@ -14523,24 +14500,6 @@ fn write_preview(
                 .collect()
         }
         Err(_) => not_shown(),
-    }
-}
-
-/// Returns the old and new text of each replacement an `edit_file` call asks for.
-fn edit_pairs(arguments: &serde_json::Value) -> Vec<(String, String)> {
-    let text = |value: &serde_json::Value, key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    match arguments.get("edits").and_then(serde_json::Value::as_array) {
-        Some(edits) => edits
-            .iter()
-            .map(|edit| (text(edit, "old_string"), text(edit, "new_string")))
-            .collect(),
-        None => vec![(text(arguments, "old_string"), text(arguments, "new_string"))],
     }
 }
 

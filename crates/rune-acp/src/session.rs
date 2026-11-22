@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::SteeringQueue;
 use rune_context::mcp::Client;
@@ -43,6 +43,8 @@ pub struct SessionConfig {
     pub effort: Effort,
     /// Permission mode in force.
     pub mode: PermissionMode,
+    /// Whether the session is planning: only reads and plan updates run.
+    pub planning: bool,
 }
 
 impl SessionConfig {
@@ -53,6 +55,18 @@ impl SessionConfig {
             model: model.into(),
             effort,
             mode,
+            planning: false,
+        }
+    }
+
+    /// Returns the mode a client sees: `plan` while planning, else the
+    /// permission mode.
+    #[must_use]
+    pub fn mode_id(&self) -> &'static str {
+        if self.planning {
+            PLAN_MODE
+        } else {
+            self.mode.as_str()
         }
     }
 
@@ -64,6 +78,9 @@ impl SessionConfig {
         }
     }
 }
+
+/// The mode that turns planning on.
+pub const PLAN_MODE: &str = "plan";
 
 /// What `session/list` reports about one stored session.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -95,6 +112,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Returns the directory the session works in.
+    #[must_use]
+    pub fn workspace(&self) -> &Utf8Path {
+        &self.workspace
+    }
+
     /// Returns the configuration in force.
     #[must_use]
     pub const fn config(&self) -> &SessionConfig {
@@ -449,17 +472,25 @@ impl Sessions {
         Ok(())
     }
 
-    /// Changes the permission mode.
+    /// Changes the permission mode, or turns planning on with `plan`.
+    ///
+    /// Planning keeps the permission mode, so leaving it for a permission
+    /// mode both ends planning and sets that mode.
     pub fn set_mode(&mut self, id: &str, mode: &str) -> Result<()> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
+        if mode == PLAN_MODE {
+            session.config.planning = true;
+            return Ok(());
+        }
         let mode = PermissionMode::from_name(mode).ok_or_else(|| {
             RuneError::invalid_field("modeId", format!("`{mode}` is not a permission mode"))
-                .with_hint("use ask, auto, or full_access")
+                .with_hint("use ask, auto, full_access, or plan")
         })?;
         session.config.mode = mode;
+        session.config.planning = false;
         Ok(())
     }
 
@@ -923,9 +954,72 @@ pub fn modes(config: &SessionConfig) -> Value {
             {"id": "ask", "name": "Ask", "description": "Request approval for unresolved tool calls."},
             {"id": "auto", "name": "Auto", "description": "Review unresolved tool calls automatically."},
             {"id": "full_access", "name": "Full access", "description": "Run every tool call without approval."},
+            {"id": PLAN_MODE, "name": "Plan", "description": "Read and plan only; changes and commands are refused."},
         ],
-        "currentModeId": config.mode.as_str(),
+        "currentModeId": config.mode_id(),
     })
+}
+
+/// Builds the update announcing the session's mode.
+#[must_use]
+pub fn current_mode_update(session: &str, config: &SessionConfig) -> Notification {
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "current_mode_update", "currentModeId": config.mode_id()},
+        }),
+    )
+}
+
+/// Builds the update carrying the whole plan, as `update_plan` last set it.
+#[must_use]
+pub fn plan_update(session: &str, update: &rune_tools::PlanUpdate) -> Notification {
+    use rune_tools::update_plan::Status;
+    let entries: Vec<Value> = update
+        .plan
+        .iter()
+        .map(|step| {
+            let status = match step.status {
+                Status::Pending => "pending",
+                Status::InProgress => "in_progress",
+                Status::Completed => "completed",
+            };
+            json!({"content": step.step, "priority": "medium", "status": status})
+        })
+        .collect();
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "plan", "entries": entries},
+        }),
+    )
+}
+
+/// Builds the update listing the commands a prompt can start with.
+#[must_use]
+pub fn available_commands_update(
+    session: &str,
+    commands: &[rune_context::commands::Command],
+) -> Notification {
+    let listed: Vec<Value> = commands
+        .iter()
+        .map(|command| {
+            let mut entry = json!({"name": command.name, "description": command.description});
+            if let Some(hint) = &command.argument_hint {
+                entry["input"] = json!({"hint": hint});
+            }
+            entry
+        })
+        .collect();
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "available_commands_update", "availableCommands": listed},
+        }),
+    )
 }
 
 /// Renders the configuration options a client may change.
@@ -1819,7 +1913,13 @@ mod tests {
         let config = SessionConfig::new("m", Effort::Low, PermissionMode::Ask);
         let modes = modes(&config);
         assert_eq!(modes["currentModeId"], "ask");
-        assert_eq!(modes["availableModes"].as_array().expect("array").len(), 3);
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|mode| mode["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["ask", "auto", "full_access", "plan"]);
         let options = config_options(&config);
         assert_eq!(options[0]["id"], "model");
         assert_eq!(options[1]["currentValue"], "low");

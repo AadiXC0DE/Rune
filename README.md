@@ -1334,6 +1334,23 @@ and a failure only shows a warning.
 ## Embedding
 
 `rune acp` serves the Agent Client Protocol over standard input and output.
+An editor that speaks it sees the session's plan as it changes, the custom
+commands a prompt can start with (`/name`), the change an edit, write or patch
+would make in each permission request, and the modes `ask`, `auto`,
+`full_access` and `plan`; in `plan` only reads and plan updates run.
+
+### Zed
+
+Add Rune to Zed's `settings.json`:
+
+```json
+"agent_servers": {
+  "Rune": { "command": "rune", "args": ["acp"] }
+}
+```
+
+Run `rune connect` once in a terminal first: the server uses the provider and
+key that stored.
 
 `rune-acp` serves the Agent Client Protocol over stdin and stdout, so an editor
 can drive a session. `rune-sdk` is the library an embedder links against: the

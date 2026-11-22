@@ -2091,3 +2091,188 @@ fn every_line_the_server_writes_is_a_protocol_frame() {
         assert!(frame["method"].is_string());
     }
 }
+
+#[test]
+fn plan_updates_are_sent() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call(
+                "p1",
+                "update_plan",
+                r#"{"plan":[{"step":"Read the code","status":"in_progress"},{"step":"Write the fix","status":"pending"}]}"#,
+            ),
+            Script::text("planned"),
+        ],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    let response = harness
+        .client()
+        .call(3, "session/prompt", &prompt(&session, "make a plan"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let plans = harness.client().updates("plan");
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(
+        plans[0]["params"]["update"]["entries"],
+        json!([
+            {"content": "Read the code", "priority": "medium", "status": "in_progress"},
+            {"content": "Write the fix", "priority": "medium", "status": "pending"},
+        ])
+    );
+}
+
+#[test]
+fn available_commands_are_listed() {
+    let mut harness = Harness::start(vec![Script::text("reviewed")], PermissionMode::Auto);
+    let commands = harness
+        .root
+        .path()
+        .join("workspace")
+        .join(".rune")
+        .join("commands");
+    std::fs::create_dir_all(&commands).expect("commands folder");
+    std::fs::write(
+        commands.join("review.md"),
+        "---\ndescription: Review one file\nargument-hint: <path>\n---\nReview $1 for bugs.\n",
+    )
+    .expect("command file");
+    let session = harness.open_session();
+    let listed = harness
+        .client()
+        .update_until(|frame| is_update(frame, "available_commands_update"));
+    assert_eq!(
+        listed["params"]["update"]["availableCommands"],
+        json!([{"name": "review", "description": "Review one file", "input": {"hint": "<path>"}}])
+    );
+
+    // A prompt that starts with the command runs its expansion.
+    let response =
+        harness
+            .client()
+            .call(3, "session/prompt", &prompt(&session, "/review src/lib.rs"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let body = harness.mock.last_body().expect("a request").to_string();
+    assert!(body.contains("Review src/lib.rs for bugs."), "{body}");
+}
+
+#[test]
+fn permission_requests_carry_the_diff() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::VerificationReminders,
+            Budget::Bounded(0),
+            Layer::User,
+        )
+        .expect("no verification reminder");
+    let mut harness = Harness::start_with(
+        vec![
+            Script::tool_call(
+                "w1",
+                "write_file",
+                r#"{"path":"notes.txt","content":"new text\n"}"#,
+            ),
+            Script::text("written"),
+        ],
+        PermissionMode::Ask,
+        limits,
+        // Empty, so the guard on overwriting an unread file leaves the write
+        // to the permission prompt.
+        vec![("notes.txt", "")],
+    );
+    let session = harness.open_session();
+    let response = harness
+        .client()
+        .call(3, "session/prompt", &prompt(&session, "write it"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let workspace = harness.root.path().join("workspace");
+    let approvals = harness.client().approvals.clone();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["params"]["toolCall"]["content"],
+        json!([{
+            "type": "diff",
+            "path": workspace.join("notes.txt"),
+            "oldText": "",
+            "newText": "new text\n",
+        }])
+    );
+    let options: Vec<&str> = approvals[0]["params"]["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .filter_map(|option| option["kind"].as_str())
+        .collect();
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+}
+
+#[test]
+fn plan_mode_is_offered_and_announced() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("w1", "write_file", r#"{"path":"plan.txt","content":"no"}"#),
+            Script::text("refused, so I planned"),
+        ],
+        PermissionMode::FullAccess,
+    );
+    harness.initialize(1);
+    let workspace = harness.root.path().join("workspace");
+    let created = harness.client().call(
+        2,
+        "session/new",
+        &json!({"cwd": workspace, "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+    let offered: Vec<&str> = created["result"]["modes"]["availableModes"]
+        .as_array()
+        .expect("modes")
+        .iter()
+        .filter_map(|mode| mode["id"].as_str())
+        .collect();
+    assert!(offered.contains(&"plan"), "{offered:?}");
+
+    harness.client().call(
+        3,
+        "session/set_mode",
+        &json!({"sessionId": session, "modeId": "plan"}),
+    );
+    let announced = harness
+        .client()
+        .update_until(|frame| is_update(frame, "current_mode_update"));
+    assert_eq!(announced["params"]["update"]["currentModeId"], "plan");
+
+    // Even in full access, planning refuses the write without asking.
+    let response =
+        harness
+            .client()
+            .call(4, "session/prompt", &prompt(&session, "change something"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        !workspace.join("plan.txt").exists(),
+        "plan mode let a write through"
+    );
+    assert!(harness.client().approvals.is_empty());
+    let body = harness.mock.last_body().expect("a request").to_string();
+    assert!(body.contains("<plan_mode>"), "{body}");
+
+    harness.client().call(
+        5,
+        "session/set_mode",
+        &json!({"sessionId": session, "modeId": "auto"}),
+    );
+    // The update is written before the response, so it is already in.
+    let modes: Vec<String> = harness
+        .client()
+        .updates("current_mode_update")
+        .iter()
+        .filter_map(|frame| {
+            frame["params"]["update"]["currentModeId"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(modes, ["plan", "auto"]);
+}

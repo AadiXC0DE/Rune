@@ -309,6 +309,15 @@ pub enum Event {
 /// ceiling is capped where it still leaves most of a window for input.
 pub const MAX_REQUESTED_OUTPUT_TOKENS: u64 = 32 * 1024;
 
+/// Sent with a prompt while a session is planning.
+///
+/// Carried in the user turn rather than the instructions, so entering and
+/// leaving plan mode never changes the cached prefix of the request. Every
+/// front end that offers plan mode sends this text.
+pub const PLAN_MODE_NOTE: &str = "<plan_mode>The session is in plan mode: changes and \
+commands are refused. Investigate with reads, then record a step-by-step plan with \
+update_plan and explain it. The user will leave plan mode to carry it out.</plan_mode>";
+
 /// Everything the loop needs from its host.
 ///
 /// The loop owns no product state: sessions, credentials, and presentation all

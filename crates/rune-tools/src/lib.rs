@@ -15,6 +15,7 @@ pub mod inventory;
 pub mod matching;
 pub mod mcp_tools;
 pub mod mutation;
+pub mod preview;
 pub mod read_file;
 pub mod read_tool_result;
 pub mod registry;
