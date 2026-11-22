@@ -4,6 +4,7 @@
 //! reader starts, so anything typed while the replies arrive is kept and handed
 //! to the draft instead of being lost.
 
+#[cfg(any(unix, test))]
 use std::time::Duration;
 
 /// Asks for the kitty keyboard flags in force.
@@ -37,8 +38,10 @@ pub const FOCUS_ON: &str = "\u{1b}[?1004h";
 pub const FOCUS_OFF: &str = "\u{1b}[?1004l";
 
 /// How long a terminal that has said nothing is waited for.
+#[cfg(any(unix, test))]
 const FIRST_REPLY: Duration = Duration::from_millis(100);
 /// How long a terminal that has started answering is waited for.
+#[cfg(any(unix, test))]
 const LAST_REPLY: Duration = Duration::from_millis(1_000);
 /// Longest unfinished reply kept between reads.
 const MAX_REPLY: usize = 512;
@@ -203,6 +206,7 @@ impl TerminalCaps {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn has_reply(&self) -> bool {
         self.kitty_keyboard.is_some()
             || self.background.is_some()
@@ -437,6 +441,7 @@ fn name(body: &[u8]) -> Option<Reply> {
 }
 
 /// What a read during the probe produced.
+#[cfg(any(unix, test))]
 enum Read {
     Bytes(Vec<u8>),
     Nothing,
@@ -448,6 +453,7 @@ enum Read {
 /// `read` waits at most the duration it is given. The deadline is
 /// [`FIRST_REPLY`] after the queries were written, extended once to
 /// [`LAST_REPLY`] when a reply has begun.
+#[cfg(any(unix, test))]
 fn collect(mut read: impl FnMut(Duration) -> Read, caps: &mut TerminalCaps) -> Vec<u8> {
     let start = std::time::Instant::now();
     let mut limit = FIRST_REPLY;

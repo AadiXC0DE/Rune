@@ -110,6 +110,7 @@ pub fn fork(
     paths.ensure_roots()?;
     paths::create_dir_private(&paths.sessions_dir())?;
     let dir = paths.session_dir(destination);
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

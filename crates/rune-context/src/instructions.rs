@@ -786,6 +786,7 @@ mod tests {
     }
 
     /// Returns the paths of every discovered file.
+    #[cfg(unix)]
     fn paths_of(files: &[InstructionFile]) -> Vec<Utf8PathBuf> {
         files.iter().map(|file| file.path.clone()).collect()
     }

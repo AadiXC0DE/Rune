@@ -1630,9 +1630,11 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::time::Duration;
 
+    use crate::command::prepare;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::command::run;
-    use crate::command::{prepare, verify_unchanged};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::command::verify_unchanged;
 
     /// Returns a condition that never cancels.
     #[cfg(any(target_os = "macos", target_os = "linux"))]

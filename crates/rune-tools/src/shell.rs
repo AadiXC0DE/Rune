@@ -1496,6 +1496,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use rune_core::budget::Budget;
     use rune_core::config::Layer;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     /// Cap the truncation tests use.
@@ -1567,6 +1568,7 @@ mod tests {
     }
 
     /// Polls a condition until it holds or the deadline passes.
+    #[cfg(unix)]
     fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
         let deadline = Instant::now().checked_add(timeout);
         loop {
@@ -2591,6 +2593,7 @@ mod tests {
     }
 
     /// The state line of a command killed at a 0.5 s deadline.
+    #[cfg(unix)]
     const HALF_SECOND_TIMEOUT: &str = "[killed after 0.5 s (timeout_ms), exit status 124. The \
         output above is partial. If it needs longer, run it with a larger timeout_ms, or \
         without one and wait with interact.]";

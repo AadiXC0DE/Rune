@@ -1300,6 +1300,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[cfg(unix)]

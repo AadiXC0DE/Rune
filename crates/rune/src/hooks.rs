@@ -730,6 +730,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn hook(event: HookEvent, script: &str, timeout_ms: u64) -> Hook {
         Hook {
             event,
@@ -743,12 +744,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct Fixture {
         directory: tempfile::TempDir,
         warnings: std::sync::Mutex<Vec<String>>,
         cancellation: Cancellation,
     }
 
+    #[cfg(unix)]
     impl Fixture {
         fn new() -> Self {
             Self {
@@ -790,6 +793,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn read_call() -> PreparedCall {
         PreparedCall {
             id: "call-1".to_owned(),
@@ -930,6 +934,7 @@ mod tests {
         assert!(old.get("arguments").is_none());
     }
 
+    #[cfg(unix)]
     fn fixture_result() -> CallResult {
         fixture("done")
     }
@@ -1070,6 +1075,7 @@ mod tests {
         assert_eq!(payload["output_truncated"], false);
     }
 
+    #[cfg(unix)]
     fn events<'a>(
         fixture: &'a Fixture,
         hooks: &'a [Hook],

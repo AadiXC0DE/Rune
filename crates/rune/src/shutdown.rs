@@ -22,9 +22,11 @@ pub const SIGINT: i32 = 2;
 /// SIGHUP, which exits 143 like SIGTERM.
 pub const SIGHUP: i32 = 1;
 /// SIGTERM, which exits 143.
+#[cfg(any(unix, test))]
 pub const SIGTERM: i32 = 15;
 
 /// The exit code a run stopped by `signal` ends with.
+#[cfg(any(unix, test))]
 #[must_use]
 pub const fn exit_code(signal: i32) -> i32 {
     if signal == SIGINT { 130 } else { 143 }
