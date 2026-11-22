@@ -634,6 +634,11 @@ def cmd_check(argv):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if os.name == "nt":
+        # Setup and verify commands are POSIX shell, and a timed-out run is
+        # ended with its process group.
+        print("run.py: the runner needs Linux or macOS", file=sys.stderr)
+        return 2
     if argv and argv[0] == "validate":
         return cmd_validate(argv[1:])
     if argv and argv[0] == "check":

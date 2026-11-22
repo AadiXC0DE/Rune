@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ KEYS = [
 ]
 
 
+@unittest.skipIf(os.name == "nt", "the runner needs Linux or macOS")
 class RunnerCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -314,6 +316,17 @@ class RunnerCase(unittest.TestCase):
             self.assertTrue(a["end"] <= b["start"] or b["end"] <= a["start"], task)
         first, second = spans[("events_a", "value-file")], spans[("events_a", "hidden-check")]
         self.assertLess(max(first["start"], second["start"]), min(first["end"], second["end"]))
+
+
+@unittest.skipUnless(os.name == "nt", "the refusal is for Windows")
+class WindowsRefusal(unittest.TestCase):
+    def test_the_runner_names_the_systems_it_needs(self):
+        proc = subprocess.run(
+            [sys.executable, RUN, "validate", "--tasks", str(TASKS)],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(proc.stderr, "run.py: the runner needs Linux or macOS\n")
 
 
 class SuiteMix(unittest.TestCase):

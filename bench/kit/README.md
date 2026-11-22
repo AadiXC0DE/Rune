@@ -18,6 +18,9 @@ python3 bench/kit/meter.py --upstream URL --log FILE [...]
 python3 -m unittest discover -s bench/kit -p 'test_*.py'
 ```
 
+The runner needs Linux or macOS: task setup and verify commands are POSIX shell, and a run that
+times out is ended with its whole process group.
+
 `run.py` writes `results.jsonl` (one row per run), `run.json` and per-run logs. `report.py` turns
 result files into `report.md`, `report.json` and `results.csv`. `check` prints one line per
 harness: found or `missing`, its version, and whether the flags its adapter relies on are still in
