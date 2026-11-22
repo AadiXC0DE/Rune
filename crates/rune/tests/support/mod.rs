@@ -3,6 +3,9 @@
 // Each integration test is a separate crate and uses only part of this module.
 #![allow(dead_code, clippy::expect_used)]
 
+#[cfg(windows)]
+pub mod conpty;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::process::Command;

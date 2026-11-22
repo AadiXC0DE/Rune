@@ -40,3 +40,13 @@ signal-hook.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rune-testkit.workspace = true
+
+# The console tests drive the binary through a pseudo console.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
