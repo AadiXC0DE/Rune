@@ -7,7 +7,8 @@
 # Run `cargo xtask perf` before each release and after any change to the turn loop,
 # history, session log or renderer.
 #
-# Every step must pass; the workspace suite has no known failures on macOS.
+# Every step must pass; the workspace suite has no known failures on macOS or
+# Windows.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_INCREMENTAL=0
@@ -34,8 +35,14 @@ else
 fi
 
 step "benchmark kit tests"
-python3 -m unittest discover -s bench/kit -p 'test_*.py'
-python3 -m unittest discover -s bench/harbor -p 'test_*.py'
+# Windows installs Python as `python`; `python3` there is often a placeholder
+# that opens the store.
+python=python3
+if ! python3 -c '' >/dev/null 2>&1; then
+    python=python
+fi
+"$python" -m unittest discover -s bench/kit -p 'test_*.py'
+"$python" -m unittest discover -s bench/harbor -p 'test_*.py'
 
 if [[ "${1:-}" != "--quick" ]]; then
     step "workspace tests"
