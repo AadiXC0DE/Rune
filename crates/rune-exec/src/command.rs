@@ -490,9 +490,7 @@ pub fn minimal_environment() -> BTreeMap<String, String> {
             environment.insert(name.to_owned(), value);
         }
     }
-    if !environment.contains_key("PATH") {
-        environment.insert("PATH".to_owned(), default_path());
-    }
+    fill_search_defaults(&mut environment);
     environment
 }
 
@@ -568,9 +566,7 @@ fn command_environment_from(
             environment.insert(name, value);
         }
     }
-    if !environment.contains_key("PATH") {
-        environment.insert("PATH".to_owned(), default_path());
-    }
+    fill_search_defaults(&mut environment);
     for name in &policy.withheld {
         environment.remove(name);
     }
@@ -604,6 +600,26 @@ fn passes(name: &str, passthrough: &[String]) -> bool {
     let upper = name.to_ascii_uppercase();
     matched && !SECRET_WORDS.iter().any(|word| upper.contains(word))
 }
+
+/// Gives a command the variables it finds programs through when this process
+/// has none to pass on.
+///
+/// Windows also needs `PATHEXT`: `cmd.exe` falls back to a built-in list, but
+/// PowerShell without it cannot find `sh.exe` from `sh`, and reports the
+/// program as missing.
+fn fill_search_defaults(environment: &mut BTreeMap<String, String>) {
+    if !environment.contains_key("PATH") {
+        environment.insert("PATH".to_owned(), default_path());
+    }
+    #[cfg(windows)]
+    if !environment.contains_key("PATHEXT") {
+        environment.insert("PATHEXT".to_owned(), DEFAULT_PATHEXT.to_owned());
+    }
+}
+
+/// The extensions a fresh Windows installation searches for, in its order.
+#[cfg(windows)]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
 
 /// Returns a search path for a process that has none of its own.
 ///
@@ -1733,6 +1749,24 @@ mod tests {
             minimal_environment().contains_key("SystemRoot"),
             "a command would be unable to start a system program"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_command_on_windows_can_find_a_program_without_its_extension() {
+        let environment = environment_of(&[("PATH", r"C:\Windows\system32")], &[], &[], false);
+        assert_eq!(
+            environment.get("PATHEXT").map(String::as_str),
+            Some(DEFAULT_PATHEXT)
+        );
+        // A list this process has is passed on as it is.
+        let environment = environment_of(
+            &[("PATH", r"C:\Windows\system32"), ("PATHEXT", ".EXE")],
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(environment.get("PATHEXT").map(String::as_str), Some(".EXE"));
     }
 
     /// Runs `command_environment_from` over a fixed set of variables.
