@@ -767,6 +767,49 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn editing_a_crlf_file_keeps_crlf() {
+        // A model writes its lines with `\n`; the file keeps the `\r\n` it
+        // had, in the lines the edit touched as well as the others.
+        let (dir, context) = workspace();
+        let path = seed(&dir, "dos.txt", "alpha\r\nbeta\r\ngamma\r\n");
+        EditFile
+            .call(
+                &json!({
+                    "path": "dos.txt",
+                    "old_string": "alpha\nbeta",
+                    "new_string": "ALPHA\nBETA\nmore",
+                }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"ALPHA\r\nBETA\r\nmore\r\ngamma\r\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_insensitive_names_match_the_existing_file() {
+        let (dir, context) = workspace();
+        let path = seed(&dir, "a.txt", "alpha\n");
+        EditFile
+            .call(
+                &json!({ "path": "A.TXT", "old_string": "alpha", "new_string": "beta" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "beta\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, ["a.txt"], "the edit made a second file");
+    }
+
     #[test]
     fn a_cr_only_file_is_edited_without_normalization() {
         let (dir, context) = workspace();

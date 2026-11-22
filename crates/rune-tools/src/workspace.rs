@@ -1005,6 +1005,65 @@ mod tests {
         assert!(resolved.external);
     }
 
+    /// Returns the workspace path spelled with its drive letter in the other
+    /// case, such as `c:\...` for `C:\...`.
+    #[cfg(windows)]
+    fn with_other_drive_case(path: &Utf8Path) -> String {
+        let text = path.as_str();
+        let mut letters = text.chars();
+        let drive = letters.next().expect("a drive letter");
+        assert_eq!(letters.next(), Some(':'), "{text}");
+        let swapped = if drive.is_ascii_uppercase() {
+            drive.to_ascii_lowercase()
+        } else {
+            drive.to_ascii_uppercase()
+        };
+        format!("{swapped}{}", &text[1..])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_letter_case_is_ignored_for_containment() {
+        let repo = Repo::new();
+        let workspace = repo.path().to_owned();
+        let context = ExecutionContext::new(workspace.clone());
+        let raw = with_other_drive_case(&workspace.join("README.md"));
+        let resolved = resolve(&context, &raw).expect("inside the workspace");
+        assert!(!resolved.external, "{raw}");
+        // A workspace named with the other case admits the usual spelling.
+        let context = ExecutionContext::new(Utf8PathBuf::from(with_other_drive_case(&workspace)));
+        let resolved =
+            resolve(&context, workspace.join("README.md").as_str()).expect("inside the workspace");
+        assert!(!resolved.external);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_resolve_inside_the_workspace() {
+        let repo = Repo::new();
+        let context = repo.context();
+        for name in ["README.md", r"src\main.rs", "new.txt"] {
+            let raw = format!(r"\\?\{}\{name}", repo.path());
+            let resolved = resolve(&context, &raw).expect("inside the workspace");
+            assert!(!resolved.external, "{raw}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn another_drive_is_outside() {
+        let repo = Repo::new();
+        let drive = repo.path().as_str().chars().next().expect("a drive letter");
+        let other = if drive.eq_ignore_ascii_case(&'D') {
+            'E'
+        } else {
+            'D'
+        };
+        let raw = format!(r"{other}:\x");
+        let error = resolve(&repo.context(), &raw).expect_err("another drive");
+        assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace, "{raw}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_link_that_stays_inside_the_workspace_is_permitted() {
