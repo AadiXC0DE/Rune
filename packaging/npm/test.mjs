@@ -97,3 +97,12 @@ test('a bad digest exits 1 and runs nothing', { skip: !target && 'no release for
     server.close();
   }
 });
+
+test('the launcher ships the binding download code unchanged', () => {
+  const shared = path.join(here, '..', '..', 'bindings', 'node', 'download.js');
+  assert.deepEqual(
+    fs.readFileSync(path.join(here, 'bin', 'download.mjs')),
+    fs.readFileSync(shared),
+    'copy bindings/node/download.js to packaging/npm/bin/download.mjs',
+  );
+});

@@ -18,7 +18,9 @@ export type RuneEffort =
 /**
  * Failure codes carried by `RuneError.code`.
  *
- * - `BINARY_NOT_FOUND`: no executable through the option, `RUNE_BIN`, or `PATH`.
+ * - `BINARY_NOT_FOUND`: no executable through the option, `RUNE_BIN`, or `PATH`,
+ *   and no release to download when `download` was set.
+ * - `OPTIONS`: options that cannot be combined, such as `checkpoints` with `noSave`.
  * - `EXIT`: the binary exited non-zero.
  * - `OUTPUT`: invalid result output or a malformed JSONL stream.
  * - `OUTPUT_LIMIT`: combined output exceeded `maxOutputBytes` or a record exceeded `maxEventBytes`.
@@ -28,6 +30,7 @@ export type RuneEffort =
  */
 export type RuneErrorCode =
   | "BINARY_NOT_FOUND"
+  | "OPTIONS"
   | "EXIT"
   | "OUTPUT"
   | "OUTPUT_LIMIT"
@@ -47,7 +50,22 @@ export interface BinaryCandidate {
 export interface AskUsage {
   input_tokens?: number;
   output_tokens?: number;
+  cache_read_tokens?: number;
 }
+
+/** How a run ended, as `rune ask --json` reports it. */
+export type AskStopReason =
+  | "end_turn"
+  | "max_model_turns"
+  | "max_output_tokens"
+  | "time_limit"
+  | "spend_limit"
+  | "objective_token_budget"
+  | "provider_error"
+  | "refused"
+  | "content_filter"
+  | "stalled"
+  | "cancelled";
 
 /** One tool call made during the run. */
 export interface AskToolCall {
@@ -80,10 +98,21 @@ export interface AskResult {
   usage: AskUsage;
   /** Tool calls made, in order. */
   tool_calls: AskToolCall[];
-  /** Failure detail, present only when the run failed. */
+  /** How the run ended; null for a failure before the first request. */
+  stop_reason?: AskStopReason | null;
+  /** Whether a check ran after the last change to a file, when files changed. */
+  verification?: string;
+  /** Files the run changed, when it changed any. */
+  changed_files?: number;
+  /** Whether the run changed test files, when files changed. */
+  tests_modified?: boolean;
+  /** Failure detail, present only when the run failed. Text, usage, steps and
+   * tool calls still describe everything that completed before it. */
   error?: string;
   /** Stable failure code from the binary, present only when the run failed. */
   error_code?: string;
+  /** Structured failure context, present when the binary has some. */
+  error_detail?: Record<string, unknown>;
 }
 
 /** Options for `ask`. */
@@ -110,6 +139,25 @@ export interface AskOptions {
   maxOutputBytes?: number;
   /** Kill the process when this signal aborts. */
   signal?: AbortSignal;
+  /** Pass `--network` so sandboxed shell commands may use the network. */
+  network?: boolean;
+  /**
+   * Pass `--checkpoints` so the workspace is snapshotted before and after the
+   * run; needs a saved session, so it cannot be combined with `noSave`.
+   */
+  checkpoints?: boolean;
+  /** Limit overrides, each passed as `--limit name=value`; a value is a non-negative integer or `"off"`. */
+  limits?: Record<string, number | "off">;
+  /** Pass `--allow-unsandboxed` so commands run where the host has no sandbox. */
+  allowUnsandboxed?: boolean;
+  /** Permission mode for the run, passed as `--permission-mode`. */
+  permissionMode?: "ask" | "auto" | "full-access";
+  /**
+   * When no executable is found through `bin`, `RUNE_BIN` or `PATH`, download
+   * the release archive of this package's version, check it against the
+   * release's `SHA256SUMS`, cache it, and run it. Defaults to false.
+   */
+  download?: boolean;
 }
 
 /** Options for the pull-based JSONL event iterator. */

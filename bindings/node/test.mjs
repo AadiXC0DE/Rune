@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
   accessSync,
   chmodSync,
   constants,
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -26,6 +29,7 @@ import {
   RuneOutputError,
   RuneOutputLimitError,
 } from "./index.js";
+import { tarProgram, targetFor } from "./download.js";
 
 // Release metadata is checked in the same suite CI runs for the binding.
 const maintainedRepository = "https://github.com/AadiXC0DE/Rune";
@@ -1188,4 +1192,230 @@ test("askStream aborts while suspended at yield and escalates for a child ignori
     childProcess.spawn = originalSpawn;
     syncBuiltinESMExports();
   }
+});
+
+// The tests below replace `spawn` with a child that prints a fixed result, so
+// they check the argument list and the download path on every platform without
+// a stub the platform can run.
+
+/** A child process that prints `stdout`, exits 0 and closes its pipes. */
+function fakeChild(stdout) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = () => true;
+  setImmediate(() => {
+    child.stdout.end(stdout);
+    child.stderr.end();
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    child.emit("close", 0, null);
+  });
+  return child;
+}
+
+/** Runs `body` with `spawn` recording each call and answering with a result. */
+async function withFakeSpawn(body) {
+  const calls = [];
+  const original = childProcess.spawn;
+  childProcess.spawn = (command, args) => {
+    calls.push({ command, args });
+    return fakeChild(`${JSON.stringify(validResult)}\n`);
+  };
+  syncBuiltinESMExports();
+  try {
+    await body();
+  } finally {
+    childProcess.spawn = original;
+    syncBuiltinESMExports();
+  }
+  return calls;
+}
+
+test("the run options reach the binary as flags", async () => {
+  const calls = await withFakeSpawn(async () => {
+    await ask("hi", {
+      bin: process.execPath,
+      network: true,
+      allowUnsandboxed: true,
+      permissionMode: "full-access",
+      limits: { max_agent_steps: 40, session_spend_cents: "off" },
+      checkpoints: true,
+    });
+    await ask("plain", { bin: process.execPath });
+  });
+  assert.deepEqual(calls[0].args, [
+    "--permission-mode", "full-access",
+    "--network",
+    "--allow-unsandboxed",
+    "--limit", "max_agent_steps=40",
+    "--limit", "session_spend_cents=off",
+    "ask", "--json", "--checkpoints", "--", "hi",
+  ]);
+  // Options left out add nothing.
+  assert.deepEqual(calls[1].args, ["ask", "--json", "--", "plain"]);
+});
+
+test("the stream takes the same run options", async () => {
+  const calls = await withFakeSpawn(async () => {
+    const events = askStream("hi", { bin: process.execPath, network: true, limits: { max_agent_steps: 3 } });
+    // The fake prints a result rather than JSONL; only the argument list matters here.
+    await assert.rejects(async () => {
+      for await (const _event of events) {
+        // drain
+      }
+    });
+  });
+  assert.deepEqual(calls[0].args, [
+    "--network", "--limit", "max_agent_steps=3", "ask", "--jsonl", "--", "hi",
+  ]);
+});
+
+test("invalid run options fail before anything is spawned", async () => {
+  const calls = await withFakeSpawn(async () => {
+    for (const [options, pattern] of [
+      [{ network: "yes" }, /network option must be a boolean/],
+      [{ permissionMode: "full_access" }, /permissionMode option must be one of ask, auto, full-access/],
+      [{ limits: [] }, /limits option must be an object/],
+      [{ limits: { "max-steps": 1 } }, /is not a limit name/],
+      [{ limits: { max_agent_steps: -1 } }, /must be a non-negative integer or "off"/],
+      [{ limits: { max_agent_steps: 1.5 } }, /must be a non-negative integer or "off"/],
+      [{ download: 1 }, /download option must be a boolean/],
+    ]) {
+      await assert.rejects(ask("hi", { bin: process.execPath, ...options }), (error) => {
+        assert.ok(error instanceof TypeError, String(error));
+        assert.match(error.message, pattern);
+        return true;
+      });
+    }
+    await assert.rejects(ask("hi", { bin: process.execPath, checkpoints: true, noSave: true }), (error) => {
+      assert.ok(error instanceof RuneError);
+      assert.equal(error.code, "OPTIONS");
+      assert.match(error.message, /checkpoints option needs a saved session/);
+      return true;
+    });
+  });
+  assert.equal(calls.length, 0);
+});
+
+/** An archive holding a file named like the binary, in this platform's format. */
+function releaseArchive() {
+  const dir = mkdtempSync(join(tmpdir(), "rune-binding-release-"));
+  const windows = process.platform === "win32";
+  const name = windows ? "rune.exe" : "rune";
+  writeFileSync(join(dir, name), "not really rune\n", { mode: 0o755 });
+  const out = join(dir, windows ? "rune.zip" : "rune.tar.gz");
+  const tar = childProcess.spawnSync(
+    tarProgram(),
+    windows ? ["-a", "-cf", out, "-C", dir, name] : ["-czf", out, "-C", dir, name],
+  );
+  assert.equal(tar.status, 0, String(tar.stderr));
+  return readFileSync(out);
+}
+
+/** Serves one release of this package's version, with an honest or a wrong digest. */
+async function serveRelease(honest) {
+  const version = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
+  const target = targetFor();
+  const archive = `rune-${version}-${target}.${target.endsWith("-windows-msvc") ? "zip" : "tar.gz"}`;
+  const bytes = releaseArchive();
+  const digest = createHash("sha256")
+    .update(honest ? bytes : Buffer.concat([bytes, Buffer.from("x")]))
+    .digest("hex");
+  const files = {
+    [`/download/v${version}/${archive}`]: bytes,
+    [`/download/v${version}/SHA256SUMS`]: Buffer.from(`${digest}  ${archive}\n`),
+  };
+  const server = createServer((request, response) => {
+    const body = files[request.url];
+    response.writeHead(body ? 200 : 404);
+    response.end(body ?? "");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { server, version };
+}
+
+/** Runs `body` with nothing on PATH, no RUNE_BIN, and an empty cache. */
+async function withNothingInstalled(baseUrl, body) {
+  const saved = {};
+  const empty = mkdtempSync(join(tmpdir(), "rune-binding-empty-"));
+  const cache = mkdtempSync(join(tmpdir(), "rune-binding-cache-"));
+  const set = {
+    PATH: empty,
+    RUNE_BIN: "",
+    RUNE_NPM_BASE_URL: baseUrl,
+    XDG_CACHE_HOME: cache,
+    LOCALAPPDATA: cache,
+  };
+  for (const [name, value] of Object.entries(set)) {
+    saved[name] = process.env[name];
+    process.env[name] = value;
+  }
+  try {
+    await body(cache);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+test("download fetches, checks and caches the release binary only when asked", { skip: targetFor() === null && "no release for this platform" }, async () => {
+  const { server, version } = await serveRelease(true);
+  try {
+    await withNothingInstalled(`http://127.0.0.1:${server.address().port}`, async (cache) => {
+      // Without the option, nothing is downloaded.
+      await assert.rejects(ask("hi"), RuneBinaryNotFoundError);
+      const calls = await withFakeSpawn(async () => {
+        await ask("hi", { download: true });
+        await ask("again", { download: true });
+      });
+      const binary = join(cache, "rune-npm", version, process.platform === "win32" ? "rune.exe" : "rune");
+      assert.equal(calls[0].command, binary);
+      assert.equal(readFileSync(binary, "utf8"), "not really rune\n");
+      // The second run starts the cached binary without a new download.
+      server.close();
+      assert.equal(calls[1].command, binary);
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test("a release with the wrong digest is refused and nothing is installed", { skip: targetFor() === null && "no release for this platform" }, async () => {
+  const { server, version } = await serveRelease(false);
+  try {
+    await withNothingInstalled(`http://127.0.0.1:${server.address().port}`, async (cache) => {
+      const calls = await withFakeSpawn(async () => {
+        await assert.rejects(ask("hi", { download: true }), (error) => {
+          assert.ok(error instanceof RuneBinaryNotFoundError, String(error));
+          assert.match(error.message, /the download failed: checksum mismatch/);
+          return true;
+        });
+      });
+      assert.equal(calls.length, 0);
+      assert.ok(!existsSync(join(cache, "rune-npm", version)));
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test("a configured binary that is missing is reported, not replaced by a download", async () => {
+  const calls = await withFakeSpawn(async () => {
+    await assert.rejects(
+      ask("hi", { bin: join(tmpdir(), "no-such-rune-binary"), download: true }),
+      RuneBinaryNotFoundError,
+    );
+  });
+  assert.equal(calls.length, 0);
+});
+
+test("only published platforms have a release target", () => {
+  assert.equal(targetFor("sunos", "x64"), null);
+  assert.equal(targetFor("linux", "x64"), "x86_64-unknown-linux-musl");
+  assert.equal(targetFor("win32", "x64"), "x86_64-pc-windows-msvc");
 });

@@ -3,11 +3,17 @@
 // The binary owns configuration, credentials, and the network path; this module
 // only builds an argument list, runs it, and returns the result object or
 // streams the JSONL events that `rune ask` prints. No provider, credential,
-// or session state is read or written here.
+// or session state is read or written here. The one file it may write is the
+// release binary, cached when a caller asks for `download`.
 
 import { spawn } from "node:child_process";
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { delimiter, extname, isAbsolute, join, resolve } from "node:path";
+
+import { ensureBinary, targetFor } from "./download.js";
+
+/** This package's version, which is the release a download fetches. */
+const VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
 
 /**
  * Reasoning effort names the command line accepts.
@@ -16,6 +22,12 @@ import { delimiter, extname, isAbsolute, join, resolve } from "node:path";
  * rejected here instead of changing behavior without a report.
  */
 const EFFORTS = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Permission modes the command line accepts. */
+const PERMISSION_MODES = ["ask", "auto", "full-access"];
+
+/** A limit name as the command line spells it. */
+const LIMIT_NAME = /^[a-z][a-z0-9_]*$/;
 
 // Node clamps larger delays to 1 ms and emits TimeoutOverflowWarning.
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
@@ -141,8 +153,9 @@ export function resolveBinary(options = {}) {
  * @returns {Promise<object>} The parsed `rune ask --json` object.
  */
 export async function ask(prompt, options = {}) {
-  const { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes } =
-    prepareAsk(prompt, options, "--json");
+  const prepared = prepareAsk(prompt, options, "--json");
+  const { args, cwd, env, timeoutMs, signal, maxOutputBytes } = prepared;
+  const executable = prepared.executable ?? (await downloadedBinary());
 
   const child = spawn(executable, args, {
     cwd,
@@ -280,8 +293,9 @@ export function askStream(prompt, options = {}) {
 }
 
 async function* streamAsk(prompt, options, setCancel) {
-  const { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes } =
-    prepareAsk(prompt, options, "--jsonl");
+  const prepared = prepareAsk(prompt, options, "--jsonl");
+  const { args, cwd, env, timeoutMs, signal, maxOutputBytes } = prepared;
+  const executable = prepared.executable ?? (await downloadedBinary());
   const { maxEventBytes = MAX_JSONL_EVENT_BYTES } = options;
   if (signal?.aborted) {
     throw new RuneError("ABORTED", "rune ask was aborted before it finished");
@@ -514,6 +528,12 @@ function prepareAsk(prompt, options, format) {
     timeoutMs,
     signal,
     maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+    network = false,
+    checkpoints = false,
+    limits,
+    allowUnsandboxed = false,
+    permissionMode,
+    download = false,
   } = options;
   if (provider !== undefined && (typeof provider !== "string" || provider.length === 0)) {
     throw new TypeError("the provider option must be a non-empty string");
@@ -538,6 +558,42 @@ function prepareAsk(prompt, options, format) {
   if (!(Number.isSafeInteger(maxOutputBytes) && maxOutputBytes > 0)) {
     throw new TypeError("the maxOutputBytes option must be a positive safe integer");
   }
+  for (const [name, value] of [
+    ["network", network],
+    ["checkpoints", checkpoints],
+    ["allowUnsandboxed", allowUnsandboxed],
+    ["download", download],
+  ]) {
+    if (typeof value !== "boolean") {
+      throw new TypeError(`the ${name} option must be a boolean`);
+    }
+  }
+  if (permissionMode !== undefined && !PERMISSION_MODES.includes(permissionMode)) {
+    throw new TypeError(`the permissionMode option must be one of ${PERMISSION_MODES.join(", ")}`);
+  }
+  const limitFlags = [];
+  if (limits !== undefined) {
+    if (typeof limits !== "object" || limits === null || Array.isArray(limits)) {
+      throw new TypeError("the limits option must be an object of limit names to values");
+    }
+    for (const [name, value] of Object.entries(limits)) {
+      if (!LIMIT_NAME.test(name)) {
+        throw new TypeError(`the limit name ${JSON.stringify(name)} is not a limit name`);
+      }
+      if (!(value === "off" || (Number.isSafeInteger(value) && value >= 0))) {
+        throw new TypeError(`the limit ${name} must be a non-negative integer or "off"`);
+      }
+      limitFlags.push("--limit", `${name}=${value}`);
+    }
+  }
+  if (checkpoints && noSave) {
+    // The binary refuses the pair too, but only after starting; this says so
+    // before anything runs.
+    throw new RuneError(
+      "OPTIONS",
+      "the checkpoints option needs a saved session; drop noSave",
+    );
+  }
 
   if (format === "--jsonl") {
     const { maxEventBytes = MAX_JSONL_EVENT_BYTES } = options;
@@ -557,7 +613,7 @@ function prepareAsk(prompt, options, format) {
     }
   }
 
-  const executable = resolveBinary(options);
+  const executable = locate(options, download);
   const args = [];
   // Options that apply to the whole process are only read before the command
   // name; everything after it belongs to the command.
@@ -565,13 +621,58 @@ function prepareAsk(prompt, options, format) {
   if (offline) args.push("--offline");
   if (model !== undefined) args.push("--model", model);
   if (effort !== undefined) args.push("--effort", effort);
+  if (permissionMode !== undefined) args.push("--permission-mode", permissionMode);
+  if (network) args.push("--network");
+  if (allowUnsandboxed) args.push("--allow-unsandboxed");
+  args.push(...limitFlags);
   args.push("ask", format);
   if (noSave) args.push("--no-save");
+  if (checkpoints) args.push("--checkpoints");
   // A bare `--` ends flag parsing, so a prompt starting with a dash is read as
   // the prompt.
   args.push("--", prompt);
 
   return { executable, args, cwd, env, timeoutMs, signal, maxOutputBytes };
+}
+
+/**
+ * Resolves the executable, or returns null when none was found and the
+ * caller asked for a download.
+ *
+ * Only a lookup that found nothing anywhere falls back to downloading: a `bin`
+ * option or `RUNE_BIN` that names something unusable is still an error, so a
+ * typo is reported rather than replaced by another binary.
+ */
+function locate(options, download) {
+  try {
+    return resolveBinary(options);
+  } catch (error) {
+    const unset = options.bin === undefined && emptyToNull(process.env.RUNE_BIN) === null;
+    if (download && unset && error instanceof RuneBinaryNotFoundError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Returns the release binary of this package's version, downloading, checking
+ * and caching it when it is not cached yet.
+ */
+async function downloadedBinary() {
+  const candidates = binaryCandidates(undefined);
+  const target = targetFor();
+  if (target === null) {
+    throw new RuneBinaryNotFoundError(
+      candidates,
+      `no release archive is published for ${process.platform} ${process.arch}`,
+    );
+  }
+  try {
+    return await ensureBinary(VERSION, target);
+  } catch (error) {
+    throw new RuneBinaryNotFoundError(candidates, `the download failed: ${error.message}`);
+  }
 }
 
 /** Collects the three locations the executable is looked up in, in order. */
