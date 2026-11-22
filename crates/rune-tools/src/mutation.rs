@@ -709,7 +709,12 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
     file.sync_all().map_err(|err| io_error(&staged, err))?;
     drop(file);
     revalidate(&resolved, identity.as_ref(), &hash)?;
-    std::fs::rename(staged.as_std_path(), resolved.as_std_path())
+    let target = if identity.is_some() {
+        existing_spelling(&resolved)
+    } else {
+        resolved.clone()
+    };
+    std::fs::rename(staged.as_std_path(), target.as_std_path())
         .map_err(|err| io_error(&resolved, err))?;
     guard.disarm();
     sync_directory(&directory);
@@ -723,6 +728,30 @@ pub fn apply(prepared: Prepared) -> Result<Applied> {
         created: identity.is_none(),
         relaxed,
     })
+}
+
+/// Returns the path of an existing file with its name as the directory holds
+/// it.
+///
+/// A file system that ignores case finds `a.txt` when asked for `A.TXT`, and a
+/// rename over it as `A.TXT` replaces the file and renames it in one step, so
+/// an edit would change the name the project uses. Only the last component is
+/// taken from the file system, and only when it differs from the spelled name
+/// in case alone; the file itself is never a link, because a mutation refuses
+/// one.
+fn existing_spelling(resolved: &Utf8Path) -> Utf8PathBuf {
+    let held = resolved
+        .canonicalize_utf8()
+        .ok()
+        .and_then(|real| real.file_name().map(str::to_owned));
+    match (resolved.parent(), resolved.file_name(), held) {
+        (Some(parent), Some(spelled), Some(held))
+            if held != spelled && held.to_lowercase() == spelled.to_lowercase() =>
+        {
+            parent.join(held)
+        }
+        _ => resolved.to_owned(),
+    }
 }
 
 /// Reads a file as text with the hash of its bytes, or `None` when it does

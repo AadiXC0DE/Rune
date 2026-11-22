@@ -261,6 +261,26 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn overwriting_a_file_named_in_another_case_keeps_its_name() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "Notes.md"), "old\n").expect("seed");
+        WriteFile
+            .call(&json!({ "path": "NOTES.MD", "content": "new\n" }), &context)
+            .expect("call");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, ["Notes.md"]);
+        assert_eq!(
+            std::fs::read_to_string(path_of(&dir, "Notes.md")).expect("read"),
+            "new\n"
+        );
+    }
+
     #[test]
     fn a_missing_argument_is_named_in_the_error() {
         let (_dir, context) = workspace();
