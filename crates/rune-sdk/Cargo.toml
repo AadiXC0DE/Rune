@@ -18,6 +18,8 @@ rune-exec = { workspace = true }
 rune-agent = { workspace = true }
 rune-net = { workspace = true }
 rune-policy = { workspace = true }
+# The workspace snapshots an embedder can turn on.
+rune-session = { workspace = true }
 camino = { workspace = true }
 rune-tools = { workspace = true }
 serde = { workspace = true }

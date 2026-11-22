@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rune_agent::turn::{Event, StopReason};
+use rune_agent::turn::{CallResult, Event, StopReason};
 
 use serde_json::json;
 
@@ -27,8 +27,9 @@ use rune_core::budget::{Budget, BudgetSet, LimitName};
 use rune_core::config::Layer;
 use rune_core::error::ErrorCode;
 use rune_sdk::agent::{
-    Agent, AgentOptions, Dialect, EVENT_QUEUE_CAPACITY, FetchRequest, FetchResponse, HostFetch,
-    HostImage, HostTool, PromptOptions, TurnResult,
+    Agent, AgentOptions, Dialect, EVENT_QUEUE_CAPACITY, FetchRequest, FetchResponse, HookVeto,
+    Hooks, HostFetch, HostImage, HostTool, PostToolEffect, PreToolOutcome, PreparedCall,
+    PromptOptions, Snapshots, TurnResult,
 };
 use rune_testkit::{MockEndpoint, Script};
 
@@ -1531,4 +1532,265 @@ fn backpressure_on_tool_started_prevents_the_host_tool_from_running() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(endpoint.request_count(), 1);
     assert_eq!(turn.events().count(), EVENT_QUEUE_CAPACITY);
+}
+
+/// Returns a tool that answers `value for <key>`.
+fn lookup_tool() -> HostTool {
+    HostTool::new(
+        "lookup",
+        "Looks a key up.",
+        json!({"type": "object", "properties": {"key": {"type": "string"}}}),
+        |arguments, _context| {
+            let key = arguments
+                .get("key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            Ok(rune_sdk::agent::HostToolResult::text(format!(
+                "value for {key}"
+            )))
+        },
+    )
+}
+
+#[test]
+fn a_failed_turn_returns_a_partial_result() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "lookup", "{\"key\":\"alpha\"}"),
+        Script::Status {
+            code: 401,
+            body: r#"{"error":{"message":"no credential"}}"#.to_owned(),
+        },
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch);
+    agent_options.tools.push(lookup_tool());
+    let mut agent = Agent::new(agent_options).expect("agent");
+
+    let mut turn = agent
+        .prompt("look alpha up", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("a partial result, not an error");
+    let error = result.error.expect("the failure is reported");
+    assert_eq!(error.code(), ErrorCode::AuthenticationRequired);
+    // What completed before the failure is still described: the step that
+    // ran the tool, not the one whose request failed.
+    assert_eq!(result.steps, 1);
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].output.text, "value for alpha");
+}
+
+/// Hooks that record what they saw and answer from fixed rules.
+#[derive(Default)]
+struct RecordingHooks {
+    continues: std::sync::Mutex<Vec<u32>>,
+    keep_going: bool,
+    append: Option<&'static str>,
+}
+
+impl Hooks for RecordingHooks {
+    fn pre_tool(&self, call: &PreparedCall) -> PreToolOutcome {
+        if call.arguments.contains("secret") {
+            PreToolOutcome::Veto(HookVeto {
+                name: "guard".to_owned(),
+                reason: "secrets stay put".to_owned(),
+            })
+        } else if call.arguments.contains("alpha") {
+            PreToolOutcome::Rewrite {
+                hook: "guard".to_owned(),
+                arguments: r#"{"key":"beta"}"#.to_owned(),
+            }
+        } else {
+            PreToolOutcome::Allow
+        }
+    }
+
+    fn post_tool(&self, _result: &CallResult) -> Option<PostToolEffect> {
+        self.append
+            .map(|text| PostToolEffect::Append(text.to_owned()))
+    }
+
+    fn turn_end(&self, _text: &str, continues: u32) -> Option<String> {
+        self.continues.lock().expect("lock").push(continues);
+        self.keep_going.then(|| "keep going".to_owned())
+    }
+}
+
+#[test]
+fn pre_tool_callbacks_can_deny_and_rewrite() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "lookup", "{\"key\":\"secret\"}"),
+        Script::tool_call("call_2", "lookup", "{\"key\":\"alpha\"}"),
+        Script::text("done"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch);
+    agent_options.tools.push(lookup_tool());
+    let mut agent = Agent::new(agent_options)
+        .expect("agent")
+        .with_hooks(Arc::new(RecordingHooks::default()));
+
+    let mut turn = agent
+        .prompt("look things up", PromptOptions::default())
+        .expect("turn");
+    let result = turn.result().expect("result");
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.calls.len(), 2);
+    assert!(!result.calls[0].executed, "the vetoed call ran");
+    assert!(
+        result.calls[0].output.text.contains("secrets stay put"),
+        "{}",
+        result.calls[0].output.text
+    );
+    assert!(result.calls[1].executed);
+    assert_eq!(result.calls[1].output.text, "value for beta");
+}
+
+#[test]
+fn post_tool_callbacks_append() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "lookup", "{\"key\":\"plain\"}"),
+        Script::text("done"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch);
+    agent_options.tools.push(lookup_tool());
+    let hooks = RecordingHooks {
+        append: Some("checked by the host"),
+        ..RecordingHooks::default()
+    };
+    let mut agent = Agent::new(agent_options)
+        .expect("agent")
+        .with_hooks(Arc::new(hooks));
+
+    let mut turn = agent
+        .prompt("look it up", PromptOptions::default())
+        .expect("turn");
+    turn.result().expect("result");
+    let body = endpoint.last_body().expect("a request body").to_string();
+    assert!(body.contains("value for plain"), "{body}");
+    assert!(body.contains("checked by the host"), "{body}");
+}
+
+#[test]
+fn turn_end_callbacks_continue_at_most_three_times() {
+    let endpoint = MockEndpoint::start(vec![
+        Script::text("one"),
+        Script::text("two"),
+        Script::text("three"),
+        Script::text("four"),
+        Script::text("five"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let hooks = Arc::new(RecordingHooks {
+        keep_going: true,
+        ..RecordingHooks::default()
+    });
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch))
+        .expect("agent")
+        .with_hooks(hooks.clone());
+
+    let mut turn = agent.prompt("go", PromptOptions::default()).expect("turn");
+    let result = turn.result().expect("result");
+    assert_eq!(endpoint.request_count(), 4, "one turn and three continues");
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(*hooks.continues.lock().expect("lock"), [0, 1, 2]);
+    let body = endpoint.last_body().expect("a request body").to_string();
+    assert!(body.contains("keep going"), "{body}");
+}
+
+#[test]
+fn snapshots_are_off_by_default() {
+    let endpoint = MockEndpoint::start(vec![Script::text("hello")]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent = Agent::new(options(&endpoint.base_url(), fetch)).expect("agent");
+    let mut turn = agent.prompt("hi", PromptOptions::default()).expect("turn");
+    let result = turn.result().expect("result");
+    assert!(result.snapshot.is_none());
+    assert!(result.error.is_none());
+}
+
+/// Runs git in `dir` with a fixed identity, or returns `None` without git.
+fn git(dir: &std::path::Path, args: &[&str]) -> Option<()> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .ok()?;
+    assert!(output.status.success(), "git {args:?} failed");
+    Some(())
+}
+
+#[test]
+fn snapshots_record_start_and_end_trees() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let workspace = root.path().join("work");
+    std::fs::create_dir(&workspace).expect("workspace");
+    if git(&workspace, &["init", "-q"]).is_none() {
+        eprintln!("skipped: git is not installed");
+        return;
+    }
+    std::fs::write(workspace.join("a.txt"), "a\n").expect("file");
+    git(&workspace, &["add", "-A"]).expect("git");
+    git(&workspace, &["commit", "-qm", "init"]).expect("git");
+
+    let endpoint = MockEndpoint::start(vec![
+        Script::tool_call("call_1", "write", "{}"),
+        Script::text("wrote it"),
+        Script::text("nothing to do"),
+    ]);
+    let fetch = Arc::new(CountingFetch::new());
+    let mut agent_options = options(&endpoint.base_url(), fetch);
+    let target = workspace.join("b.txt");
+    agent_options.tools.push(HostTool::new(
+        "write",
+        "Writes a file.",
+        json!({"type": "object"}),
+        move |_arguments, _context| {
+            std::fs::write(&target, "b\n").expect("write");
+            Ok(rune_sdk::agent::HostToolResult::text("written"))
+        },
+    ));
+    let utf8 = |path: &std::path::Path| {
+        camino::Utf8PathBuf::from_path_buf(path.to_path_buf()).expect("utf8 path")
+    };
+    let mut agent = Agent::new(agent_options)
+        .expect("agent")
+        .with_snapshots(Snapshots {
+            workspace: utf8(&workspace),
+            store: utf8(&root.path().join("store")),
+        });
+
+    let mut turn = agent
+        .prompt("write b", PromptOptions::default())
+        .expect("turn");
+    let (start, end) = turn.result().expect("result").snapshot.expect("both trees");
+    assert_ne!(start, end, "the tool's file is not in the end tree");
+    drop(turn);
+
+    // A prompt that changes nothing starts and ends on the tree the last one
+    // ended on.
+    let mut turn = agent
+        .prompt("anything else?", PromptOptions::default())
+        .expect("turn");
+    let (again, still) = turn.result().expect("result").snapshot.expect("both trees");
+    assert_eq!(
+        (again.as_str(), still.as_str()),
+        (end.as_str(), end.as_str())
+    );
+    // The workspace's own repository was not written.
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&workspace)
+        .output()
+        .expect("git status");
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "?? b.txt");
 }

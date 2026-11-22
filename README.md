@@ -1339,6 +1339,14 @@ and a failure only shows a warning.
 can drive a session. `rune-sdk` is the library an embedder links against: the
 host supplies the credential, the tools, and the network path.
 
+An agent can also take `with_hooks`, whose `pre_tool`, `post_tool` and
+`turn_end` callbacks run where the terminal's hooks run (a rewritten call is
+checked by policy again, and a turn is continued at most three times), and
+`with_snapshots`, which records the workspace's tree at the start and end of
+each prompt in a private git store, leaving the workspace's repository alone.
+A turn that fails after producing text or calls returns them, with the failure
+in `TurnResult::error`.
+
 Rust hosts can call `Agent::diagnostics()` before the first turn, without a
 network request, and serialize the snapshot with `serde_json::to_string`.
 It reports dialect capabilities (effort, images, tool streaming, fast mode,

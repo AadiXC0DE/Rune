@@ -19,10 +19,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use camino::Utf8PathBuf;
 use rune_agent::History;
 use rune_agent::compaction;
 use rune_agent::steering::{Cancellation, SteeringQueue};
 use rune_agent::turn::{CallResult, Event, StopReason, TurnOutcome};
+pub use rune_agent::turn::{HookVeto, PostToolEffect, PreToolOutcome, PreparedCall};
 use rune_core::budget::{Budget, BudgetSet, LimitDescription, LimitName};
 use rune_core::config::Layer;
 use rune_core::error::{ErrorCode, Result, RuneError};
@@ -555,6 +557,45 @@ impl fmt::Debug for HostTool {
     }
 }
 
+/// Callbacks a host runs at points of a turn. Every method has a default that
+/// does nothing, so a host implements only the points it cares about.
+///
+/// The callbacks run on the turn's worker thread, after policy has allowed a
+/// call and before it runs, so a host can narrow what a turn does but never
+/// widen it: a rewritten call is checked by policy again.
+pub trait Hooks: Send + Sync {
+    /// Decides whether a call runs as the model sent it, with other arguments,
+    /// or not at all.
+    fn pre_tool(&self, _call: &PreparedCall) -> PreToolOutcome {
+        PreToolOutcome::Allow
+    }
+
+    /// Adds to or replaces a call's result before the model sees it.
+    fn post_tool(&self, _result: &CallResult) -> Option<PostToolEffect> {
+        None
+    }
+
+    /// Called when a turn is about to end by itself, with its final text and
+    /// how many times a callback already continued it. A message asks the
+    /// model to go on; a turn is continued at most three times.
+    fn turn_end(&self, _text: &str, _continues: u32) -> Option<String> {
+        None
+    }
+}
+
+/// Workspace snapshots at the start and end of each prompt.
+///
+/// Each snapshot is a tree in a private git store under `store`, so the
+/// workspace's own repository is never written. Taking them needs `git` and a
+/// workspace inside a git work tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshots {
+    /// The directory snapshotted.
+    pub workspace: Utf8PathBuf,
+    /// Where the snapshot store is kept.
+    pub store: Utf8PathBuf,
+}
+
 /// Everything an agent needs to run.
 pub struct AgentOptions {
     /// Credential sent with every request.
@@ -619,6 +660,15 @@ pub struct TurnResult {
     pub calls: Vec<CallResult>,
     /// Images produced by tool calls during this turn.
     pub images: Vec<HostImage>,
+    /// Why the turn stopped early, when it failed after doing some work.
+    ///
+    /// The text, usage, steps and calls above still describe everything that
+    /// completed before the failure. A turn that failed before producing
+    /// anything is an `Err` from [`Turn::result`] instead.
+    pub error: Option<RuneError>,
+    /// The workspace trees at the start and end of the prompt, when snapshots
+    /// are on and both could be taken.
+    pub snapshot: Option<(String, String)>,
 }
 
 /// State shared between the agent and a running turn.
@@ -683,6 +733,7 @@ impl Completion {
 struct TurnProduct {
     outcome: TurnOutcome,
     images: Vec<HostImage>,
+    snapshot: Option<(String, String)>,
 }
 
 /// Clears the claim and completes the turn, whatever the worker does.
@@ -741,6 +792,10 @@ impl Turn {
     /// worker stops, and any cancellation requested while it ran is reflected in
     /// the stop reason.
     ///
+    /// A turn that failed after producing text or calls returns them, with the
+    /// failure in [`TurnResult::error`]; one that failed before producing
+    /// anything returns the error.
+    ///
     /// If the unread event queue filled, returns `LimitExceeded` with the
     /// `sdk_event_queue` invariant. Consume events as the turn runs to avoid
     /// this backpressure failure on long responses.
@@ -754,6 +809,8 @@ impl Turn {
             steps: product.outcome.steps,
             calls: product.outcome.calls,
             images: product.images,
+            error: product.outcome.error,
+            snapshot: product.snapshot,
         })
     }
 
@@ -798,6 +855,8 @@ pub struct Agent {
     limits: BudgetSet,
     /// The window automatic compaction decides against, when it is on.
     auto_compact: Option<compaction::Window>,
+    hooks: Option<Arc<dyn Hooks>>,
+    snapshots: Option<Snapshots>,
     sources: AgentSources,
     conversation: Arc<Conversation>,
     /// Cancellation for the turn started last, which is the only one that can
@@ -917,6 +976,8 @@ impl Agent {
                         .unwrap_or(rune_net::catalog::DEFAULT_CONTEXT_WINDOW),
                 )
             }),
+            hooks: None,
+            snapshots: None,
             sources,
             conversation: Arc::new(Conversation {
                 history: Mutex::new(history),
@@ -956,6 +1017,23 @@ impl Agent {
     #[must_use]
     pub fn with_limits(mut self, limits: BudgetSet) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Runs `hooks` at the points of every turn. Without them a turn runs
+    /// exactly as before.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Snapshots the workspace at the start and end of every prompt.
+    ///
+    /// Off by default: without it the agent reads no file it was not asked to.
+    #[must_use]
+    pub fn with_snapshots(mut self, snapshots: Snapshots) -> Self {
+        self.snapshots = Some(snapshots);
         self
     }
 
@@ -1148,6 +1226,8 @@ impl Agent {
             specs: Arc::clone(&self.specs),
             limits: self.limits.clone(),
             auto_compact: self.auto_compact,
+            hooks: self.hooks.clone(),
+            snapshots: self.snapshots.clone(),
             max_steps: if options.max_steps == 0 {
                 self.limits
                     .get(LimitName::MaxAgentSteps)
@@ -1342,6 +1422,8 @@ struct TurnContext {
     limits: BudgetSet,
     max_steps: u64,
     auto_compact: Option<compaction::Window>,
+    hooks: Option<Arc<dyn Hooks>>,
+    snapshots: Option<Snapshots>,
 }
 
 impl TurnContext {
@@ -1378,12 +1460,24 @@ impl TurnContext {
 
 /// Runs one turn on the loop every surface shares.
 fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
+    let shadow = context.snapshots.as_ref().and_then(open_shadow);
+    let start = shadow
+        .as_ref()
+        .and_then(|shadow| tree(shadow, "prompt start"));
     let host = SdkHost::new(context)?;
     let outcome = {
         // The conversation is not readable while a turn runs, so the history
         // is held for the whole turn.
         let mut history = lock(&context.conversation.history);
-        rune_agent::turn::run_turn(&mut history, &host).and_then(TurnOutcome::into_strict)?
+        rune_agent::turn::run_turn(&mut history, &host)?
+    };
+    // A turn that failed before the model produced anything has nothing to
+    // hand back but the failure.
+    let produced = !outcome.narration.is_empty() || !outcome.calls.is_empty();
+    let outcome = if produced {
+        outcome
+    } else {
+        outcome.into_strict()?
     };
     // The SDK's answer is the text of every step, not only the last one.
     let mut outcome = outcome;
@@ -1396,7 +1490,38 @@ fn run_turn(context: &TurnContext) -> Result<TurnProduct> {
         })
         .collect();
     let images = std::mem::take(&mut *lock(&host.images));
-    Ok(TurnProduct { outcome, images })
+    let end = shadow
+        .as_ref()
+        .and_then(|shadow| tree(shadow, "prompt end"));
+    Ok(TurnProduct {
+        outcome,
+        images,
+        snapshot: start.zip(end),
+    })
+}
+
+/// The ref the SDK's snapshots are kept under in the store.
+const SNAPSHOT_SESSION: &str = "sdk";
+
+/// Opens the snapshot store, or `None` where snapshots cannot be taken: no
+/// git, or a workspace outside a git work tree.
+fn open_shadow(snapshots: &Snapshots) -> Option<rune_session::shadow::Shadow> {
+    let paths = rune_core::paths::Paths {
+        config_root: snapshots.store.clone(),
+        state_root: snapshots.store.clone(),
+        data_root: snapshots.store.clone(),
+    };
+    rune_session::shadow::Shadow::open(&paths, &snapshots.workspace)
+        .ok()
+        .flatten()
+}
+
+/// Snapshots the workspace and returns the tree, or `None` when it failed.
+fn tree(shadow: &rune_session::shadow::Shadow, message: &str) -> Option<String> {
+    shadow
+        .snapshot(SNAPSHOT_SESSION, message)
+        .ok()
+        .map(|snapshot| snapshot.tree)
 }
 
 /// The embedder's tools, endpoint and fetch, presented to the shared loop.
@@ -1441,6 +1566,23 @@ impl<'a> SdkHost<'a> {
 impl rune_agent::turn::Host for SdkHost<'_> {
     fn dialect(&self) -> &dyn Provider {
         self.provider.as_ref()
+    }
+
+    fn pre_tool_outcome(&self, call: &PreparedCall) -> Result<PreToolOutcome> {
+        Ok(self
+            .context
+            .hooks
+            .as_ref()
+            .map_or(PreToolOutcome::Allow, |hooks| hooks.pre_tool(call)))
+    }
+
+    fn post_tool_effect(&self, result: &CallResult) -> Option<PostToolEffect> {
+        self.context.hooks.as_ref()?.post_tool(result)
+    }
+
+    fn turn_end(&self, text: &str, continues: u32) -> Option<(String, String)> {
+        let message = self.context.hooks.as_ref()?.turn_end(text, continues)?;
+        Some(("host".to_owned(), message))
     }
 
     fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
@@ -1580,7 +1722,7 @@ impl rune_agent::turn::Host for SdkHost<'_> {
     }
 
     fn context(&self) -> ExecutionContext {
-        ExecutionContext::new(camino::Utf8PathBuf::from("/"))
+        ExecutionContext::new(Utf8PathBuf::from("/"))
     }
 
     fn limits(&self) -> BudgetSet {

@@ -1119,6 +1119,7 @@ dependencies = [
  "rune-exec",
  "rune-net",
  "rune-policy",
+ "rune-session",
  "rune-testkit",
  "rune-tools",
  "serde",
