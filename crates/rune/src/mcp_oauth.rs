@@ -262,12 +262,13 @@ mod tests {
 
     impl Fixture {
         fn start() -> Self {
-            let mut child = Command::new("python3")
+            let python = if cfg!(windows) { "python" } else { "python3" };
+            let mut child = Command::new(python)
                 .args(["-c", include_str!("../tests/mcp_oauth_server.py"), "oauth"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
-                .expect("python3 runs the OAuth fixture");
+                .expect("Python runs the OAuth fixture");
             let mut line = String::new();
             BufReader::new(child.stdout.take().expect("stdout"))
                 .read_line(&mut line)

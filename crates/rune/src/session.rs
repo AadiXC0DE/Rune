@@ -26226,7 +26226,7 @@ for line in sys.stdin:
             "name": "local",
             "transport": {
                 "transport": "stdio",
-                "command": ["python3", "-c", SERVER],
+                "command": [if cfg!(windows) { "python" } else { "python3" }, "-c", SERVER],
                 "environment": {"MCP_PANEL_LOG": log.to_string_lossy()},
             },
         }))

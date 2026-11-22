@@ -84,6 +84,12 @@ def event_wait(event, master, timeout, sink):
     return True
 ";
 
+/// The Python interpreter to run fixtures with. Windows installs it as
+/// `python`; `python3` there is often only a placeholder that opens the store.
+pub fn python() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
 /// Give embedded Python fixtures the same OS allowlist without a second copy.
 /// The Python helper leaves each fixture's Linux environment exactly intact.
 pub fn python_script(script: &str) -> String {
