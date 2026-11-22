@@ -7452,12 +7452,15 @@ fn rememberable(tool: &str, target: &str) -> bool {
         return false;
     }
     if tool == "shell" {
-        // The program's own argv is read when the line needs no shell, which
-        // is what lets subcommands such as `git push` be recognized.
-        let argv = rune_policy::command::direct_argv(target)
-            .unwrap_or_else(|| rune_policy::command::shell_argv(target));
-        return rune_policy::command::classify(&argv).kind
-            != rune_policy::command::CommandKind::Consequential;
+        // Every command the line runs is read, a script handed to a shell
+        // included, so a destructive command after a harmless one is seen,
+        // whichever shell the host runs the line in.
+        return rune_policy::command_line::split(target)
+            .iter()
+            .all(|command| {
+                rune_policy::command::classify(&command.words).kind
+                    != rune_policy::command::CommandKind::Consequential
+            });
     }
     true
 }
@@ -24397,6 +24400,16 @@ mod tests {
         assert!(rememberable("write_file", "../outside/notes.txt"));
         assert!(!rememberable("shell", "rm -rf build"));
         assert!(!rememberable("shell", "git push --force"));
+        // A destructive command later in the line, or in a script the line
+        // hands a shell, is read as well.
+        assert!(!rememberable("shell", "ls; rm -rf build"));
+        assert!(!rememberable("shell", "cargo test && git push"));
+        assert!(!rememberable("shell", "echo ok | sh -c 'rm -rf build'"));
+        assert!(rememberable("shell", "cargo build && cargo test"));
+        assert!(!rememberable(
+            "shell",
+            "Get-ChildItem; Remove-Item -Recurse build"
+        ));
         assert!(!rememberable("web_fetch_private", "http://10.0.0.1"));
     }
 
