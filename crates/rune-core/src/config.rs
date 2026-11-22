@@ -1569,6 +1569,12 @@ impl EnvironmentOverrides {
     /// connected.
     #[must_use]
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        Self::from_dyn_lookup(&mut lookup)
+    }
+
+    /// [`EnvironmentOverrides::from_lookup`] without the generic parameter, so
+    /// the body is compiled once however many callers pass a closure.
+    fn from_dyn_lookup(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Self {
         let mut lookup = move |key: &str| lookup(key).filter(|value| !value.trim().is_empty());
         let mut invalid_booleans = Vec::new();
         let auto_upgrade = lookup("RUNE_AUTO_UPGRADE").and_then(|raw| {
