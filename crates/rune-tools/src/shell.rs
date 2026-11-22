@@ -3321,6 +3321,42 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_command_starts_in_the_workspace() {
+        // The working directory is a canonical path, which on Windows carries
+        // `\\?\`; cmd.exe still has to start in the workspace itself.
+        let tool = shell(4, 64 * 1024);
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let workspace = root.join("plain");
+        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let context = ExecutionContext::new(workspace.clone()).with_allow_unsandboxed(true);
+
+        let output = call(
+            &tool,
+            &context,
+            &serde_json::json!({
+                "action": "run",
+                "command": "cd > where.txt",
+                "yield_time_ms": 5_000,
+            }),
+        );
+        let recorded = std::fs::read_to_string(workspace.join("where.txt")).unwrap_or_else(|_| {
+            panic!("the command did not run in its workspace: {}", output.text)
+        });
+        assert_eq!(
+            Utf8PathBuf::from(recorded.trim()),
+            {
+                let canonical = workspace.canonicalize_utf8().expect("canonical");
+                rune_core::paths::plain_spelling(canonical.as_str())
+                    .map_or(canonical, Utf8PathBuf::from)
+            },
+            "{}",
+            output.text
+        );
+    }
+
     #[test]
     fn a_command_runs_when_the_override_is_set_and_no_backend_is_available() {
         // A host with no usable backend refuses every command by default. The
