@@ -350,13 +350,18 @@ mod tests {
 
     #[test]
     fn write_file_refuses_a_parent_escape() {
-        let (dir, context) = workspace();
+        // The parent is a folder of its own, so a file of that name left by
+        // anything else cannot be mistaken for an escape.
+        let parent = tempfile::TempDir::new().expect("temp dir");
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let context =
+            ExecutionContext::new(Utf8PathBuf::from_path_buf(workspace).expect("utf8 path"));
         let err = WriteFile
             .call(&json!({ "path": "../x", "content": "x" }), &context)
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
-        let parent = dir.path().parent().expect("parent");
-        assert!(!parent.join("x").exists());
+        assert!(!parent.path().join("x").exists());
     }
 
     #[cfg(unix)]

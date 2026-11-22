@@ -927,7 +927,14 @@ mod tests {
     #[test]
     fn existing_workspace_paths_are_linked_with_their_line() {
         let (_dir, root) = workspace();
-        let absolute = root.as_str().trim_start_matches('/');
+        // A link names the path with forward slashes and without the
+        // verbatim prefix Windows puts on a canonical path.
+        let absolute = root.as_str();
+        let absolute = absolute
+            .strip_prefix("\\\\?\\")
+            .unwrap_or(absolute)
+            .replace('\\', "/");
+        let absolute = absolute.trim_start_matches('/');
         let line = body(
             "see src/main.rs:12:4 and src/main.rs.",
             &linking(Some(&root), false),
