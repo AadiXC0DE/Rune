@@ -5,7 +5,6 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-#![cfg(unix)]
 
 //! End-to-end tests for the protocol server.
 //!
@@ -13,9 +12,13 @@
 //! client drives it over a socket pair. The property most often under test is
 //! that a second prompt arriving during a live turn is admitted rather than
 //! refused, so the client sends frames while a turn is genuinely in flight.
+//!
+//! The socket is a TCP connection on the loopback address, which every
+//! platform has; the tests that start a stdio MCP server use a shell script
+//! and run on Unix only.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +36,15 @@ use serde_json::{Value, json};
 /// Time a test waits for a frame before failing, so a defect reports rather
 /// than hangs.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Returns the two ends of a connected loopback socket: the server's, then the
+/// client's.
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    (server, client)
+}
 
 /// Builds a state layout rooted at a temporary directory.
 fn paths_for(root: &Path) -> Paths {
@@ -61,8 +73,8 @@ enum Approval {
 
 /// A client driving the server over a socket.
 struct Client {
-    to_server: UnixStream,
-    from_server: BufReader<UnixStream>,
+    to_server: TcpStream,
+    from_server: BufReader<TcpStream>,
     /// Responses that arrived before the test asked for them.
     responses: Vec<Value>,
     /// The order response identifiers were answered in.
@@ -78,7 +90,7 @@ struct Client {
 }
 
 impl Client {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: TcpStream) -> Self {
         let to_server = stream.try_clone().expect("clone");
         Self {
             to_server,
@@ -342,7 +354,7 @@ impl Harness {
             None => config,
         };
 
-        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let (server_side, client_side) = socket_pair();
         let output = server_side.try_clone().expect("clone");
         let server = Arc::new(Server::new(config, output).expect("server"));
         let join = std::thread::spawn(move || {
@@ -418,6 +430,7 @@ fn stdio_server(log: &Path, greeting: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn assert_mcp_stopped(log: &Path) {
     let pid = std::fs::read_to_string(log.with_extension("pid")).expect("fixture PID");
     let deadline = Instant::now()
@@ -763,6 +776,8 @@ fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_cha
     );
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
     let mut harness = Harness::start(
@@ -875,6 +890,8 @@ fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
     assert_mcp_stopped(&other_log);
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
     let mut harness = Harness::start(
@@ -941,6 +958,8 @@ fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
     ));
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn denied_mcp_calls_never_reach_the_stdio_server() {
     let mut harness = Harness::start(
@@ -971,6 +990,8 @@ fn denied_mcp_calls_never_reach_the_stdio_server() {
     );
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
     let mut limits = BudgetSet::new();
@@ -1262,7 +1283,7 @@ fn connections_list_only_sessions_with_their_stored_workspace() {
             "test/model",
         )
         .expect("config");
-        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let (server_side, client_side) = socket_pair();
         let output = server_side.try_clone().expect("output");
         let server = Arc::new(Server::new(config, output).expect("server"));
         let join = std::thread::spawn(move || {
