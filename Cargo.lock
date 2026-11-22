@@ -1135,6 +1135,8 @@ dependencies = [
  "jiff",
  "proptest",
  "rune-core",
+ "rune-exec",
+ "rune-policy",
  "serde",
  "serde_json",
  "sha2",

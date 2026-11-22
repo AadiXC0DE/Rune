@@ -18,6 +18,7 @@ pub mod fork;
 pub mod recovery;
 pub mod replay;
 pub mod report;
+pub mod shadow;
 pub mod store;
 pub mod tree;
 pub mod usage;

@@ -1,6 +1,6 @@
 [package]
 name = "rune-session"
-description = "Append-only session event log, session store, trees, and the usage ledger."
+description = "Append-only session event log, session store, trees, the usage ledger, and workspace snapshots."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 rune-core = { workspace = true }
+# The snapshot store runs git as a supervised command with a deadline, and
+# keys a workspace by the canonical path the trust store also uses.
+rune-exec = { workspace = true }
+rune-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
