@@ -31,10 +31,15 @@ fn running_pings() -> Vec<u32> {
 #[test]
 fn stopping_a_command_stops_its_children() {
     let before = running_pings();
-    let process = Process::start(
-        "start /b ping -t 127.0.0.1 & ping -t 127.0.0.1",
+    // The job holds the tree whichever shell starts it; `cmd.exe` is named so
+    // the command means the same on every host.
+    let root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let cmd = format!(r"{root}\System32\cmd.exe");
+    let process = Process::start_argv(
+        &rune_exec::shell_argv(&cmd, "start /b ping -t 127.0.0.1 & ping -t 127.0.0.1"),
         None,
         4096,
+        &rune_exec::minimal_environment(),
         Input::Closed,
     )
     .expect("start");

@@ -16,25 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Program every command is run by.
-///
-/// The platform's own shell: a command string written for this machine is
-/// written for the shell this machine has.
-#[cfg(unix)]
-const SHELL: &str = "/bin/sh";
-
-/// Program every command is run by.
-#[cfg(not(unix))]
-const SHELL: &str = "cmd.exe";
-
-/// Flag that hands a shell one string to interpret.
-#[cfg(unix)]
-const SHELL_FLAG: &str = "-c";
-
-/// Flag that hands a shell one string to interpret.
-#[cfg(not(unix))]
-const SHELL_FLAG: &str = "/C";
-
 /// Bytes read from a pipe in one call.
 const CHUNK_BYTES: usize = 8 * 1024;
 
@@ -364,11 +345,9 @@ impl Process {
         capture_bytes: usize,
         input: Input,
     ) -> io::Result<Self> {
-        let argv = [
-            SHELL.to_owned(),
-            String::from(SHELL_FLAG),
-            command.to_owned(),
-        ];
+        // The host's own shell, the one the prompt tells the model it writes
+        // commands for.
+        let argv = crate::command::shell_argv(&crate::command::default_shell(), command);
         Self::start_argv(
             &argv,
             cwd,
@@ -1052,22 +1031,36 @@ mod tests {
     /// Time a test gives a process to take its input.
     const WRITE_LIMIT: Duration = Duration::from_secs(10);
 
+    /// Picks the spelling of a command for the shell this host runs commands
+    /// in: sh or bash, either PowerShell, or `cmd.exe`.
+    fn spelled(posix: &str, powershell: &str, cmd: &str) -> String {
+        use crate::command::ShellKind;
+        match crate::command::shell().1 {
+            ShellKind::Posix | ShellKind::Bash => posix,
+            ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => powershell,
+            ShellKind::Cmd => cmd,
+        }
+        .to_owned()
+    }
+
     /// Returns a command that writes to both streams and exits with `code`.
     fn echo_both_and_exit(code: i32) -> String {
-        if cfg!(windows) {
-            format!("echo out & echo err 1>&2 & exit /b {code}")
-        } else {
-            format!("echo out; echo err 1>&2; exit {code}")
-        }
+        spelled(
+            &format!("echo out; echo err 1>&2; exit {code}"),
+            &format!(
+                "[Console]::Out.WriteLine('out'); [Console]::Error.WriteLine('err'); exit {code}"
+            ),
+            &format!("echo out & echo err 1>&2 & exit /b {code}"),
+        )
     }
 
     /// Returns a command that exits with `code`.
     fn exit_with(code: i32) -> String {
-        if cfg!(windows) {
-            format!("exit /b {code}")
-        } else {
-            format!("exit {code}")
-        }
+        spelled(
+            &format!("exit {code}"),
+            &format!("exit {code}"),
+            &format!("exit /b {code}"),
+        )
     }
 
     /// Returns the argv of a process that reads one line and writes it back.
@@ -1159,23 +1152,22 @@ mod tests {
     }
 
     /// Returns the argv that runs `command` under the platform shell.
-    fn shell_argv(command: &str) -> [String; 3] {
-        [
-            SHELL.to_owned(),
-            String::from(SHELL_FLAG),
-            command.to_owned(),
-        ]
+    fn shell_argv(command: &str) -> Vec<String> {
+        crate::command::shell_argv(&crate::command::default_shell(), command)
     }
 
     #[test]
     fn merged_streams_keep_the_order_the_command_wrote() {
-        let command = if cfg!(windows) {
-            "echo o1& echo e1 1>&2& echo o2& echo e2 1>&2"
-        } else {
-            "printf 'o1\\n'; printf 'e1\\n' >&2; printf 'o2\\n'; printf 'e2\\n' >&2"
-        };
+        // PowerShell writes through the console streams directly, because its
+        // own output goes through a formatter that may hold a line back.
+        let command = spelled(
+            "printf 'o1\\n'; printf 'e1\\n' >&2; printf 'o2\\n'; printf 'e2\\n' >&2",
+            "[Console]::Out.WriteLine('o1'); [Console]::Error.WriteLine('e1'); \
+             [Console]::Out.WriteLine('o2'); [Console]::Error.WriteLine('e2')",
+            "echo o1& echo e1 1>&2& echo o2& echo e2 1>&2",
+        );
         let process = Process::start_argv_with(
-            &shell_argv(command),
+            &shell_argv(&command),
             None,
             CAPTURE_BYTES,
             &crate::command::minimal_environment(),
@@ -1266,27 +1258,159 @@ mod tests {
         assert!(process.write(b"hello\n", WRITE_LIMIT).is_err());
     }
 
+    /// Returns a system program's path under `%SystemRoot%\System32`.
+    #[cfg(windows)]
+    fn system_program(relative: &str) -> String {
+        let root = std::env::var("SystemRoot").expect("SystemRoot is set");
+        format!(r"{root}\System32\{relative}")
+    }
+
+    /// Runs `command` under `shell` and returns its exit and standard output.
+    #[cfg(windows)]
+    fn run_in(
+        shell: &str,
+        command: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> (Exit, String) {
+        let process = Process::start_argv(
+            &crate::command::shell_argv(shell, command),
+            None,
+            CAPTURE_BYTES,
+            environment,
+            Input::Closed,
+        )
+        .expect("start");
+        (exit_of(&process), text(process.stdout()))
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_quoted_argument_reaches_the_command_as_written() {
-        let process =
-            Process::start("echo \"fix bug\"", None, CAPTURE_BYTES, Input::Closed).expect("start");
-        assert!(exit_of(&process).is_success());
-        assert_eq!(text(process.stdout()).trim(), "\"fix bug\"");
+        let cmd = system_program("cmd.exe");
+        let (exit, stdout) = run_in(
+            &cmd,
+            "echo \"fix bug\"",
+            &crate::command::minimal_environment(),
+        );
+        assert!(exit.is_success());
+        assert_eq!(stdout.trim(), "\"fix bug\"");
     }
 
     #[cfg(windows)]
     #[test]
     fn a_command_that_begins_with_a_quote_keeps_every_quote() {
-        let process = Process::start(
+        let cmd = system_program("cmd.exe");
+        let (exit, stdout) = run_in(
+            &cmd,
             "\"%SystemRoot%\\System32\\cmd.exe\" /C echo \"a b\"",
-            None,
+            &crate::command::minimal_environment(),
+        );
+        assert!(exit.is_success());
+        assert_eq!(stdout.trim(), "\"a b\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_starts_in_a_verbatim_working_directory() {
+        // A canonical path on Windows carries `\\?\`, which cmd.exe cannot
+        // use as its current directory; it has to start there all the same.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let canonical = dir.path().canonicalize().expect("canonical");
+        let spelled = canonical.to_str().expect("utf8").to_owned();
+        assert!(spelled.starts_with(r"\\?\"), "{spelled}");
+        let process = Process::start_argv(
+            &crate::command::shell_argv(&system_program("cmd.exe"), "cd > where.txt"),
+            Some(&canonical),
             CAPTURE_BYTES,
+            &crate::command::minimal_environment(),
             Input::Closed,
         )
         .expect("start");
         assert!(exit_of(&process).is_success());
-        assert_eq!(text(process.stdout()).trim(), "\"a b\"");
+        let recorded = std::fs::read_to_string(canonical.join("where.txt")).expect("recorded");
+        assert_eq!(
+            Some(recorded.trim().to_owned()),
+            rune_core::paths::plain_spelling(&spelled)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_receives_quoted_arguments_whole() {
+        // Windows PowerShell ships with Windows; PowerShell 7 is tested too
+        // when this host has it on its path.
+        let mut shells = vec![system_program(r"WindowsPowerShell\v1.0\powershell.exe")];
+        if let (shell, crate::command::ShellKind::PowerShell7) = crate::command::shell() {
+            shells.push(shell);
+        }
+        for shell in shells {
+            let (exit, stdout) = run_in(
+                &shell,
+                "Write-Output \"a b\"",
+                &crate::command::minimal_environment(),
+            );
+            assert!(exit.is_success(), "{shell}: {exit:?} {stdout:?}");
+            assert_eq!(stdout.trim(), "a b", "{shell}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_quoted_commit_message_reaches_git_whole_in_every_shell() {
+        let mut shells = vec![
+            system_program("cmd.exe"),
+            system_program(r"WindowsPowerShell\v1.0\powershell.exe"),
+        ];
+        let (host, _) = crate::command::shell();
+        if !shells.contains(&host) {
+            shells.push(host);
+        }
+        for shell in shells {
+            let repository = tempfile::TempDir::new().expect("tempdir");
+            let mut environment = crate::command::minimal_environment();
+            for (name, value) in [
+                ("GIT_AUTHOR_NAME", "a"),
+                ("GIT_AUTHOR_EMAIL", "a@example.com"),
+                ("GIT_COMMITTER_NAME", "a"),
+                ("GIT_COMMITTER_EMAIL", "a@example.com"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+            ] {
+                environment.insert(name.to_owned(), value.to_owned());
+            }
+            let cwd = repository.path();
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .envs(&environment)
+                    .output()
+                    .expect("git runs")
+            };
+            assert!(git(&["init", "--quiet"]).status.success());
+            let process = Process::start_argv(
+                &crate::command::shell_argv(
+                    &shell,
+                    "git commit --quiet --allow-empty -m \"fix bug\"",
+                ),
+                Some(cwd),
+                CAPTURE_BYTES,
+                &environment,
+                Input::Closed,
+            )
+            .expect("start");
+            let exit = exit_of(&process);
+            assert!(
+                exit.is_success(),
+                "{shell}: {exit:?} {}",
+                text(process.stderr())
+            );
+            let subject = git(&["log", "-1", "--format=%s"]);
+            assert_eq!(
+                String::from_utf8_lossy(&subject.stdout).trim(),
+                "fix bug",
+                "{shell}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1387,12 +1511,12 @@ mod tests {
     #[test]
     fn a_write_the_process_never_reads_returns_within_its_limit() {
         // Far more than any pipe holds, to a process that reads nothing.
-        let command = if cfg!(windows) {
-            "ping -n 60 127.0.0.1 >nul"
-        } else {
-            "sleep 30"
-        };
-        let process = Process::start(command, None, CAPTURE_BYTES, Input::Piped).expect("start");
+        let command = spelled(
+            "sleep 30",
+            "Start-Sleep -Seconds 30",
+            "ping -n 60 127.0.0.1 >nul",
+        );
+        let process = Process::start(&command, None, CAPTURE_BYTES, Input::Piped).expect("start");
         let bytes = vec![b'x'; 8 * 1024 * 1024];
 
         let began = Instant::now();

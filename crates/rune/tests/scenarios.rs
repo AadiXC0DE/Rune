@@ -26,6 +26,7 @@ const SCENARIOS: &[&str] = &[
     "max_cost_without_prices",
     "parallel_reads",
     "env_passthrough",
+    "env_passthrough_windows",
     "overwrite_guard",
     "unknown_window_no_compaction",
     "cut_text_continues",
@@ -770,11 +771,18 @@ fn sigint_exits_130() {
     assert_no_survivor(&marker);
 }
 
-// The command is POSIX shell syntax.
+// The command is POSIX shell syntax; `env_passthrough_windows` is its twin.
 #[cfg(unix)]
 #[test]
 fn env_passthrough() {
     run_scenario("env_passthrough");
+}
+
+// A Windows command runs in PowerShell, which every supported Windows has.
+#[cfg(windows)]
+#[test]
+fn env_passthrough_windows() {
+    run_scenario("env_passthrough_windows");
 }
 
 #[test]

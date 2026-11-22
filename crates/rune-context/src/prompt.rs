@@ -718,13 +718,35 @@ fn environment(workspace: &Utf8Path) -> Option<String> {
     let tests = detect_test_command(workspace)
         .map(|command| format!(" Tests run with `{command}`."))
         .unwrap_or_default();
+    let (shell, kind) = rune_exec::command::shell();
     Some(format!(
-        "Environment: {platform} on {arch}. Commands run through `{shell} {flag}`. The workspace \
-         is {workspace}{repository}.{tests}",
+        "Environment: {platform} on {arch}. {commands} The workspace is \
+         {workspace}{repository}.{tests}",
         arch = std::env::consts::ARCH,
-        shell = rune_exec::command::default_shell(),
-        flag = rune_exec::command::SHELL_COMMAND_FLAG,
+        commands = shell_sentence(&shell, kind),
     ))
+}
+
+/// Says which shell commands run through and, for a shell whose syntax is not
+/// the one a model writes by default, which syntax to write.
+#[cfg(not(target_family = "wasm"))]
+fn shell_sentence(shell: &str, kind: rune_exec::ShellKind) -> String {
+    use rune_exec::ShellKind;
+    let invocation = std::iter::once(shell)
+        .chain(rune_exec::command_flags(kind).iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match kind {
+        ShellKind::Posix => format!("Commands run through `{invocation}`."),
+        ShellKind::Bash => format!("Commands run through bash (`{invocation}`)."),
+        ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => format!(
+            "Commands run through {label} (`{invocation}`); write PowerShell syntax.",
+            label = kind.label()
+        ),
+        ShellKind::Cmd => {
+            format!("Commands run through cmd.exe (`{invocation}`); write cmd syntax.")
+        }
+    }
 }
 
 /// Names the command that runs the project's tests, when the workspace root
@@ -1206,6 +1228,43 @@ mod tests {
         // directory nor anything above it contributes.
         assert!(!text.contains("home rules"), "{text}");
         assert!(!text.contains("rules above home"), "{text}");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_environment_line_names_powershell() {
+        use rune_exec::ShellKind;
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        assert_eq!(
+            shell_sentence(pwsh, ShellKind::PowerShell7),
+            format!(
+                "Commands run through PowerShell 7 (`{pwsh} -NoProfile -NonInteractive \
+                 -Command`); write PowerShell syntax."
+            )
+        );
+        let windows = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        assert_eq!(
+            shell_sentence(windows, ShellKind::WindowsPowerShell),
+            format!(
+                "Commands run through Windows PowerShell 5.1 (`{windows} -NoProfile \
+                 -NonInteractive -Command`); write PowerShell syntax."
+            )
+        );
+        let bash = r"C:\Program Files\Git\bin\bash.exe";
+        assert_eq!(
+            shell_sentence(bash, ShellKind::Bash),
+            format!("Commands run through bash (`{bash} -c`).")
+        );
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        assert_eq!(
+            shell_sentence(cmd, ShellKind::Cmd),
+            format!("Commands run through cmd.exe (`{cmd} /C`); write cmd syntax.")
+        );
+        // The Unix line is the one every earlier prompt carried.
+        assert_eq!(
+            shell_sentence("/bin/sh", ShellKind::Posix),
+            "Commands run through `/bin/sh -c`."
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]

@@ -34,9 +34,9 @@ pub mod session;
 pub use command::{
     CommandOutcome, DEFAULT_ADDRESS_SPACE_BYTES, DEFAULT_CPU_SECONDS, DEFAULT_FILE_BYTES,
     DEFAULT_PROCESSES, DEFAULT_SHELL, EnvironmentPolicy, Exit, PreparedCommand, QUIET_DEFAULTS,
-    ResourceLimits, TRUNCATION_MARKER, command_environment, minimal_environment, own_group,
-    prepare, prepare_shell, requires_shell, resource_limits, run, run_with_limits, shell_reason,
-    verify_unchanged,
+    ResourceLimits, ShellKind, TRUNCATION_MARKER, command_environment, command_flags,
+    minimal_environment, own_group, prepare, prepare_shell, requires_shell, resource_limits, run,
+    run_with_limits, shell, shell_argv, shell_reason, verify_unchanged,
 };
 pub use sandbox::{
     CACHE_ROOT_VARIABLES, CacheRoot, DEFAULT_CACHE_ROOTS, LinuxSandbox, MacSandbox,

@@ -1797,65 +1797,79 @@ mod tests {
         }
     }
 
+    /// Picks the spelling of a command for the shell this host runs commands
+    /// in: sh or bash, either PowerShell, or `cmd.exe`.
+    fn spelled(posix: &str, powershell: &str, cmd: &str) -> String {
+        use rune_exec::ShellKind;
+        match rune_exec::shell().1 {
+            ShellKind::Posix | ShellKind::Bash => posix,
+            ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => powershell,
+            ShellKind::Cmd => cmd,
+        }
+        .to_owned()
+    }
+
     /// Returns a command that waits long enough to be stopped by the test.
     fn long_sleep() -> String {
-        if cfg!(windows) {
-            // The platform's sleep is a console command that fails when its
-            // input is redirected, so a ping is used as a delay instead.
-            String::from("ping -n 60 127.0.0.1 >nul")
-        } else {
-            String::from("sleep 30")
-        }
+        // cmd.exe's sleep is a console command that fails when its input is
+        // redirected, so a ping is the delay there.
+        spelled(
+            "sleep 30",
+            "Start-Sleep -Seconds 30",
+            "ping -n 60 127.0.0.1 >nul",
+        )
     }
 
     /// Returns a command that prints far more than the cap and then keeps going.
     fn flood_then_wait() -> String {
-        if cfg!(windows) {
-            // The loop is grouped, because the separator that joins it to the
-            // wait binds inside the loop body rather than after the loop, which
-            // would run the wait once per line and emit one line.
-            format!("({}) & {}", numbered_lines(2000), long_sleep())
-        } else {
-            format!("{}; {}", numbered_lines(2000), long_sleep())
-        }
+        // cmd.exe's loop is grouped, because the separator that joins it to
+        // the wait binds inside the loop body rather than after the loop, which
+        // would run the wait once per line and emit one line.
+        spelled(
+            &format!("{}; {}", numbered_lines(2000), long_sleep()),
+            &format!("{}; {}", numbered_lines(2000), long_sleep()),
+            &format!("({}) & {}", numbered_lines(2000), long_sleep()),
+        )
     }
 
     /// Returns a command that prints `count` numbered lines.
     fn numbered_lines(count: u32) -> String {
-        if cfg!(windows) {
-            format!("for /l %i in (1,1,{count}) do @echo line %i padding")
-        } else {
-            format!("i=0; while [ $i -lt {count} ]; do i=$((i+1)); echo \"line $i padding\"; done")
-        }
+        spelled(
+            &format!(
+                "i=0; while [ $i -lt {count} ]; do i=$((i+1)); echo \"line $i padding\"; done"
+            ),
+            &format!("1..{count} | ForEach-Object {{ \"line $_ padding\" }}"),
+            &format!("for /l %i in (1,1,{count}) do @echo line %i padding"),
+        )
     }
 
     /// Returns a command that ends with `code`.
     fn exit_with(code: i32) -> String {
-        if cfg!(windows) {
-            format!("exit /b {code}")
-        } else {
-            format!("exit {code}")
-        }
+        spelled(
+            &format!("exit {code}"),
+            &format!("exit {code}"),
+            &format!("exit /b {code}"),
+        )
     }
 
     /// Returns a command that prints two words, the first holding two spaces.
     fn echo_two_words() -> String {
-        if cfg!(windows) {
-            // The platform's shell would collapse the spaces, so the text is
-            // printed by a program that takes it as one argument.
-            String::from("powershell -NoProfile -Command \"Write-Output 'a  b c'\"")
-        } else {
-            String::from("printf 'a  b'; echo ' c'")
-        }
+        // cmd.exe would collapse the spaces, so there the text is printed by a
+        // program that takes it as one argument.
+        spelled(
+            "printf 'a  b'; echo ' c'",
+            "Write-Output 'a  b c'",
+            "powershell -NoProfile -Command \"Write-Output 'a  b c'\"",
+        )
     }
 
     /// Returns a command that writes to the error stream and exits with `code`.
     fn echo_to_stderr_and_exit(code: i32) -> String {
-        if cfg!(windows) {
-            format!("echo oops 1>&2 & exit /b {code}")
-        } else {
-            format!("echo oops 1>&2; exit {code}")
-        }
+        spelled(
+            &format!("echo oops 1>&2; exit {code}"),
+            &format!("[Console]::Error.WriteLine('oops'); exit {code}"),
+            &format!("echo oops 1>&2 & exit /b {code}"),
+        )
     }
 
     /// Returns a command that ends the shell with the signal that kills it.
@@ -1881,15 +1895,18 @@ mod tests {
         }
     }
 
-    /// Returns a command that prints the working directory.
+    /// Returns a command that prints the working directory as a path this
+    /// process can open.
     fn print_cwd() -> String {
-        if cfg!(windows) {
-            // The platform's shell has a directory builtin, and a program that
-            // prints a directory prints it in its own notation.
-            String::from("cd")
-        } else {
-            String::from("pwd")
+        use rune_exec::ShellKind;
+        match rune_exec::shell().1 {
+            ShellKind::Posix => "pwd",
+            // Git's bash prints `/c/...` unless asked for the Windows form.
+            ShellKind::Bash => "pwd -W",
+            ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => "(Get-Location).ProviderPath",
+            ShellKind::Cmd => "cd",
         }
+        .to_owned()
     }
 
     /// Returns true for a line holding only digits.
@@ -2898,7 +2915,11 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": format!("echo late & {}", long_sleep()),
+                "command": spelled(
+                    &format!("echo late; {}", long_sleep()),
+                    &format!("echo late; {}", long_sleep()),
+                    &format!("echo late & {}", long_sleep()),
+                ),
                 "yield_time_ms": 0,
             }),
         );
@@ -3325,7 +3346,9 @@ mod tests {
     #[test]
     fn a_windows_command_starts_in_the_workspace() {
         // The working directory is a canonical path, which on Windows carries
-        // `\\?\`; cmd.exe still has to start in the workspace itself.
+        // `\\?\`; the shell still has to start in the workspace itself. The
+        // redirection means the same in cmd.exe, PowerShell and bash, so the
+        // test holds for whichever shell this host runs commands in.
         let tool = shell(4, 64 * 1024);
         let dir = tempfile::tempdir().expect("temp");
         let root = Utf8Path::from_path(dir.path()).expect("utf8");
@@ -3338,21 +3361,13 @@ mod tests {
             &context,
             &serde_json::json!({
                 "action": "run",
-                "command": "cd > where.txt",
+                "command": "echo here > where.txt",
                 "yield_time_ms": 5_000,
             }),
         );
-        let recorded = std::fs::read_to_string(workspace.join("where.txt")).unwrap_or_else(|_| {
-            panic!("the command did not run in its workspace: {}", output.text)
-        });
-        assert_eq!(
-            Utf8PathBuf::from(recorded.trim()),
-            {
-                let canonical = workspace.canonicalize_utf8().expect("canonical");
-                rune_core::paths::plain_spelling(canonical.as_str())
-                    .map_or(canonical, Utf8PathBuf::from)
-            },
-            "{}",
+        assert!(
+            workspace.join("where.txt").is_file(),
+            "the command did not run in its workspace: {}",
             output.text
         );
     }

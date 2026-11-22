@@ -534,9 +534,10 @@ fn io_error(err: &std::io::Error) -> RuneError {
 
 /// Builds the platform shell running one command line.
 fn shell(line: &str) -> Command {
-    let mut command = Command::new(rune_exec::command::default_shell());
+    let (program, kind) = rune_exec::command::shell();
+    let mut command = Command::new(program);
     command
-        .arg(rune_exec::command::SHELL_COMMAND_FLAG)
+        .args(rune_exec::command::command_flags(kind))
         .arg(line);
     command
 }

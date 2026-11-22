@@ -216,13 +216,7 @@ pub fn run(settings: &Settings, paths: &Paths, workspace: &Utf8Path) -> Report {
         paths, workspace,
     )));
     checks.extend(mcp_checks(settings, paths, workspace));
-    checks.push(Check::ok(
-        "shell",
-        format!(
-            "commands run through {}",
-            rune_exec::command::default_shell()
-        ),
-    ));
+    checks.push(shell_check(rune_exec::command::shell()));
     checks.push(disk_check(
         rune_exec::disk::free_bytes(&paths.state_root).or_else(|| {
             paths
@@ -468,6 +462,17 @@ fn network_check(settings: &Settings) -> Check {
         detail.push_str("; offline mode");
     }
     Check::ok("network", detail)
+}
+
+/// The shell commands run through, named by its kind where the path alone
+/// does not say which syntax it reads.
+fn shell_check((path, kind): (String, rune_exec::ShellKind)) -> Check {
+    let message = if kind == rune_exec::ShellKind::Posix {
+        format!("commands run through {path}")
+    } else {
+        format!("commands run through {path} ({})", kind.label())
+    };
+    Check::ok("shell", message)
 }
 
 /// Git, which undoing command changes relies on.
@@ -924,6 +929,19 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn the_shell_row_names_a_windows_shell_by_its_kind() {
+        let posix = shell_check((String::from("/bin/sh"), rune_exec::ShellKind::Posix));
+        assert_eq!(posix.outcome, Outcome::Ok);
+        assert_eq!(posix.detail, "commands run through /bin/sh");
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let named = shell_check((pwsh.to_owned(), rune_exec::ShellKind::PowerShell7));
+        assert_eq!(
+            named.detail,
+            format!("commands run through {pwsh} (PowerShell 7)")
+        );
     }
 
     #[test]

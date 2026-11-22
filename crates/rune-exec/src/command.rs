@@ -37,37 +37,218 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 #[cfg(not(unix))]
 pub const DEFAULT_SHELL: &str = "cmd.exe";
 
+/// The kind of shell commands run through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    /// `/bin/sh`, or any shell on a Unix host.
+    Posix,
+    /// PowerShell 7 (`pwsh.exe`).
+    PowerShell7,
+    /// Windows PowerShell 5.1 (`powershell.exe`), which ships with Windows.
+    WindowsPowerShell,
+    /// `cmd.exe`.
+    Cmd,
+    /// bash on Windows, such as the one Git for Windows installs.
+    Bash,
+}
+
+impl ShellKind {
+    /// Returns the name a person knows this shell by.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Posix => "sh",
+            Self::PowerShell7 => "PowerShell 7",
+            Self::WindowsPowerShell => "Windows PowerShell 5.1",
+            Self::Cmd => "cmd.exe",
+            Self::Bash => "bash",
+        }
+    }
+
+    /// Returns the kind of shell a program path names, from its file name.
+    ///
+    /// The kind is read from the program rather than stored beside it, so an
+    /// argv carries everything needed to rebuild it: the flags a verification
+    /// expects are the flags the program it names takes.
+    #[must_use]
+    pub fn of(program: &str) -> Self {
+        Self::of_on(program, cfg!(windows))
+    }
+
+    /// [`ShellKind::of`] for a chosen platform.
+    ///
+    /// A Unix host hands every shell its string with `-c`, so every program is
+    /// `Posix` there. On Windows a name this module does not know keeps the
+    /// `cmd.exe` flags, which every shell was given before the others were
+    /// recognized.
+    fn of_on(program: &str, windows: bool) -> Self {
+        if !windows {
+            return Self::Posix;
+        }
+        let name = file_name(program);
+        let stem = name
+            .len()
+            .checked_sub(4)
+            .filter(|&at| {
+                name.get(at..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(".exe"))
+            })
+            .and_then(|at| name.get(..at))
+            .unwrap_or(name);
+        if stem.eq_ignore_ascii_case("pwsh") {
+            Self::PowerShell7
+        } else if stem.eq_ignore_ascii_case("powershell") {
+            Self::WindowsPowerShell
+        } else if stem.eq_ignore_ascii_case("bash") {
+            Self::Bash
+        } else {
+            Self::Cmd
+        }
+    }
+}
+
+/// Returns the last component of a path written with either separator.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Returns the shell and its kind for this host.
+///
+/// On Windows the first of these that exists wins: `SHELL` naming an absolute
+/// `bash.exe` (Git Bash exports it to the programs it starts), `pwsh.exe` in a
+/// `PATH` directory, Windows PowerShell under the system directory, then
+/// `cmd.exe`. A Unix host always has `/bin/sh`. The answer is computed once, so
+/// every command in a run goes to the shell the prompt names.
+#[must_use]
+pub fn shell() -> (String, ShellKind) {
+    static SHELL: std::sync::OnceLock<(String, ShellKind)> = std::sync::OnceLock::new();
+    SHELL.get_or_init(detect_shell).clone()
+}
+
+/// Looks for this host's shell.
+#[cfg(windows)]
+fn detect_shell() -> (String, ShellKind) {
+    let variable = std::env::var("SHELL").ok();
+    let directories: Vec<String> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter_map(|directory| directory.into_os_string().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let root = std::env::var("SystemRoot")
+        .ok()
+        .or_else(|| std::env::var("windir").ok());
+    shell_from(
+        variable.as_deref(),
+        &directories,
+        root.as_deref(),
+        &|path| std::path::Path::new(path).is_file(),
+    )
+}
+
+/// Looks for this host's shell.
+#[cfg(not(windows))]
+fn detect_shell() -> (String, ShellKind) {
+    (DEFAULT_SHELL.to_owned(), ShellKind::Posix)
+}
+
+/// Chooses the Windows shell from the inputs that decide it.
+///
+/// Only absolute candidates are taken. A relative `PATH` entry resolves against
+/// the directory Rune started in, which is the workspace, so a `pwsh.exe`
+/// checked into a repository would otherwise run every command.
+#[cfg(any(windows, test))]
+fn shell_from(
+    variable: Option<&str>,
+    directories: &[String],
+    system_root: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> (String, ShellKind) {
+    if let Some(bash) = variable
+        && windows_absolute(bash)
+        && file_name(bash).eq_ignore_ascii_case("bash.exe")
+        && exists(bash)
+    {
+        return (bash.to_owned(), ShellKind::Bash);
+    }
+    if let Some(pwsh) = directories
+        .iter()
+        .filter(|directory| windows_absolute(directory))
+        .map(|directory| windows_join(directory, "pwsh.exe"))
+        .find(|candidate| exists(candidate))
+    {
+        return (pwsh, ShellKind::PowerShell7);
+    }
+    if let Some(root) = system_root.filter(|root| windows_absolute(root)) {
+        let system = windows_join(root, "System32");
+        let powershell = windows_join(&system, r"WindowsPowerShell\v1.0\powershell.exe");
+        if exists(&powershell) {
+            return (powershell, ShellKind::WindowsPowerShell);
+        }
+        let cmd = windows_join(&system, "cmd.exe");
+        if exists(&cmd) {
+            return (cmd, ShellKind::Cmd);
+        }
+    }
+    // A host that will not say where its system directory is gets the name,
+    // which is what Windows has always been handed here.
+    (String::from("cmd.exe"), ShellKind::Cmd)
+}
+
+/// Returns true for a path that names a drive or a share, as `C:\x` and
+/// `\\server\share` do; `\x` is relative to the current drive.
+#[cfg(any(windows, test))]
+fn windows_absolute(path: &str) -> bool {
+    matches!(path.as_bytes(), [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic())
+        || path.starts_with(r"\\")
+        || path.starts_with("//")
+}
+
+/// Joins a Windows directory and a relative path with one backslash.
+#[cfg(any(windows, test))]
+fn windows_join(directory: &str, relative: &str) -> String {
+    format!("{}\\{relative}", directory.trim_end_matches(['\\', '/']))
+}
+
 /// Returns the shell that parses a command string on this host.
 ///
 /// A shell has to be absolute to be verified as the program that was reviewed,
 /// and the platform that names its shell keeps it under the system directory,
 /// which is not always on the system drive. The conventional location is the
-/// fallback for a host that will not say where it is, so the value is always a
-/// path rather than a name to look up.
+/// fallback for a host that will not say where it is.
 #[must_use]
 pub fn default_shell() -> String {
-    #[cfg(windows)]
-    {
-        let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"));
-        if let Some(root) = root {
-            let candidate = Utf8PathBuf::from(root.to_string_lossy().into_owned())
-                .join("System32")
-                .join("cmd.exe");
-            if candidate.exists() {
-                return candidate.into_string();
-            }
-        }
-    }
-    DEFAULT_SHELL.to_owned()
+    shell().0
 }
 
-/// Flag that hands a shell one string to interpret.
-#[cfg(unix)]
-pub const SHELL_COMMAND_FLAG: &str = "-c";
+/// The arguments that hand a shell one command string.
+///
+/// Both PowerShells read the user's profile and may stop to ask a question
+/// unless told not to; a profile is code the reviewer never saw, and a question
+/// waits for an answer nobody can give.
+#[must_use]
+pub const fn command_flags(kind: ShellKind) -> &'static [&'static str] {
+    match kind {
+        ShellKind::Posix | ShellKind::Bash => &["-c"],
+        ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => {
+            &["-NoProfile", "-NonInteractive", "-Command"]
+        }
+        ShellKind::Cmd => &["/C"],
+    }
+}
 
-/// Flag that hands a shell one string to interpret.
-#[cfg(not(unix))]
-pub const SHELL_COMMAND_FLAG: &str = "/C";
+/// Returns the argv that hands `command` to `shell` as one argument, with the
+/// flags the shell's kind takes.
+#[must_use]
+pub fn shell_argv(shell: &str, command: &str) -> Vec<String> {
+    let flags = command_flags(ShellKind::of(shell));
+    let mut argv = Vec::with_capacity(flags.len().saturating_add(2));
+    argv.push(shell.to_owned());
+    argv.extend(flags.iter().map(|flag| (*flag).to_owned()));
+    argv.push(command.to_owned());
+    argv
+}
 
 /// Tokens that make a command more than a program and its arguments.
 ///
@@ -276,11 +457,7 @@ pub fn prepare_shell(
         .with_hint("a shell resolved through PATH is not the program that was reviewed"));
     }
     Ok(PreparedCommand {
-        argv: vec![
-            shell.to_owned(),
-            String::from(SHELL_COMMAND_FLAG),
-            command.to_owned(),
-        ],
+        argv: shell_argv(shell, command),
         cwd: workspace.to_owned(),
         environment,
         limits: resource_limits(),
@@ -665,11 +842,7 @@ pub fn shell_reason(command: &str) -> Option<&'static str> {
 /// Returns the argv a command routes to.
 fn route(command: &str, shell: &str) -> Vec<String> {
     if requires_shell(command) {
-        vec![
-            shell.to_owned(),
-            String::from(SHELL_COMMAND_FLAG),
-            command.to_owned(),
-        ]
+        shell_argv(shell, command)
     } else {
         command.split_whitespace().map(str::to_owned).collect()
     }
@@ -716,9 +889,19 @@ pub fn verify_unchanged(prepared: &PreparedCommand) -> Result<()> {
 }
 
 /// Returns the shell an argv invokes the reviewed string with, if it does.
+///
+/// The flags between the shell and the string have to be exactly the ones the
+/// shell's kind takes, so a flag added or dropped is a changed route.
 fn shell_invocation(prepared: &PreparedCommand) -> Option<&str> {
     match prepared.argv.as_slice() {
-        [shell, flag, command] if flag == SHELL_COMMAND_FLAG && command == &prepared.reviewed => {
+        [shell, flags @ .., command]
+            if command == &prepared.reviewed
+                && !flags.is_empty()
+                && flags
+                    .iter()
+                    .map(String::as_str)
+                    .eq(command_flags(ShellKind::of(shell)).iter().copied()) =>
+        {
             Some(shell)
         }
         _ => None,
@@ -1450,7 +1633,7 @@ mod tests {
             let prepared = prepare(command, dir.as_path(), None, environment()).expect("prepare");
             assert_eq!(
                 prepared.argv,
-                [default_shell().as_str(), SHELL_COMMAND_FLAG, command],
+                shell_argv(&default_shell(), command),
                 "`{command}` did not route through the shell"
             );
             assert_eq!(prepared.reviewed, command);
@@ -1466,10 +1649,7 @@ mod tests {
         let named = default_shell();
         let prepared =
             prepare("echo a | cat", dir.as_path(), Some(&named), environment()).expect("prepare");
-        assert_eq!(
-            prepared.argv,
-            [named.as_str(), SHELL_COMMAND_FLAG, "echo a | cat"]
-        );
+        assert_eq!(prepared.argv, shell_argv(&named, "echo a | cat"));
 
         let bare = Utf8Path::new(&named)
             .file_name()
@@ -2240,6 +2420,161 @@ mod tests {
                 "`{command}` was refused"
             );
         }
+    }
+
+    /// Runs `shell_from` with a fixed set of files that exist.
+    fn shell_with(
+        variable: Option<&str>,
+        directories: &[&str],
+        system_root: Option<&str>,
+        files: &[&str],
+    ) -> (String, ShellKind) {
+        let directories: Vec<String> = directories
+            .iter()
+            .map(|directory| (*directory).to_owned())
+            .collect();
+        shell_from(variable, &directories, system_root, &|path| {
+            files.iter().any(|file| file.eq_ignore_ascii_case(path))
+        })
+    }
+
+    const GIT_BASH: &str = r"C:\Program Files\Git\bin\bash.exe";
+    const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
+    const WINDOWS_POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    const CMD: &str = r"C:\Windows\System32\cmd.exe";
+
+    #[test]
+    fn git_bash_wins_when_shell_points_at_it() {
+        let all = [GIT_BASH, PWSH, WINDOWS_POWERSHELL, CMD];
+        let dirs = [r"C:\Program Files\PowerShell\7"];
+        assert_eq!(
+            shell_with(Some(GIT_BASH), &dirs, Some(r"C:\Windows"), &all),
+            (GIT_BASH.to_owned(), ShellKind::Bash)
+        );
+        // The bash Git keeps under `usr` is the same shell.
+        let usr = r"C:\Program Files\Git\usr\bin\bash.exe";
+        assert_eq!(
+            shell_with(Some(usr), &dirs, Some(r"C:\Windows"), &[usr, CMD]),
+            (usr.to_owned(), ShellKind::Bash)
+        );
+        // A `SHELL` that names a missing file, a relative path, or another
+        // program is ignored.
+        for ignored in [
+            r"C:\missing\bash.exe",
+            r"bin\bash.exe",
+            r"C:\Git\bin\sh.exe",
+        ] {
+            assert_eq!(
+                shell_with(Some(ignored), &dirs, Some(r"C:\Windows"), &all).1,
+                ShellKind::PowerShell7,
+                "{ignored}"
+            );
+        }
+    }
+
+    #[test]
+    fn pwsh_comes_before_windows_powershell() {
+        let all = [PWSH, WINDOWS_POWERSHELL, CMD];
+        assert_eq!(
+            shell_with(
+                None,
+                &[r"C:\Windows\System32", r"C:\Program Files\PowerShell\7\"],
+                Some(r"C:\Windows"),
+                &all
+            ),
+            (PWSH.to_owned(), ShellKind::PowerShell7)
+        );
+        assert_eq!(
+            shell_with(None, &[r"C:\Windows\System32"], Some(r"C:\Windows"), &all),
+            (WINDOWS_POWERSHELL.to_owned(), ShellKind::WindowsPowerShell)
+        );
+        // A relative directory resolves against the workspace, so a `pwsh.exe`
+        // there is not taken.
+        assert_eq!(
+            shell_with(
+                None,
+                &["tools", r"\tools"],
+                Some(r"C:\Windows"),
+                &[r"tools\pwsh.exe", r"\tools\pwsh.exe", WINDOWS_POWERSHELL]
+            ),
+            (WINDOWS_POWERSHELL.to_owned(), ShellKind::WindowsPowerShell)
+        );
+    }
+
+    #[test]
+    fn cmd_is_the_last_resort() {
+        assert_eq!(
+            shell_with(None, &[r"C:\Windows\System32"], Some(r"C:\Windows"), &[CMD]),
+            (CMD.to_owned(), ShellKind::Cmd)
+        );
+        // A system directory on another drive is where its programs are.
+        assert_eq!(
+            shell_with(
+                None,
+                &[],
+                Some(r"D:\WINNT"),
+                &[r"D:\WINNT\System32\cmd.exe"]
+            ),
+            (r"D:\WINNT\System32\cmd.exe".to_owned(), ShellKind::Cmd)
+        );
+        assert_eq!(
+            shell_with(None, &[], None, &[]),
+            (String::from("cmd.exe"), ShellKind::Cmd)
+        );
+    }
+
+    #[test]
+    fn the_kind_is_read_from_the_program_file_name() {
+        for (program, kind) in [
+            (PWSH, ShellKind::PowerShell7),
+            ("C:/tools/PWSH.EXE", ShellKind::PowerShell7),
+            (WINDOWS_POWERSHELL, ShellKind::WindowsPowerShell),
+            (GIT_BASH, ShellKind::Bash),
+            (CMD, ShellKind::Cmd),
+            ("cmd", ShellKind::Cmd),
+            (r"C:\tools\nu.exe", ShellKind::Cmd),
+        ] {
+            assert_eq!(ShellKind::of_on(program, true), kind, "{program}");
+            assert_eq!(ShellKind::of_on(program, false), ShellKind::Posix);
+        }
+        assert_eq!(command_flags(ShellKind::Posix), ["-c"]);
+        assert_eq!(command_flags(ShellKind::Bash), ["-c"]);
+        assert_eq!(command_flags(ShellKind::Cmd), ["/C"]);
+        for kind in [ShellKind::PowerShell7, ShellKind::WindowsPowerShell] {
+            assert_eq!(
+                command_flags(kind),
+                ["-NoProfile", "-NonInteractive", "-Command"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_shell_is_absolute_and_takes_its_own_flags() {
+        let (shell, kind) = shell();
+        assert!(Utf8Path::new(&shell).is_absolute(), "{shell}");
+        assert_eq!(default_shell(), shell);
+        assert_eq!(ShellKind::of(&shell), kind);
+        if cfg!(unix) {
+            assert_eq!((shell.as_str(), kind), ("/bin/sh", ShellKind::Posix));
+        }
+    }
+
+    #[test]
+    fn a_shell_route_with_changed_flags_is_refused() {
+        let (_dir, dir) = tempdir();
+        let prepared =
+            prepare("echo a | cat", dir.as_path(), None, environment()).expect("prepare");
+        assert!(verify_unchanged(&prepared).is_ok());
+        let flags = prepared.argv.len().saturating_sub(2);
+        assert!(flags >= 1, "{:?}", prepared.argv);
+
+        // A flag dropped from the middle, and one added before the string.
+        let mut dropped = prepared.clone();
+        dropped.argv.remove(flags);
+        assert!(verify_unchanged(&dropped).is_err(), "{:?}", dropped.argv);
+        let mut added = prepared.clone();
+        added.argv.insert(1, String::from("-x"));
+        assert!(verify_unchanged(&added).is_err(), "{:?}", added.argv);
     }
 
     #[test]
