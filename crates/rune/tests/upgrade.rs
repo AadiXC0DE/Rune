@@ -411,15 +411,66 @@ fn upgrade_latest(root: &std::path::Path, base: &str, extra: &[&str]) -> Output 
         .expect("run upgrade")
 }
 
+/// The payload the served release installs.
+const RELEASED: &[u8] = b"#!/bin/sh\necho rune 9.9.9\n";
+
 fn release_archive() -> Vec<u8> {
     if cfg!(windows) {
-        // The Windows archive is a zip; its fixture is not built here.
-        return Vec::new();
+        zip(MEMBER, RELEASED)
+    } else {
+        gzip(&tar(MEMBER, RELEASED))
     }
-    gzip(&tar(MEMBER, b"#!/bin/sh\necho rune 9.9.9\n"))
 }
 
-#[cfg(unix)]
+/// A single-member Deflate ZIP laid out as the Windows release is: one local
+/// header, the stream, one central record and the end record, with no extra
+/// fields, comment or data descriptor.
+fn zip(name: &str, payload: &[u8]) -> Vec<u8> {
+    use flate2::write::DeflateEncoder;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(payload).expect("deflate fixture");
+    let packed = encoder.finish().expect("finish fixture");
+    let mut crc = flate2::Crc::new();
+    crc.update(payload);
+    let u16le = |value: usize| u16::try_from(value).expect("fits").to_le_bytes();
+    let u32le = |value: usize| u32::try_from(value).expect("fits").to_le_bytes();
+    // Version needed, flags, method, time, date, CRC, sizes, name and extra lengths.
+    let mut common = Vec::new();
+    common.extend_from_slice(&20_u16.to_le_bytes());
+    common.extend_from_slice(&0_u16.to_le_bytes());
+    common.extend_from_slice(&8_u16.to_le_bytes());
+    common.extend_from_slice(&[0; 4]);
+    common.extend_from_slice(&crc.sum().to_le_bytes());
+    common.extend_from_slice(&u32le(packed.len()));
+    common.extend_from_slice(&u32le(payload.len()));
+    common.extend_from_slice(&u16le(name.len()));
+    common.extend_from_slice(&0_u16.to_le_bytes());
+
+    let mut bytes = b"PK\x03\x04".to_vec();
+    bytes.extend_from_slice(&common);
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&packed);
+    let central_offset = bytes.len();
+    bytes.extend_from_slice(b"PK\x01\x02");
+    bytes.extend_from_slice(&20_u16.to_le_bytes());
+    bytes.extend_from_slice(&common);
+    // Comment length, disk, internal and external attributes, local offset.
+    bytes.extend_from_slice(&[0; 6]);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(name.as_bytes());
+    let central_size = bytes.len().saturating_sub(central_offset);
+    bytes.extend_from_slice(b"PK\x05\x06");
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&u32le(central_size));
+    bytes.extend_from_slice(&u32le(central_offset));
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes
+}
+
 #[test]
 fn upgrade_installs_a_verified_release() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -438,7 +489,6 @@ fn upgrade_installs_a_verified_release() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn upgrade_refuses_a_bad_digest() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -457,7 +507,6 @@ fn upgrade_refuses_a_bad_digest() {
     assert!(staging_entries(dir.path()).is_empty());
 }
 
-#[cfg(unix)]
 #[test]
 fn upgrade_check_reports_without_writing() {
     let dir = tempfile::tempdir().expect("tempdir");
