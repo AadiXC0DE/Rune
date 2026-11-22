@@ -318,6 +318,14 @@ pub fn run_wrapped(
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
+    // Windows loads its network providers from paths under the system root, so
+    // a child without these cannot open a socket to the scripted provider.
+    #[cfg(windows)]
+    for name in ["SystemRoot", "windir"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command
         .env("HOME", root.join("home"))
         .env("RUNE_HOME", root.join("state"))

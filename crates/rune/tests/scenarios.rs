@@ -1,5 +1,4 @@
 //! Whole `rune ask` runs against a scripted provider.
-#![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -58,6 +57,7 @@ const SCENARIOS: &[&str] = &[
     "goal_judge_spend",
     "context_report",
     "hook_continue",
+    "hook_continue_windows",
 ];
 
 /// Scenarios built in Rust, which have no file.
@@ -399,10 +399,18 @@ fn context_overflow() {
     run_scenario("context_overflow");
 }
 
+// The hook is a POSIX shell script; `hook_continue_windows` is its twin.
+#[cfg(unix)]
 #[test]
 fn hook_continue() {
     // A turn-end hook that asks once for more gets exactly one more request.
     run_scenario("hook_continue");
+}
+
+#[cfg(windows)]
+#[test]
+fn hook_continue_windows() {
+    run_scenario("hook_continue_windows");
 }
 
 #[test]
@@ -762,6 +770,8 @@ fn sigint_exits_130() {
     assert_no_survivor(&marker);
 }
 
+// The command is POSIX shell syntax.
+#[cfg(unix)]
 #[test]
 fn env_passthrough() {
     run_scenario("env_passthrough");
