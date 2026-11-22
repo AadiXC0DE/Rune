@@ -37,7 +37,10 @@ const GC_DEADLINE: Duration = Duration::from_secs(120);
 /// A private git directory that snapshots one workspace.
 pub struct Shadow {
     git_dir: Utf8PathBuf,
+    /// The canonical workspace, which names the store and is recorded in it.
     workspace: Utf8PathBuf,
+    /// The workspace as git is given it.
+    work_tree: Utf8PathBuf,
     index: Utf8PathBuf,
     exclude: Utf8PathBuf,
     /// Directory holding one folder per session, to tell which sessions still exist.
@@ -136,12 +139,13 @@ impl Shadow {
 
     /// The shadow of a canonical workspace path, whether or not it exists yet.
     fn at(paths: &Paths, workspace: Utf8PathBuf) -> Self {
-        let git_dir = shadow_dir(paths, &workspace);
+        let git_dir = for_git(shadow_dir(paths, &workspace));
         Self {
             index: git_dir.join("rune-index"),
             exclude: git_dir.join("info").join("rune-exclude"),
             sessions: paths.sessions_dir(),
             git_dir,
+            work_tree: for_git(workspace.clone()),
             workspace,
         }
     }
@@ -160,7 +164,7 @@ impl Shadow {
                 "--template=".to_owned(),
                 self.git_dir.to_string(),
             ],
-            &self.workspace,
+            &self.work_tree,
             &environment(None),
             DEFAULT_DEADLINE,
         )?;
@@ -535,7 +539,7 @@ impl Shadow {
         let hooks = format!("core.hooksPath={}", self.hooks_dir());
         let mut argv = vec![
             format!("--git-dir={}", self.git_dir),
-            format!("--work-tree={}", self.workspace),
+            format!("--work-tree={}", self.work_tree),
             "-c".to_owned(),
             hooks,
             "-c".to_owned(),
@@ -549,7 +553,7 @@ impl Shadow {
         run_git_named(
             &argv,
             name,
-            &self.workspace,
+            &self.work_tree,
             &environment(Some(&self.index)),
             timeout,
         )
@@ -571,7 +575,7 @@ impl Shadow {
                 "--get".to_owned(),
                 "core.sharedRepository".to_owned(),
             ],
-            &self.workspace,
+            &self.work_tree,
             &environment(None),
             DEFAULT_DEADLINE,
         )
@@ -1226,6 +1230,17 @@ fn shadow_dir(paths: &Paths, workspace: &Utf8Path) -> Utf8PathBuf {
     paths.state_root.join(CHECKPOINTS_DIR).join(key)
 }
 
+/// A path spelled the way git accepts it. Git for Windows refuses the `\\?\`
+/// form a canonical path has there, so the plain spelling is used whenever it
+/// names the same directory.
+fn for_git(path: Utf8PathBuf) -> Utf8PathBuf {
+    if cfg!(windows) {
+        paths::plain_spelling(path.as_str()).map_or(path, Utf8PathBuf::from)
+    } else {
+        path
+    }
+}
+
 /// The nearest directory from the workspace upward that contains `.git`.
 fn git_root(workspace: &Utf8Path) -> Option<&Utf8Path> {
     workspace.ancestors().find(|dir| dir.join(".git").exists())
@@ -1363,7 +1378,7 @@ fn directory_size(directory: &std::path::Path) -> u64 {
     total
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1406,6 +1421,8 @@ mod tests {
 
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().expect("tempdir");
+        // On Windows a canonical path has the `\\?\` form, which git refuses;
+        // the store and the work tree must still reach git in a form it takes.
         let base = Utf8PathBuf::from_path_buf(root.path().canonicalize().expect("canonical"))
             .expect("utf8");
         let workspace = base.join("work");
@@ -1538,17 +1555,22 @@ mod tests {
 
     #[test]
     fn hooks_in_the_real_repository_never_run() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         if !git_present() {
             return;
         }
         let fixture = fixture();
         let marker = fixture.workspace.join("hook-ran");
+        // Git for Windows runs a hook through its own sh, with no executable bit.
+        let marker_text = marker.as_str().replace('\\', "/");
         for hook in ["pre-commit", "post-index-change"] {
             let path = fixture.workspace.join(".git/hooks").join(hook);
-            std::fs::write(&path, format!("#!/bin/sh\ntouch '{marker}'\n")).expect("hook");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{marker_text}'\n")).expect("hook");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+            }
         }
         std::fs::write(fixture.workspace.join("b.txt"), "b\n").expect("file");
         let shadow = open(&fixture);
@@ -1785,6 +1807,7 @@ mod tests {
         assert!(fixture.workspace.join("a.txt").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_keeps_the_executable_bit() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1818,6 +1841,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_store_from_before_private_stores_is_tightened_on_open() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1882,7 +1906,7 @@ mod tests {
         let target = shadow.snapshot("s", "turn 1 start").expect("snapshot");
         let outside = tempfile::tempdir().expect("outside");
         std::fs::remove_dir_all(fixture.workspace.join("link")).expect("remove");
-        std::os::unix::fs::symlink(outside.path(), fixture.workspace.join("link")).expect("link");
+        link_directory(outside.path(), fixture.workspace.join("link").as_std_path());
         std::fs::write(fixture.workspace.join("a.txt"), "later\n").expect("edit");
         let current = shadow.snapshot("s", "turn 1 end").expect("snapshot");
 
@@ -1899,6 +1923,25 @@ mod tests {
             "later\n",
             "nothing is written when one path is refused"
         );
+    }
+
+    /// Makes `link` lead to `target`: a symbolic link, or on Windows a
+    /// junction, which needs no privilege.
+    fn link_directory(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("link");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd.exe")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("mklink");
+            assert!(made.status.success(), "{made:?}");
+        }
     }
 
     #[test]

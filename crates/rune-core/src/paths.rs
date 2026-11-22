@@ -326,6 +326,60 @@ impl fmt::Display for Paths {
     }
 }
 
+/// The plain spelling of a Windows `\\?\` path, when it names the same file:
+/// `\\?\C:\a` is `C:\a` and `\\?\UNC\host\share\a` is `\\host\share\a`.
+///
+/// `None` when there is no prefix, or when the plain spelling would mean
+/// something else: a path of 260 characters or more, a name that ends in a dot
+/// or a space, a name with `/` in it, or a device name such as `NUL` or
+/// `com1.txt`, all of which Windows rewrites when the prefix is gone.
+#[must_use]
+pub fn plain_spelling(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("\\\\?\\")?;
+    let plain = if let Some(unc) = rest.strip_prefix("UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        let bytes = rest.as_bytes();
+        let drive = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), None | Some(&b'\\'));
+        if !drive {
+            return None;
+        }
+        rest.to_owned()
+    };
+    if plain.chars().count() >= 260 || plain.contains('/') {
+        return None;
+    }
+    let names = plain
+        .trim_start_matches('\\')
+        .split('\\')
+        .skip(1)
+        .filter(|name| !name.is_empty());
+    for name in names {
+        if name.ends_with(['.', ' ']) || is_device_name(name) {
+            return None;
+        }
+    }
+    Some(plain)
+}
+
+/// True for the names Windows treats as devices in any folder, with or
+/// without an extension.
+fn is_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let mut chars = upper.chars();
+            let last = chars.next_back();
+            matches!(chars.as_str(), "COM" | "LPT")
+                && last.is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, '¹' | '²' | '³'))
+        }
+    }
+}
+
 /// Returns the current user's home directory, when it is an absolute path.
 ///
 /// The variable differs by platform: `HOME` is normally unset in a Windows
@@ -710,6 +764,58 @@ fn set_open_mode(_options: &mut std::fs::OpenOptions, _mode: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_paths_have_a_plain_spelling_when_it_means_the_same() {
+        let plain = |path: &str| plain_spelling(path);
+        assert_eq!(
+            plain("\\\\?\\C:\\Users\\ada\\work").as_deref(),
+            Some("C:\\Users\\ada\\work")
+        );
+        assert_eq!(plain("\\\\?\\d:\\").as_deref(), Some("d:\\"));
+        assert_eq!(plain("\\\\?\\C:").as_deref(), Some("C:"));
+        assert_eq!(
+            plain("\\\\?\\UNC\\host\\share\\work").as_deref(),
+            Some("\\\\host\\share\\work")
+        );
+        assert_eq!(
+            plain("\\\\?\\C:\\a\\icon.txt\\b").as_deref(),
+            Some("C:\\a\\icon.txt\\b")
+        );
+        assert_eq!(
+            plain("\\\\?\\C:\\a\\console").as_deref(),
+            Some("C:\\a\\console")
+        );
+        assert_eq!(
+            plain("\\\\?\\C:\\a\\com10").as_deref(),
+            Some("C:\\a\\com10")
+        );
+        // Nothing to drop.
+        assert_eq!(plain("C:\\Users\\ada"), None);
+        assert_eq!(plain("/home/ada"), None);
+        // The plain spelling would name something else.
+        for kept in [
+            "\\\\?\\Volume{0b1c}\\work",
+            "\\\\?\\C:\\a\\trailing.",
+            "\\\\?\\C:\\a\\trailing \\b",
+            "\\\\?\\C:\\a\\NUL",
+            "\\\\?\\C:\\a\\com1.txt",
+            "\\\\?\\C:\\a\\con.txt.d\\b",
+            "\\\\?\\C:\\a\\Lpt9",
+            "\\\\?\\C:\\a\\COM\u{b9}",
+            "\\\\?\\C:\\a\\CONOUT$",
+            "\\\\?\\C:\\a/b",
+            "\\\\?\\UNC\\host\\share\\aux",
+        ] {
+            assert_eq!(plain(kept), None, "{kept}");
+        }
+        let long = format!("\\\\?\\C:\\{}", "a".repeat(257));
+        assert_eq!(plain(&long), None);
+        let fits = format!("\\\\?\\C:\\{}", "a".repeat(256));
+        assert_eq!(plain(&fits).map(|path| path.len()), Some(259));
+        // A name ending in a multi-byte character is not a device name.
+        assert!(plain("\\\\?\\C:\\a\\caf\u{e9}").is_some());
+    }
 
     fn windows_inputs<'a>() -> RootInputs<'a> {
         RootInputs {
