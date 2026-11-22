@@ -274,11 +274,10 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// `from` attribute shows it, relative to the workspace, so a resumed session
 /// can find it in a rebuilt result.
 fn rules_key(file: &rune_context::InstructionFile, workspace: &Utf8Path) -> String {
-    let path = file
-        .path
-        .strip_prefix(workspace)
-        .map_or_else(|_| file.path.to_string(), ToString::to_string);
-    format!("rules:{path}")
+    format!(
+        "rules:{}",
+        rune_context::instructions::shown_path(&file.path, workspace)
+    )
 }
 
 /// Returns the nested instruction files the step's calls touched for the
@@ -452,12 +451,8 @@ mod tests {
             appendix.text
         );
         assert!(!appendix.text.contains("Use spaces in b."));
-        // Keys show the path as the rendered `from` does, with this
-        // platform's separator.
-        assert_eq!(
-            appendix.keys,
-            vec![format!("rules:{}", Utf8Path::new("a").join("AGENTS.md"))]
-        );
+        // Keys show the path as the rendered `from` does.
+        assert_eq!(appendix.keys, vec!["rules:a/AGENTS.md".to_owned()]);
 
         // A deep path gets every file on the way, the widest first.
         let deep = deliver(&[call(
@@ -473,10 +468,7 @@ mod tests {
         let other = deliver(&[call("read_file", &serde_json::json!({"path": "b/z.txt"}))])
             .expect("rules for b");
         assert!(
-            other.text.contains(&format!(
-                "from=\"{}\"",
-                Utf8Path::new("b").join("CLAUDE.md")
-            )),
+            other.text.contains("from=\"b/CLAUDE.md\""),
             "{}",
             other.text
         );

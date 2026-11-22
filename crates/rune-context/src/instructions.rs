@@ -198,15 +198,27 @@ pub fn discover(workspace: &Utf8Path, home: Option<&Utf8Path>) -> Result<Vec<Ins
         .map(Discovery::all)
 }
 
+/// A path as a scoped rules block names it: relative to the workspace when it
+/// is inside, with `/` between its parts on every platform, as the model is
+/// shown every other path.
+#[must_use]
+pub fn shown_path(path: &Utf8Path, workspace: &Utf8Path) -> String {
+    let shown = path
+        .strip_prefix(workspace)
+        .map_or_else(|_| path.to_string(), ToString::to_string);
+    if std::path::MAIN_SEPARATOR == '/' {
+        shown
+    } else {
+        shown.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 /// Renders a nested file for delivery when its directory is first touched,
 /// cut at `cap` bytes as the prompt cuts a file, with paths relative to the
 /// workspace.
 #[must_use]
 pub fn scoped_rules(file: &InstructionFile, workspace: &Utf8Path, cap: usize) -> String {
-    let shown = |path: &Utf8Path| {
-        path.strip_prefix(workspace)
-            .map_or_else(|_| path.to_string(), ToString::to_string)
-    };
+    let shown = |path: &Utf8Path| shown_path(path, workspace);
     let retained = prefix(&file.content, cap);
     let mut text = String::new();
     let _ = writeln!(
@@ -679,11 +691,10 @@ mod tests {
 
         let file = &found.nested[0];
         let rendered = scoped_rules(file, &workspace, 1_000);
-        let expected_from = under(Utf8Path::new("pkg"), "AGENTS.md");
         assert!(
-            rendered.starts_with(&format!(
-                "<scoped-rules from=\"{expected_from}\" applies-to=\"pkg/\">\npackage rules\n"
-            )),
+            rendered.starts_with(
+                "<scoped-rules from=\"pkg/AGENTS.md\" applies-to=\"pkg/\">\npackage rules\n"
+            ),
             "{rendered}"
         );
         assert!(rendered.ends_with("</scoped-rules>"));
