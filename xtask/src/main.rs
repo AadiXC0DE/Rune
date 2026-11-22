@@ -1769,6 +1769,10 @@ const DUPLICATE_EXCEPTIONS: &[(&str, &str)] = &[
         "getrandom",
         "xtask replays scripted sessions through rune-testkit, whose tempfile uses getrandom 0.4; the shipped binary uses 0.2",
     ),
+    (
+        "windows-sys",
+        "Windows only: ring 0.17 requires windows-sys 0.52, and the job object and file calls use 0.61, whose handles are pointers",
+    ),
 ];
 
 /// Fails when the release dependency graph contains two versions of one crate.
