@@ -66,19 +66,23 @@ impl Burst {
 /// The image files a paste names, with their sizes, when every word of it is
 /// one: a dropped path as terminals write it (`my\\ shot.png`, quoted, or a
 /// `file://` URL). Anything else is text.
+///
+/// On Windows a backslash separates path parts, so it is kept as written and
+/// only quotes group a path that has spaces.
 #[must_use]
 pub fn image_paths(text: &str) -> Option<Vec<(std::path::PathBuf, u64)>> {
     let text = text.trim();
     if text.is_empty() || text.contains('\n') {
         return None;
     }
+    let backslash_escapes = !cfg!(windows);
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         match (quote, ch) {
-            (None, '\\') => {
+            (None, '\\') if backslash_escapes => {
                 if let Some(next) = chars.next() {
                     word.push(next);
                 }
@@ -104,7 +108,7 @@ pub fn image_paths(text: &str) -> Option<Vec<(std::path::PathBuf, u64)>> {
         let path = word
             .strip_prefix("file://")
             .map_or_else(|| word.clone(), |rest| rest.replace("%20", " "));
-        let path = std::path::PathBuf::from(path);
+        let path = std::path::PathBuf::from(without_url_slash(&path));
         let image = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -123,6 +127,20 @@ pub fn image_paths(text: &str) -> Option<Vec<(std::path::PathBuf, u64)>> {
         found.push((path, meta.len()));
     }
     (!found.is_empty()).then_some(found)
+}
+
+/// Drops the slash a `file:///C:/a.png` URL puts before a Windows drive.
+fn without_url_slash(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    let drive = cfg!(windows)
+        && bytes.first() == Some(&b'/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(2) == Some(&b':');
+    if drive {
+        path.strip_prefix('/').unwrap_or(path)
+    } else {
+        path
+    }
 }
 
 /// Describes the bindings used by this reader and the session's input modes.
@@ -2497,6 +2515,8 @@ mod tests {
         assert!(!refused.take_image_refusal());
     }
 
+    // A backslash escapes a space only where it is not the path separator.
+    #[cfg(unix)]
     #[test]
     fn an_escaped_dropped_path_attaches() {
         let (_dir, path) = image_fixture("my shot.PNG");
@@ -2513,6 +2533,31 @@ mod tests {
             path.display().to_string().replace(' ', "%20")
         ));
         assert_eq!(url.images().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_windows_path_attaches() {
+        let (_dir, path) = image_fixture("my shot.PNG");
+        let shown = path.display().to_string();
+        // Windows Terminal and Explorer quote a path that has a space.
+        let mut quoted = reader();
+        quoted.paste(&format!("\"{shown}\""));
+        assert_eq!(quoted.images().len(), 1, "{}", quoted.line());
+        let mut single = reader();
+        single.paste(&format!("'{shown}'"));
+        assert_eq!(single.images().len(), 1, "{}", single.line());
+        let mut url = reader();
+        url.paste(&format!(
+            "file:///{}",
+            shown.replace('\\', "/").replace(' ', "%20")
+        ));
+        assert_eq!(url.images().len(), 1, "{}", url.line());
+        // A path without a space needs no quotes.
+        let (_plain_dir, plain) = image_fixture("shot.png");
+        let mut bare = reader();
+        bare.paste(&plain.display().to_string());
+        assert_eq!(bare.images().len(), 1, "{}", bare.line());
     }
 
     #[test]
