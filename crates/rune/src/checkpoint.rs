@@ -351,7 +351,7 @@ impl Shadow {
             let camino::Utf8Component::Normal(name) = component else {
                 return Err(refused());
             };
-            if name.eq_ignore_ascii_case(".git") {
+            if names_git_directory(name) {
                 return Err(refused());
             }
             if index.saturating_add(1) < components.len() {
@@ -367,6 +367,8 @@ impl Shadow {
     }
 
     /// Writes one path from `target` through a temporary file and a rename.
+    ///
+    /// Every path reaching here has passed [`Self::check_safe`].
     fn write_path(&self, target: &str, path: &str) -> Result<()> {
         let listed = self.git(&["ls-tree", "-z", target, "--", path], DEFAULT_DEADLINE)?;
         let entry = listed.split(|byte| *byte == 0).next().unwrap_or_default();
@@ -1230,6 +1232,27 @@ fn shadow_dir(paths: &Paths, workspace: &Utf8Path) -> Utf8PathBuf {
     paths.state_root.join(CHECKPOINTS_DIR).join(key)
 }
 
+/// True when a path component opens a `.git` directory on this platform.
+///
+/// Windows also opens `.git` for a name with trailing dots or spaces, for its
+/// short name `GIT~1`, and for a name followed by a stream (`.git::$DATA`), so
+/// those are refused too, as git itself does there.
+fn names_git_directory(name: &str) -> bool {
+    names_git_directory_on(name, cfg!(windows))
+}
+
+fn names_git_directory_on(name: &str, windows: bool) -> bool {
+    if name.eq_ignore_ascii_case(".git") {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let name = name.split(':').next().unwrap_or(name);
+    let name = name.trim_end_matches(['.', ' ']);
+    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
+}
+
 /// A path spelled the way git accepts it. Git for Windows refuses the `\\?\`
 /// form a canonical path has there, so the plain spelling is used whenever it
 /// names the same directory.
@@ -1899,6 +1922,22 @@ mod tests {
                 format!("checkpoint path {path} is not safe to restore")
             );
         }
+        #[cfg(windows)]
+        for path in [
+            "..\\escape",
+            "a\\..\\..\\b",
+            "C:\\Windows\\x",
+            "D:x",
+            "\\\\server\\share\\x",
+            ".git.\\config",
+            ".GIT \\config",
+            "GIT~1\\config",
+            "sub/.git::$INDEX_ALLOCATION/x",
+        ] {
+            assert!(shadow.check_safe(path).is_err(), "{path}");
+        }
+        assert!(shadow.check_safe("src/a.txt").is_ok());
+        assert!(shadow.check_safe(".gitignore").is_ok());
         // A directory that is now a link out of the workspace is not written through.
         std::fs::create_dir(fixture.workspace.join("link")).expect("dir");
         std::fs::write(fixture.workspace.join("link/file.txt"), "inside\n").expect("file");
@@ -1941,6 +1980,26 @@ mod tests {
                 .output()
                 .expect("mklink");
             assert!(made.status.success(), "{made:?}");
+        }
+    }
+
+    #[test]
+    fn git_directory_names_follow_the_platform() {
+        for windows in [false, true] {
+            assert!(names_git_directory_on(".git", windows));
+            assert!(names_git_directory_on(".GIT", windows));
+            assert!(!names_git_directory_on(".gitignore", windows));
+            assert!(!names_git_directory_on("git", windows));
+            for name in [
+                ".git.",
+                ".git ",
+                ".git. .",
+                "GIT~1",
+                "git~1",
+                ".git::$INDEX_ALLOCATION",
+            ] {
+                assert_eq!(names_git_directory_on(name, windows), windows, "{name}");
+            }
         }
     }
 
