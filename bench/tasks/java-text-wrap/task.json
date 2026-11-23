@@ -1,0 +1,16 @@
+{
+  "title": "Fix word wrapping for split words, long words and repeated spaces",
+  "kind": "bugfix",
+  "prompt": "Word wrapping breaks lines in the middle of words even when it does not need to, and words longer than the width disappear.",
+  "verify": "rm -rf out && javac -d out $(find src test -name '*.java') && java -ea -cp out HiddenTests",
+  "protected": [
+    "test/VisibleTests.java",
+    "test/HiddenTests.java"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "java"
+}

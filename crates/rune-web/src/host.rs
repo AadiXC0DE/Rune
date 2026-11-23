@@ -227,7 +227,7 @@ impl Session {
         self.control.cancellation.reset();
         let mut history = std::mem::take(&mut self.history);
         history.push_user(text);
-        let result = turn::run_turn(&mut history, &*self);
+        let result = turn::run_turn(&mut history, &*self).and_then(TurnOutcome::into_strict);
         self.history = history;
         result
     }
@@ -274,8 +274,8 @@ impl Host for Session {
         self.dialect.as_ref()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.endpoint)
     }
 
     fn model(&self) -> String {
@@ -414,6 +414,7 @@ fn encode(event: &Event) -> serde_json::Value {
             next_attempt,
             max_attempts,
             delay,
+            ..
         } => json!({
             "kind": "provider_retry",
             "step": step,
@@ -424,9 +425,28 @@ fn encode(event: &Event) -> serde_json::Value {
         Event::ProviderRetryFinished { step } => {
             json!({ "kind": "provider_retry_finished", "step": step })
         }
+        Event::Notice { text } => json!({ "kind": "notice", "text": text }),
         Event::PlanUpdated { update } => json!({ "kind": "plan_updated", "update": update }),
         Event::TextDelta { delta } => json!({ "kind": "text", "delta": delta }),
         Event::ReasoningDelta { delta } => json!({ "kind": "reasoning", "delta": delta }),
+        Event::CallRepaired {
+            id,
+            from,
+            to,
+            repairs,
+        } => json!({
+            "kind": "call_repaired",
+            "id": id,
+            "from": from,
+            "to": to,
+            "repairs": repairs,
+        }),
+        Event::ToolRewritten { call, hook } => json!({
+            "kind": "tool_rewritten",
+            "id": call.id,
+            "name": call.name,
+            "hook": hook,
+        }),
         Event::ToolStarted { call, activity } => json!({
             "kind": "tool_started",
             "id": call.id,
@@ -447,9 +467,18 @@ fn encode(event: &Event) -> serde_json::Value {
             "arguments": call.arguments,
             "reason": reason,
         }),
+        Event::ContextPruned {
+            results,
+            tokens_freed,
+        } => json!({
+            "kind": "pruned",
+            "results": results,
+            "tokens_freed": tokens_freed,
+        }),
         Event::ContextCompacted {
             removed_turns,
             remaining_turns,
+            ..
         } => json!({
             "kind": "compacted",
             "removed_turns": removed_turns,

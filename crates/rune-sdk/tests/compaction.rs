@@ -21,8 +21,7 @@ use rune_sdk::{Agent, AgentOptions, CHECKPOINT_VERSION, Dialect, FetchRequest, F
 use rune_sdk::{HostFetch, PromptOptions};
 use serde_json::{Value, json};
 
-const SUMMARY: &str =
-    "Earlier lookups completed successfully. Continue the current work with the retained results.";
+const SUMMARY: &str = "## Goal\n- look up the keys the user named\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- earlier lookups completed successfully\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- continue the current work with the retained results\n## Files that matter\n- none\n## Facts to keep\n- none";
 
 #[derive(Default)]
 struct FixtureFetch {
@@ -52,6 +51,8 @@ impl HostFetch for FixtureFetch {
 
 fn options(fetch: Arc<dyn HostFetch>) -> AgentOptions {
     AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "fixture-secret".to_owned(),
         model: Some("fixture-model".to_owned()),
         instructions: Some(vec!["fixture host instructions".to_owned()]),
@@ -89,6 +90,7 @@ fn fixture(single_prompt: bool) -> Vec<u8> {
         history.push_assistant_with_replay(
             calls,
             Some(json!([{"type": "thinking", "thinking": format!("thought {index}"), "signature": format!("signature_{index}")}]).to_string()),
+            None,
         );
         history.push_tool_results(results);
         if !single_prompt || index == 5 {
@@ -111,6 +113,20 @@ fn checkpoint_history(bytes: &[u8]) -> History {
     serde_json::from_value(value["history"].clone()).expect("checkpoint history")
 }
 
+/// Limits with a verbatim tail small enough for these short fixtures: the
+/// newest results and what follows them.
+fn tail_limits() -> BudgetSet {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::CompactionKeepTokens,
+            Budget::Bounded(10),
+            Layer::CommandLine,
+        )
+        .expect("tail budget");
+    limits
+}
+
 #[test]
 fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_restore() {
     let constraints = [
@@ -119,7 +135,9 @@ fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_re
         "  Change only the requested item.  ",
     ];
     let fetch = Arc::new(FixtureFetch::default());
-    let mut agent = Agent::restore(options(fetch.clone()), &fixture(false)).expect("fixture");
+    let mut agent =
+        Agent::restore_with_limits(options(fetch.clone()), &fixture(false), tail_limits())
+            .expect("fixture");
     for text in constraints {
         assert!(agent.pin_constraint(text).expect("pin"));
         assert!(!agent.pin_constraint(text).expect("duplicate"));
@@ -137,7 +155,8 @@ fn three_pinned_constraints_reach_every_request_after_repeated_compaction_and_re
                 > 0
         );
         let bytes = agent.checkpoint().expect("checkpoint");
-        agent = Agent::restore(options(fetch.clone()), &bytes).expect("restore pins");
+        agent = Agent::restore_with_limits(options(fetch.clone()), &bytes, tail_limits())
+            .expect("restore pins");
         assert_eq!(checkpoint_history(&bytes).pinned_constraints(), constraints);
         for _ in 0..3 {
             agent
@@ -210,7 +229,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         let fetch = Arc::new(FixtureFetch::default());
         let before = fixture(single_prompt);
         let original = checkpoint_history(&before);
-        let mut agent = Agent::restore(options(fetch.clone()), &before).expect("restore fixture");
+        let mut agent = Agent::restore_with_limits(options(fetch.clone()), &before, tail_limits())
+            .expect("restore fixture");
         let usage = agent.usage();
         let mut calls = 0;
         let removed = agent
@@ -227,7 +247,7 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
             })
             .expect("compact");
         assert_eq!(calls, 1);
-        assert_eq!(removed, if single_prompt { 9 } else { 20 });
+        assert_eq!(removed, if single_prompt { 11 } else { 20 });
         assert_eq!(agent.usage(), usage);
         assert!(fetch.requests.lock().expect("requests").is_empty());
 
@@ -238,7 +258,11 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         assert_eq!(history.len(), original.len() - removed + 1);
         assert!(compacted.len() < before.len());
         assert!(history.turns()[0].text().contains(SUMMARY));
-        assert!(history.turns()[0].text().contains("<context_handoff>"));
+        assert!(
+            history.turns()[0]
+                .text()
+                .contains("<conversation-checkpoint>")
+        );
         let text = String::from_utf8_lossy(&compacted);
         assert!(!text.contains("fixture-secret"));
         assert!(!text.contains("fixture host instructions"));
@@ -255,7 +279,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
         }
 
         let mut restored =
-            Agent::restore(options(fetch.clone()), &compacted).expect("restore compacted");
+            Agent::restore_with_limits(options(fetch.clone()), &compacted, tail_limits())
+                .expect("restore compacted");
         assert_eq!(restored.checkpoint().expect("checkpoint again"), compacted);
         assert_eq!(restored.usage(), usage);
         let result = restored
@@ -313,7 +338,8 @@ fn compact_preserves_tool_pairs_signed_replay_and_checkpoint_continuation() {
 fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
     let fetch = Arc::new(FixtureFetch::default());
     let before = fixture(false);
-    let mut agent = Agent::restore(options(fetch.clone()), &before).expect("fixture");
+    let mut agent = Agent::restore_with_limits(options(fetch.clone()), &before, tail_limits())
+        .expect("fixture");
     let before = agent.checkpoint().expect("before");
     let usage = agent.usage();
     let error = agent
@@ -331,7 +357,7 @@ fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
         );
         assert_eq!(agent.checkpoint().expect("after invalid summary"), before);
     }
-    let mut limits = BudgetSet::new();
+    let mut limits = tail_limits();
     limits
         .set(
             LimitName::PromptHistoryBytes,
@@ -354,8 +380,10 @@ fn compaction_failures_preserve_the_exact_checkpoint_and_usage() {
 #[test]
 fn compaction_can_recover_a_conversation_above_the_checkpoint_cap() {
     let fetch = Arc::new(FixtureFetch::default());
-    let mut agent = Agent::restore(options(fetch.clone()), &fixture(false)).expect("fixture");
-    let mut limits = BudgetSet::new();
+    let mut agent =
+        Agent::restore_with_limits(options(fetch.clone()), &fixture(false), tail_limits())
+            .expect("fixture");
+    let mut limits = tail_limits();
     limits
         .set(
             LimitName::PromptHistoryBytes,
@@ -436,4 +464,104 @@ fn running_turns_and_closed_agents_refuse_compaction_before_calling_the_host() {
         ErrorCode::InvalidState
     );
     assert_eq!(agent.checkpoint().expect("after"), before);
+}
+
+/// Answers the summary request with a usable summary and anything else with
+/// a short reply, recording every request body.
+#[derive(Default)]
+struct SummaryFetch {
+    requests: Mutex<Vec<String>>,
+}
+
+impl HostFetch for SummaryFetch {
+    fn post(&self, request: FetchRequest) -> Result<FetchResponse> {
+        let text = if request
+            .body
+            .contains("Write a checkpoint of the conversation above")
+        {
+            SUMMARY
+        } else {
+            "continued"
+        };
+        self.requests.lock().expect("requests").push(request.body);
+        let frames = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ];
+        let mut body = String::new();
+        for frame in frames {
+            write!(body, "data: {frame}\n\n").expect("write SSE frame");
+        }
+        Ok(FetchResponse::new(200, body))
+    }
+}
+
+#[test]
+fn auto_compact_summarises_before_the_window_is_reached() {
+    let fetch = Arc::new(SummaryFetch::default());
+    let mut options = options(fetch.clone());
+    options.auto_compact = true;
+    // The Anthropic dialect reserves 8,192 output tokens; 900 remain, and
+    // the restored conversation is about 950 tokens, so it no longer fits.
+    options.context_window = Some(8_192 + 900);
+    let mut agent =
+        Agent::restore_with_limits(options, &fixture(false), tail_limits()).expect("fixture");
+    let before = agent.usage();
+    for _ in 0..2 {
+        agent
+            .prompt("continue", PromptOptions::default())
+            .expect("turn")
+            .result()
+            .expect("result");
+    }
+    let requests = fetch.requests.lock().expect("requests");
+    let summaries = requests
+        .iter()
+        .filter(|body| body.contains("Write a checkpoint of the conversation"))
+        .count();
+    assert!(
+        summaries >= 1,
+        "no summary request among {}",
+        requests.len()
+    );
+    let last = requests.last().expect("a request");
+    assert!(last.contains("<conversation-checkpoint>"), "{last}");
+    // The earlier prompt survives only as a carried user message.
+    assert!(!last.contains("value_0_0"), "{last}");
+    assert_eq!(last.matches("question 0").count(), 1, "{last}");
+    assert!(
+        last.contains(r"<user-messages>\n<message>\nquestion 0\n</message>"),
+        "{last}"
+    );
+    // The summary request is billed like the others.
+    let after = agent.usage();
+    let billed = after.input_tokens.unwrap_or(0) - before.input_tokens.unwrap_or(0);
+    assert_eq!(billed, 10 * u64::try_from(requests.len()).expect("count"));
+}
+
+#[test]
+fn auto_compact_off_by_default_sends_the_whole_history() {
+    let fetch = Arc::new(SummaryFetch::default());
+    let mut options = options(fetch.clone());
+    options.context_window = Some(2_000);
+    let mut agent = Agent::restore(options, &fixture(false)).expect("fixture");
+    for _ in 0..2 {
+        agent
+            .prompt("continue", PromptOptions::default())
+            .expect("turn")
+            .result()
+            .expect("result");
+    }
+    let requests = fetch.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    for body in requests.iter() {
+        assert!(
+            !body.contains("Write a checkpoint of the conversation"),
+            "{body}"
+        );
+        assert!(body.contains("question 0"), "{body}");
+    }
 }

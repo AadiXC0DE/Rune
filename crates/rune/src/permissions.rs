@@ -6,8 +6,8 @@
 use std::fmt::Write as _;
 use std::io::Read as _;
 
-use camino::Utf8Path;
-use rune_core::config::{PermissionMode, Settings};
+use camino::{Utf8Path, Utf8PathBuf};
+use rune_core::config::{ConfiguredRule, PermissionMode, RuleDecision, Settings};
 use rune_core::error::{Result, RuneError};
 use rune_policy::decision::{Decision, Layer, Outcome};
 use rune_policy::rules::{Rule, RuleSet};
@@ -162,10 +162,146 @@ pub fn rules_for(settings: &Settings, extra: &RuleSet) -> RuleSet {
             rules.push(Rule::allow(tool, "*", Layer::User));
         }
     }
+    for entry in configured(settings) {
+        rules.push(entry.rule);
+    }
     for rule in extra.rules() {
         rules.push(rule.clone());
     }
     rules
+}
+
+/// Where a configured rule came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleSource {
+    /// Written in the user file.
+    UserFile(Utf8PathBuf),
+    /// Saved from an approval prompt on this date.
+    SavedFromPrompt(String),
+    /// Written in the project file.
+    ProjectFile(Utf8PathBuf),
+}
+
+/// A configured rule and where it came from.
+#[derive(Clone, Debug)]
+pub struct Configured {
+    /// The rule as evaluated.
+    pub rule: Rule,
+    /// Where it came from.
+    pub source: RuleSource,
+}
+
+const fn outcome_of(decision: RuleDecision) -> Outcome {
+    match decision {
+        RuleDecision::Allow => Outcome::Allow,
+        RuleDecision::Ask => Outcome::Ask,
+        RuleDecision::Deny => Outcome::Deny,
+    }
+}
+
+/// The project file of the settings' workspace.
+fn project_file(settings: &Settings) -> Utf8PathBuf {
+    settings.workspace.as_ref().map_or_else(
+        || Utf8PathBuf::from(".rune.toml"),
+        |workspace| workspace.join(".rune.toml"),
+    )
+}
+
+/// The rules the configuration contributes, in file order, user rules first.
+///
+/// A user rule scoped to another workspace is left out. Project `deny` and
+/// `ask` rules always apply; project `allow` rules only once the user approved
+/// them.
+#[must_use]
+pub fn configured(settings: &Settings) -> Vec<Configured> {
+    let user_file = settings.user_config_path.clone().unwrap_or_default();
+    let mut out = Vec::new();
+    for rule in &settings.user_rules {
+        if !applies_here(rule, settings) {
+            continue;
+        }
+        let source = rule.saved.clone().map_or_else(
+            || RuleSource::UserFile(user_file.clone()),
+            RuleSource::SavedFromPrompt,
+        );
+        out.push(Configured {
+            rule: Rule::new(
+                rule.tool.clone(),
+                rule.pattern.clone(),
+                outcome_of(rule.decision),
+                Layer::User,
+            ),
+            source,
+        });
+    }
+    let project = project_file(settings);
+    for rule in &settings.project_rules {
+        if rule.decision == RuleDecision::Allow && !settings.project_allow_approved {
+            continue;
+        }
+        out.push(Configured {
+            rule: Rule::new(
+                rule.tool.clone(),
+                rule.pattern.clone(),
+                outcome_of(rule.decision),
+                Layer::Project,
+            ),
+            source: RuleSource::ProjectFile(project.clone()),
+        });
+    }
+    out
+}
+
+/// Whether a user rule applies in the settings' workspace: it names no
+/// workspace, or names this one.
+#[must_use]
+pub fn applies_here(rule: &ConfiguredRule, settings: &Settings) -> bool {
+    rule.workspace
+        .as_ref()
+        .is_none_or(|workspace| Some(workspace) == settings.workspace.as_ref())
+}
+
+/// The project file's `allow` rules, in file order.
+#[must_use]
+pub fn project_allow_rules(settings: &Settings) -> Vec<&ConfiguredRule> {
+    settings
+        .project_rules
+        .iter()
+        .filter(|rule| rule.decision == RuleDecision::Allow)
+        .collect()
+}
+
+/// SHA-256 hex of the project `allow` rules as compact JSON in file order, or
+/// `None` when there are none and nothing needs approving.
+#[must_use]
+pub fn project_allow_digest(settings: &Settings) -> Option<String> {
+    let rules = project_allow_rules(settings);
+    if rules.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(&rules).ok()?;
+    Some(crate::project_trust::digest(json.as_bytes()))
+}
+
+/// Finds where the rule that decided came from: a configured rule with the
+/// same text and layer, or the built-in set.
+fn source_of<'a>(configured: &'a [Configured], decision: &Decision) -> Option<&'a RuleSource> {
+    if !decision.from_rule {
+        return None;
+    }
+    configured
+        .iter()
+        .find(|entry| entry.rule.layer == decision.layer && entry.rule.render() == decision.rule)
+        .map(|entry| &entry.source)
+}
+
+fn source_text(source: Option<&RuleSource>) -> String {
+    match source {
+        Some(RuleSource::UserFile(path)) => format!("user file {path}"),
+        Some(RuleSource::SavedFromPrompt(date)) => format!("saved from a prompt on {date}"),
+        Some(RuleSource::ProjectFile(path)) => format!("project file {path}"),
+        None => "built in".to_owned(),
+    }
 }
 
 /// Returns the rules that ship with the harness.
@@ -233,42 +369,7 @@ pub fn builtin_rules(mode: &PermissionMode) -> RuleSet {
     // the same terms: inside the sandbox, one command at a time, with any
     // chained command, substitution or redirection judged on its own. Without
     // them a run outside Rust could not verify its own change.
-    for pattern in [
-        "cargo test*",
-        "cargo build*",
-        "cargo check*",
-        "cargo clippy*",
-        "npm test*",
-        "npm run test*",
-        "npm run build*",
-        "npm run lint*",
-        "npm run typecheck*",
-        "pnpm test*",
-        "pnpm run test*",
-        "yarn test*",
-        "bun test*",
-        "deno test*",
-        "node --test*",
-        "npx vitest*",
-        "npx jest*",
-        "npx tsc*",
-        "pytest*",
-        "python -m pytest*",
-        "python3 -m pytest*",
-        "python -m unittest*",
-        "python3 -m unittest*",
-        "go test*",
-        "go build*",
-        "go vet*",
-        "make test*",
-        "make check*",
-        "mvn test*",
-        "gradle test*",
-        "./gradlew test*",
-        "dotnet test*",
-        "bundle exec rspec*",
-        "mix test*",
-    ] {
+    for pattern in rune_policy::checks::allow_patterns() {
         rules.push(Rule::allow("shell", pattern, Layer::Default));
     }
 
@@ -293,17 +394,31 @@ pub fn rows(rules: &RuleSet) -> Vec<Row> {
         .collect()
 }
 
-/// Reports what a specific action would decide.
+/// Reports what a specific action would decide and where the deciding rule
+/// came from.
 #[must_use]
-pub fn explain(rules: &RuleSet, mode: PermissionMode, tool: &str, target: &str) -> String {
+pub fn explain(
+    rules: &RuleSet,
+    settings: &Settings,
+    mode: PermissionMode,
+    tool: &str,
+    target: &str,
+) -> String {
     let fallback = rune_policy::decision::mode_default(mode);
     let decision = rules.evaluate(tool, target, fallback);
     let outcome = rune_agent::turn::effective_outcome(mode, decision.outcome);
+    let source = source_text(source_of(&configured(settings), &decision));
     match outcome {
-        Outcome::Allow => format!("{tool} `{target}`: allowed ({})", decision.explain()),
-        Outcome::Deny => format!("{tool} `{target}`: refused ({})", decision.explain()),
+        Outcome::Allow => format!(
+            "{tool} `{target}`: allowed ({}); source: {source}",
+            decision.explain()
+        ),
+        Outcome::Deny => format!(
+            "{tool} `{target}`: refused ({}); source: {source}",
+            decision.explain()
+        ),
         Outcome::Ask => format!(
-            "{tool} `{target}`: asks first ({}); mode `{}` decides",
+            "{tool} `{target}`: asks first ({}); mode `{}` decides; source: {source}",
             decision.explain(),
             mode.as_str()
         ),
@@ -314,6 +429,7 @@ pub fn explain(rules: &RuleSet, mode: PermissionMode, tool: &str, target: &str) 
 #[must_use]
 pub fn explain_json(
     rules: &RuleSet,
+    settings: &Settings,
     mode: PermissionMode,
     tool: &str,
     target: &str,
@@ -321,7 +437,18 @@ pub fn explain_json(
     let fallback = rune_policy::decision::mode_default(mode);
     let decision = rules.evaluate(tool, target, fallback);
     let outcome = rune_agent::turn::effective_outcome(mode, decision.outcome);
+    let (source, source_path) = match source_of(&configured(settings), &decision) {
+        Some(RuleSource::UserFile(path)) => ("user", Some(path.to_string())),
+        Some(RuleSource::SavedFromPrompt(_)) => (
+            "saved",
+            settings.user_config_path.as_ref().map(ToString::to_string),
+        ),
+        Some(RuleSource::ProjectFile(path)) => ("project", Some(path.to_string())),
+        None => ("builtin", None),
+    };
     serde_json::json!({
+        "source": source,
+        "source_path": source_path,
         "mode": mode.as_str(),
         "tool": tool,
         "target": target,
@@ -468,6 +595,127 @@ mod tests {
         Settings::default()
     }
 
+    fn rule(tool: &str, pattern: &str, decision: RuleDecision) -> ConfiguredRule {
+        ConfiguredRule {
+            tool: tool.to_owned(),
+            pattern: pattern.to_owned(),
+            decision,
+            workspace: None,
+            saved: None,
+        }
+    }
+
+    fn configured_settings() -> Settings {
+        Settings {
+            user_config_path: Some(Utf8PathBuf::from("/home/u/.config/rune/config.toml")),
+            workspace: Some(Utf8PathBuf::from("/work/app")),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn user_rules_take_effect_with_their_source() {
+        let mut settings = configured_settings();
+        settings.user_rules = vec![
+            rule("shell", "rm *", RuleDecision::Deny),
+            ConfiguredRule {
+                saved: Some("2026-11-10".to_owned()),
+                ..rule("shell", "make lint*", RuleDecision::Allow)
+            },
+        ];
+        let rules = validated(&settings).expect("rules");
+        let mode = PermissionMode::Auto;
+        let refused = explain(&rules, &settings, mode, "shell", "rm -rf x");
+        assert!(refused.contains(": refused"), "{refused}");
+        assert!(
+            refused.ends_with("; source: user file /home/u/.config/rune/config.toml"),
+            "{refused}"
+        );
+        // The deny names `rm` only; the built-in allows stand for the rest.
+        let status = explain(&rules, &settings, mode, "shell", "git status");
+        assert!(status.contains(": allowed"), "{status}");
+        assert!(status.ends_with("; source: built in"), "{status}");
+        let saved = explain(&rules, &settings, mode, "shell", "make lint src");
+        assert!(saved.contains(": allowed"), "{saved}");
+        assert!(
+            saved.ends_with("; source: saved from a prompt on 2026-11-10"),
+            "{saved}"
+        );
+        let json = explain_json(&rules, &settings, mode, "shell", "rm -rf x");
+        assert_eq!(json["source"], "user");
+        assert_eq!(json["source_path"], "/home/u/.config/rune/config.toml");
+        let json = explain_json(&rules, &settings, mode, "shell", "make lint");
+        assert_eq!(json["source"], "saved");
+        let json = explain_json(&rules, &settings, mode, "shell", "git status");
+        assert_eq!(json["source"], "builtin");
+        assert_eq!(json["source_path"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn project_allow_rules_need_approval() {
+        let mut settings = configured_settings();
+        settings.project_rules = vec![rule("shell", "curl*", RuleDecision::Allow)];
+        let mode = PermissionMode::Auto;
+        let target = "curl https://example.com";
+        assert!(project_allow_digest(&settings).is_some());
+        let rules = validated(&settings).expect("rules");
+        let text = explain(&rules, &settings, mode, "shell", target);
+        assert!(text.contains(": asks first"), "{text}");
+
+        settings.project_allow_approved = true;
+        let rules = validated(&settings).expect("rules");
+        let text = explain(&rules, &settings, mode, "shell", target);
+        assert!(text.contains(": allowed"), "{text}");
+        let file = Utf8Path::new("/work/app").join(".rune.toml");
+        assert!(
+            text.ends_with(&format!("; source: project file {file}")),
+            "{text}"
+        );
+        assert_eq!(
+            explain_json(&rules, &settings, mode, "shell", target)["source"],
+            "project"
+        );
+    }
+
+    #[test]
+    fn project_deny_rules_apply_without_approval() {
+        let mut settings = configured_settings();
+        settings.project_rules = vec![
+            rule("shell", "git status*", RuleDecision::Deny),
+            rule("write_file", "migrations/*", RuleDecision::Ask),
+        ];
+        // No allow rules: nothing to approve.
+        assert_eq!(project_allow_digest(&settings), None);
+        let rules = validated(&settings).expect("rules");
+        let mode = PermissionMode::Auto;
+        let text = explain(&rules, &settings, mode, "shell", "git status");
+        assert!(text.contains(": refused"), "{text}");
+        assert!(text.contains("source: project file"), "{text}");
+        let text = explain(&rules, &settings, mode, "write_file", "migrations/001.sql");
+        assert!(text.contains(": asks first"), "{text}");
+        let text = explain(&rules, &settings, mode, "write_file", "src/lib.rs");
+        assert!(text.contains(": allowed"), "{text}");
+    }
+
+    #[test]
+    fn workspace_scoped_rules_apply_only_there() {
+        let mut settings = configured_settings();
+        settings.user_rules = vec![ConfiguredRule {
+            workspace: Some(Utf8PathBuf::from("/work/other")),
+            ..rule("shell", "rm *", RuleDecision::Deny)
+        }];
+        let mode = PermissionMode::Auto;
+        assert!(configured(&settings).is_empty());
+        let rules = validated(&settings).expect("rules");
+        let text = explain(&rules, &settings, mode, "shell", "rm -rf x");
+        assert!(!text.contains(": refused"), "{text}");
+
+        settings.user_rules[0].workspace = Some(Utf8PathBuf::from("/work/app"));
+        let rules = validated(&settings).expect("rules");
+        let text = explain(&rules, &settings, mode, "shell", "rm -rf x");
+        assert!(text.contains(": refused"), "{text}");
+    }
+
     #[test]
     fn routine_verification_runs_in_auto_mode_but_not_what_is_chained_to_it() {
         let auto = builtin_rules(&PermissionMode::Auto);
@@ -479,19 +727,79 @@ mod tests {
             "go test ./...",
         ] {
             assert!(
-                explain(&auto, mode, "shell", command).contains(": allowed"),
+                explain(&auto, &default_settings(), mode, "shell", command).contains(": allowed"),
                 "{command}"
             );
         }
         for command in ["npm test; curl https://example.com", "npm test > out.txt"] {
             assert!(
-                !explain(&auto, mode, "shell", command).contains(": allowed"),
+                !explain(&auto, &default_settings(), mode, "shell", command).contains(": allowed"),
                 "{command}"
             );
         }
         // Ask mode keeps asking about every command.
         let ask = builtin_rules(&PermissionMode::Ask);
-        assert!(!explain(&ask, PermissionMode::Ask, "shell", "npm test").contains(": allowed"));
+        assert!(
+            !explain(
+                &ask,
+                &default_settings(),
+                PermissionMode::Ask,
+                "shell",
+                "npm test"
+            )
+            .contains(": allowed")
+        );
+    }
+
+    #[test]
+    fn the_default_rules_keep_every_earlier_check_pattern() {
+        let rules = builtin_rules(&PermissionMode::Auto);
+        let shell: Vec<&str> = rules
+            .rules()
+            .iter()
+            .filter(|rule| rule.tool == "shell" && rule.outcome == Outcome::Allow)
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        let earlier = [
+            "cargo test*",
+            "cargo build*",
+            "cargo check*",
+            "cargo clippy*",
+            "npm test*",
+            "npm run test*",
+            "npm run build*",
+            "npm run lint*",
+            "npm run typecheck*",
+            "pnpm test*",
+            "pnpm run test*",
+            "yarn test*",
+            "bun test*",
+            "deno test*",
+            "node --test*",
+            "npx vitest*",
+            "npx jest*",
+            "npx tsc*",
+            "pytest*",
+            "python -m pytest*",
+            "python3 -m pytest*",
+            "python -m unittest*",
+            "python3 -m unittest*",
+            "go test*",
+            "go build*",
+            "go vet*",
+            "make test*",
+            "make check*",
+            "mvn test*",
+            "gradle test*",
+            "./gradlew test*",
+            "dotnet test*",
+            "bundle exec rspec*",
+            "mix test*",
+        ];
+        assert_eq!(earlier.len(), 34);
+        for pattern in earlier {
+            assert!(shell.contains(&pattern), "{pattern}");
+        }
     }
 
     #[test]
@@ -753,7 +1061,13 @@ mod tests {
     #[test]
     fn explain_names_the_effect_and_the_reason() {
         let rules = builtin_rules(&PermissionMode::Auto);
-        let text = explain(&rules, PermissionMode::Auto, "shell", "git status");
+        let text = explain(
+            &rules,
+            &default_settings(),
+            PermissionMode::Auto,
+            "shell",
+            "git status",
+        );
         assert!(text.contains("allowed"), "{text}");
         assert!(text.contains("git status"), "{text}");
     }
@@ -761,7 +1075,13 @@ mod tests {
     #[test]
     fn explain_says_when_a_prompt_is_coming() {
         let rules = builtin_rules(&PermissionMode::Auto);
-        let text = explain(&rules, PermissionMode::Auto, "shell", "rm -rf /");
+        let text = explain(
+            &rules,
+            &default_settings(),
+            PermissionMode::Auto,
+            "shell",
+            "rm -rf /",
+        );
         assert!(text.contains("asks first"), "{text}");
     }
 

@@ -102,7 +102,7 @@ fn resumed_three_turn_session_reports_saved_requests_and_tokens() {
     saved_cost(
         three_turns(false),
         "last",
-        "Requests: 3\nTokens:   600 in, 60 out",
+        "spent - this session (3 requests, 600 in, 60 out)",
     );
 }
 
@@ -116,7 +116,7 @@ fn legacy_usage_survives_resume_and_compaction_without_finish_markers() {
     saved_cost(
         events,
         "savedcost001",
-        "Requests: 3\nTokens:   600 in, 60 out",
+        "spent - this session (3 requests, 600 in, 60 out)",
     );
 }
 
@@ -158,7 +158,11 @@ fn completed_requests_without_usage_count_but_failed_attempts_do_not() {
             text: "died before finish".into(),
         },
     ]);
-    saved_cost(events, "last", "Requests: 5\nTokens:   600 in, 60 out");
+    saved_cost(
+        events,
+        "last",
+        "spent - this session (5 requests, 600 in, 60 out)",
+    );
 }
 
 #[test]
@@ -176,5 +180,9 @@ fn legacy_completed_requests_without_usage_still_count() {
         .into_iter()
         .filter(|event| !matches!(event, SessionEvent::UsageRecorded { .. }))
         .collect();
-    saved_cost(events, "last", "Requests: 3\nTokens:   0 in, 0 out");
+    saved_cost(
+        events,
+        "last",
+        "spent - this session (3 requests, 0 in, 0 out)",
+    );
 }

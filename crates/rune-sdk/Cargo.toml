@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["agent", "llm", "sdk", "coding-agent", "embedding"]
 
 [lints]
 workspace = true
@@ -17,6 +19,10 @@ rune-core = { workspace = true }
 rune-exec = { workspace = true }
 rune-agent = { workspace = true }
 rune-net = { workspace = true }
+rune-policy = { workspace = true }
+# The workspace snapshots an embedder can turn on.
+rune-session = { workspace = true }
+camino = { workspace = true }
 rune-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

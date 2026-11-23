@@ -9,7 +9,8 @@ use std::fmt::Write as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
-use rune_agent::turn::TurnOutcome;
+use rune_agent::history::JournalQueue;
+use rune_agent::turn::{JournalEntry, NotePlacement, TurnOutcome};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::id::SessionId;
 use rune_core::paths::Paths;
@@ -40,6 +41,53 @@ pub fn derive_title(prompt: &str) -> String {
     title
 }
 
+/// The index and text of every user message in the log, in log order.
+/// Corrections sent while a turn ran are user messages too.
+pub fn user_messages(recorder: &Recorder) -> Result<Vec<(usize, String)>> {
+    Ok(recorder
+        .store
+        .read()?
+        .events
+        .into_iter()
+        .filter_map(|frame| match frame.event {
+            SessionEvent::UserMessage { text } => Some(text),
+            _ => None,
+        })
+        .enumerate()
+        .collect())
+}
+
+/// The turn the `message`-th user message started, when it started one. A
+/// correction sent while a turn ran started none.
+pub fn turn_started_by(recorder: &Recorder, message: usize) -> Result<Option<u64>> {
+    let events = recorder.store.read()?.events;
+    let Some(position) = events
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| matches!(frame.event, SessionEvent::UserMessage { .. }))
+        .nth(message)
+        .map(|(position, _)| position)
+    else {
+        return Ok(None);
+    };
+    for frame in events.iter().skip(position.saturating_add(1)) {
+        match frame.event {
+            SessionEvent::TurnStarted { turn } => return Ok(Some(turn)),
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::AssistantContent { .. }
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::TurnFinished { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::TurnFailed { .. }
+            | SessionEvent::TurnInterrupted { .. } => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// One session as a listing shows it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Summary {
@@ -63,8 +111,20 @@ pub struct Summary {
     pub workspace: Option<String>,
     /// Parent session, when this session is a child of another.
     pub parent: Option<String>,
+    /// Model most recently selected in the log, when one was recorded.
+    pub model: Option<String>,
+    /// Text of the first user message, when there is one.
+    pub first_prompt: Option<String>,
     /// Directory holding the log.
     pub dir: Utf8PathBuf,
+}
+
+impl Summary {
+    /// Returns the last activity in milliseconds since the epoch.
+    #[must_use]
+    pub const fn updated_at_ms(&self) -> u64 {
+        self.updated_at_ms
+    }
 }
 
 /// An open session log.
@@ -84,6 +144,49 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Copies this session's journal, through its latest event, into a new
+    /// session and returns the new id. This session is left as it is.
+    pub fn fork(&self, paths: &Paths) -> Result<SessionId> {
+        let last = self
+            .store
+            .read()?
+            .events
+            .last()
+            .map(|frame| frame.seq)
+            .ok_or_else(|| {
+                RuneError::new(ErrorCode::NotFound, "the session has nothing to fork yet")
+            })?;
+        let destination = SessionId::generate();
+        rune_session::fork::fork(paths, &self.store.id(), &destination, last)?;
+        Ok(destination)
+    }
+
+    /// Copies this session's journal up to just before its `message`-th user
+    /// message (0-based, in log order) into a new session and returns the new
+    /// id. This session is left as it is.
+    pub fn fork_before(&self, paths: &Paths, message: usize) -> Result<SessionId> {
+        let events = self.store.read()?.events;
+        let position = events
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| matches!(frame.event, SessionEvent::UserMessage { .. }))
+            .nth(message)
+            .map(|(position, _)| position)
+            .ok_or_else(|| RuneError::new(ErrorCode::NotFound, "no such message"))?;
+        let before = position
+            .checked_sub(1)
+            .and_then(|previous| events.get(previous))
+            .ok_or_else(|| {
+                RuneError::new(
+                    ErrorCode::NotFound,
+                    "nothing comes before the first message",
+                )
+            })?;
+        let destination = SessionId::generate();
+        rune_session::fork::fork(paths, &self.store.id(), &destination, before.seq)?;
+        Ok(destination)
+    }
+
     /// Creates a new session and its log.
     pub fn create(paths: &Paths, id: &SessionId) -> Result<Self> {
         let store = SessionStore::create(paths, id)?;
@@ -272,7 +375,31 @@ impl Recorder {
         Ok(())
     }
 
+    /// The number of the latest turn begun, zero before the first.
+    pub fn current_turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// Records a workspace snapshot taken at a turn boundary, or a restore of one.
+    pub fn workspace_checkpoint(&self, event: SessionEvent) -> Result<()> {
+        if !matches!(
+            event,
+            SessionEvent::WorkspaceCheckpoint { .. } | SessionEvent::Restored { .. }
+        ) {
+            return Err(RuneError::new(
+                ErrorCode::Internal,
+                format!("expected a workspace checkpoint, got {}", event.kind()),
+            ));
+        }
+        self.append(event)
+    }
+
     /// Starts an exchange before the provider can produce visible text.
+    /// The number of the current or last turn, zero before the first.
+    pub const fn turn_number(&self) -> u64 {
+        self.turn
+    }
+
     pub fn begin_turn(&mut self) -> Result<()> {
         if !self.active_turn {
             let turn = self.turn.saturating_add(1);
@@ -332,28 +459,18 @@ impl Recorder {
     /// This is independent of model history, which can compact between steps.
     pub fn response(&mut self, outcome: &rune_net::transport::StreamOutcome) -> Result<()> {
         self.begin_turn()?;
-        let mut parts = Vec::new();
-        let text = outcome.text();
-        if !text.is_empty() {
-            parts.push(ContentPart::Text { text });
-        }
-        let reasoning = outcome.reasoning();
-        if !reasoning.is_empty() {
-            parts.push(ContentPart::Reasoning { text: reasoning });
-        }
-        for (id, name, arguments) in outcome.tool_calls() {
-            parts.push(ContentPart::ToolCall {
-                id: rune_core::id::ToolCallId::new(id)?,
-                name,
-                arguments,
-            });
-        }
+        let (parts, _) = rune_agent::turn::assistant_parts(outcome);
         let mut message = rune_agent::history::Turn::assistant(0, parts);
         message.replay.clone_from(&outcome.replay);
         if !message.parts.is_empty() {
             self.responses.push(message);
         }
         Ok(())
+    }
+
+    /// Records a history change a resume must repeat, at its position.
+    pub fn journal(&self, entry: &JournalEntry) -> Result<()> {
+        self.append(journal_event(entry))
     }
 
     /// Records a turn and everything it produced.
@@ -376,6 +493,9 @@ impl Recorder {
                     arguments: call.call.arguments.clone(),
                 })?;
             }
+            for repair in &outcome.repairs {
+                self.append(repaired_event(repair))?;
+            }
             for call in &outcome.calls {
                 self.append(SessionEvent::ToolResult {
                     call_id: call.call.id.clone(),
@@ -395,6 +515,15 @@ impl Recorder {
             for message in std::mem::take(&mut self.responses) {
                 for event in message_events(&message, turn)? {
                     self.append(event)?;
+                }
+                for (id, _, _) in message.tool_calls() {
+                    if let Some(repair) = outcome
+                        .repairs
+                        .iter()
+                        .find(|repair| repair.id == id.as_str())
+                    {
+                        self.append(repaired_event(repair))?;
+                    }
                 }
                 for (id, _, _) in message.tool_calls() {
                     if let Some(result) = results
@@ -475,6 +604,40 @@ impl Recorder {
         Ok(())
     }
 
+    /// Returns the session title, if it has one.
+    #[must_use]
+    pub fn title(&self) -> Option<String> {
+        self.store.title()
+    }
+
+    /// The notice for a session another process left open and died holding,
+    /// when the lock was taken over from it.
+    #[must_use]
+    pub fn takeover_notice(&self) -> Option<String> {
+        self.store.took_over().map(|holder| {
+            let on = holder
+                .host
+                .as_ref()
+                .map(|host| format!(" on {host}"))
+                .unwrap_or_default();
+            format!(
+                "session {} was left open by pid {}{on}, which is no longer running; continuing",
+                self.store.id(),
+                holder.pid
+            )
+        })
+    }
+
+    /// Writes the session's event log as JSON lines, as `rune session export`
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the log cannot be read or the writer refuses the bytes.
+    pub fn export_jsonl(&self, out: impl std::io::Write) -> Result<()> {
+        load_read_only(self.store.dir())?.export_jsonl(out)
+    }
+
     /// Returns true when the session has no title yet.
     #[must_use]
     pub fn title_is_unset(&self) -> bool {
@@ -530,7 +693,7 @@ pub fn page(
     paginate(list_scoped(paths, scope), limit, cursor)
 }
 
-/// Searches titles and recorded user messages by a case-insensitive literal fragment.
+/// Searches titles and recorded messages by a case-insensitive literal fragment.
 ///
 /// Workspace and child-session exclusions are the same as for an ordinary
 /// listing. Matching precedes the listing cap and pagination.
@@ -615,8 +778,8 @@ fn list_matching(paths: &Paths, scope: Option<&Utf8Path>, query: Option<&str>) -
                 .as_deref()
                 .is_some_and(|title| title.to_lowercase().contains(query))
             && !state.events.iter().any(|frame| {
-                matches!(&frame.event, SessionEvent::UserMessage { text }
-                    if text.to_lowercase().contains(query))
+                message_text(&frame.event)
+                    .is_some_and(|(_, text)| text.to_lowercase().contains(query))
             })
         {
             continue;
@@ -722,8 +885,14 @@ pub fn tree_of(state: &SessionState) -> Tree {
             | SessionEvent::ConstraintPinned { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::WorkspaceCheckpoint { .. }
+            | SessionEvent::Restored { .. }
             | SessionEvent::ForkedFrom { .. }
-            | SessionEvent::ChildOf { .. } => continue,
+            | SessionEvent::ChildOf { .. }
+            | SessionEvent::HarnessNote { .. }
+            | SessionEvent::Checkpoint { .. }
+            | SessionEvent::ResultReplaced { .. }
+            | SessionEvent::ToolCallRepaired { .. } => continue,
         };
         let node = Node::new(
             role,
@@ -911,6 +1080,97 @@ pub fn load(paths: &Paths, id: &SessionId) -> Result<(Recorder, History)> {
     Ok((recorder, history))
 }
 
+/// Encodes a history change for the journal.
+#[must_use]
+pub fn journal_event(entry: &JournalEntry) -> SessionEvent {
+    match entry.clone() {
+        JournalEntry::Note {
+            at,
+            placement,
+            text,
+        } => SessionEvent::HarnessNote {
+            at,
+            placement: match placement {
+                NotePlacement::PromptPrefix => rune_session::NotePlacement::PromptPrefix,
+                NotePlacement::PromptSuffix => rune_session::NotePlacement::PromptSuffix,
+                NotePlacement::UserPart => rune_session::NotePlacement::UserPart,
+                NotePlacement::UserTurn => rune_session::NotePlacement::UserTurn,
+                NotePlacement::AssistantTurn => rune_session::NotePlacement::AssistantTurn,
+            },
+            text,
+        },
+        JournalEntry::Checkpoint {
+            at,
+            through,
+            message,
+        } => SessionEvent::Checkpoint {
+            at,
+            through,
+            message,
+        },
+        JournalEntry::ResultReplaced {
+            at,
+            call_id,
+            content,
+        } => SessionEvent::ResultReplaced {
+            at,
+            call_id,
+            content,
+        },
+    }
+}
+
+/// Decodes a journaled history change; `None` for any other event.
+#[must_use]
+pub fn journal_entry(event: &SessionEvent) -> Option<JournalEntry> {
+    match event.clone() {
+        SessionEvent::HarnessNote {
+            at,
+            placement,
+            text,
+        } => Some(JournalEntry::Note {
+            at,
+            placement: match placement {
+                rune_session::NotePlacement::PromptPrefix => NotePlacement::PromptPrefix,
+                rune_session::NotePlacement::PromptSuffix => NotePlacement::PromptSuffix,
+                rune_session::NotePlacement::UserPart => NotePlacement::UserPart,
+                rune_session::NotePlacement::UserTurn => NotePlacement::UserTurn,
+                rune_session::NotePlacement::AssistantTurn => NotePlacement::AssistantTurn,
+            },
+            text,
+        }),
+        SessionEvent::Checkpoint {
+            at,
+            through,
+            message,
+        } => Some(JournalEntry::Checkpoint {
+            at,
+            through,
+            message,
+        }),
+        SessionEvent::ResultReplaced {
+            at,
+            call_id,
+            content,
+        } => Some(JournalEntry::ResultReplaced {
+            at,
+            call_id,
+            content,
+        }),
+        _ => None,
+    }
+}
+
+/// Records that a call ran in a repaired form.
+fn repaired_event(repair: &rune_agent::turn::CallRepair) -> SessionEvent {
+    SessionEvent::ToolCallRepaired {
+        call_id: repair.id.clone(),
+        from: repair.from.clone(),
+        to: repair.to.clone(),
+        repairs: repair.repairs.clone(),
+    }
+}
+
 /// Encodes one history message without flattening provider response boundaries.
 pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<Vec<SessionEvent>> {
     let mut events = Vec::new();
@@ -920,6 +1180,7 @@ pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<
                 role: message.role,
                 parts: message.parts.clone(),
                 replay: message.replay.clone(),
+                origin: message.origin.clone(),
             })?,
         });
         let text = message.text();
@@ -959,7 +1220,7 @@ pub fn message_events(message: &rune_agent::history::Turn, turn: u64) -> Result<
 }
 
 /// The result a replayed call is given when the log holds none for it.
-const INTERRUPTED_CALL: &str = "the session stopped before this call returned, so it has no result";
+const INTERRUPTED_CALL: &str = rune_net::normalize::NOT_RUN;
 
 /// Builds a conversation from a stored log.
 #[must_use]
@@ -968,8 +1229,15 @@ pub fn history_from(state: &SessionState) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
     let mut assistant: Option<rune_net::message::Message> = None;
+    let mut queue = JournalQueue::default();
+    queue.apply_ready(&mut history);
 
     for frame in rune_session::replay::replay_events(&state.events) {
+        if let Some(entry) = journal_entry(&frame.event) {
+            queue.push(entry);
+            queue.apply_ready(&mut history);
+            continue;
+        }
         match &frame.event {
             SessionEvent::ConstraintPinned { text } => {
                 // Empty pins are refused at write time. Keep replay compatible
@@ -977,11 +1245,24 @@ pub fn history_from(state: &SessionState) -> History {
                 let _ = history.pin_constraint(text.clone());
             }
             SessionEvent::UserMessage { text } => {
-                flush(&mut history, &mut calls, &mut results, &mut assistant);
+                flush(
+                    &mut history,
+                    &mut calls,
+                    &mut results,
+                    &mut assistant,
+                    &mut queue,
+                );
                 history.push_user(text.clone());
+                queue.apply_ready(&mut history);
             }
             SessionEvent::AssistantContent { message } => {
-                flush(&mut history, &mut calls, &mut results, &mut assistant);
+                flush(
+                    &mut history,
+                    &mut calls,
+                    &mut results,
+                    &mut assistant,
+                    &mut queue,
+                );
                 assistant = serde_json::from_str(message).ok();
                 if let Some(message) = &assistant {
                     calls.extend(
@@ -995,9 +1276,16 @@ pub fn history_from(state: &SessionState) -> History {
             }
             SessionEvent::AssistantMessage { .. } if assistant.is_some() => {}
             SessionEvent::AssistantMessage { text, .. } => {
-                flush(&mut history, &mut calls, &mut results, &mut assistant);
+                flush(
+                    &mut history,
+                    &mut calls,
+                    &mut results,
+                    &mut assistant,
+                    &mut queue,
+                );
                 if !text.is_empty() {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
+                    queue.apply_ready(&mut history);
                 }
             }
             SessionEvent::ToolCall { .. } if assistant.is_some() && results.is_empty() => {}
@@ -1009,7 +1297,13 @@ pub fn history_from(state: &SessionState) -> History {
                 // A tool result run always follows the calls it answers, so a
                 // new call closes the previous group.
                 if !results.is_empty() {
-                    flush(&mut history, &mut calls, &mut results, &mut assistant);
+                    flush(
+                        &mut history,
+                        &mut calls,
+                        &mut results,
+                        &mut assistant,
+                        &mut queue,
+                    );
                 }
                 if let Ok(id) = rune_core::id::ToolCallId::new(call_id.clone()) {
                     calls.push(ContentPart::ToolCall {
@@ -1045,16 +1339,65 @@ pub fn history_from(state: &SessionState) -> History {
             | SessionEvent::ObjectiveTokensRecorded { .. }
             | SessionEvent::ModelSet { .. }
             | SessionEvent::WorkspaceSet { .. }
+            | SessionEvent::WorkspaceCheckpoint { .. }
+            | SessionEvent::Restored { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. }
             | SessionEvent::TurnInterrupted { .. }
             | SessionEvent::TurnCancelled { .. }
-            | SessionEvent::TurnFailed { .. } => {}
+            | SessionEvent::TurnFailed { .. }
+            | SessionEvent::HarnessNote { .. }
+            | SessionEvent::Checkpoint { .. }
+            | SessionEvent::ResultReplaced { .. }
+            | SessionEvent::ToolCallRepaired { .. } => {}
         }
     }
 
-    flush(&mut history, &mut calls, &mut results, &mut assistant);
+    flush(
+        &mut history,
+        &mut calls,
+        &mut results,
+        &mut assistant,
+        &mut queue,
+    );
+    queue.apply_ready(&mut history);
+    mark_scoped_rules(&mut history);
     history
+}
+
+/// Reverses the attribute escaping of a rendered instruction file's path.
+fn unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Marks every nested instruction file a rebuilt tool result carries as
+/// delivered, so a resumed session does not send it twice.
+fn mark_scoped_rules(history: &mut History) {
+    const OPEN: &str = "<scoped-rules from=\"";
+    let mut found = Vec::new();
+    for turn in history.turns() {
+        for part in &turn.parts {
+            let ContentPart::ToolResult { content, .. } = part else {
+                continue;
+            };
+            let mut rest = content.as_str();
+            while let Some(start) = rest.find(OPEN) {
+                rest = &rest[start.saturating_add(OPEN.len())..];
+                let Some(end) = rest.find('"') else {
+                    break;
+                };
+                found.push((format!("rules:{}", unescape(&rest[..end])), turn.seq));
+                rest = &rest[end..];
+            }
+        }
+    }
+    for (key, seq) in found {
+        history.mark_delivered(key, seq);
+    }
 }
 
 /// Appends the pending calls, then the pending results.
@@ -1068,6 +1411,7 @@ fn flush(
     calls: &mut Vec<ContentPart>,
     results: &mut Vec<ContentPart>,
     assistant: &mut Option<rune_net::message::Message>,
+    queue: &mut JournalQueue,
 ) {
     if !calls.is_empty() {
         for call in calls.iter() {
@@ -1097,20 +1441,35 @@ fn flush(
         }
         if assistant.is_none() {
             history.push_assistant(std::mem::take(calls));
+            queue.apply_ready(history);
         } else {
             calls.clear();
         }
     }
     if let Some(message) = assistant.take() {
-        history.push_assistant_with_replay(message.parts, message.replay);
+        history.push_assistant_with_replay(message.parts, message.replay, message.origin);
+        queue.apply_ready(history);
     }
     if !results.is_empty() {
         history.push_tool_results(std::mem::take(results));
+        queue.apply_ready(history);
     }
 }
 
 /// Projects a stored session into a listing row.
 fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
+    let model = state
+        .events
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.event {
+            SessionEvent::ModelSet { model, .. } => Some(model.clone()),
+            _ => None,
+        });
+    let first_prompt = state.events.iter().find_map(|frame| match &frame.event {
+        SessionEvent::UserMessage { text } => Some(text.clone()),
+        _ => None,
+    });
     Summary {
         id: state.id.to_string(),
         turns: state.turns,
@@ -1123,8 +1482,137 @@ fn summarize(state: &SessionState, dir: Utf8PathBuf) -> Summary {
         title: state.title.clone(),
         workspace: state.workspace.clone(),
         parent: state.parent.clone(),
+        model,
+        first_prompt,
         dir,
     }
+}
+
+/// Returns the role and text of a user or assistant message.
+fn message_text(event: &SessionEvent) -> Option<(&'static str, &str)> {
+    match event {
+        SessionEvent::UserMessage { text } => Some(("user", text)),
+        SessionEvent::AssistantMessage { text, .. } => Some(("assistant", text)),
+        _ => None,
+    }
+}
+
+/// Most search hits printed in one command.
+pub const HIT_LIMIT: usize = 50;
+
+/// Longest line a search hit shows, in characters.
+pub const HIT_CHARS: usize = 100;
+
+/// One line of a stored session that matched a search.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Hit {
+    /// Session identifier.
+    pub id: String,
+    /// Day of the session's last activity, as `YYYY-MM-DD`.
+    pub date: String,
+    /// `user`, `assistant`, or `title` when only the title matched.
+    pub role: &'static str,
+    /// The matching line, cut to [`HIT_CHARS`].
+    pub line: String,
+}
+
+/// Finds the matching message lines of the listed sessions, newest session
+/// first and in log order within a session.
+///
+/// Returns at most [`HIT_LIMIT`] hits and whether more were found.
+#[must_use]
+pub fn search_hits(rows: &[Summary], query: &str) -> (Vec<Hit>, bool) {
+    let query = query.to_lowercase();
+    let mut hits = Vec::new();
+    for row in rows {
+        let Ok(state) = load_read_only(&row.dir) else {
+            continue;
+        };
+        let date = date_of(row.updated_at_ms).unwrap_or_else(|| "unknown".to_owned());
+        let before = hits.len();
+        for frame in &state.events {
+            let Some((role, text)) = message_text(&frame.event) else {
+                continue;
+            };
+            for line in matching_lines(text, &query) {
+                hits.push(Hit {
+                    id: row.id.clone(),
+                    date: date.clone(),
+                    role,
+                    line: cut(line.trim(), HIT_CHARS),
+                });
+            }
+        }
+        if hits.len() == before
+            && let Some(title) = &state.title
+            && title.to_lowercase().contains(&query)
+        {
+            hits.push(Hit {
+                id: row.id.clone(),
+                date: date.clone(),
+                role: "title",
+                line: cut(title, HIT_CHARS),
+            });
+        }
+        if hits.len() > HIT_LIMIT {
+            break;
+        }
+    }
+    let more = hits.len() > HIT_LIMIT;
+    hits.truncate(HIT_LIMIT);
+    (hits, more)
+}
+
+/// Returns the lines of `text` containing `query`, already lowercased.
+///
+/// A query that spans a line break matches no single line, so the line where
+/// the match starts stands for it.
+fn matching_lines<'a>(text: &'a str, query: &str) -> Vec<&'a str> {
+    let lowered = text.to_lowercase();
+    let lines: Vec<&str> = text.lines().collect();
+    let hits: Vec<&str> = lowered
+        .lines()
+        .zip(&lines)
+        .filter(|(folded, _)| folded.contains(query))
+        .map(|(_, line)| *line)
+        .collect();
+    if !hits.is_empty() {
+        return hits;
+    }
+    lowered
+        .find(query)
+        .and_then(|at| lines.get(lowered[..at].matches('\n').count()).copied())
+        .into_iter()
+        .collect()
+}
+
+/// Cuts `text` to at most `limit` characters.
+fn cut(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+/// Formats milliseconds since the epoch as a `YYYY-MM-DD` date.
+fn date_of(millis: u64) -> Option<String> {
+    let millis = i64::try_from(millis).ok()?;
+    jiff::Timestamp::from_millisecond(millis)
+        .ok()
+        .map(|at| at.strftime("%Y-%m-%d").to_string())
+}
+
+/// Renders search hits for a terminal, one line each.
+#[must_use]
+pub fn render_hits(hits: &[Hit], more: bool) -> String {
+    if hits.is_empty() {
+        return "no sessions stored".to_owned();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        let _ = writeln!(out, "{}  {}  {}", hit.id, hit.date, hit.line);
+    }
+    if more {
+        out.push_str("more matches: narrow the search");
+    }
+    out.trim_end().to_owned()
 }
 
 /// Renders a listing for a terminal.
@@ -1343,6 +1831,73 @@ mod tests {
     }
 
     #[test]
+    fn fork_before_drops_the_chosen_message_and_after() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let store = SessionStore::create(&paths, &id).expect("store");
+        store
+            .append(SessionEvent::WorkspaceSet {
+                workspace: "/work".into(),
+            })
+            .expect("workspace");
+        for (turn, text) in [(1, "one"), (2, "two"), (3, "three")] {
+            for event in [
+                SessionEvent::UserMessage { text: text.into() },
+                SessionEvent::TurnStarted { turn },
+                SessionEvent::AssistantMessage {
+                    turn,
+                    text: format!("A{turn}"),
+                },
+                SessionEvent::TurnFinished { turn },
+            ] {
+                store.append(event).expect("event");
+            }
+        }
+        drop(store);
+        let recorder = Recorder::open(&paths, &id).expect("open");
+        let listed = user_messages(&recorder).expect("messages");
+        assert_eq!(
+            listed,
+            vec![
+                (0, "one".to_owned()),
+                (1, "two".to_owned()),
+                (2, "three".to_owned())
+            ]
+        );
+        assert_eq!(turn_started_by(&recorder, 1).expect("turn"), Some(2));
+        assert_eq!(turn_started_by(&recorder, 5).expect("none"), None);
+        let fork = recorder.fork_before(&paths, 1).expect("fork");
+        let (forked, history) = load(&paths, &fork).expect("load the fork");
+        assert_eq!(
+            user_messages(&forked).expect("forked messages"),
+            vec![(0, "one".to_owned())]
+        );
+        assert_eq!(history.turns().len(), 2);
+        assert_eq!(user_messages(&recorder).expect("source").len(), 3);
+        assert!(recorder.fork_before(&paths, 3).is_err());
+        let first = Recorder::create(&paths, &SessionId::generate()).expect("create");
+        first.user_message("alone").expect("message");
+        let err = first.fork_before(&paths, 0).expect_err("first frame");
+        assert_eq!(err.message(), "nothing comes before the first message");
+    }
+
+    #[test]
+    fn a_recorder_forks_into_a_new_session_with_the_same_history() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
+        let id = SessionId::generate();
+        let recorder = Recorder::create(&paths, &id).expect("create");
+        assert!(recorder.fork(&paths).is_err());
+        recorder.user_message("hello").expect("message");
+        let branch = recorder.fork(&paths).expect("fork");
+        assert_ne!(branch, id);
+        let (_, history) = load(&paths, &branch).expect("resume the branch");
+        assert_eq!(history.turns().len(), 1);
+        Recorder::open(&paths, &branch).expect("the branch is writable");
+    }
+
+    #[test]
     fn forked_tool_pair_replays_as_a_valid_history_and_continues_with_the_next_turn() {
         let temp = tempfile::tempdir().expect("temp");
         let paths = paths(Utf8Path::from_path(temp.path()).expect("utf8"));
@@ -1429,8 +1984,11 @@ mod tests {
 
     fn outcome(text: &str) -> TurnOutcome {
         TurnOutcome {
+            error: None,
+            judge: None,
             stop_reason: StopReason::Completed,
             text: text.to_owned(),
+            narration: Vec::new(),
             reasoning: String::new(),
             usage: Usage {
                 input_tokens: Some(10),
@@ -1444,7 +2002,10 @@ mod tests {
             },
             steps: 1,
             verification: rune_agent::turn::Verification::NotApplicable,
+            checks: rune_agent::verify::CheckSummary::default(),
             calls: Vec::new(),
+            repairs: Vec::new(),
+            repaired_calls: 0,
         }
     }
 
@@ -1529,7 +2090,7 @@ mod tests {
             let (recorder, _) = load(&paths, &key).expect("resumed");
             let expected = match usage {
                 Some((input, output)) => (input.saturating_add(output), Some("saved usage")),
-                None => (1, Some("history bytes")),
+                None => (2, Some("history bytes")),
             };
             assert_eq!(recorder.resumed_context(), expected);
         }
@@ -2157,6 +2718,8 @@ mod tests {
                 title: Some("parser work".to_owned()),
                 workspace: Some("/tmp/work".to_owned()),
                 parent: None,
+                model: None,
+                first_prompt: None,
                 dir: Utf8PathBuf::from("/tmp/a"),
             },
             Summary {
@@ -2168,6 +2731,8 @@ mod tests {
                 title: None,
                 workspace: None,
                 parent: None,
+                model: None,
+                first_prompt: None,
                 dir: Utf8PathBuf::from("/tmp/b"),
             },
         ];
@@ -2550,6 +3115,48 @@ mod tests {
     }
 
     #[test]
+    fn summaries_carry_model_and_first_prompt() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = Utf8Path::from_path(dir.path()).expect("utf8");
+        let paths = paths(root);
+
+        let mut recorder = Recorder::create(&paths, &id("sessionmmmmm")).expect("created");
+        for model in ["first-model", "second-model"] {
+            recorder
+                .store
+                .append(SessionEvent::ModelSet {
+                    model: model.to_owned(),
+                    effort: rune_core::config::Effort::Max,
+                })
+                .expect("model");
+        }
+        recorder
+            .user_message("opening prompt\nsecond line")
+            .expect("wrote");
+        recorder.turn(&outcome("answer")).expect("wrote");
+        recorder.user_message("later prompt").expect("wrote");
+        drop(recorder);
+        drop(Recorder::create(&paths, &id("sessionnnnnn")).expect("created"));
+
+        let rows = list_scoped(&paths, None);
+        let full = rows
+            .iter()
+            .find(|row| row.id == "sessionmmmmm")
+            .expect("row");
+        assert_eq!(full.model.as_deref(), Some("second-model"));
+        assert_eq!(
+            full.first_prompt.as_deref(),
+            Some("opening prompt\nsecond line")
+        );
+        let empty = rows
+            .iter()
+            .find(|row| row.id == "sessionnnnnn")
+            .expect("row");
+        assert_eq!(empty.model, None);
+        assert_eq!(empty.first_prompt, None);
+    }
+
+    #[test]
     fn a_long_title_is_truncated() {
         let title = derive_title(&"x".repeat(TITLE_CHARS + 10));
         assert_eq!(title.chars().count(), TITLE_CHARS + 3);
@@ -2590,6 +3197,178 @@ mod tests {
             timestamp(1_704_164_645_000).as_deref(),
             Some("2024-01-02T03:04:05Z")
         );
+    }
+
+    /// A completed response with `text`, then one call to `read_file` when
+    /// `call` is given.
+    fn streamed(text: &str, call: Option<&str>) -> rune_net::transport::StreamOutcome {
+        use rune_net::stream::ProviderEvent;
+        let mut events = vec![ProviderEvent::TextDelta {
+            delta: text.to_owned(),
+        }];
+        if let Some(call) = call {
+            let id = rune_core::id::ToolCallId::new(call).expect("id");
+            events.push(ProviderEvent::ToolCallStart {
+                id: id.clone(),
+                name: "read_file".to_owned(),
+            });
+            events.push(ProviderEvent::ToolCallEnd {
+                id,
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            });
+        }
+        rune_net::transport::StreamOutcome {
+            events,
+            ..rune_net::transport::StreamOutcome::default()
+        }
+    }
+
+    #[test]
+    fn a_resumed_history_equals_the_one_in_memory() {
+        use rune_agent::history::JournalQueue;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let key = id("fidelity0001");
+        let mut recorder = Recorder::create(&paths, &key).expect("create");
+        let mut live = History::new();
+        let at = |history: &History| u64::try_from(history.len()).expect("length");
+        let respond = |recorder: &mut Recorder, live: &mut History, outcome| {
+            recorder.response(&outcome).expect("response");
+            let (parts, _) = rune_agent::turn::assistant_parts(&outcome);
+            live.push_assistant(parts);
+        };
+
+        // A prompt with a note before it.
+        recorder.user_message("read a.rs").expect("prompt");
+        recorder
+            .journal(&JournalEntry::Note {
+                at: at(&live),
+                placement: NotePlacement::PromptPrefix,
+                text: "PLAN".to_owned(),
+            })
+            .expect("note");
+        live.push_user("PLAN\n\nread a.rs");
+
+        // A turn that reads a file, answers, is reminded, and answers again.
+        respond(&mut recorder, &mut live, streamed("reading", Some("c1")));
+        live.push_tool_results(vec![ContentPart::ToolResult {
+            id: rune_core::id::ToolCallId::new("c1").expect("id"),
+            name: "read_file".to_owned(),
+            content: "file text".to_owned(),
+            is_error: false,
+        }]);
+        respond(&mut recorder, &mut live, streamed("done", None));
+        let reminder = JournalEntry::Note {
+            at: at(&live),
+            placement: NotePlacement::UserTurn,
+            text: "REMINDER".to_owned(),
+        };
+        recorder.journal(&reminder).expect("reminder");
+        live.push_user("REMINDER");
+        respond(&mut recorder, &mut live, streamed("checked", None));
+        let mut first = outcome("checked");
+        first.calls = vec![rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            },
+            output: ToolOutput::success("file text"),
+            executed: true,
+        }];
+        recorder.turn(&first).expect("turn");
+
+        // The old result becomes a receipt, then a checkpoint replaces the
+        // first exchange.
+        let replaced = JournalEntry::ResultReplaced {
+            at: at(&live),
+            call_id: "c1".to_owned(),
+            content: "receipt".to_owned(),
+        };
+        recorder.journal(&replaced).expect("replaced");
+        let mut direct = JournalQueue::default();
+        direct.push(replaced);
+        direct.apply_ready(&mut live);
+        let checkpoint_at = at(&live);
+        live.replace_with_summary("<conversation-checkpoint>", 4);
+        recorder
+            .journal(&JournalEntry::Checkpoint {
+                at: checkpoint_at,
+                through: 3,
+                message: "<conversation-checkpoint>".to_owned(),
+            })
+            .expect("checkpoint");
+
+        // One more turn.
+        recorder.user_message("next").expect("prompt");
+        live.push_user("next");
+        respond(&mut recorder, &mut live, streamed("fine", None));
+        recorder.turn(&outcome("fine")).expect("turn");
+        drop(recorder);
+
+        let (_, resumed) = load(&paths, &key).expect("load");
+        assert_eq!(resumed.to_messages(), live.to_messages());
+        assert_eq!(
+            serde_json::to_string(&resumed.to_messages()).expect("resumed"),
+            serde_json::to_string(&live.to_messages()).expect("live")
+        );
+        assert_eq!(resumed.turns()[0].text(), "<conversation-checkpoint>");
+        assert!(
+            resumed
+                .turns()
+                .iter()
+                .all(|turn| !turn.text().contains("file text"))
+        );
+    }
+
+    #[test]
+    fn rebuilt_scoped_rules_count_as_delivered() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let key = id("scopedrules1");
+        let mut recorder = Recorder::create(&paths, &key).expect("create");
+        recorder.user_message("read it").expect("prompt");
+        let mut read = outcome("");
+        read.calls = vec![rune_agent::turn::CallResult {
+            call: PreparedCall {
+                id: "c1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a&b/x.rs\"}".to_owned(),
+            },
+            output: ToolOutput::success(
+                "text\n\n<scoped-rules from=\"a&amp;b/AGENTS.md\" applies-to=\"a&amp;b/\">\nUse tabs.\n</scoped-rules>",
+            ),
+            executed: true,
+        }];
+        recorder.turn(&read).expect("turn");
+        drop(recorder);
+
+        let (_, history) = load(&paths, &key).expect("load");
+        assert!(history.is_delivered("rules:a&b/AGENTS.md"));
+        assert!(!history.is_delivered("rules:b/AGENTS.md"));
+    }
+
+    #[test]
+    fn old_journals_ignore_compaction_records() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(Utf8Path::from_path(root.path()).expect("utf8"));
+        let key = id("oldjournal01");
+        let mut recorder = Recorder::create(&paths, &key).expect("create");
+        recorder.user_message("first").expect("prompt");
+        recorder.turn(&outcome("one")).expect("turn");
+        recorder
+            .append(SessionEvent::Compaction {
+                through: 2,
+                summary: "a summary".to_owned(),
+            })
+            .expect("compaction");
+        recorder.user_message("second").expect("prompt");
+        recorder.turn(&outcome("two")).expect("turn");
+        drop(recorder);
+
+        let (_, history) = load(&paths, &key).expect("load");
+        let texts: Vec<String> = history.turns().iter().map(rune_agent::Turn::text).collect();
+        assert_eq!(texts, ["first", "one", "second", "two"]);
     }
 
     #[test]

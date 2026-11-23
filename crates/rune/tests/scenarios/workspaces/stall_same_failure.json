@@ -1,0 +1,4 @@
+{
+  "a.txt": "v0\n",
+  "check.sh": "echo \"running 1 test\"\necho \"test a ... FAILED\"\necho \"test result: FAILED. 0 passed; 1 failed; 0 ignored\"\nexit 101\n"
+}

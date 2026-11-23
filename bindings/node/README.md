@@ -67,15 +67,31 @@ the validated object the binary printed, including `error` and `error_code`, or
 | `ask(prompt, options)` | Runs one bounded turn, resolves with the parsed result object |
 | `askStream(prompt, options)` | Yields JSONL events through an async iterator with bounded buffering |
 | `resolveBinary(options)` | Returns the path the next `ask` would run |
-| `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `EXIT`, `OUTPUT`, `OUTPUT_LIMIT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
+| `RuneError` | Base class, with a `code` of `BINARY_NOT_FOUND`, `OPTIONS`, `EXIT`, `OUTPUT`, `OUTPUT_LIMIT`, `TIMEOUT`, `ABORTED`, or `SIGNALED` |
 | `RuneBinaryNotFoundError` | No executable through the option, `RUNE_BIN`, or `PATH` |
 | `RuneExitError` | Non-zero exit, with `exitCode`, `result`, and `stderr` |
 | `RuneOutputError` | Invalid result object or malformed JSONL stream; names missing or invalid fields |
 | `RuneOutputLimitError` | Output exceeded a byte cap; carries `maxOutputBytes`, the `stream`, and the `scope` (`combined` or `record`) |
 
 `options` accepts `bin`, `provider`, `offline`, `model`, `effort`, `cwd`, `env`,
-`noSave`, `timeoutMs`, `maxOutputBytes`, and `signal`. Types for every field of
-the result object are in `index.d.ts`.
+`noSave`, `timeoutMs`, `maxOutputBytes`, `signal`, `network`, `checkpoints`,
+`limits`, `allowUnsandboxed`, `permissionMode`, and `download`. Types for every
+field of the result object are in `index.d.ts`, including `stop_reason`,
+`verification` and `changed_files`; a failed run's text, usage and tool calls
+still describe what completed before the failure.
+`network: true` passes `--network`, `allowUnsandboxed: true` passes
+`--allow-unsandboxed`, `permissionMode` (`ask`, `auto` or `full-access`) passes
+`--permission-mode`, and `limits` (an object such as
+`{ max_agent_steps: 40, session_spend_cents: "off" }`) passes one
+`--limit name=value` per entry; all of them go before `ask`. `checkpoints: true`
+passes `--checkpoints` after `ask`, and needs a saved session: with `noSave`
+it throws a `RuneError` with code `OPTIONS` before anything runs.
+`download: true` fetches the release archive of the binding's own version when
+`bin`, `RUNE_BIN` and `PATH` all find nothing, checks it against the release's
+`SHA256SUMS`, caches it (under `~/.cache/rune-npm` or `%LOCALAPPDATA%\rune-npm`)
+and runs it; a `bin` or `RUNE_BIN` that names something unusable is still an
+error. Without a published archive for the platform it throws
+`RuneBinaryNotFoundError` naming the platform.
 Set `provider` to a non-empty provider name to pass `--provider <name>`.
 Set `offline: true` to pass `--offline`; false or omission adds no offline flag
 and leaves the binary's configured offline setting in effect. Both flags are

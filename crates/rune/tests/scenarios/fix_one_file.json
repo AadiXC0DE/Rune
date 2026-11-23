@@ -1,0 +1,69 @@
+{
+  "prompt": "The check in check.sh fails. Fix the configuration so it passes.",
+  "workspace": "workspaces/fix_one_file.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "config/limits.conf"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "edit_file",
+          "arguments": {
+            "path": "config/limits.conf",
+            "old_string": "max_items = 5",
+            "new_string": "max_items = 10"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Set max_items to 10; check.sh passes."
+    }
+  ],
+  "expect": {
+    "files": {
+      "config/limits.conf": "max_items = 10\n"
+    },
+    "exit_code": 0,
+    "error_code": null,
+    "final_output": "Set max_items to 10; check.sh passes.",
+    "min_steps": 4,
+    "requests": 4,
+    "prefix_breaks": 0,
+    "request_contains": [
+      {
+        "request": 1,
+        "text": "<run_context>This is a non-interactive run."
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 1,
+        "text": "This is the last step allowed in this run."
+      }
+    ],
+    "stop_reason": "end_turn"
+  }
+}

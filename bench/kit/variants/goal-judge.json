@@ -1,0 +1,8 @@
+{
+  "description": "An ask run works toward its prompt and a judge checks the result.",
+  "env": {
+    "RUNE_EXPERIMENT": "goal=judge"
+  },
+  "flags": [],
+  "files": {}
+}

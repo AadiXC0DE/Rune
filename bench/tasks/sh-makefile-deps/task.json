@@ -1,0 +1,15 @@
+{
+  "title": "Fix the makefile so header changes rebuild and idle runs do nothing",
+  "kind": "bugfix",
+  "prompt": "After editing a shared header, running make does not rebuild everything that uses it, so the output is stale. A second make with nothing changed should do nothing.",
+  "verify": "sh tests/run.sh",
+  "protected": [
+    "tests",
+    "tests/run.sh"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "shell"
+}

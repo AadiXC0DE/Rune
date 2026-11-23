@@ -1,0 +1,16 @@
+{
+  "title": "Fix overdrafts and lost cents in account transfers",
+  "kind": "bugfix",
+  "prompt": "Transfers between accounts sometimes allow an overdraft and lose cents on currency conversion.",
+  "verify": "rm -rf out && javac -d out $(find src test -name '*.java') && java -ea -cp out HiddenTests",
+  "protected": [
+    "test/VisibleTests.java",
+    "test/HiddenTests.java"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "java"
+}

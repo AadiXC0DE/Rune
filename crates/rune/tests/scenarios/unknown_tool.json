@@ -1,0 +1,28 @@
+{
+  "prompt": "Do something.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "frobnicate",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "text": "That tool does not exist."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "requests": 2,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "there is no tool"
+      }
+    ]
+  }
+}

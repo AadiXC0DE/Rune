@@ -1,0 +1,48 @@
+{
+  "prompt": "Replace notes.txt with the word new.",
+  "workspace": "workspaces/overwrite_guard.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "w1",
+          "name": "write_file",
+          "arguments": {
+            "path": "notes.txt",
+            "content": "new\n"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "w2",
+          "name": "write_file",
+          "arguments": {
+            "path": "notes.txt",
+            "content": "new\n"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Replaced notes.txt."
+    },
+    {
+      "text": "done"
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "files": {
+      "notes.txt": "new\n"
+    },
+    "result_contains": [
+      {
+        "call": "w1",
+        "text": "has not been read in this session"
+      }
+    ]
+  }
+}

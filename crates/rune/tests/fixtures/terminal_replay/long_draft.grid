@@ -1,12 +1,12 @@
-end: 80x24, caret 79,3
+end: 80x24, caret 14,7
 00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|draft-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|
-04||
-05||
-06||
-07||
+01|rune <version> · draft-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|/ commands   @ files   shift-tab mode   ctrl-j newline|
+04|draft-fixture | auto | ctx ~###k (request bytes)|
+05|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+06|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+07|  aaaaTAIL-END|
 08||
 09||
 10||
@@ -23,15 +23,15 @@ end: 80x24, caret 79,3
 21||
 22||
 23||
-left: 80x24, caret 79,3
+left: 80x24, caret 13,7
 00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|draft-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-END|
-04||
-05||
-06||
-07||
+01|rune <version> · draft-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|/ commands   @ files   shift-tab mode   ctrl-j newline|
+04|draft-fixture | auto | ctx ~###k (request bytes)|
+05|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+06|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+07|  aaaaTAIL-END|
 08||
 09||
 10||
@@ -48,15 +48,15 @@ left: 80x24, caret 79,3
 21||
 22||
 23||
-edited: 80x24, caret 79,3
+edited: 80x24, caret 14,7
 00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|draft-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|
-04||
-05||
-06||
-07||
+01|rune <version> · draft-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|/ commands   @ files   shift-tab mode   ctrl-j newline|
+04|draft-fixture | auto | ctx ~###k (request bytes)|
+05|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+06|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+07|  aaaaTAIL-ENZ|
 08||
 09||
 10||
@@ -73,15 +73,15 @@ edited: 80x24, caret 79,3
 21||
 22||
 23||
-home: 80x24, caret 2,3
+home: 80x24, caret 2,5
 00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|draft-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
-04||
-05||
-06||
-07||
+01|rune <version> · draft-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|/ commands   @ files   shift-tab mode   ctrl-j newline|
+04|draft-fixture | auto | ctx ~###k (request bytes)|
+05|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+06|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+07|  aaaaTAIL-ENZ|
 08||
 09||
 10||
@@ -98,15 +98,15 @@ home: 80x24, caret 2,3
 21||
 22||
 23||
-end-again: 80x24, caret 79,3
+end-again: 80x24, caret 14,7
 00|session ************|
-01|ctrl-c cancel  /help commands  esc clear|
-02|draft-fixture | auto | ctx ~2.7k (request bytes) (125.2k left)|
-03|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTAIL-ENZ|
-04||
-05||
-06||
-07||
+01|rune <version> · draft-fixture · auto · <workspace>|
+02|tip: @ mentions a file; tab completes it|
+03|/ commands   @ files   shift-tab mode   ctrl-j newline|
+04|draft-fixture | auto | ctx ~###k (request bytes)|
+05|> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+06|  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|
+07|  aaaaTAIL-ENZ|
 08||
 09||
 10||

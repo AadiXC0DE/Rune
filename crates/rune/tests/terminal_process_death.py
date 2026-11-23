@@ -139,7 +139,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
     def stop():
         global child, master
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         os.close(master)
         master = None
         child = None
@@ -160,12 +160,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
 
     try:
         launch()
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         start = len(transcript)
         os.write(master, b"slow\r")
         wait_for("STREAM-03", start)
         os.kill(child.pid, signal.SIGKILL)
-        assert child.wait(timeout=10) == -signal.SIGKILL
+        assert drain_wait(child, master, 10, transcript) == -signal.SIGKILL
         child = None
         os.close(master)
         master = None
@@ -180,13 +180,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         session_id = log.parent.name
 
         launch("resume", "last")
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         replay = transcript.decode(errors="replace")
         assert f"session {session_id}" in replay, replay
         for line in partial.splitlines():
             assert replay.count(line) == 1, replay
         assert replay.count("[interrupted]") == 1, replay
         assert "STREAM-04" not in replay, replay
+        # The last turn never finished, so the resumed session offers /retry.
+        assert "the last turn was interrupted before it finished; /retry runs it again" in replay, replay
         start = len(transcript)
         os.write(master, b"/tree\r")
         wait_for("[interrupted]", start)
@@ -206,10 +208,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         # Replaying again after a completed continuation must still preserve the
         # old partial exactly once, and discard the completed reply's deltas.
         launch("resume", session_id)
-        wait_for("ctrl-c cancel")
+        wait_for("/ commands")
         replay = transcript.decode(errors="replace")
         for text in [*partial.splitlines(), "AFTER_RESUME_OK", "[interrupted]"]:
             assert replay.count(text) == 1, replay
+        # A later turn finished, so nothing is offered again.
+        assert "the last turn was interrupted" not in replay, replay
         start = len(transcript)
         os.write(master, b"after-resume\r")
         wait_for("AFTER_RESUME_OK", start)
@@ -228,6 +232,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r058-") as directory:
         if child is not None:
             if child.poll() is None:
                 child.kill()
+                # A session blocked writing to the terminal ends only when it is
+                # drained while it exits.
+                drain_wait(child, master, 10, bytearray())
             child.wait(timeout=10)
         if master is not None:
             os.close(master)

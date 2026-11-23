@@ -264,6 +264,71 @@ fn offline_overrides_an_explicit_context_grant_and_reports_its_source() {
 }
 
 #[test]
+fn sandbox_explain_reports_the_network_flag() {
+    let fixture = Fixture::new();
+    let granted = fixture.json(&["--network", "sandbox", "explain", "--json", "--", "curl x"]);
+    assert_eq!(granted["network"]["value"], true, "{granted}");
+    assert!(
+        granted["network"]["source"]
+            .as_str()
+            .expect("source")
+            .contains("shell_network=true"),
+        "{granted}"
+    );
+    let denied = fixture.json(&["sandbox", "explain", "--json", "--", "curl x"]);
+    assert_eq!(denied["network"]["value"], false, "{denied}");
+    // --offline still wins over --network.
+    let offline = fixture.json(&[
+        "--offline",
+        "--network",
+        "sandbox",
+        "explain",
+        "--json",
+        "--",
+        "curl x",
+    ]);
+    assert_eq!(offline["network"]["value"], false, "{offline}");
+    assert!(
+        offline["network"]["source"]
+            .as_str()
+            .expect("source")
+            .contains("offline=true"),
+        "{offline}"
+    );
+}
+
+#[test]
+fn sandbox_explain_lists_cache_roots() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.dir.path().join("home/.cache")).expect("cache");
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "go build"]);
+    let caches = report["cache_roots"].as_array().expect("cache roots");
+    assert!(
+        caches.iter().any(|cache| {
+            cache["path"] == resolved(&fixture.dir.path().join("home/.cache"))
+                && cache["source"] == "default ~/.cache"
+        }),
+        "{report}"
+    );
+    let text = fixture.run(&["sandbox", "explain", "--", "go build"]);
+    let text = String::from_utf8(text.stdout).expect("utf8");
+    assert!(text.contains("cache root: "), "{text}");
+    assert!(text.contains("(source: default ~/.cache)"), "{text}");
+    // A protected directory named in the configuration is refused.
+    let config = fixture.dir.path().join("config.toml");
+    let mut contents = std::fs::read_to_string(&config).expect("config");
+    contents.push_str("sandbox_cache_roots = [\"~/.ssh\"]\n");
+    std::fs::write(&config, contents).expect("config");
+    let report = fixture.json(&["sandbox", "explain", "--json", "--", "go build"]);
+    assert_eq!(report["cache_roots"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["cache_roots_refused"],
+        serde_json::json!([{"entry": "~/.ssh", "reason": "a protected directory"}]),
+        "{report}"
+    );
+}
+
+#[test]
 fn saved_roots_can_be_ignored_while_command_line_roots_remain() {
     let fixture = Fixture::new();
     let added = fixture.dir.path().join("added");
@@ -287,7 +352,6 @@ fn saved_roots_can_be_ignored_while_command_line_roots_remain() {
 fn missing_command_invalid_action_and_missing_root_are_rejected() {
     let fixture = Fixture::new();
     for args in [
-        vec!["sandbox", "explain"],
         vec!["sandbox", "run", "echo fixture"],
         vec![
             "sandbox",
@@ -304,6 +368,50 @@ fn missing_command_invalid_action_and_missing_root_are_rejected() {
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.is_empty());
     }
+}
+
+#[test]
+fn explain_without_a_command_prints_the_backend() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.dir.path().join("home/.cache")).expect("cache");
+    let output = fixture.run(&["sandbox", "explain"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        !text.lines().any(|line| line.starts_with("command:")),
+        "{text}"
+    );
+    for label in [
+        "backend: ",
+        "support: ",
+        "allow_unsandboxed: ",
+        "network policy: ",
+        "cache root",
+        "writable roots:",
+        "protected paths:",
+    ] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    let report = fixture.json(&["sandbox", "explain", "--json"]);
+    assert!(report["command"].is_null(), "{report}");
+    assert!(
+        !report["backend"]["value"]
+            .as_str()
+            .expect("backend")
+            .is_empty()
+    );
+    let guidance = report.get("guidance").expect("guidance key");
+    if let Some(sentence) = guidance.as_str() {
+        assert!(text.contains(&format!("guidance: {sentence}\n")), "{text}");
+    } else {
+        assert!(guidance.is_null(), "{report}");
+        assert!(!text.contains("guidance:"), "{text}");
+    }
+    assert_eq!(text.contains("job object:"), cfg!(windows), "{text}");
 }
 
 #[cfg(target_os = "linux")]
@@ -435,7 +543,7 @@ fn top_level_help_names_sandbox_and_mcp_actions() {
         .find(|line| line.trim_start().starts_with("sandbox "))
         .expect("sandbox summary");
     assert!(
-        sandbox.contains("sandbox [explain] -- <command>"),
+        sandbox.contains("sandbox [explain] [-- <command>]"),
         "{sandbox}"
     );
     let mcp = text
@@ -448,5 +556,7 @@ fn top_level_help_names_sandbox_and_mcp_actions() {
     let reference = fixture.run(&["reference"]);
     assert!(reference.status.success());
     let reference = String::from_utf8(reference.stdout).expect("reference");
-    assert!(reference.contains("rune sandbox [explain] [--external-access] [--json] -- <command>"));
+    assert!(
+        reference.contains("rune sandbox [explain] [--external-access] [--json] [-- <command>]")
+    );
 }

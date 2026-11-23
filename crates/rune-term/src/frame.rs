@@ -884,25 +884,36 @@ mod tests {
             model: "claude-sonnet-4".to_owned(),
             permission_mode: rune_core::config::PermissionMode::Auto,
             planning: false,
+            unsandboxed: false,
             workspace: "/Users/dev/rune".to_owned(),
             context_used: 24_500,
             context_source: None,
             context_limit: 200_000,
             session_id: "9f2c1a7b4e".to_owned(),
             cost: None,
+            ..crate::footer::FooterState::default()
         };
         let layout = crate::footer::solve((80, 24), 1, false, crate::footer::DEFAULT_MINIMUM_ROWS);
         assert!(!layout.too_small);
-        let footer = crate::footer::render(&state, &layout, &Theme::fx_dark(), 80, true);
+        let footer = crate::footer::render(
+            &state,
+            &layout,
+            &Theme::dark(),
+            80,
+            crate::theme::ColorDepth::TrueColor,
+        );
         let prompt = lines(&["> "]);
         let transcript: Vec<String> = (0..40).map(|index| format!("line {index}")).collect();
         let regions = Regions::new(&transcript, &footer).with_prompt(&prompt);
         let composed = compose(&regions, 80, 24).expect("compose");
         assert_eq!(
             composed.row_text(23),
-            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left) | /Users/dev/"
+            "claude-sonnet-4 | auto | ctx 12% (provider-reported) (175.5k left)"
         );
-        assert_eq!(composed.row_text(22), crate::footer::HINTS);
+        assert_eq!(
+            composed.row_text(22),
+            crate::footer::hints(crate::footer::UiState::Idle)
+        );
         assert_eq!(composed.row_text(21), ">");
         assert_eq!(composed.row_text(20), "line 39");
         assert_eq!(composed.row_text(0), "line 19");

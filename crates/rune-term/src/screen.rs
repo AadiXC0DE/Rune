@@ -307,7 +307,7 @@ impl Transcript {
     pub fn header(&self) -> Option<String> {
         let query = sanitize(self.query.as_deref()?);
         if self.hits.is_empty() {
-            return Some(format!("no matches for {query:?}"));
+            return Some(format!("no match for {query:?}"));
         }
         let position = self.selected.map_or(1, |index| index.saturating_add(1));
         Some(format!(
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(transcript.selected(), None);
         assert_eq!(
             transcript.header(),
-            Some("no matches for \"anything\"".to_owned())
+            Some("no match for \"anything\"".to_owned())
         );
     }
 

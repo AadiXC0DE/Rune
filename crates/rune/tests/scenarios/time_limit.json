@@ -1,0 +1,32 @@
+{
+  "prompt": "Read a.txt, then answer.",
+  "workspace": "workspaces/six_files.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--timeout",
+    "2"
+  ],
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "read_file",
+          "arguments": {
+            "path": "a.txt"
+          }
+        }
+      ]
+    },
+    {
+      "delay_ms": 20000,
+      "text": "too late"
+    }
+  ],
+  "expect": {
+    "exit_code": 3,
+    "error_code": "limit_exceeded",
+    "stop_reason": "time_limit"
+  }
+}

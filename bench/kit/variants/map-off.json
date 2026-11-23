@@ -1,0 +1,8 @@
+{
+  "description": "No repository symbol map in the instructions.",
+  "env": {
+    "RUNE_EXPERIMENT": "map=off"
+  },
+  "flags": [],
+  "files": {}
+}

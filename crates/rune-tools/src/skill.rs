@@ -16,6 +16,7 @@ use rune_context::skills::Skill;
 use rune_core::error::{Result, RuneError};
 
 use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
+use crate::mcp_tools::{McpDirectory, McpEntry};
 
 /// A source of skills, so the tool can be driven without a filesystem walk.
 pub trait Catalog: Send + Sync {
@@ -165,9 +166,22 @@ impl Tool for LoadSkill {
     }
 }
 
-/// Searches the catalog by name and description.
+/// MCP tools listed in one search result.
+const MAX_LISTED_MCP_TOOLS: usize = 20;
+
+/// MCP tools whose schemas follow the list.
+const MAX_SHOWN_MCP_SCHEMAS: usize = 3;
+
+/// Characters of an MCP tool's description shown in the list.
+const MAX_MCP_DESCRIPTION_CHARS: usize = 200;
+
+/// Searches the catalog, and the connected MCP tools when there are any, by
+/// name and description.
 pub struct CapabilitySearch {
     catalog: Arc<dyn Catalog>,
+    mcp: Option<Arc<dyn McpDirectory>>,
+    /// Largest schema shown in a result, in bytes.
+    schema_bytes: usize,
 }
 
 impl std::fmt::Debug for CapabilitySearch {
@@ -180,8 +194,85 @@ impl CapabilitySearch {
     /// Builds the tool.
     #[must_use]
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            mcp: None,
+            schema_bytes: 0,
+        }
     }
+
+    /// Builds the tool over the skill catalog and the connected MCP tools,
+    /// showing schemas of at most `schema_bytes` bytes.
+    #[must_use]
+    pub fn with_mcp(
+        catalog: Arc<dyn Catalog>,
+        mcp: Arc<dyn McpDirectory>,
+        schema_bytes: usize,
+    ) -> Self {
+        Self {
+            catalog,
+            mcp: Some(mcp),
+            schema_bytes,
+        }
+    }
+
+    /// Writes the MCP tools every term matches, best first, with the schemas
+    /// of the first few.
+    fn write_mcp_tools(&self, out: &mut String, tools: &[McpEntry]) {
+        let _ = writeln!(out, "MCP tools (call them with mcp_call):");
+        for entry in tools.iter().take(MAX_LISTED_MCP_TOOLS) {
+            let description: String = entry
+                .description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(MAX_MCP_DESCRIPTION_CHARS)
+                .collect();
+            let _ = writeln!(out, "- {}/{}: {description}", entry.server, entry.tool);
+        }
+        for entry in tools.iter().take(MAX_SHOWN_MCP_SCHEMAS) {
+            let schema = entry.input_schema.to_string();
+            if schema.len() > self.schema_bytes {
+                let _ = writeln!(
+                    out,
+                    "schema {}/{}: too large to show ({} bytes)",
+                    entry.server,
+                    entry.tool,
+                    schema.len()
+                );
+            } else {
+                let _ = writeln!(out, "schema {}/{}: {schema}", entry.server, entry.tool);
+            }
+        }
+    }
+}
+
+/// Returns the MCP tools every term matches, ranked by the number of terms
+/// found in the tool name, then by name.
+fn matching_mcp_tools(entries: Vec<McpEntry>, terms: &[String]) -> Vec<McpEntry> {
+    let mut ranked: Vec<(usize, McpEntry)> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.tool.to_ascii_lowercase();
+            let haystack = format!(
+                "{}\n{name}\n{}",
+                entry.server.to_ascii_lowercase(),
+                entry.description.to_ascii_lowercase()
+            );
+            terms.iter().all(|term| haystack.contains(term)).then(|| {
+                let in_name = terms.iter().filter(|term| name.contains(*term)).count();
+                (in_name, entry)
+            })
+        })
+        .collect();
+    ranked.sort_by(|(left_count, left), (right_count, right)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left.tool.cmp(&right.tool))
+            .then_with(|| left.server.cmp(&right.server))
+    });
+    ranked.into_iter().map(|(_, entry)| entry).collect()
 }
 
 impl Tool for CapabilitySearch {
@@ -190,10 +281,15 @@ impl Tool for CapabilitySearch {
     }
 
     fn is_advertised(&self) -> bool {
-        !self.catalog.is_empty()
+        !self.catalog.is_empty() || self.mcp.is_some()
     }
 
     fn description(&self) -> &'static str {
+        if self.mcp.is_some() {
+            return "Search skills and connected MCP tools by name and description. Returns \
+                    skill locations, and MCP tool names with the argument schemas of the best \
+                    matches.";
+        }
         "Search the skill catalog by name and description and return matching \
          locations. Use it to find a skill when the catalog in the instructions \
          does not obviously contain one."
@@ -256,8 +352,17 @@ impl Tool for CapabilitySearch {
             }
         }
 
-        if matches.is_empty() {
-            return Ok(ToolOutput::success(format!("no skill matches `{query}`")));
+        let tools = self
+            .mcp
+            .as_ref()
+            .map(|directory| matching_mcp_tools(directory.entries(), &terms))
+            .unwrap_or_default();
+        if matches.is_empty() && tools.is_empty() {
+            return Ok(ToolOutput::success(if self.mcp.is_some() {
+                format!("no skill or MCP tool matches `{query}`")
+            } else {
+                format!("no skill matches `{query}`")
+            }));
         }
 
         let mut out = String::new();
@@ -270,6 +375,9 @@ impl Tool for CapabilitySearch {
                 skill.location,
                 skill.description.as_deref().unwrap_or("(no description)")
             );
+        }
+        if !tools.is_empty() {
+            self.write_mcp_tools(&mut out, &tools);
         }
         Ok(ToolOutput::success(out.trim_end().to_owned()))
     }
@@ -565,6 +673,110 @@ mod tests {
             .expect("searched");
         assert!(!output.is_error);
         assert!(output.text.contains("no skill matches"), "{}", output.text);
+    }
+
+    #[test]
+    fn capability_search_lists_mcp_tools_and_three_schemas() {
+        use crate::mcp_tools::tests::{FixedDirectory, entry};
+
+        let mut entries = vec![
+            entry(
+                "tracker",
+                "list_projects",
+                "Lists projects that hold issues.",
+            ),
+            entry("tracker", "create_issue", "Creates an issue.\nSecond line."),
+            entry("tracker", "close_issue", "Closes an issue."),
+            entry("files", "read", "Reads a file."),
+            entry(
+                "tracker",
+                "issue_comments",
+                &format!("Lists comments on an issue {}", "c".repeat(400)),
+            ),
+        ];
+        entries[2].input_schema =
+            serde_json::json!({ "type": "object", "description": "d".repeat(300) });
+        let directory: Arc<dyn McpDirectory> = Arc::new(FixedDirectory {
+            entries,
+            ..FixedDirectory::default()
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(Empty);
+        let plain = CapabilitySearch::new(Arc::clone(&catalog));
+        assert!(!plain.is_advertised());
+        let tool = CapabilitySearch::with_mcp(catalog, directory, 200);
+        assert!(
+            tool.is_advertised(),
+            "an MCP directory alone advertises the search"
+        );
+        assert_eq!(
+            tool.description(),
+            "Search skills and connected MCP tools by name and description. Returns skill \
+             locations, and MCP tool names with the argument schemas of the best matches."
+        );
+        assert_eq!(tool.description().len(), 153);
+        assert_eq!(plain.description().len(), 171);
+
+        let output = tool
+            .call(
+                &serde_json::json!({ "query": "Issue" }),
+                &context(&Utf8PathBuf::from("/tmp")),
+            )
+            .expect("searched");
+        let schema = r#"{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}"#;
+        let expected = format!(
+            "MCP tools (call them with mcp_call):\n\
+             - tracker/close_issue: Closes an issue.\n\
+             - tracker/create_issue: Creates an issue.\n\
+             - tracker/issue_comments: Lists comments on an issue {}\n\
+             - tracker/list_projects: Lists projects that hold issues.\n\
+             schema tracker/close_issue: too large to show (334 bytes)\n\
+             schema tracker/create_issue: {schema}\n\
+             schema tracker/issue_comments: {schema}",
+            "c".repeat(200 - "Lists comments on an issue ".len())
+        );
+        assert_eq!(output.text, expected);
+
+        let none = tool
+            .call(
+                &serde_json::json!({ "query": "unrelated" }),
+                &context(&Utf8PathBuf::from("/tmp")),
+            )
+            .expect("searched");
+        assert_eq!(none.text, "no skill or MCP tool matches `unrelated`");
+    }
+
+    #[test]
+    fn capability_search_lists_at_most_twenty_mcp_tools() {
+        use crate::mcp_tools::tests::{FixedDirectory, entry};
+
+        let entries = (0..25)
+            .map(|index| entry("big", &format!("tool_{index:02}"), "Does one thing."))
+            .collect();
+        let directory: Arc<dyn McpDirectory> = Arc::new(FixedDirectory {
+            entries,
+            ..FixedDirectory::default()
+        });
+        let tool = CapabilitySearch::with_mcp(Arc::new(Empty), directory, 64 * 1024);
+        let output = tool
+            .call(
+                &serde_json::json!({ "query": "big thing" }),
+                &context(&Utf8PathBuf::from("/tmp")),
+            )
+            .expect("searched");
+        assert_eq!(
+            output.text.matches("\n- big/").count(),
+            20,
+            "{}",
+            output.text
+        );
+        assert_eq!(
+            output.text.matches("\nschema big/").count(),
+            3,
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("- big/tool_19:"), "{}", output.text);
+        assert!(!output.text.contains("tool_20"), "{}", output.text);
     }
 
     #[test]

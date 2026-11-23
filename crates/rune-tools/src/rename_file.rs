@@ -16,8 +16,7 @@ impl Tool for RenameFile {
     }
 
     fn description(&self) -> &'static str {
-        "Rename or move a regular file. The destination must not exist and its parent \
-         directory must."
+        "Rename or move a regular file. new_path must not exist; its parent directory must."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -25,12 +24,10 @@ impl Tool for RenameFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "new_path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 }
             },
             "required": ["path", "new_path"],

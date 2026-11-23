@@ -1,0 +1,31 @@
+{
+  "prompt": "Use the alpha skill.",
+  "workspace": "workspaces/cache_skill.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "skill",
+          "arguments": {
+            "location": "skill:alpha"
+          }
+        }
+      ]
+    },
+    {
+      "text": "The alpha steps are loaded."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "requests": 2,
+    "prefix_breaks": 0,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "<skill_content name=\\\"alpha\\\">"
+      }
+    ]
+  }
+}

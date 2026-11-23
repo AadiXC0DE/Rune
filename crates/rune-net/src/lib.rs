@@ -7,18 +7,24 @@ pub mod anthropic;
 pub mod auth;
 pub mod catalog;
 pub mod chat_completions;
+pub mod compat;
 pub mod error;
 pub mod fetch;
 pub mod gemini;
 pub mod message;
 pub mod models_dev;
+pub mod normalize;
 pub mod ollama;
 pub mod provider;
 pub mod providers;
 pub mod redact;
 pub mod responses;
+#[cfg(not(target_family = "wasm"))]
+pub mod roots;
+pub mod schema;
 pub mod sse;
 pub mod stream;
+pub mod trace;
 pub mod transport;
 
 pub use auth::{Credential, CredentialSource};

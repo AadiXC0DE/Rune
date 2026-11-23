@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Providers · Rune</title>
+<meta name="description" content="How to connect each provider preset.">
+<link rel="canonical" href="https://rune.heyaadi.com/docs/providers.html">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="Rune home"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5" fill="none" stroke="#ffb454" stroke-width="3"/></svg> rune</a>
+    <nav>
+      <a href="index.html">documentation</a>
+      <a href="commands.html">commands</a>
+      <a href="configuration.html">configuration</a>
+      <a href="providers.html" aria-current="page">providers</a>
+      <a href="keys.html">key bindings</a>
+      <a href="troubleshooting.html">troubleshooting</a>
+      <a href="benchmarks.html">benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<h1>Providers</h1>
+<p>Each preset names an endpoint and the variable its key is read from. <code>rune connect &lt;name&gt;</code> connects one; <code>rune connect</code> alone chooses from a list. The configuration shown is the smallest file that selects the preset.</p>
+<h2>anthropic</h2>
+<p>Anthropic Messages API. Dialect: <code>anthropic</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect anthropic</pre>
+<ul>
+  <li>Endpoint: <code>https://api.anthropic.com</code>.</li>
+  <li>Key variable: <code>ANTHROPIC_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;anthropic&quot;
+
+[models]
+anthropic = &quot;&lt;model id&gt;&quot;</pre>
+<h2>openai</h2>
+<p>OpenAI Responses API. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect openai</pre>
+<ul>
+  <li>Endpoint: <code>https://api.openai.com/v1</code>.</li>
+  <li>Key variable: <code>OPENAI_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;openai&quot;
+
+[models]
+openai = &quot;&lt;model id&gt;&quot;</pre>
+<h2>gemini</h2>
+<p>Google Gemini Generate Content API. Dialect: <code>gemini</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect gemini</pre>
+<ul>
+  <li>Endpoint: <code>https://generativelanguage.googleapis.com/v1beta</code>.</li>
+  <li>Key variable: <code>GEMINI_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;gemini&quot;
+
+[models]
+gemini = &quot;&lt;model id&gt;&quot;</pre>
+<h2>deepseek</h2>
+<p>DeepSeek API, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect deepseek</pre>
+<ul>
+  <li>Endpoint: <code>https://api.deepseek.com</code>.</li>
+  <li>Key variable: <code>DEEPSEEK_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;deepseek&quot;
+
+[models]
+deepseek = &quot;&lt;model id&gt;&quot;</pre>
+<h2>zai</h2>
+<p>Z.ai GLM models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect zai</pre>
+<ul>
+  <li>Endpoint: <code>https://api.z.ai/api/paas/v4</code>.</li>
+  <li>Key variable: <code>ZAI_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;zai&quot;
+
+[models]
+zai = &quot;&lt;model id&gt;&quot;</pre>
+<h2>moonshot</h2>
+<p>Moonshot Kimi models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect moonshot</pre>
+<ul>
+  <li>Endpoint: <code>https://api.moonshot.ai/v1</code>.</li>
+  <li>Key variable: <code>MOONSHOT_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;moonshot&quot;
+
+[models]
+moonshot = &quot;&lt;model id&gt;&quot;</pre>
+<h2>minimax</h2>
+<p>MiniMax models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect minimax</pre>
+<ul>
+  <li>Endpoint: <code>https://api.minimax.io/v1</code>.</li>
+  <li>Key variable: <code>MINIMAX_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;minimax&quot;
+
+[models]
+minimax = &quot;&lt;model id&gt;&quot;</pre>
+<h2>xai</h2>
+<p>xAI Grok models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect xai</pre>
+<ul>
+  <li>Endpoint: <code>https://api.x.ai/v1</code>.</li>
+  <li>Key variable: <code>XAI_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;xai&quot;
+
+[models]
+xai = &quot;&lt;model id&gt;&quot;</pre>
+<h2>groq</h2>
+<p>Groq hosted open models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect groq</pre>
+<ul>
+  <li>Endpoint: <code>https://api.groq.com/openai/v1</code>.</li>
+  <li>Key variable: <code>GROQ_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;groq&quot;
+
+[models]
+groq = &quot;&lt;model id&gt;&quot;</pre>
+<h2>mistral</h2>
+<p>Mistral models, OpenAI-compatible. Dialect: <code>chat_completions</code>. Direct from the model vendor; API key.</p>
+<pre>rune connect mistral</pre>
+<ul>
+  <li>Endpoint: <code>https://api.mistral.ai/v1</code>.</li>
+  <li>Key variable: <code>MISTRAL_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;mistral&quot;
+
+[models]
+mistral = &quot;&lt;model id&gt;&quot;</pre>
+<h2>openrouter</h2>
+<p>OpenRouter, many vendors behind one key. Dialect: <code>chat_completions</code>. Gateways; API key.</p>
+<pre>rune connect openrouter</pre>
+<ul>
+  <li>Endpoint: <code>https://openrouter.ai/api/v1</code>.</li>
+  <li>Key variable: <code>OPENROUTER_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;openrouter&quot;
+
+[models]
+openrouter = &quot;&lt;model id&gt;&quot;</pre>
+<h2>vercel</h2>
+<p>Vercel AI Gateway, OpenAI-compatible route. Dialect: <code>chat_completions</code>. Gateways; API key.</p>
+<pre>rune connect vercel</pre>
+<ul>
+  <li>Endpoint: <code>https://ai-gateway.vercel.sh/v1</code>.</li>
+  <li>Key variable: <code>AI_GATEWAY_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;vercel&quot;
+
+[models]
+vercel = &quot;&lt;model id&gt;&quot;</pre>
+<h2>opencode</h2>
+<p>OpenCode Zen, pay-per-use over the OpenAI-compatible route. Dialect: <code>chat_completions</code>. Gateways; API key.</p>
+<pre>rune connect opencode</pre>
+<ul>
+  <li>Endpoint: <code>https://opencode.ai/zen/v1</code>.</li>
+  <li>Key variable: <code>OPENCODE_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;opencode&quot;
+
+[models]
+opencode = &quot;&lt;model id&gt;&quot;</pre>
+<h2>opencode-go</h2>
+<p>OpenCode Go, a subscription over the OpenAI-compatible route. Dialect: <code>chat_completions</code>. Gateways; API key.</p>
+<pre>rune connect opencode-go</pre>
+<ul>
+  <li>Endpoint: <code>https://opencode.ai/zen/go/v1</code>.</li>
+  <li>Key variable: <code>OPENCODE_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;opencode-go&quot;
+
+[models]
+opencode-go = &quot;&lt;model id&gt;&quot;</pre>
+<h2>chat_completions</h2>
+<p>Any OpenAI-compatible Chat Completions endpoint. Dialect: <code>chat_completions</code>. Any compatible endpoint; API key.</p>
+<pre>rune connect chat_completions</pre>
+<ul>
+  <li>Endpoint: none built in; set <code>base_url</code>.</li>
+  <li>Key variable: <code>OPENAI_API_KEY</code>.</li>
+</ul>
+<pre>provider = &quot;chat_completions&quot;
+base_url = &quot;&lt;endpoint&gt;&quot;
+
+[models]
+chat_completions = &quot;&lt;model id&gt;&quot;</pre>
+<h2>ollama</h2>
+<p>Local Ollama models, native discovery and Chat Completions requests. Dialect: <code>chat_completions</code>. Local servers; no credential (loopback only).</p>
+<pre>rune connect ollama</pre>
+<ul>
+  <li>Endpoint: <code>http://127.0.0.1:11434/v1</code>.</li>
+  <li>No key: the server is reached on this machine only.</li>
+</ul>
+<pre>provider = &quot;ollama&quot;
+anonymous = true
+
+[models]
+ollama = &quot;&lt;model id&gt;&quot;</pre>
+<h2>lmstudio</h2>
+<p>Local LM Studio server. Dialect: <code>chat_completions</code>. Local servers; no credential (loopback only).</p>
+<pre>rune connect lmstudio</pre>
+<ul>
+  <li>Endpoint: <code>http://127.0.0.1:1234/v1</code>.</li>
+  <li>No key: the server is reached on this machine only.</li>
+</ul>
+<pre>provider = &quot;lmstudio&quot;
+anonymous = true
+
+[models]
+lmstudio = &quot;&lt;model id&gt;&quot;</pre>
+<h2>llamacpp</h2>
+<p>Local llama.cpp server. Dialect: <code>chat_completions</code>. Local servers; no credential (loopback only).</p>
+<pre>rune connect llamacpp</pre>
+<ul>
+  <li>Endpoint: <code>http://127.0.0.1:8080/v1</code>.</li>
+  <li>No key: the server is reached on this machine only.</li>
+</ul>
+<pre>provider = &quot;llamacpp&quot;
+anonymous = true
+
+[models]
+llamacpp = &quot;&lt;model id&gt;&quot;</pre>
+</main>
+
+</body>
+</html>

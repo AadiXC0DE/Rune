@@ -4,7 +4,12 @@
   "prompt": "TopWords in wordfreq.go miscounts words and orders ties unpredictably. The tests in wordfreq_test.go describe the intended behaviour. Fix wordfreq.go so they pass. Do not modify the tests.",
   "verify": "go test ./...",
   "protected": [
-    "wordfreq_test.go"
+    "wordfreq_test.go",
+    "hidden_test.go"
   ],
-  "timeoutMs": 600000
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "dev",
+  "language": "go"
 }

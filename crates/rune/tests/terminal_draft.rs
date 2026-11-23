@@ -179,8 +179,10 @@ fn external_editor_reloads_the_draft_and_restores_the_terminal_on_success_and_fa
                 "{scenario}/{stage}"
             );
             assert_eq!(grid.cursor().col, column, "{scenario}/{stage}");
+            // The steering scenario edits while a turn runs, whose hints differ.
+            let screen = grid.text();
             assert_eq!(
-                grid.text().matches("ctrl-c cancel").count(),
+                screen.matches("/ commands").count() + screen.matches("enter steer").count(),
                 1,
                 "{scenario}/{stage}"
             );
@@ -303,11 +305,7 @@ fn pasted_multiline_drafts_show_each_edited_line_and_its_terminal_caret() {
             "{stage}: {screen}"
         );
         assert_eq!(grid.cursor().col, column, "{stage}: {screen}");
-        assert_eq!(
-            screen.matches("ctrl-c cancel").count(),
-            1,
-            "{stage}: {screen}"
-        );
+        assert_eq!(screen.matches("/ commands").count(), 1, "{stage}: {screen}");
     }
 }
 
@@ -392,7 +390,7 @@ fn undo_restores_unicode_drafts_and_carets_in_a_real_terminal() {
 }
 
 #[test]
-fn long_drafts_scroll_with_the_caret_in_a_real_terminal() {
+fn long_drafts_wrap_with_the_caret_in_a_real_terminal() {
     let output = std::process::Command::new("python3")
         .args([
             "-c",
@@ -414,29 +412,113 @@ fn long_drafts_scroll_with_the_caret_in_a_real_terminal() {
         let mut grid = rune_term::Grid::new(80, 24).expect("grid");
         grid.feed(&bytes).expect("feed");
         let screen = grid.text();
+        let rows: Vec<&str> = screen.lines().collect();
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("> aaa"))
+            .expect("first draft row");
+        // 168 characters wrap to 78 + 78 + 12 columns after the prompt.
+        assert_eq!(rows[first], "> ".to_owned() + &"a".repeat(78), "{stage}");
+        assert_eq!(
+            rows[first + 1],
+            "  ".to_owned() + &"a".repeat(78),
+            "{stage}"
+        );
+        let tail = if matches!(stage.as_str(), "end" | "left") {
+            "  aaaaTAIL-END"
+        } else {
+            "  aaaaTAIL-ENZ"
+        };
+        assert_eq!(rows[first + 2], tail, "{stage}: {screen}");
         let caret = grid.cursor();
-        let input = screen
-            .lines()
-            .nth(usize::from(caret.row))
-            .expect("input row");
-        assert!(input.starts_with("> "), "{stage}: {screen}");
-        match stage.as_str() {
-            "end" | "left" => {
-                assert!(input.contains("TAIL-END"), "{stage}: {screen}");
-                assert_eq!(caret.col, 79, "{stage}: {screen}");
-                if stage == "left" {
-                    assert_eq!(input.chars().nth(usize::from(caret.col)), Some('D'));
-                }
-            }
-            "edited" | "end-again" => {
-                assert!(input.contains("TAIL-ENZ"), "{stage}: {screen}");
-                assert_eq!(caret.col, 79, "{stage}: {screen}");
-            }
-            "home" => {
-                assert_eq!(input, "> ".to_owned() + &"a".repeat(78));
-                assert_eq!(caret.col, 2);
-            }
+        let (row, column) = match stage.as_str() {
+            "end" | "edited" | "end-again" => (first + 2, 14),
+            "left" => (first + 2, 13),
+            "home" => (first, 2),
             _ => panic!("unexpected capture {stage}"),
-        }
+        };
+        assert_eq!(usize::from(caret.row), row, "{stage}: {screen}");
+        assert_eq!(caret.col, column, "{stage}: {screen}");
     }
+}
+
+#[test]
+fn up_moves_between_wrapped_rows_at_forty_columns() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &support::python_script(include_str!("terminal_draft.py")),
+            env!("CARGO_BIN_EXE_rune"),
+            "wrap",
+        ])
+        .output()
+        .expect("python3 is required for the Unix wrapped draft test");
+    assert!(
+        output.status.success(),
+        "wrapped draft test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captures: Vec<(String, Vec<u8>)> =
+        serde_json::from_slice(&output.stdout).expect("terminal captures");
+    assert_eq!(captures.len(), 5);
+    for (stage, bytes) in captures {
+        let mut grid = rune_term::Grid::new(40, 24).expect("grid");
+        grid.feed(&bytes).expect("feed");
+        let screen = grid.text();
+        let rows: Vec<&str> = screen.lines().collect();
+        let caret = grid.cursor();
+        if stage == "long" {
+            let first = rows
+                .iter()
+                .rposition(|row| row.starts_with("> word"))
+                .expect("first draft row");
+            let words = |count: usize| "word ".repeat(count).trim_end().to_owned();
+            assert_eq!(rows[first], format!("> {}", words(7)), "{screen}");
+            assert_eq!(rows[first + 1], format!("  {}", words(7)), "{screen}");
+            assert_eq!(
+                rows[first + 2].trim_end(),
+                format!("  {}", words(6)),
+                "{screen}"
+            );
+            assert_eq!(usize::from(caret.row), first + 2, "{screen}");
+            assert_eq!(caret.col, 32, "{screen}");
+            continue;
+        }
+        let first = rows
+            .iter()
+            .position(|row| row.starts_with("> one"))
+            .expect("first draft row");
+        let head = if stage == "edited" { "> oneX" } else { "> one" };
+        assert_eq!(rows[first], head, "{stage}: {screen}");
+        assert_eq!(rows[first + 1], "  two 漢字", "{stage}: {screen}");
+        assert_eq!(rows[first + 2], "  three", "{stage}: {screen}");
+        let (row, column) = match stage.as_str() {
+            "typed" => (2, 7),
+            "up-once" => (1, 6),
+            "up-twice" => (0, 5),
+            "edited" => (0, 6),
+            _ => panic!("unexpected capture {stage}"),
+        };
+        assert_eq!(usize::from(caret.row), first + row, "{stage}: {screen}");
+        assert_eq!(caret.col, column, "{stage}: {screen}");
+    }
+}
+
+#[test]
+fn an_unsent_draft_survives_a_kill() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &support::python_script(include_str!("terminal_draft_kill.py")),
+            env!("CARGO_BIN_EXE_rune"),
+        ])
+        .output()
+        .expect("python3 is required for the Unix draft survival test");
+    assert!(
+        output.status.success(),
+        "draft survival failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

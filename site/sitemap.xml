@@ -3,4 +3,25 @@
   <url>
     <loc>https://rune.heyaadi.com/</loc>
   </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/index.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/commands.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/configuration.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/providers.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/keys.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/troubleshooting.html</loc>
+  </url>
+  <url>
+    <loc>https://rune.heyaadi.com/docs/benchmarks.html</loc>
+  </url>
 </urlset>

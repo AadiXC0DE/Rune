@@ -255,9 +255,10 @@ fn output_loss_releases_an_unanswered_permission_request() {
         }
     }
     assert_eq!(server.pending.lock().expect("pending").len(), 1);
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
+    // Closing the peer, not shutting its read side, is what fails the next
+    // write on every platform: macOS accepts writes after `shutdown(Read)`.
+    drop(reader);
+    drop(client);
     let started = Instant::now();
     server.respond(Id::Number(2), json!({}));
     assert_settled(&server, started);
@@ -325,9 +326,8 @@ fn output_loss_before_tool_registration_prevents_provider_and_tool_work() {
         active.cancellation = Some(Cancellation::new());
         active.session = Some(session.clone());
     }
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
+    // Closing the peer fails the next write on every platform.
+    drop(client);
     let started = Instant::now();
     server.respond(Id::Number(1), json!({}));
     run_queued(
@@ -376,9 +376,8 @@ fn output_loss_cancels_a_silent_stdio_mcp_tool_and_terminates_its_child() {
         std::thread::sleep(POLL);
     }
     prompt(&server, session, 2);
-    client
-        .shutdown(std::net::Shutdown::Read)
-        .expect("close output");
+    // Closing the peer fails the next write on every platform.
+    drop(client);
     let started = Instant::now();
     server.respond(Id::Number(3), json!({}));
     assert_settled(&server, started);

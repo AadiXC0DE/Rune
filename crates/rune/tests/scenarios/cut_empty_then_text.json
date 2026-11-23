@@ -1,0 +1,31 @@
+{
+  "prompt": "Answer briefly.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "finish": "length"
+    },
+    {
+      "text": "Half",
+      "finish": "length"
+    },
+    {
+      "text": " done."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Half done.",
+    "requests": 3,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "before giving any answer"
+      },
+      {
+        "request": 3,
+        "text": "Your reply was cut at the output limit."
+      }
+    ]
+  }
+}

@@ -51,7 +51,7 @@ fn every_help_binding_has_a_terminal_action_including_cancellation_and_paste() {
         grid.feed(&bytes[start..]).expect("captured output");
         if stage.starts_with("viewer-") && !stage.starts_with("viewer-close-") {
             assert!(main.is_some(), "{stage}");
-            assert!(grid.text().contains("Transcript |"), "{stage}");
+            assert!(grid.text().contains("q close"), "{stage}");
             viewer_rows.insert(stage, grid.row_text(0));
         } else {
             assert!(main.is_none(), "{stage}");
@@ -66,12 +66,13 @@ fn every_help_binding_has_a_terminal_action_including_cancellation_and_paste() {
             }
         }
     }
-    assert_ne!(viewer_rows["viewer-open"], viewer_rows["viewer-down"]);
-    assert_eq!(viewer_rows["viewer-open"], viewer_rows["viewer-up"]);
+    // The viewer opens at the newest row, following the session.
+    assert_ne!(viewer_rows["viewer-open"], viewer_rows["viewer-home"]);
+    assert_ne!(viewer_rows["viewer-home"], viewer_rows["viewer-down"]);
+    assert_eq!(viewer_rows["viewer-home"], viewer_rows["viewer-up"]);
     assert_ne!(viewer_rows["viewer-up"], viewer_rows["viewer-page-down"]);
     assert_eq!(viewer_rows["viewer-up"], viewer_rows["viewer-page-up"]);
-    assert_ne!(viewer_rows["viewer-home"], viewer_rows["viewer-end"]);
-    assert_eq!(viewer_rows["viewer-open"], viewer_rows["viewer-home"]);
+    assert_eq!(viewer_rows["viewer-open"], viewer_rows["viewer-end"]);
 }
 
 #[test]

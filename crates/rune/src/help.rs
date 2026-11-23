@@ -62,6 +62,12 @@ pub fn render_command(name: &str) -> Option<String> {
         out.push_str("\nThis command accepts --json for machine-readable output.\n");
     }
 
+    let notes = spec::notes(item.name);
+    if !notes.is_empty() {
+        out.push('\n');
+        out.push_str(notes);
+    }
+
     Some(out)
 }
 

@@ -1,0 +1,18 @@
+{
+  "title": "Fix the build order tool crash, false cycles and cycle report",
+  "kind": "bugfix",
+  "prompt": "The build order tool crashes on some projects and on others reports a cycle that is not there. When there really is a cycle, it should say which tasks form it.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "dev",
+  "language": "python",
+  "tags": [
+    "long-debug"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "title": "Make equal-priority jobs run in the order added",
+  "kind": "bugfix",
+  "prompt": "Jobs with the same priority run in a random-looking order. They must run in the order they were added, and higher priority must still win.",
+  "verify": "node --experimental-strip-types --test test/*.test.ts",
+  "protected": [
+    "test",
+    "test/hidden.test.ts"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "heldout",
+  "language": "typescript",
+  "tags": [
+    "fix-breaks-other-test"
+  ]
+}

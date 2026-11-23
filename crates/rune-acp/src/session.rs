@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rune_agent::history::History;
 use rune_agent::steering::SteeringQueue;
 use rune_context::mcp::Client;
@@ -43,6 +43,8 @@ pub struct SessionConfig {
     pub effort: Effort,
     /// Permission mode in force.
     pub mode: PermissionMode,
+    /// Whether the session is planning: only reads and plan updates run.
+    pub planning: bool,
 }
 
 impl SessionConfig {
@@ -53,6 +55,18 @@ impl SessionConfig {
             model: model.into(),
             effort,
             mode,
+            planning: false,
+        }
+    }
+
+    /// Returns the mode a client sees: `plan` while planning, else the
+    /// permission mode.
+    #[must_use]
+    pub fn mode_id(&self) -> &'static str {
+        if self.planning {
+            PLAN_MODE
+        } else {
+            self.mode.as_str()
         }
     }
 
@@ -64,6 +78,9 @@ impl SessionConfig {
         }
     }
 }
+
+/// The mode that turns planning on.
+pub const PLAN_MODE: &str = "plan";
 
 /// What `session/list` reports about one stored session.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -95,6 +112,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Returns the directory the session works in.
+    #[must_use]
+    pub fn workspace(&self) -> &Utf8Path {
+        &self.workspace
+    }
+
     /// Returns the configuration in force.
     #[must_use]
     pub const fn config(&self) -> &SessionConfig {
@@ -449,17 +472,25 @@ impl Sessions {
         Ok(())
     }
 
-    /// Changes the permission mode.
+    /// Changes the permission mode, or turns planning on with `plan`.
+    ///
+    /// Planning keeps the permission mode, so leaving it for a permission
+    /// mode both ends planning and sets that mode.
     pub fn set_mode(&mut self, id: &str, mode: &str) -> Result<()> {
         let session = self
             .entries
             .get_mut(id)
             .ok_or_else(|| unknown_session(id))?;
+        if mode == PLAN_MODE {
+            session.config.planning = true;
+            return Ok(());
+        }
         let mode = PermissionMode::from_name(mode).ok_or_else(|| {
             RuneError::invalid_field("modeId", format!("`{mode}` is not a permission mode"))
-                .with_hint("use ask, auto, or full_access")
+                .with_hint("use ask, auto, full_access, or plan")
         })?;
         session.config.mode = mode;
+        session.config.planning = false;
         Ok(())
     }
 
@@ -711,17 +742,32 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<ContentPart> = Vec::new();
     let mut native_assistant = false;
+    let mut queue = rune_agent::history::JournalQueue::default();
 
     for frame in rune_session::replay::replay_events(frames) {
+        if let Some(entry) = journal_entry(&frame.event) {
+            queue.push(entry);
+            queue.apply_ready(&mut history);
+            continue;
+        }
         match &frame.event {
             // Model settings are metadata, not conversation boundaries. A
             // client may change them while a tool batch is still being saved.
             SessionEvent::ModelSet { .. } => {}
+            // A workspace snapshot can be written while a tool batch runs.
+            SessionEvent::WorkspaceCheckpoint { .. } | SessionEvent::Restored { .. } => {}
+            // The call it describes is already recorded as it ran.
+            SessionEvent::ToolCallRepaired { .. } => {}
             SessionEvent::AssistantContent { message } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 if let Ok(message) = serde_json::from_str::<rune_net::message::Message>(message) {
-                    history.push_assistant_with_replay(message.parts, message.replay);
+                    history.push_assistant_with_replay(
+                        message.parts,
+                        message.replay,
+                        message.origin,
+                    );
+                    queue.apply_ready(&mut history);
                     native_assistant = true;
                 }
             }
@@ -737,7 +783,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             } => {
                 // A result run always follows the calls it answers, so a new
                 // call closes the previous result group.
-                flush_results(&mut history, &mut results);
+                flush_results(&mut history, &mut results, &mut queue);
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     calls.push(ContentPart::ToolCall {
                         id,
@@ -751,7 +797,7 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
                 ok,
                 output,
             } => {
-                flush_calls(&mut history, &mut calls);
+                flush_calls(&mut history, &mut calls, &mut queue);
                 if let Ok(id) = ToolCallId::new(call_id.clone()) {
                     results.push(ContentPart::ToolResult {
                         id,
@@ -769,17 +815,22 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             }
             SessionEvent::UserMessage { text } => {
                 native_assistant = false;
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 history.push_user(text.clone());
+                queue.apply_ready(&mut history);
             }
             SessionEvent::AssistantMessage { text, .. } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
                 if !text.is_empty() {
                     history.push_assistant(vec![ContentPart::Text { text: text.clone() }]);
+                    queue.apply_ready(&mut history);
                 }
             }
+            SessionEvent::HarnessNote { .. }
+            | SessionEvent::Checkpoint { .. }
+            | SessionEvent::ResultReplaced { .. } => {}
             SessionEvent::AssistantDelta { .. }
             | SessionEvent::AssistantReset { .. }
             | SessionEvent::TurnInterrupted { .. }
@@ -796,30 +847,82 @@ pub fn history_from_events(frames: &[EventFrame]) -> History {
             | SessionEvent::WorkspaceSet { .. }
             | SessionEvent::ForkedFrom { .. }
             | SessionEvent::ChildOf { .. } => {
-                flush_calls(&mut history, &mut calls);
-                flush_results(&mut history, &mut results);
+                flush_calls(&mut history, &mut calls, &mut queue);
+                flush_results(&mut history, &mut results, &mut queue);
             }
         }
     }
-    flush_calls(&mut history, &mut calls);
-    flush_results(&mut history, &mut results);
+    flush_calls(&mut history, &mut calls, &mut queue);
+    flush_results(&mut history, &mut results, &mut queue);
+    queue.apply_ready(&mut history);
     history
 }
 
+/// Decodes a journaled history change; `None` for any other event.
+fn journal_entry(event: &SessionEvent) -> Option<rune_agent::turn::JournalEntry> {
+    use rune_agent::turn::{JournalEntry, NotePlacement};
+    match event.clone() {
+        SessionEvent::HarnessNote {
+            at,
+            placement,
+            text,
+        } => Some(JournalEntry::Note {
+            at,
+            placement: match placement {
+                rune_session::NotePlacement::PromptPrefix => NotePlacement::PromptPrefix,
+                rune_session::NotePlacement::PromptSuffix => NotePlacement::PromptSuffix,
+                rune_session::NotePlacement::UserPart => NotePlacement::UserPart,
+                rune_session::NotePlacement::UserTurn => NotePlacement::UserTurn,
+                rune_session::NotePlacement::AssistantTurn => NotePlacement::AssistantTurn,
+            },
+            text,
+        }),
+        SessionEvent::Checkpoint {
+            at,
+            through,
+            message,
+        } => Some(JournalEntry::Checkpoint {
+            at,
+            through,
+            message,
+        }),
+        SessionEvent::ResultReplaced {
+            at,
+            call_id,
+            content,
+        } => Some(JournalEntry::ResultReplaced {
+            at,
+            call_id,
+            content,
+        }),
+        _ => None,
+    }
+}
+
 /// Appends the collected assistant turn, when there is one.
-fn flush_calls(history: &mut History, calls: &mut Vec<ContentPart>) {
+fn flush_calls(
+    history: &mut History,
+    calls: &mut Vec<ContentPart>,
+    queue: &mut rune_agent::history::JournalQueue,
+) {
     if calls.is_empty() {
         return;
     }
     history.push_assistant(std::mem::take(calls));
+    queue.apply_ready(history);
 }
 
 /// Appends the collected tool results, when there are any.
-fn flush_results(history: &mut History, results: &mut Vec<ContentPart>) {
+fn flush_results(
+    history: &mut History,
+    results: &mut Vec<ContentPart>,
+    queue: &mut rune_agent::history::JournalQueue,
+) {
     if results.is_empty() {
         return;
     }
     history.push_tool_results(std::mem::take(results));
+    queue.apply_ready(history);
 }
 
 /// Formats milliseconds since the epoch as an ISO 8601 timestamp.
@@ -851,9 +954,72 @@ pub fn modes(config: &SessionConfig) -> Value {
             {"id": "ask", "name": "Ask", "description": "Request approval for unresolved tool calls."},
             {"id": "auto", "name": "Auto", "description": "Review unresolved tool calls automatically."},
             {"id": "full_access", "name": "Full access", "description": "Run every tool call without approval."},
+            {"id": PLAN_MODE, "name": "Plan", "description": "Read and plan only; changes and commands are refused."},
         ],
-        "currentModeId": config.mode.as_str(),
+        "currentModeId": config.mode_id(),
     })
+}
+
+/// Builds the update announcing the session's mode.
+#[must_use]
+pub fn current_mode_update(session: &str, config: &SessionConfig) -> Notification {
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "current_mode_update", "currentModeId": config.mode_id()},
+        }),
+    )
+}
+
+/// Builds the update carrying the whole plan, as `update_plan` last set it.
+#[must_use]
+pub fn plan_update(session: &str, update: &rune_tools::PlanUpdate) -> Notification {
+    use rune_tools::update_plan::Status;
+    let entries: Vec<Value> = update
+        .plan
+        .iter()
+        .map(|step| {
+            let status = match step.status {
+                Status::Pending => "pending",
+                Status::InProgress => "in_progress",
+                Status::Completed => "completed",
+            };
+            json!({"content": step.step, "priority": "medium", "status": status})
+        })
+        .collect();
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "plan", "entries": entries},
+        }),
+    )
+}
+
+/// Builds the update listing the commands a prompt can start with.
+#[must_use]
+pub fn available_commands_update(
+    session: &str,
+    commands: &[rune_context::commands::Command],
+) -> Notification {
+    let listed: Vec<Value> = commands
+        .iter()
+        .map(|command| {
+            let mut entry = json!({"name": command.name, "description": command.description});
+            if let Some(hint) = &command.argument_hint {
+                entry["input"] = json!({"hint": hint});
+            }
+            entry
+        })
+        .collect();
+    Notification::new(
+        "session/update",
+        json!({
+            "sessionId": session,
+            "update": {"sessionUpdate": "available_commands_update", "availableCommands": listed},
+        }),
+    )
 }
 
 /// Renders the configuration options a client may change.
@@ -1553,6 +1719,65 @@ mod tests {
     }
 
     #[test]
+    fn acp_history_applies_checkpoints() {
+        let text = |text: &str| SessionEvent::UserMessage {
+            text: text.to_owned(),
+        };
+        let answer = |text: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            text: text.to_owned(),
+        };
+        let frames: Vec<_> = [
+            text("first"),
+            SessionEvent::HarnessNote {
+                at: 0,
+                placement: rune_session::NotePlacement::PromptSuffix,
+                text: "NOTE".to_owned(),
+            },
+            answer("one"),
+            text("second"),
+            answer("two"),
+            SessionEvent::Checkpoint {
+                at: 4,
+                through: 2,
+                message: "<conversation-checkpoint>".to_owned(),
+            },
+            text("third"),
+            answer("three"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| EventFrame::new(EventSeq(index as u64 + 1), 0, event))
+        .collect();
+        let history = history_from_events(&frames);
+        history.validate().expect("valid");
+        let texts: Vec<String> = history
+            .turns()
+            .iter()
+            .map(rune_agent::history::Turn::text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "<conversation-checkpoint>",
+                "second",
+                "two",
+                "third",
+                "three"
+            ]
+        );
+
+        // Without the checkpoint record the note still applies and every turn stays.
+        let old: Vec<_> = frames
+            .into_iter()
+            .filter(|frame| !matches!(frame.event, SessionEvent::Checkpoint { .. }))
+            .collect();
+        let history = history_from_events(&old);
+        assert_eq!(history.len(), 6);
+        assert_eq!(history.turns()[0].text(), "first\n\nNOTE");
+    }
+
+    #[test]
     fn an_empty_log_rebuilds_to_an_empty_conversation() {
         assert!(history_from_events(&[]).is_empty());
     }
@@ -1688,7 +1913,13 @@ mod tests {
         let config = SessionConfig::new("m", Effort::Low, PermissionMode::Ask);
         let modes = modes(&config);
         assert_eq!(modes["currentModeId"], "ask");
-        assert_eq!(modes["availableModes"].as_array().expect("array").len(), 3);
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|mode| mode["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["ask", "auto", "full_access", "plan"]);
         let options = config_options(&config);
         assert_eq!(options[0]["id"], "model");
         assert_eq!(options[1]["currentValue"], "low");

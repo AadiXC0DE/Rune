@@ -1,0 +1,16 @@
+{
+  "title": "Fix CSV quoting and column order",
+  "kind": "bugfix",
+  "prompt": "The CSV export produces files that spreadsheet apps cannot open when a field contains a comma, a quote or a line break, and the column order does not follow the schema.",
+  "verify": "node --test",
+  "protected": [
+    "test",
+    "test/hidden.test.js"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "javascript",
+  "tags": []
+}

@@ -1,0 +1,57 @@
+name: tap
+
+# Opens the Homebrew tap update once a release is published. The formula is
+# rendered from the published release's SHA256SUMS, so it can only name
+# archives that release carries.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # A fine-grained token with contents and pull request write access on
+      # AadiXC0DE/homebrew-tap alone.
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the tap token
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::TAP_GITHUB_TOKEN is not set; update the tap by hand with render-formula.py"
+            exit 1
+          fi
+
+      - name: Render the formula from the release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --pattern SHA256SUMS --dir release
+          python3 .github/scripts/render-formula.py "${TAG#v}" release/SHA256SUMS > rune.rb
+          cat rune.rb
+
+      - name: Open the tap pull request
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          git clone --depth 1 "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/AadiXC0DE/homebrew-tap.git" tap
+          cd tap
+          git checkout -b "rune-$version"
+          cp ../rune.rb Formula/rune.rb
+          git config user.name "rune release"
+          git config user.email "rune-release@users.noreply.github.com"
+          git add Formula/rune.rb
+          git commit -m "rune $version"
+          git push origin "rune-$version"
+          gh pr create --repo AadiXC0DE/homebrew-tap --head "rune-$version" \
+            --title "rune $version" --body "Update rune to $version."

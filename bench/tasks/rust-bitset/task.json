@@ -1,0 +1,16 @@
+{
+  "title": "Fix bitset set operations and iteration at word boundaries",
+  "kind": "bugfix",
+  "prompt": "Set operations on the bitset give wrong answers near word boundaries, and iterating skips the highest bits.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests/basic.rs",
+    "tests/hidden.rs"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "rust"
+}

@@ -24,7 +24,7 @@ pub fn fetch_catalog(
     endpoint: &Endpoint,
     timeout: Duration,
 ) -> NetResult<Catalog> {
-    if endpoint.offline {
+    if endpoint.offline && !crate::transport::is_loopback_url(&endpoint.base_url) {
         return Err(NetError::new(
             FailureKind::PolicyDenied,
             "outbound requests are disabled",
@@ -241,6 +241,8 @@ mod tests {
                 status,
                 content_type: "application/json".to_owned(),
                 retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: Box::new(std::io::Cursor::new(body.into_bytes())),
             })
@@ -344,8 +346,10 @@ mod tests {
     #[test]
     fn offline_invalid_endpoint_and_expired_budget_make_no_requests() {
         let fixture = Fixture::new(&[]);
-        let error = fetch_catalog(&fixture, &endpoint().offline(true), Duration::from_secs(5))
-            .expect_err("offline");
+        // Offline still reaches a loopback server, so the refusal is shown on
+        // a remote one.
+        let remote = Endpoint::new("https://ollama.example.com/v1", "key").offline(true);
+        let error = fetch_catalog(&fixture, &remote, Duration::from_secs(5)).expect_err("offline");
         assert_eq!(error.kind(), FailureKind::PolicyDenied);
         let invalid = Endpoint::new("http://127.0.0.1:11434", "key");
         assert_eq!(

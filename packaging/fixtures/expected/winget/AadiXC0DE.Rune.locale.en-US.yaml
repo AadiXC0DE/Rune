@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: AadiXC0DE.Rune
+PackageVersion: 1.2.3
+PackageLocale: en-US
+Publisher: AadiXC0DE
+PackageName: Rune
+PackageUrl: https://github.com/AadiXC0DE/Rune
+License: Apache-2.0
+ShortDescription: A tiny, native coding agent harness.
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

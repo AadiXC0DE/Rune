@@ -1,4 +1,5 @@
-//! Records the commit this binary was produced from.
+//! Records the commit this binary was produced from, and on Windows defers
+//! loading two system libraries until they are used.
 //!
 //! The ref that HEAD points at is what changes on a commit, not HEAD itself, so
 //! that is what is watched. Watching `.git/HEAD` alone leaves a binary reporting
@@ -7,6 +8,9 @@
 
 use std::path::Path;
 use std::process::Command;
+
+/// Windows libraries the binary loads only when it first calls into them.
+const DELAY_LOADED: [&str; 2] = ["user32.dll", "ws2_32.dll"];
 
 fn main() {
     let commit = Command::new("git")
@@ -20,7 +24,23 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
 
     println!("cargo:rustc-env=RUNE_COMMIT={commit}");
+    // The target triple names this build's release archive.
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=RUNE_TARGET={target}");
+    }
+    // Windows maps user32 (keyboard layout calls) and ws2_32 (sockets) on first
+    // use instead of at start, so a command that needs neither, such as
+    // `rune --version`, does not pay to load them.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        for library in DELAY_LOADED {
+            println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{library}");
+        }
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
+    }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RUNE_CHANNEL");
 
     // Watch the branch, not the pointer to it. A detached checkout has no ref to
     // watch, so HEAD itself is the fallback.

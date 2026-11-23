@@ -1,0 +1,26 @@
+{
+  "prompt": "Say hello.",
+  "workspace": "workspaces/goal_check.json",
+  "ask_args": [
+    "--json",
+    "--no-save",
+    "--goal",
+    "x"
+  ],
+  "turns": [
+    {
+      "text": "Hello."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "final_output": "Hello.",
+    "requests": 1,
+    "request_contains": [
+      {
+        "request": 1,
+        "text": "Active session objective:"
+      }
+    ]
+  }
+}

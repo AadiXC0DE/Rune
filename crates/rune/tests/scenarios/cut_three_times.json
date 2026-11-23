@@ -1,0 +1,22 @@
+{
+  "prompt": "Write a long answer.",
+  "workspace": "workspaces/readme_only.json",
+  "turns": [
+    {
+      "text": "First part, ",
+      "finish": "length"
+    },
+    {
+      "text": "second part, ",
+      "finish": "length"
+    },
+    {
+      "text": "third part",
+      "finish": "length"
+    }
+  ],
+  "expect": {
+    "requests": 3,
+    "stop_reason": "max_output_tokens"
+  }
+}

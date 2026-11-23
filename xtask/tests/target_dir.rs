@@ -94,7 +94,14 @@ fn budget_measures_and_runs_the_binary_in_cargos_target_directory() {
         let dirs = workspace.target_dirs();
         let directory = dirs[index].as_deref();
         let output = workspace.task(&["budget"], directory);
-        assert!(output.status.success(), "{directory:?}: {output:?}");
+        // The fixture binary cannot serve a scripted session, so the budget
+        // stops at that step, after every check this test reads.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{directory:?}: {output:?}");
+        assert!(
+            stderr.contains("scripted session `fix_one_file` did not pass"),
+            "{directory:?}: {output:?}"
+        );
         let size = std::fs::metadata(workspace.binary(directory))
             .expect("read built binary metadata")
             .len();

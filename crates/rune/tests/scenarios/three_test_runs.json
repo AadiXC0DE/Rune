@@ -1,0 +1,89 @@
+{
+  "prompt": "Make both tests in check.sh pass.",
+  "workspace": "workspaces/three_test_runs.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "edit_file",
+          "arguments": {
+            "path": "src/a.txt",
+            "old_string": "broken",
+            "new_string": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_3",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_4",
+          "name": "edit_file",
+          "arguments": {
+            "path": "src/b.txt",
+            "old_string": "broken",
+            "new_string": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_5",
+          "name": "shell",
+          "arguments": {
+            "action": "run",
+            "command": "sh check.sh"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Both tests pass."
+    }
+  ],
+  "expect": {
+    "files": {
+      "src/a.txt": "fixed\n",
+      "src/b.txt": "fixed\n"
+    },
+    "exit_code": 0,
+    "requests": 6,
+    "request_contains": [
+      {
+        "request": 4,
+        "text": "[since the last run: now passing: a; still failing: b;"
+      },
+      {
+        "request": 6,
+        "text": "[since the last run: now passing: b;"
+      }
+    ]
+  }
+}

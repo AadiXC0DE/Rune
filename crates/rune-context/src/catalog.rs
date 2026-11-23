@@ -167,6 +167,15 @@ pub fn render_catalog_within(
     out
 }
 
+/// Returns the line the catalog renders for `skill`, without its newline.
+#[must_use]
+pub fn catalog_line(skill: &Skill) -> String {
+    line(skill, resolve_limit(LimitName::SkillDescriptionBytes))
+        .0
+        .trim_end()
+        .to_owned()
+}
+
 /// Renders one catalog line, shortening a long description.
 fn line(skill: &Skill, cap: usize) -> (String, bool) {
     let description = skill.description.as_deref().unwrap_or_default();

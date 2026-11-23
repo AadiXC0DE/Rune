@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::width::{grapheme_width, graphemes, str_width, truncate_to_width, wrap};
+use crate::width::{expand_tabs, grapheme_width, graphemes, str_width, truncate_to_width, wrap};
 
 /// Who produced a line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,6 +24,18 @@ pub enum Speaker {
     Notice,
 }
 
+/// How serious a harness note is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Severity {
+    /// Something the reader may want to know.
+    #[default]
+    Info,
+    /// Something that went wrong but did not stop the work.
+    Warning,
+    /// Something that stopped the work.
+    Error,
+}
+
 /// One entry in a transcript.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -33,6 +45,10 @@ pub struct Entry {
     pub text: String,
     /// Whether the text may be expanded rather than summarized.
     pub expandable: bool,
+    /// How serious a notice is.
+    pub severity: Severity,
+    /// What the reader can do about an error.
+    pub hint: Option<String>,
 }
 
 impl Entry {
@@ -43,6 +59,8 @@ impl Entry {
             speaker: Speaker::User,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -53,6 +71,8 @@ impl Entry {
             speaker: Speaker::Assistant,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -63,6 +83,8 @@ impl Entry {
             speaker: Speaker::Tool,
             text: text.into(),
             expandable: true,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -73,6 +95,8 @@ impl Entry {
             speaker: Speaker::Reasoning,
             text: text.into(),
             expandable: false,
+            severity: Severity::Info,
+            hint: None,
         }
     }
 
@@ -83,6 +107,29 @@ impl Entry {
             speaker: Speaker::Notice,
             text: text.into(),
             expandable: false,
+            severity: Severity::Info,
+            hint: None,
+        }
+    }
+
+    /// Builds a harness note about something that went wrong but did not stop
+    /// the work.
+    #[must_use]
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::notice(text)
+        }
+    }
+
+    /// Builds a harness note about something that stopped the work, with what
+    /// the reader can do about it.
+    #[must_use]
+    pub fn error(text: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            hint,
+            ..Self::notice(text)
         }
     }
 }
@@ -101,9 +148,16 @@ pub fn accessible_lines(entries: &[Entry]) -> Vec<String> {
                 Speaker::Tool => "Tool",
                 Speaker::Notice => "Notice",
             };
+            let warning = if entry.severity == Severity::Warning {
+                "warning: "
+            } else {
+                ""
+            };
+            let hint = entry.hint.as_deref().map(sanitize).unwrap_or_default();
             sanitize(&entry.text)
                 .lines()
-                .map(|line| format!("{label}: {line}"))
+                .map(|line| format!("{label}: {warning}{line}"))
+                .chain(hint.lines().map(|line| format!("{label}: {line}")))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -336,41 +390,154 @@ pub fn render(entries: &[Entry], display: Display) -> String {
     render_lanes(entries, display, &Lanes::default())
 }
 
-/// Maximum source bytes and wrapped rows in a requested tool expansion.
-pub const TOOL_DETAIL_BYTES: usize = 16 * 1024;
-/// Maximum wrapped content rows in a requested tool expansion.
-pub const TOOL_DETAIL_ROWS: usize = 200;
-
-/// Tool selection and disclosure state for a transcript snapshot.
-///
-/// Untouched entries retain the full transcript view. Toggling a selected tool
-/// collapses it to the normal preview, then expands it within fixed bounds.
-/// Source entries are kept intact so closing and reopening restores the full view.
-#[derive(Debug)]
-pub struct ToolDetails {
-    entries: Vec<Entry>,
-    expanded: Vec<Option<bool>>,
-    selected: Option<usize>,
+/// What an expanded entry shows in place of its recorded text.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Expansion {
+    /// Nothing more than the recorded text.
+    Recorded,
+    /// Text drawn as the entry's body, in full.
+    Text(String),
+    /// Rows drawn as they are, such as a rendered diff.
+    Rows(Vec<String>),
 }
 
+/// The viewer's rows with where each entry and the selection start.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DetailRows {
+    /// Every row, in order.
+    pub rows: Vec<String>,
+    /// The selected entry's header row.
+    pub selected: Option<usize>,
+    /// The first row of each entry.
+    pub starts: Vec<usize>,
+}
+
+/// Whether an entry can be expanded and collapsed in the viewer.
+fn collapsible(entry: &Entry) -> bool {
+    match entry.speaker {
+        Speaker::Tool => entry.expandable,
+        Speaker::Reasoning => true,
+        _ => false,
+    }
+}
+
+/// Selection and disclosure state for the transcript viewer.
+///
+/// A tool entry shows its recorded text until it is expanded, when it shows
+/// what the caller supplied for it, uncapped. A reasoning entry shows one
+/// `thought:` row until it is expanded. Source entries are kept intact.
+#[derive(Debug, Default)]
+pub struct ToolDetails {
+    entries: Vec<Entry>,
+    expanded: Vec<bool>,
+    expansions: Vec<Option<Expansion>>,
+    selected: Option<usize>,
+    cache: Option<SharedBodies>,
+}
+
+/// The rows of collapsed viewer entries, kept between openings of the viewer
+/// so that only entries added since the last opening are rendered.
+///
+/// Each body is stored with the entry it was rendered from and is used again
+/// only while the entry at that position is equal, so a transcript that was
+/// replaced (a new session, a compaction) renders afresh by itself.
+#[derive(Debug, Default)]
+pub struct BodyCache {
+    display: Option<Display>,
+    bodies: Vec<(Entry, Vec<String>)>,
+    renders: usize,
+}
+
+impl BodyCache {
+    /// How many entry bodies were rendered rather than reused.
+    #[must_use]
+    pub const fn renders(&self) -> usize {
+        self.renders
+    }
+
+    /// The rows of `entry` at `index`, rendered by `render` when not kept.
+    fn body(
+        &mut self,
+        index: usize,
+        entry: &Entry,
+        display: Display,
+        render: impl FnOnce() -> Vec<String>,
+    ) -> Vec<String> {
+        if self.display != Some(display) {
+            self.display = Some(display);
+            self.bodies.clear();
+        }
+        if let Some((kept, rows)) = self.bodies.get(index)
+            && kept == entry
+        {
+            return rows.clone();
+        }
+        let rows = render();
+        self.renders = self.renders.saturating_add(1);
+        self.bodies.truncate(index);
+        if self.bodies.len() == index {
+            self.bodies.push((entry.clone(), rows.clone()));
+        }
+        rows
+    }
+}
+
+/// A body cache shared by the viewer's openings.
+pub type SharedBodies = std::sync::Arc<std::sync::Mutex<BodyCache>>;
+
 impl ToolDetails {
-    /// Starts with every recorded entry visible, matching the full viewer.
+    /// Starts with every entry collapsed and nothing selected.
     #[must_use]
     pub fn new(entries: Vec<Entry>) -> Self {
-        Self {
-            expanded: vec![None; entries.len()],
-            entries,
-            selected: None,
+        let mut details = Self::default();
+        details.replace(entries);
+        details
+    }
+
+    /// Renders collapsed entries through `cache`, reusing the rows it holds.
+    #[must_use]
+    pub fn with_cache(mut self, cache: SharedBodies) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Replaces the entries, keeping each unchanged entry's state by index.
+    pub fn replace(&mut self, entries: Vec<Entry>) {
+        let kept = self
+            .entries
+            .iter()
+            .zip(&entries)
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.expanded.truncate(kept);
+        self.expansions.truncate(kept);
+        self.expanded.resize(entries.len(), false);
+        self.expansions.resize(entries.len(), None);
+        self.entries = entries;
+        if self.selected.is_some_and(|index| index >= kept) {
+            self.selected = None;
         }
     }
 
-    /// Selects the next or previous expandable tool, wrapping at either end.
+    /// The entries as given.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// The selected entry.
+    #[must_use]
+    pub const fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Selects the next or previous collapsible entry, wrapping at either end.
     pub fn select(&mut self, backwards: bool) {
         let tools: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.speaker == Speaker::Tool && entry.expandable)
+            .filter(|(_, entry)| collapsible(entry))
             .map(|(index, _)| index)
             .collect();
         self.selected = if backwards {
@@ -388,92 +555,174 @@ impl ToolDetails {
         .copied();
     }
 
-    /// Toggles the selected tool; without a selection this is a no-op.
+    /// Selects the first collapsible entry with a row at or after `row`, or
+    /// the last one before it, given the starts [`Self::rows`] reported.
+    pub fn select_from_row(&mut self, row: usize, starts: &[usize]) {
+        let candidates = || {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| collapsible(entry))
+                .map(|(index, _)| index)
+        };
+        let end = |index: usize| {
+            starts
+                .get(index.saturating_add(1))
+                .copied()
+                .unwrap_or(usize::MAX)
+        };
+        self.selected = candidates()
+            .find(|&index| end(index) > row)
+            .or_else(|| candidates().next_back());
+    }
+
+    /// Toggles the selected entry; without a selection this is a no-op.
     pub fn toggle(&mut self) {
         if let Some(index) = self.selected {
-            self.expanded[index] = Some(!self.expanded[index].unwrap_or(true));
+            self.expanded[index] = !self.expanded[index];
         }
     }
 
-    /// Renders rows and the selected tool's header row for viewport navigation.
-    #[must_use]
-    pub fn rows(&self, display: Display) -> (Vec<String>, Option<usize>) {
-        let mut out = String::new();
-        let mut selected_row = None;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if index > 0 {
-                out.push('\n');
-            }
-            let selected = self.selected == Some(index);
-            if selected || self.expanded[index].is_some() {
-                if selected {
-                    selected_row = Some(out.lines().count());
-                }
-                let state = match self.expanded[index] {
-                    None => "full",
-                    Some(false) => "collapsed",
-                    Some(true) => "expanded, up to 16 KiB / 200 rows",
-                };
-                for line in wrap(
-                    &format!(
-                        "{}tool {}: {state}",
-                        if selected { "> " } else { "  " },
-                        index.saturating_add(1)
-                    ),
-                    display.width.max(MIN_WIDTH),
-                ) {
-                    let _ = writeln!(out, "{line}");
-                }
-            }
-            if let Some(expanded) = self.expanded[index] {
-                let end = entry
-                    .text
-                    .floor_char_boundary(TOOL_DETAIL_BYTES.min(entry.text.len()));
-                let bounded = Entry::tool(&entry.text[..end]);
-                let mut preview = String::new();
-                render_entry(
-                    &bounded,
-                    Display {
-                        tool_lines: if expanded {
-                            TOOL_DETAIL_ROWS
-                        } else {
-                            display.tool_lines
-                        },
-                        ..display
-                    },
-                    &Lanes::default(),
-                    &mut preview,
-                );
-                for line in preview
-                    .lines()
-                    .flat_map(|line| wrap(line, display.width.max(MIN_WIDTH)))
-                {
-                    let _ = writeln!(out, "{line}");
-                }
-                if end < entry.text.len() {
-                    for line in wrap(
-                        "  [tool preview byte limit; reopen for full recorded output]",
-                        display.width.max(MIN_WIDTH),
-                    ) {
-                        let _ = writeln!(out, "{line}");
-                    }
-                }
-            } else {
-                render_entry(
-                    entry,
-                    Display {
-                        tool_lines: usize::MAX,
-                        ..display
-                    },
-                    &Lanes::default(),
-                    &mut out,
-                );
+    /// Expands every collapsible entry, or collapses them all when all are
+    /// expanded already.
+    pub fn toggle_all(&mut self) {
+        let all = self
+            .entries
+            .iter()
+            .zip(&self.expanded)
+            .all(|(entry, expanded)| !collapsible(entry) || *expanded);
+        for (entry, expanded) in self.entries.iter().zip(&mut self.expanded) {
+            if collapsible(entry) {
+                *expanded = !all;
             }
         }
-        (
-            out.trim_end().lines().map(str::to_owned).collect(),
-            selected_row,
-        )
+    }
+
+    /// Expanded tool entries whose expansion is not known yet.
+    #[must_use]
+    pub fn pending(&self) -> Vec<usize> {
+        (0..self.entries.len())
+            .filter(|&index| {
+                self.expanded[index]
+                    && self.entries[index].speaker == Speaker::Tool
+                    && self.expansions[index].is_none()
+            })
+            .collect()
+    }
+
+    /// Drops every supplied expansion, so [`Self::pending`] asks again.
+    pub fn forget_expansions(&mut self) {
+        self.expansions.fill(None);
+    }
+
+    /// Supplies what an expanded entry shows.
+    pub fn set_expansion(&mut self, index: usize, expansion: Expansion) {
+        if let Some(slot) = self.expansions.get_mut(index) {
+            *slot = Some(expansion);
+        }
+    }
+
+    /// Renders rows with a header row on the selected and expanded entries.
+    #[must_use]
+    pub fn rows(&self, display: Display) -> DetailRows {
+        self.render(display, false)
+    }
+
+    /// Renders every entry expanded, without header rows.
+    #[must_use]
+    pub fn expanded_rows(&self, display: Display) -> DetailRows {
+        self.render(display, true)
+    }
+
+    fn render(&self, display: Display, everything: bool) -> DetailRows {
+        let width = display.width.max(MIN_WIDTH);
+        let mut out: Vec<String> = Vec::new();
+        let mut selected_row = None;
+        let mut starts = Vec::with_capacity(self.entries.len());
+        let push = |out: &mut Vec<String>, text: &str| {
+            out.extend(text.trim_end().lines().map(str::to_owned));
+        };
+        let mut cache = self.cache.as_ref().map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                out.push(String::new());
+            }
+            starts.push(out.len());
+            let expanded = everything || self.expanded[index];
+            let selected = !everything && self.selected == Some(index);
+            if selected || (!everything && expanded) {
+                if selected {
+                    selected_row = Some(out.len());
+                }
+                let kind = if entry.speaker == Speaker::Reasoning {
+                    "thought"
+                } else {
+                    "tool"
+                };
+                let state = if expanded { "expanded" } else { "collapsed" };
+                let header = format!(
+                    "{}{kind} {}: {state}",
+                    if selected { "> " } else { "  " },
+                    index.saturating_add(1)
+                );
+                out.extend(wrap(&header, width));
+            }
+            let mut body = String::new();
+            let full = Display {
+                tool_lines: usize::MAX,
+                ..display
+            };
+            // A collapsed body depends on the entry and the display alone.
+            if !expanded && let Some(cache) = cache.as_mut() {
+                let rows = cache.body(index, entry, full, || {
+                    let mut body = String::new();
+                    collapsed_body(entry, full, &mut body);
+                    body.trim_end().lines().map(str::to_owned).collect()
+                });
+                out.extend(rows);
+                continue;
+            }
+            match (entry.speaker, expanded, self.expansions[index].as_ref()) {
+                (_, false, _) => collapsed_body(entry, full, &mut body),
+                (Speaker::Tool, true, Some(Expansion::Text(text))) => {
+                    render_entry(&Entry::tool(text), full, &Lanes::default(), &mut body);
+                }
+                (Speaker::Tool, true, Some(Expansion::Rows(rows))) => {
+                    out.extend(rows.iter().cloned());
+                    continue;
+                }
+                _ => render_entry(entry, full, &Lanes::default(), &mut body),
+            }
+            push(&mut out, &body);
+        }
+        while out.last().is_some_and(String::is_empty) {
+            out.pop();
+        }
+        DetailRows {
+            rows: out,
+            selected: selected_row,
+            starts,
+        }
+    }
+}
+
+/// Renders a collapsed viewer entry: one `thought:` row for reasoning, the
+/// recorded text for everything else.
+fn collapsed_body(entry: &Entry, display: Display, body: &mut String) {
+    if entry.speaker == Speaker::Reasoning {
+        let first = first_line(&sanitize(&entry.text));
+        render_entry(
+            &Entry::reasoning(format!("thought: {first}")),
+            display,
+            &Lanes::default(),
+            body,
+        );
+    } else {
+        render_entry(entry, display, &Lanes::default(), body);
     }
 }
 
@@ -492,6 +741,14 @@ pub struct Lanes {
     pub reset: String,
     /// How Markdown in the answer is drawn. Off by default.
     pub markdown: crate::markdown::MarkdownStyle,
+    /// Opens the marker beside a user message.
+    pub user_rail: String,
+    /// Opens a secondary row: an informational notice or an error's hint.
+    pub dim: String,
+    /// Opens the `warning:` label.
+    pub warning: String,
+    /// Opens the `error:` label.
+    pub error: String,
 }
 
 impl Default for Lanes {
@@ -500,8 +757,28 @@ impl Default for Lanes {
             reasoning: "\u{1b}[2m".to_owned(),
             reset: "\u{1b}[0m".to_owned(),
             markdown: crate::markdown::MarkdownStyle::default(),
+            user_rail: String::new(),
+            dim: String::new(),
+            warning: String::new(),
+            error: String::new(),
         }
     }
+}
+
+/// Wraps `text` in `open` and `reset`, or leaves it bare when there is no style.
+fn painted(open: &str, text: &str, reset: &str) -> String {
+    if open.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{open}{text}{reset}")
+    }
+}
+
+/// Writes one row without trailing spaces: a row is never padded, so what is
+/// copied from scrollback ends where the text does.
+fn push_row(out: &mut String, row: &str) {
+    out.push_str(row.trim_end_matches(' '));
+    out.push('\n');
 }
 
 /// Renders a transcript with caller-supplied lane styling.
@@ -528,13 +805,15 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
     let text = sanitize(&entry.text);
     let body = if entry.speaker == Speaker::Assistant {
         // A finished answer is whole, so its tables can be measured and aligned.
-        let text = if lanes.markdown.enabled {
-            crate::markdown::align_tables(&text, display.ascii)
+        let aligned;
+        let source = if lanes.markdown.enabled {
+            aligned = crate::markdown::align_tables(&text, &lanes.markdown, display.ascii, width);
+            &aligned
         } else {
-            text
+            &text
         };
         AssistantRows::with_markdown(lanes.markdown.clone()).rows_with_ascii(
-            &text,
+            source,
             width,
             display.ascii,
         )
@@ -542,42 +821,73 @@ fn render_entry(entry: &Entry, display: Display, lanes: &Lanes, out: &mut String
         wrap(&text, width)
     };
 
+    let reset = lanes.reset.as_str();
     match entry.speaker {
         Speaker::User => {
-            let _ = writeln!(out, "> {}", body.first().map_or("", String::as_str));
+            let marker = if display.ascii { ">" } else { "\u{258c}" };
+            let rail = painted(&lanes.user_rail, marker, reset);
+            let first = body.first().map_or("", String::as_str);
+            push_row(out, &format!("{rail} {first}"));
             for line in body.iter().skip(1) {
-                let _ = writeln!(out, "  {line}");
+                push_row(out, &format!("  {line}"));
             }
         }
         Speaker::Assistant => {
             for line in &body {
-                let _ = writeln!(out, "{line}");
+                push_row(out, line);
             }
         }
         // Reasoning is drawn in a secondary colour and indented, so it is
         // visually a separate lane from the answer rather than mixed into it.
         Speaker::Reasoning => {
             for line in &body {
-                let _ = writeln!(out, "{}  {line}{}", lanes.reasoning, lanes.reset);
+                push_row(out, &format!("{}  {line}{}", lanes.reasoning, lanes.reset));
             }
         }
         Speaker::Tool => {
             let keep = display.tool_lines.min(body.len());
             for line in body.iter().take(keep) {
-                let _ = writeln!(out, "  {line}");
+                push_row(out, &format!("  {line}"));
             }
             if keep < body.len() {
-                let _ = writeln!(
+                push_row(
                     out,
-                    "  ... {} more line(s)",
-                    body.len().saturating_sub(keep)
+                    &format!("  ... {} more line(s)", body.len().saturating_sub(keep)),
                 );
             }
         }
-        Speaker::Notice => {
-            for line in &body {
-                let _ = writeln!(out, "[{line}]");
+        Speaker::Notice => match entry.severity {
+            Severity::Info => {
+                for line in &body {
+                    push_row(out, &painted(&lanes.dim, &format!("[{line}]"), reset));
+                }
             }
+            Severity::Warning => labelled(out, "warning:", &lanes.warning, &text, display, reset),
+            Severity::Error => {
+                labelled(out, "error:", &lanes.error, &text, display, reset);
+                let hint = entry.hint.as_deref().map(sanitize).unwrap_or_default();
+                let width = display.width.saturating_sub(2).max(MIN_WIDTH);
+                for line in wrap(&hint, width) {
+                    if !line.trim().is_empty() {
+                        push_row(out, &painted(&lanes.dim, &format!("  {line}"), reset));
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Writes a notice under a word naming its severity: the label on the first
+/// row, the rest indented under the text.
+fn labelled(out: &mut String, label: &str, open: &str, text: &str, display: Display, reset: &str) {
+    let indent = str_width(label).saturating_add(1);
+    let width = display.width.saturating_sub(indent).max(MIN_WIDTH);
+    let label = painted(open, label, reset);
+    for (index, line) in wrap(text, width).iter().enumerate() {
+        if index == 0 {
+            push_row(out, &format!("{label} {line}"));
+        } else {
+            push_row(out, &format!("{:indent$}{line}", ""));
         }
     }
 }
@@ -589,11 +899,18 @@ pub const MIN_WIDTH: usize = 1;
 ///
 /// Complete source lines keep their rows and fence state. Only the unfinished
 /// line is rewrapped, so completing a fence or appending code cannot move an
-/// earlier line. A width change or a cleared source resets the cache.
+/// earlier line. A width change rewraps from the committed base; a cleared
+/// source resets the cache.
 #[derive(Clone, Debug, Default)]
 pub struct AssistantRows {
-    finished: Vec<String>,
+    /// Rows of each complete line after `base`, with the line's end offset and
+    /// the fence state after it.
+    finished: Vec<(usize, Vec<String>, Option<Fence>)>,
     covered: usize,
+    /// Bytes of the source already handed out by `take_through`.
+    base: usize,
+    /// The fence state at `base`.
+    base_fence: Option<Fence>,
     width: Option<usize>,
     ascii: bool,
     fence: Option<Fence>,
@@ -604,7 +921,8 @@ impl AssistantRows {
     /// Draws Markdown prose with `style` from now on, rewrapping if it changed.
     pub fn set_markdown(&mut self, markdown: &crate::markdown::MarkdownStyle) {
         if &self.markdown != markdown {
-            *self = Self::with_markdown(markdown.clone());
+            self.markdown = markdown.clone();
+            self.rewrap();
         }
     }
 
@@ -620,35 +938,33 @@ impl AssistantRows {
     /// Returns all rows for text that grows by appending deltas.
     ///
     /// Prose uses ordinary word wrapping. Inside backtick or tilde fences,
-    /// whitespace is preserved, tabs expand to eight-column stops, and soft
-    /// breaks repeat the source indentation followed by `↪ `. On narrow
-    /// terminals the repeated indentation shrinks to leave room for code.
+    /// whitespace is preserved, tabs expand to eight-column stops, and each
+    /// source line is one row, however wide, so it copies as written.
     #[must_use]
     pub fn rows(&mut self, text: &str, width: usize) -> Vec<String> {
         self.rows_with_ascii(text, width, false)
     }
 
     /// Returns wrapped rows using ASCII continuation markers when requested.
+    ///
+    /// Only the text after the committed base is drawn.
     #[must_use]
     pub fn rows_with_ascii(&mut self, text: &str, width: usize, ascii: bool) -> Vec<String> {
         let width = width.max(MIN_WIDTH);
-        if text.len() < self.covered || self.width != Some(width) || self.ascii != ascii {
+        if text.len() < self.covered {
             *self = Self::with_markdown(std::mem::take(&mut self.markdown));
         }
-        self.width = Some(width);
-        self.ascii = ascii;
-        let sealed = text.rfind('\n').map_or(0, |at| at.saturating_add(1));
-        for line in text[self.covered..sealed].split_inclusive('\n') {
-            self.finished.extend(assistant_line(
-                line.strip_suffix('\n').unwrap_or(line),
-                width,
-                &mut self.fence,
-                ascii,
-                &self.markdown,
-            ));
+        if self.width != Some(width) || self.ascii != ascii {
+            self.width = Some(width);
+            self.ascii = ascii;
+            self.rewrap();
         }
-        self.covered = sealed;
-        let mut rows = self.finished.clone();
+        let sealed = self.cover(text);
+        let mut rows: Vec<String> = self
+            .finished
+            .iter()
+            .flat_map(|(_, rows, _)| rows.iter().cloned())
+            .collect();
         // A partial closing fence must not change the cached state until its
         // newline arrives: the next delta may still make it ordinary code.
         let mut fence = self.fence;
@@ -658,8 +974,86 @@ impl AssistantRows {
             &mut fence,
             ascii,
             &self.markdown,
+            false,
         ));
         rows
+    }
+
+    /// Hands out the rows for `text[base..offset]` and moves the base to
+    /// `offset`, so they are never drawn again.
+    ///
+    /// `offset` is a line start, or a point inside the unfinished line, whose
+    /// part before `offset` is then drawn as a complete line.
+    #[must_use]
+    pub fn take_through(&mut self, text: &str, offset: usize) -> Vec<String> {
+        let width = self.width.unwrap_or(MIN_WIDTH);
+        let offset = offset.min(text.len());
+        if offset <= self.base {
+            return Vec::new();
+        }
+        self.cover(&text[..offset]);
+        let keep = self
+            .finished
+            .iter()
+            .take_while(|(end, _, _)| *end <= offset)
+            .count();
+        let mut rows = Vec::new();
+        for (_, line, fence) in self.finished.drain(..keep) {
+            rows.extend(line);
+            self.base_fence = fence;
+        }
+        if offset > self.covered {
+            let line = &text[self.covered..offset];
+            rows.extend(assistant_line(
+                line,
+                width,
+                &mut self.fence,
+                self.ascii,
+                &self.markdown,
+                true,
+            ));
+            self.base_fence = self.fence;
+            self.covered = offset;
+        }
+        self.base = offset;
+        rows
+    }
+
+    /// Whether the committed base is inside a code fence.
+    #[must_use]
+    pub const fn base_in_code(&self) -> bool {
+        self.base_fence.is_some()
+    }
+
+    /// Wraps the complete lines after `covered`, returning the new `covered`.
+    fn cover(&mut self, text: &str) -> usize {
+        let width = self.width.unwrap_or(MIN_WIDTH);
+        let start = self.covered.min(text.len());
+        let sealed = text[start..]
+            .rfind('\n')
+            .map_or(start, |at| start.saturating_add(at).saturating_add(1));
+        let mut end = start;
+        for line in text[start..sealed].split_inclusive('\n') {
+            end = end.saturating_add(line.len());
+            let rows = assistant_line(
+                line.strip_suffix('\n').unwrap_or(line),
+                width,
+                &mut self.fence,
+                self.ascii,
+                &self.markdown,
+                true,
+            );
+            self.finished.push((end, rows, self.fence));
+        }
+        self.covered = sealed.max(self.covered);
+        self.covered
+    }
+
+    /// Drops the cached rows so they are wrapped again from the base.
+    fn rewrap(&mut self) {
+        self.finished.clear();
+        self.covered = self.base;
+        self.fence = self.base_fence;
     }
 }
 
@@ -700,83 +1094,268 @@ fn assistant_line(
     fence: &mut Option<Fence>,
     ascii: bool,
     markdown: &crate::markdown::MarkdownStyle,
+    complete: bool,
 ) -> Vec<String> {
-    // A fence line is syntax rather than content, so styled output dims it.
-    let delimiter = |line: &str| {
-        if markdown.enabled {
-            wrap(&format!("{}{line}{}", markdown.dim, markdown.reset), width)
-        } else {
-            wrap(line, width)
-        }
-    };
+    // A fence line is syntax rather than content, so styled output leaves it
+    // out; copying a code block from scrollback then gives only the code.
     let candidate = fence_start(line);
     if let Some(open) = *fence {
         if candidate.is_some_and(|(close, rest)| {
             close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
         }) {
             *fence = None;
-            return delimiter(line);
+            return if markdown.enabled {
+                Vec::new()
+            } else {
+                wrap(line, width)
+            };
         }
-        return wrap_code(line, width, ascii)
-            .into_iter()
-            .map(|row| crate::highlight::highlight(&row, open.language, &markdown.code_block))
-            .collect();
+        return vec![code_row(line, open.language, markdown)];
     }
     if let Some((open, rest)) = candidate
         && (open.marker != b'`' || !rest.contains('`'))
     {
         *fence = Some(open);
-        return delimiter(line);
+        if !markdown.enabled {
+            return wrap(line, width);
+        }
+        let indent = line
+            .len()
+            .saturating_sub(line.trim_start_matches(' ').len());
+        return rest
+            .split_whitespace()
+            .next()
+            .map(|language| {
+                vec![format!(
+                    "{:indent$}{}{language}{}",
+                    "", markdown.dim, markdown.reset
+                )]
+            })
+            .unwrap_or_default();
     }
-    wrap(
-        &crate::markdown::style_line(line, markdown, ascii, width),
-        width,
-    )
+    let styled = if complete {
+        crate::markdown::style_line(line, markdown, ascii, width)
+    } else {
+        crate::markdown::style_open_line(line, markdown, ascii, width)
+    };
+    let body_width = if styled.indent == 0 {
+        width
+    } else {
+        width.saturating_sub(styled.indent).max(8)
+    };
+    wrap(&styled.body, body_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 {
+                &styled.first
+            } else {
+                &styled.continuation
+            };
+            format!("{prefix}{row}")
+        })
+        .collect()
 }
 
-/// Hard wraps code by grapheme, retaining every space instead of word breaks.
-fn wrap_code(source: &str, width: usize, ascii: bool) -> Vec<String> {
-    let mut expanded = String::new();
-    let mut column = 0_usize;
-    for cluster in graphemes(source) {
-        if cluster == "\t" {
-            let spaces = 8_usize.saturating_sub(column % 8);
-            expanded.extend(std::iter::repeat_n(' ', spaces));
-            column = column.saturating_add(spaces);
+/// The kind of Markdown block a streaming answer is in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Block {
+    /// Between blocks: everything before is sealed.
+    #[default]
+    None,
+    Paragraph,
+    List,
+    Quote,
+    Table,
+    /// Inside a fence.
+    Code,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LineKind {
+    #[default]
+    Other,
+    Blank,
+    Row,
+    Delimiter,
+}
+
+/// Finds where the finished blocks of a streaming answer end.
+///
+/// A block is finished once a later line shows it cannot change: its blank
+/// line, the next heading, a fence of its own, the end of a table. Only
+/// complete lines are examined, so text after the last newline is never
+/// sealed.
+#[derive(Clone, Debug, Default)]
+pub struct Sealer {
+    scanned: usize,
+    sealed: usize,
+    block: Block,
+    fence: Option<Fence>,
+    table_rows: usize,
+    previous: LineKind,
+}
+
+impl Sealer {
+    /// Examines the complete lines of `text` not seen yet and returns the
+    /// sealed byte offset: always a line start, never decreasing.
+    pub fn advance(&mut self, text: &str) -> usize {
+        if text.len() < self.scanned {
+            self.reset();
+        }
+        while let Some(at) = text[self.scanned..].find('\n') {
+            let start = self.scanned;
+            let end = start.saturating_add(at).saturating_add(1);
+            self.line(&text[start..end.saturating_sub(1)], start, end);
+            self.scanned = end;
+        }
+        self.sealed
+    }
+
+    /// The block the unsealed text is in.
+    #[must_use]
+    pub const fn block(&self) -> Block {
+        self.block
+    }
+
+    /// Rows of the table being written, counting its header and delimiter.
+    #[must_use]
+    pub const fn open_table_rows(&self) -> usize {
+        if matches!(self.block, Block::Table) {
+            self.table_rows
         } else {
-            expanded.push_str(cluster);
-            column = column.saturating_add(grapheme_width(cluster));
+            0
         }
     }
-    let indent = expanded.bytes().take_while(|byte| *byte == b' ').count();
-    let marker = match (ascii, width >= 3) {
-        (true, true) => "> ",
-        (true, false) => ">",
-        (false, true) => "↪ ",
-        (false, false) => "↪",
+
+    /// The start of the line not yet complete.
+    #[must_use]
+    pub const fn line_start(&self) -> usize {
+        self.scanned
+    }
+
+    /// Forgets everything, for an answer that was cleared.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn seal(&mut self, at: usize) {
+        self.sealed = self.sealed.max(at);
+    }
+
+    fn line(&mut self, line: &str, start: usize, end: usize) {
+        let candidate = fence_start(line);
+        if let Some(open) = self.fence {
+            if candidate.is_some_and(|(close, rest)| {
+                close.marker == open.marker && close.length >= open.length && rest.trim().is_empty()
+            }) {
+                self.fence = None;
+                self.block = Block::None;
+                self.seal(end);
+            }
+            self.previous = LineKind::Other;
+            return;
+        }
+        let row = crate::markdown::is_row(line);
+        let kind = if crate::markdown::is_delimiter(line) {
+            LineKind::Delimiter
+        } else if row {
+            LineKind::Row
+        } else if line.trim_matches(' ').is_empty() {
+            LineKind::Blank
+        } else {
+            LineKind::Other
+        };
+        let previous = std::mem::replace(&mut self.previous, kind);
+        if self.block == Block::Table {
+            if row {
+                self.table_rows = self.table_rows.saturating_add(1);
+                return;
+            }
+            self.seal(start);
+            self.block = Block::None;
+            self.table_rows = 0;
+        }
+        if let Some((open, rest)) = candidate
+            && (open.marker != b'`' || !rest.contains('`'))
+        {
+            self.seal(start);
+            self.fence = Some(open);
+            self.block = Block::Code;
+            return;
+        }
+        if kind == LineKind::Blank {
+            self.seal(end);
+            self.block = Block::None;
+            return;
+        }
+        let indent = line
+            .len()
+            .saturating_sub(line.trim_start_matches(' ').len());
+        let rest = &line[indent..];
+        if indent <= 3
+            && (crate::markdown::heading(rest).is_some() || crate::markdown::is_rule(rest))
+        {
+            self.seal(end);
+            self.block = Block::None;
+            return;
+        }
+        if row && matches!(previous, LineKind::Row | LineKind::Delimiter) {
+            self.block = Block::Table;
+            self.table_rows = 2;
+            return;
+        }
+        let item = crate::markdown::bullet(rest).is_some() || ordered_item(rest);
+        if self.block == Block::List && !item && indent >= 2 {
+            return;
+        }
+        let quote = indent <= 3 && rest.starts_with('>');
+        let next = if item {
+            Block::List
+        } else if quote {
+            Block::Quote
+        } else {
+            Block::Paragraph
+        };
+        if next != self.block {
+            self.seal(start);
+            self.block = next;
+        }
+    }
+}
+
+/// Returns true for an ordered list item: digits, `.` or `)`, then a space.
+fn ordered_item(text: &str) -> bool {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=9).contains(&digits)
+        && matches!(text.as_bytes().get(digits), Some(b'.' | b')'))
+        && text.as_bytes().get(digits.saturating_add(1)) == Some(&b' ')
+}
+
+/// Erases from the cursor to the end of the row in the current background.
+const ERASE_TO_END: &str = "\u{1b}[K";
+
+/// Draws one line of fenced code whole: tabs expanded, highlighted, on the
+/// code background when there is one. It is never wrapped, so the terminal
+/// soft-wraps a long row and copying it gives the line as written.
+fn code_row(
+    source: &str,
+    language: crate::highlight::Language,
+    markdown: &crate::markdown::MarkdownStyle,
+) -> String {
+    let row = crate::highlight::highlight(&expand_tabs(source), language, &markdown.code_block);
+    let bg = markdown.code_bg.as_str();
+    if bg.is_empty() {
+        return row;
+    }
+    // Each token's reset would end the background, so it is reopened.
+    let close = markdown.code_block.reset.as_str();
+    let row = if close.is_empty() {
+        row
+    } else {
+        row.replace(close, &format!("{close}{bg}"))
     };
-    // Leave at least two cells for a wide grapheme whenever possible.
-    let prefix = " ".repeat(indent.min(width.saturating_sub(4))) + marker;
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut used = 0_usize;
-    let mut has_source = false;
-    for cluster in graphemes(&expanded) {
-        let columns = grapheme_width(cluster);
-        if has_source && used.saturating_add(columns) > width {
-            rows.push(std::mem::take(&mut row));
-            // Below three columns the marker may need to shrink or disappear
-            // to accommodate a wide glyph without clipping its code bytes.
-            let (shown, columns_used) = truncate_to_width(&prefix, width.saturating_sub(columns));
-            shown.clone_into(&mut row);
-            used = columns_used;
-        }
-        row.push_str(cluster);
-        used = used.saturating_add(columns);
-        has_source = true;
-    }
-    rows.push(row);
-    rows
+    format!("{bg}{row}{ERASE_TO_END}{}", crate::engine::Style::RESET)
 }
 
 /// Removes control sequences a terminal would act on.
@@ -898,53 +1477,238 @@ pub fn render_prompt_at(prompt: &str, input: &str, column: usize, width: usize) 
     (format!("{prompt}{shown}"), caret)
 }
 
-/// Renders draft line breaks as separate rows with an editable caret.
+/// Renders a draft on the rows it wraps to, with an editable caret.
 ///
 /// `column` counts the displayed prefix, including one cell for each newline
-/// and tab, as returned by [`crate::editor::Composer::cursor_column`]. Each
-/// logical line uses a horizontal viewport; the active line scrolls to its
-/// caret. Continuations align with the text after the prompt marker.
+/// and tab, as returned by [`crate::editor::Composer::cursor_column`]. Rows
+/// come from [`crate::editor::layout`]: the prompt marker leads the first row
+/// and later rows are indented to the text after it. A draft that fits on one
+/// row keeps the single-row viewport.
 #[must_use]
 pub fn render_draft_at(
     prompt: &str,
     input: &str,
-    mut column: usize,
+    column: usize,
     width: usize,
 ) -> (Vec<String>, (u16, u16)) {
-    if !input.contains('\n') {
+    let (marker, indent) = truncate_to_width(prompt, width.saturating_sub(1));
+    let rows = crate::editor::layout(input, indent, indent, width);
+    if rows.len() <= 1 {
         let (row, caret) = render_prompt_at(prompt, input, column, width);
         return (vec![row], (0, u16::try_from(caret).unwrap_or(u16::MAX)));
     }
-    column = column.min(str_width(&crate::editor::displayed(input)));
-    let continuation = " ".repeat(str_width(prompt).min(width.saturating_sub(1)));
-    let mut rows = Vec::new();
-    let mut caret = (0, 0);
-    let mut located = false;
-    for (index, line) in input.split('\n').enumerate() {
-        let line_width = str_width(&crate::editor::displayed(line));
-        let active = !located && column <= line_width;
-        let marker = if index == 0 { prompt } else { &continuation };
-        let (row, col) = render_prompt_at(marker, line, if active { column } else { 0 }, width);
-        rows.push(row);
-        if active {
-            caret = (
-                u16::try_from(index).unwrap_or(u16::MAX),
-                u16::try_from(col).unwrap_or(u16::MAX),
-            );
-            located = true;
-        } else if !located {
-            column = column.saturating_sub(line_width.saturating_add(1));
+    let caret = caret_index(input, column);
+    let (caret_row, caret_column) = crate::editor::caret_in(input, &rows, caret);
+    let continuation = " ".repeat(indent);
+    let chars: Vec<char> = input.chars().collect();
+    let drawn = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let text: String = chars
+                .get(row.start..row.end)
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            let lead = if index == 0 { marker } else { &continuation };
+            // A cluster wider than the whole row is cut rather than overflowing it.
+            let shown = crate::editor::displayed(&text);
+            let (shown, _) = truncate_to_width(&shown, width.saturating_sub(indent));
+            format!("{lead}{shown}")
+        })
+        .collect();
+    let caret_column = indent
+        .saturating_add(caret_column)
+        .min(width.saturating_sub(1));
+    (
+        drawn,
+        (
+            u16::try_from(caret_row).unwrap_or(u16::MAX),
+            u16::try_from(caret_column).unwrap_or(u16::MAX),
+        ),
+    )
+}
+
+/// Returns the character index whose displayed prefix is `column` wide.
+fn caret_index(input: &str, column: usize) -> usize {
+    let mut used = 0usize;
+    let mut at = 0usize;
+    for cluster in graphemes(input) {
+        if used >= column {
+            break;
         }
+        used = used.saturating_add(str_width(&crate::editor::displayed(cluster)));
+        at = at.saturating_add(cluster.chars().count());
     }
-    (rows, caret)
+    at
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn sealed(text: &str) -> usize {
+        Sealer::default().advance(text)
+    }
+
     #[test]
-    fn tool_disclosure_bounds_rows_and_preserves_surrounding_entries() {
+    fn a_paragraph_seals_at_its_blank_line() {
+        assert_eq!(sealed("one\ntwo\n"), 0);
+        assert_eq!(sealed("one\ntwo\n\nthree\n"), "one\ntwo\n\n".len());
+    }
+
+    #[test]
+    fn a_fence_seals_at_its_closing_line_and_not_before() {
+        let open = "intro\n```rust\nfn main() {}\n\n";
+        let mut sealer = Sealer::default();
+        assert_eq!(sealer.advance(open), "intro\n".len());
+        assert_eq!(sealer.block(), Block::Code);
+        let closed = format!("{open}```\n");
+        assert_eq!(sealer.advance(&closed), closed.len());
+        assert_eq!(sealer.block(), Block::None);
+    }
+
+    #[test]
+    fn a_heading_seals_at_its_line_end() {
+        assert_eq!(sealed("# Title\nbody"), "# Title\n".len());
+        assert_eq!(sealed("text\n## Next\n"), "text\n## Next\n".len());
+    }
+
+    #[test]
+    fn a_table_seals_at_the_first_line_that_is_not_a_row() {
+        let table = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+        let mut sealer = Sealer::default();
+        assert_eq!(sealer.advance(table), 0);
+        assert_eq!(sealer.block(), Block::Table);
+        assert_eq!(sealer.open_table_rows(), 3);
+        let after = format!("{table}after\n");
+        assert_eq!(sealer.advance(&after), table.len());
+        assert_eq!(sealer.block(), Block::Paragraph);
+    }
+
+    #[test]
+    fn a_list_seals_at_a_blank_or_unindented_line() {
+        assert_eq!(sealed("- one\n  more\n- two\n"), 0);
+        assert_eq!(sealed("- one\n- two\n\n"), "- one\n- two\n\n".len());
+        assert_eq!(sealed("- one\n1. two\nafter\n"), "- one\n1. two\n".len());
+        assert_eq!(sealed("text\n- item\n"), "text\n".len());
+    }
+
+    #[test]
+    fn an_unfinished_line_is_never_sealed() {
+        assert_eq!(
+            sealed("one\n\n# heading without its newline"),
+            "one\n\n".len()
+        );
+        assert_eq!(sealed("unfinished"), 0);
+    }
+
+    #[test]
+    fn sealing_one_delta_at_a_time_matches_sealing_the_whole_text() {
+        let answer = "# Report\n\nIntro line\nsecond line\n\n- a\n  more\n- b\n> quoted\n\
+            plain\n| a | b |\n| - | - |\n| 1 | 2 |\ntail\n```\ncode\n\n```\n---\nend";
+        let mut whole = Sealer::default();
+        let expected = whole.advance(answer);
+        let mut stepped = Sealer::default();
+        let mut last = 0;
+        for end in 1..=answer.len() {
+            if answer.is_char_boundary(end) {
+                let offset = stepped.advance(&answer[..end]);
+                assert!(offset >= last, "the sealed offset went back at {end}");
+                assert!(answer[..offset].is_empty() || answer[..offset].ends_with('\n'));
+                last = offset;
+            }
+        }
+        assert_eq!(last, expected);
+        assert_eq!(expected, answer.len() - "end".len());
+    }
+
+    #[test]
+    fn a_long_draft_wraps_at_forty_columns_with_the_caret_on_the_right_row() {
+        let draft = "x".repeat(100);
+        let (rows, caret) = render_draft_at("> ", &draft, 100, 40);
+        assert_eq!(
+            rows,
+            vec![
+                format!("> {}", "x".repeat(38)),
+                format!("  {}", "x".repeat(38)),
+                format!("  {}", "x".repeat(24)),
+            ]
+        );
+        assert_eq!(caret, (2, 26));
+        assert_eq!(render_draft_at("> ", &draft, 50, 40).1, (1, 14));
+        assert_eq!(render_draft_at("> ", &draft, 38, 40).1, (1, 2));
+        assert_eq!(render_draft_at("> ", &draft, 0, 40).1, (0, 2));
+        assert!(rows.iter().all(|row| str_width(row) <= 40));
+    }
+
+    fn renders(cache: &SharedBodies) -> usize {
+        cache
+            .lock()
+            .map(|cache| cache.renders())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_viewer_renders_only_new_entries() {
+        let cache = SharedBodies::default();
+        let mut entries = vec![
+            Entry::user("one"),
+            Entry::assistant("A1"),
+            Entry::tool("read a.txt"),
+        ];
+        let display = Display::default();
+        let first = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 3);
+        entries.push(Entry::assistant("A2"));
+        let second = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 4, "only the new entry is rendered");
+        assert_eq!(second, ToolDetails::new(entries.clone()).rows(display));
+        assert!(second.rows.starts_with(&first.rows));
+
+        // A changed entry renders again, and so does everything after it.
+        entries[1] = Entry::assistant("A1 changed");
+        let changed = ToolDetails::new(entries.clone())
+            .with_cache(std::sync::Arc::clone(&cache))
+            .rows(display);
+        assert_eq!(renders(&cache), 7);
+        assert_eq!(changed, ToolDetails::new(entries).rows(display));
+    }
+
+    #[test]
+    fn a_width_change_invalidates_the_viewer_cache() {
+        let cache = SharedBodies::default();
+        let entries = vec![Entry::assistant("word ".repeat(30)), Entry::user("two")];
+        let narrow = Display {
+            width: 40,
+            ..Display::default()
+        };
+        let wide = Display {
+            width: 100,
+            ..Display::default()
+        };
+        let details = ToolDetails::new(entries.clone()).with_cache(std::sync::Arc::clone(&cache));
+        let _ = details.rows(narrow);
+        assert_eq!(renders(&cache), 2);
+        let rows = details.rows(wide);
+        assert_eq!(renders(&cache), 4);
+        assert_eq!(rows, ToolDetails::new(entries.clone()).rows(wide));
+        let ascii = Display {
+            ascii: true,
+            ..wide
+        };
+        let _ = details.rows(ascii);
+        assert_eq!(renders(&cache), 6, "an ASCII change renders again too");
+        let _ = details.rows(ascii);
+        assert_eq!(renders(&cache), 6);
+    }
+
+    #[test]
+    fn tool_disclosure_keeps_surrounding_entries_and_source_text() {
         let content = (0..300)
             .map(|row| format!("TOOL-{row:03}"))
             .collect::<Vec<_>>()
@@ -956,8 +1720,9 @@ mod tests {
         ];
         let mut details = ToolDetails::new(entries.clone());
         let display = Display::default();
+        let untouched = details.rows(display);
         assert_eq!(
-            details.rows(display).0.join("\n"),
+            untouched.rows.join("\n"),
             render(
                 &entries,
                 Display {
@@ -966,37 +1731,55 @@ mod tests {
                 }
             )
         );
+        assert_eq!(untouched.starts, [0, 2, 303]);
         details.toggle();
-        assert_eq!(details.rows(display).1, None);
+        assert_eq!(details.rows(display).selected, None);
         details.select(false);
         details.toggle();
-        let collapsed = details.rows(display);
-        assert!(collapsed.0.join("\n").contains("TOOL-011"));
-        assert!(!collapsed.0.join("\n").contains("TOOL-012"));
-        assert!(collapsed.0[collapsed.1.expect("selection")].contains("collapsed"));
+        let expanded = details.rows(display);
+        assert!(expanded.rows[expanded.selected.expect("selection")].contains("expanded"));
+        assert!(expanded.rows.join("\n").contains("TOOL-299"));
+        details.set_expansion(1, Expansion::Text("STORED-BODY".to_owned()));
+        let stored = details.rows(display).rows.join("\n");
+        assert!(stored.contains("STORED-BODY") && !stored.contains("TOOL-000"));
+        assert!(stored.starts_with("\u{258c} before"));
+        assert!(stored.ends_with("after"));
         details.toggle();
-        let expanded = details.rows(display).0.join("\n");
-        assert!(expanded.contains("TOOL-199"));
-        assert!(!expanded.contains("TOOL-200"));
-        assert!(expanded.contains("100 more line(s)"));
-        assert!(expanded.starts_with("> before"));
-        assert!(expanded.ends_with("after"));
-        details.toggle();
-        assert_eq!(details.rows(display), collapsed);
+        assert!(details.rows(display).rows.join("\n").contains("TOOL-000"));
         details.select(true);
-        assert_eq!(details.rows(display), collapsed, "one tool wraps to itself");
-        assert_eq!(details.entries, entries, "source content stays intact");
+        assert_eq!(details.selected(), Some(1), "one tool wraps to itself");
+        assert_eq!(details.entries(), entries.as_slice(), "source stays intact");
+
+        details.toggle();
+        let mut grown = entries.clone();
+        grown.push(Entry::assistant("later"));
+        details.replace(grown);
+        assert_eq!(details.selected(), Some(1));
+        assert!(
+            details
+                .rows(display)
+                .rows
+                .join("\n")
+                .contains("STORED-BODY")
+        );
+        let mut changed = entries;
+        changed[1] = Entry::tool("other");
+        details.replace(changed);
+        assert!(details.pending().is_empty());
+        assert_eq!(details.selected(), None);
     }
 
     #[test]
-    fn tool_disclosure_bounds_unicode_bytes_and_rewraps_without_losing_state() {
-        let mut details = ToolDetails::new(vec![
-            Entry::tool(String::from("x") + &"é".repeat(TOOL_DETAIL_BYTES) + "END"),
-            Entry::assistant("after"),
-        ]);
-        details.select(true);
+    fn expanded_tool_details_are_not_capped() {
+        let text = (0..1100)
+            .map(|row| format!("{row:04} {}", "x".repeat(34)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.len() >= 40 * 1024);
+        let mut details = ToolDetails::new(vec![Entry::tool(text), Entry::assistant("after")]);
+        details.select(false);
         details.toggle();
-        details.toggle();
+        assert_eq!(details.pending(), [0]);
         for width in [80, 12] {
             let rows = details
                 .rows(Display {
@@ -1004,18 +1787,41 @@ mod tests {
                     ascii: true,
                     ..Display::default()
                 })
-                .0;
-            let text = rows.join("\n");
-            assert!(text.contains("expanded"));
-            assert!(text.contains("byte"));
-            assert!(!text.contains("END"));
-            assert!(text.ends_with("after"));
+                .rows;
+            let joined = rows.join("\n");
+            assert!(joined.contains("expanded"));
+            assert!(joined.contains("1099"), "the last line is shown");
+            assert!(!joined.contains("more line(s)"));
+            assert!(!joined.contains("byte limit"));
+            assert!(joined.ends_with("after"));
             assert!(rows.iter().all(|row| str_width(row) <= width));
-            assert_eq!(
-                text.chars().filter(|ch| *ch == 'é').count(),
-                ((TOOL_DETAIL_BYTES - 1) / 2).min(TOOL_DETAIL_ROWS * (width - 2) - 1)
-            );
         }
+    }
+
+    #[test]
+    fn reasoning_entries_collapse_by_default() {
+        let mut details = ToolDetails::new(vec![
+            Entry::reasoning("first idea\nsecond idea"),
+            Entry::assistant("answer"),
+        ]);
+        let plain = |rows: &[String]| sanitize(&rows.join("\n"));
+        let display = Display::default();
+        let collapsed = plain(&details.rows(display).rows);
+        assert!(collapsed.contains("thought: first idea"), "{collapsed}");
+        assert!(!collapsed.contains("second idea"));
+        details.select(false);
+        assert_eq!(details.selected(), Some(0));
+        details.toggle();
+        let expanded = plain(&details.rows(display).rows);
+        assert!(expanded.contains("second idea"), "{expanded}");
+        assert!(details.pending().is_empty(), "reasoning needs no expansion");
+        details.toggle();
+        details.toggle_all();
+        assert!(plain(&details.rows(display).rows).contains("second idea"));
+        details.toggle_all();
+        assert!(!plain(&details.rows(display).rows).contains("second idea"));
+        let everything = plain(&details.expanded_rows(display).rows);
+        assert!(everything.contains("second idea") && !everything.contains("thought 1"));
     }
 
     #[test]
@@ -1039,8 +1845,9 @@ mod tests {
         let mut empty = ToolDetails::new(vec![Entry::assistant("answer")]);
         empty.select(false);
         empty.toggle();
+        let rows = empty.rows(Display::default());
         assert_eq!(
-            empty.rows(Display::default()),
+            (rows.rows, rows.selected),
             (vec![String::from("answer")], None)
         );
     }
@@ -1091,20 +1898,20 @@ mod tests {
     }
 
     #[test]
-    fn multiline_drafts_scroll_only_the_edited_line_and_bound_narrow_carets() {
+    fn multiline_drafts_wrap_and_bound_narrow_carets() {
         let input = "first\nab書👋🏽e\u{301}Z\nlast";
         for width in 0..=12 {
             for column in 0..=str_width(&crate::editor::displayed(input)) {
                 let (rows, caret) = render_draft_at("> ", input, column, width);
-                assert_eq!(rows.len(), 3);
+                assert!(rows.len() >= 3);
                 assert!(rows.iter().all(|row| str_width(row) <= width));
                 assert!(usize::from(caret.1) < width.max(1));
-                assert!(caret.0 < 3);
+                assert!(usize::from(caret.0) < rows.len());
             }
         }
         let (rows, caret) = render_draft_at("> ", input, 14, 8);
-        assert_eq!(rows, ["> first", "  👋🏽e\u{301}Z", "  last"]);
-        assert_eq!(caret, (1, 6));
+        assert_eq!(rows, ["> first", "  ab書👋🏽", "  e\u{301}Z", "  last"]);
+        assert_eq!(caret, (2, 4));
     }
 
     #[test]
@@ -1145,61 +1952,96 @@ mod tests {
             assert!(rendered.contains("more line(s)"));
             assert!(render_grouped(&entries, display).is_ascii());
             let rows = AssistantRows::default().rows_with_ascii(&entries[0].text, width, true);
-            assert!(
-                rows.iter()
-                    .all(|row| row.is_ascii() && str_width(row) <= width)
-            );
+            assert!(rows.iter().all(|row| row.is_ascii()));
+            assert!(rows.iter().any(|row| row == "    abcdefghijkl  mnop"));
         }
-        let display = Display {
-            width: 12,
-            ascii: true,
-            ..Display::default()
-        };
-        assert!(render(&entries, display).contains("    > "));
         let text = "```\n    界↪éabcdefghij\n```";
         let rows = AssistantRows::default().rows_with_ascii(text, 10, true);
-        let code: String = rows[1..rows.len() - 1]
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                if index == 0 {
-                    row.as_str()
-                } else {
-                    row.trim_start().strip_prefix("> ").unwrap_or(row)
-                }
-            })
-            .collect();
-        assert_eq!(code, "    界↪éabcdefghij", "source Unicode must survive");
+        assert_eq!(rows[1], "    界↪éabcdefghij", "source Unicode must survive");
     }
 
     #[test]
     fn switching_ascii_markers_invalidates_finished_streaming_rows() {
-        let text = "```\n    abcdefghijklmnop\n```\n";
-        let mut cache = AssistantRows::default();
-        assert!(cache.rows(text, 10).iter().any(|row| row.contains('↪')));
+        let text = "- item\n  - nested\n";
+        let style = crate::markdown::MarkdownStyle::attributes();
+        let mut cache = AssistantRows::with_markdown(style.clone());
+        assert!(
+            cache
+                .rows(text, 10)
+                .iter()
+                .any(|row| row.contains('\u{2022}'))
+        );
         let ascii = cache.rows_with_ascii(text, 10, true);
-        assert!(ascii.iter().all(|row| row.is_ascii()));
-        assert!(ascii.iter().any(|row| row.starts_with("    > ")));
+        assert!(ascii.iter().all(|row| row.is_ascii()), "{ascii:?}");
         assert_eq!(
             cache.rows(text, 10),
-            AssistantRows::default().rows(text, 10)
+            AssistantRows::with_markdown(style).rows(text, 10)
         );
     }
 
     #[test]
-    fn fenced_code_preserves_spaces_and_indents_its_continuations() {
+    fn code_rows_are_never_wrapped() {
         let text = "before\n```rust\n    abcdefghijkl  mnop\n\n```\nafter";
-        let rendered = render(
-            &[Entry::assistant(text)],
-            Display {
-                width: 12,
-                ..Display::default()
-            },
-        );
+        for width in [4, 12, 80] {
+            let rendered = render(
+                &[Entry::assistant(text)],
+                Display {
+                    width,
+                    ..Display::default()
+                },
+            );
+            assert!(
+                rendered.contains("\n    abcdefghijkl  mnop\n\n"),
+                "{rendered:?}"
+            );
+            assert!(!rendered.contains('\u{21aa}'), "{rendered:?}");
+        }
+        let styled = AssistantRows::with_markdown(crate::markdown::MarkdownStyle::attributes())
+            .rows("```\n\tlet x = 1;\n```", 6);
+        assert_eq!(styled, ["        let x = 1;"]);
+    }
+
+    #[test]
+    fn fence_lines_are_hidden_and_the_language_is_a_dim_row() {
+        let style = crate::markdown::MarkdownStyle::attributes();
+        let rows = AssistantRows::with_markdown(style.clone())
+            .rows("intro\n```rust ignore\nlet x = 1;\n```\nafter", 40);
         assert_eq!(
-            rendered,
-            "before\n```rust\n    abcdef\n    ↪ ghij\n    ↪ kl  \n    ↪ mnop\n\n```\nafter"
+            rows,
+            ["intro", "\u{1b}[2mrust\u{1b}[0m", "let x = 1;", "after"]
         );
+        // Without an info string the fence leaves no row at all.
+        let rows = AssistantRows::with_markdown(style.clone()).rows("```\ncode\n```", 40);
+        assert_eq!(rows, ["code"]);
+        // An unclosed fence still draws its rows as code.
+        let rows = AssistantRows::with_markdown(style.clone()).rows("~~~py\n  x  = 1\n", 40);
+        assert_eq!(rows, ["\u{1b}[2mpy\u{1b}[0m", "  x  = 1", ""]);
+        // A fence inside a list item keeps the item's indent.
+        let rows = AssistantRows::with_markdown(style).rows("- item\n  ```sh\n  ls -l\n  ```", 40);
+        assert_eq!(
+            rows[1..],
+            ["  \u{1b}[2msh\u{1b}[0m".to_owned(), "  ls -l".to_owned()]
+        );
+    }
+
+    #[test]
+    fn code_rows_carry_the_code_background_at_truecolor() {
+        let mut style = crate::markdown::MarkdownStyle::attributes();
+        style.code_block.keyword = "\u{1b}[38;2;1;2;3m".to_owned();
+        style.code_block.reset = "\u{1b}[0m".to_owned();
+        style.code_bg = "\u{1b}[48;2;28;28;28m".to_owned();
+        let rows = AssistantRows::with_markdown(style.clone()).rows("```rust\nlet x = 1;\n```", 40);
+        assert_eq!(
+            rows[1],
+            "\u{1b}[48;2;28;28;28m\u{1b}[38;2;1;2;3mlet\u{1b}[0m\u{1b}[48;2;28;28;28m x = 1;\u{1b}[K\u{1b}[0m"
+        );
+        let mut grid = crate::Grid::new(20, 2).unwrap();
+        grid.feed(rows[1].as_bytes()).unwrap();
+        assert_eq!(grid.row_text(0), "let x = 1;");
+        // At sixteen colours there is no background, so rows stay plain.
+        style.code_bg = String::new();
+        let rows = AssistantRows::with_markdown(style).rows("```rust\nlet x = 1;\n```", 40);
+        assert_eq!(rows[1], "\u{1b}[38;2;1;2;3mlet\u{1b}[0m x = 1;");
     }
 
     #[test]
@@ -1215,7 +2057,11 @@ mod tests {
             assert_eq!(rows, AssistantRows::default().rows(&text, 18));
             previous = rows;
         }
-        assert!(previous.iter().any(|row| row.starts_with("    ↪ ")));
+        assert!(
+            previous
+                .iter()
+                .any(|row| row == "    call(\"alpha  beta\",  gamma);")
+        );
     }
 
     #[test]
@@ -1230,7 +2076,7 @@ mod tests {
                 "{opening}\n```\n~~~\n````suffix\n    abcdefghijkl\n{close}\nwords after the code"
             );
             let rows = AssistantRows::default().rows(&text, 12);
-            assert!(rows.iter().any(|row| row == "    ↪ ijkl"), "{rows:?}");
+            assert!(rows.iter().any(|row| row == "    abcdefghijkl"), "{rows:?}");
             assert_eq!(
                 &rows[rows.len().saturating_sub(2)..],
                 &["words after", "the code"]
@@ -1246,28 +2092,15 @@ mod tests {
     }
 
     #[test]
-    fn code_tabs_and_graphemes_fit_narrow_rows_without_losing_indentation() {
+    fn code_tabs_and_graphemes_stay_whole_at_narrow_widths() {
         let rows = AssistantRows::default().rows("~~~\n\t書e\u{301}👩‍💻書\n~~~", 12);
-        assert_eq!(
-            rows,
-            [
-                "~~~",
-                "        書e\u{301}",
-                "        ↪ 👩‍💻",
-                "        ↪ 書",
-                "~~~"
-            ]
-        );
-        assert!(rows.iter().all(|row| str_width(row) <= 12));
+        assert_eq!(rows, ["~~~", "        書e\u{301}👩‍💻書", "~~~"]);
         for width in 1..=12 {
             let rows = AssistantRows::default().rows("```\n                abcdef\n```", width);
-            assert!(rows.iter().all(|row| str_width(row) <= width), "{rows:?}");
-            let recovered: String = rows
-                .iter()
-                .flat_map(|row| row.chars())
-                .filter(char::is_ascii_alphabetic)
-                .collect();
-            assert_eq!(recovered, "abcdef");
+            assert!(
+                rows.iter().any(|row| row == "                abcdef"),
+                "{rows:?}"
+            );
         }
     }
 
@@ -1311,7 +2144,10 @@ mod tests {
         let expected: Vec<String> = wrap(text, 12)
             .into_iter()
             .enumerate()
-            .map(|(index, row)| format!("{}{row}", if index == 0 { "> " } else { "  " }))
+            .map(|(index, row)| {
+                let row = format!("{}{row}", if index == 0 { "\u{258c} " } else { "  " });
+                row.trim_end_matches(' ').to_owned()
+            })
             .collect();
         assert_eq!(render(&[Entry::user(text)], display), expected.join("\n"));
     }
@@ -1346,7 +2182,7 @@ mod tests {
     #[test]
     fn a_user_line_is_marked_so_it_is_distinguishable() {
         let rendered = render(&[Entry::user("hello")], Display::default());
-        assert_eq!(rendered, "> hello");
+        assert_eq!(rendered, "\u{258c} hello");
     }
 
     #[test]
@@ -1358,7 +2194,7 @@ mod tests {
         let rendered = render(&[Entry::user("a".repeat(60))], display);
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines.len() > 1, "{rendered}");
-        assert!(lines[0].starts_with("> "));
+        assert!(lines[0].starts_with("\u{258c} "));
         for line in lines.iter().skip(1) {
             assert!(
                 line.starts_with("  "),
@@ -1417,7 +2253,7 @@ mod tests {
             &[Entry::user("hi"), Entry::assistant("hello")],
             Display::default(),
         );
-        assert_eq!(rendered, "> hi\n\nhello");
+        assert_eq!(rendered, "\u{258c} hi\n\nhello");
     }
 
     #[test]
@@ -1606,7 +2442,7 @@ mod tests {
 
     #[test]
     fn an_empty_entry_renders_its_marker_only() {
-        assert_eq!(render(&[Entry::user("")], Display::default()), ">");
+        assert_eq!(render(&[Entry::user("")], Display::default()), "\u{258c}");
     }
 
     #[test]
@@ -1684,6 +2520,161 @@ mod tests {
                 let (row, caret) = render_prompt_at("> ", input, column, width);
                 assert!(str_width(&row) <= width, "{row:?} at width {width}");
                 assert!(caret < width.max(1), "caret {caret} at width {width}");
+            }
+        }
+    }
+
+    fn styled_lanes() -> Lanes {
+        Lanes {
+            reset: "<reset>".to_owned(),
+            user_rail: "<rail>".to_owned(),
+            dim: "<dim>".to_owned(),
+            warning: "<warning>".to_owned(),
+            error: "<error>".to_owned(),
+            ..Lanes::default()
+        }
+    }
+
+    #[test]
+    fn a_user_message_wraps_whole_under_its_rail() {
+        let first = "alpha ".repeat(30);
+        let second = "omega ".repeat(21);
+        let text = format!("{}\n{}", first.trim_end(), second.trim_end());
+        assert!(text.chars().count() >= 300, "{}", text.len());
+        let rendered = render_lanes(&[Entry::user(&text)], Display::default(), &styled_lanes());
+        let rows: Vec<&str> = rendered.lines().collect();
+        assert!((4..=5).contains(&rows.len()), "{rendered}");
+        assert!(
+            rows[0].starts_with("<rail>\u{258c}<reset> alpha"),
+            "{rendered}"
+        );
+        for row in rows.iter().skip(1) {
+            assert!(
+                row.starts_with("  ") && !row.contains('\u{258c}'),
+                "{rendered}"
+            );
+        }
+        let words: Vec<&str> = rows
+            .iter()
+            .flat_map(|row| row.split_whitespace())
+            .skip(1)
+            .collect();
+        assert_eq!(
+            words.join(" "),
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| str_width(&row.replace("<rail>", "").replace("<reset>", "")) <= 80),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ascii_user_rail_is_a_marker() {
+        let display = Display {
+            ascii: true,
+            width: 12,
+            ..Display::default()
+        };
+        let rendered = render(&[Entry::user("one two three four")], display);
+        assert_eq!(rendered, "> one two\n  three four");
+        assert!(!rendered.contains('\u{258c}'), "{rendered}");
+        let colourless = render(&[Entry::user("hi")], Display::default());
+        assert_eq!(
+            colourless, "\u{258c} hi",
+            "the shape carries the rail without colour"
+        );
+    }
+
+    #[test]
+    fn warning_and_error_entries_are_labelled_words() {
+        let display = Display {
+            width: 24,
+            ..Display::default()
+        };
+        let lanes = styled_lanes();
+        let warning = render_lanes(
+            &[Entry::warning("the server did not start in time")],
+            display,
+            &lanes,
+        );
+        let rows: Vec<&str> = warning.lines().collect();
+        assert_eq!(rows[0], "<warning>warning:<reset> the server did");
+        assert!(rows.len() > 1, "{warning}");
+        for row in rows.iter().skip(1) {
+            assert!(row.starts_with(&" ".repeat(9)), "{warning}");
+            assert!(!row.starts_with(&" ".repeat(10)), "{warning}");
+        }
+        let error = render_lanes(
+            &[Entry::error("the turn failed: no route", None)],
+            display,
+            &lanes,
+        );
+        let rows: Vec<&str> = error.lines().collect();
+        assert_eq!(rows[0], "<error>error:<reset> the turn failed:");
+        assert_eq!(rows[1], "       no route");
+        let info = render_lanes(&[Entry::notice("cancelled")], display, &lanes);
+        assert_eq!(info, "<dim>[cancelled]<reset>");
+        let plain = render(&[Entry::error("stopped", None)], Display::default());
+        assert_eq!(
+            plain, "error: stopped",
+            "the label is a word without colour"
+        );
+        assert_eq!(
+            render(&[Entry::warning("slow")], Display::default()),
+            "warning: slow"
+        );
+    }
+
+    #[test]
+    fn an_error_hint_is_its_own_dim_row() {
+        let entry = Entry::error(
+            "the turn failed: the endpoint returned HTTP 401",
+            Some("run `rune connect` to store a new key".to_owned()),
+        );
+        let rendered = render_lanes(
+            std::slice::from_ref(&entry),
+            Display::default(),
+            &styled_lanes(),
+        );
+        assert_eq!(
+            rendered,
+            "<error>error:<reset> the turn failed: the endpoint returned HTTP 401\n\
+             <dim>  run `rune connect` to store a new key<reset>"
+        );
+        assert_eq!(
+            accessible_lines(&[entry]),
+            [
+                "Notice: the turn failed: the endpoint returned HTTP 401",
+                "Notice: run `rune connect` to store a new key",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_rendered_row_ends_with_a_space() {
+        let entries = [
+            Entry::user("first line \n\n   \nlast "),
+            Entry::user(""),
+            Entry::assistant("answer  \n```\ncode   \n```\n"),
+            Entry::reasoning("thinking "),
+            Entry::tool("out \n\n"),
+            Entry::notice(" "),
+            Entry::warning("warned \n"),
+            Entry::error("failed ", Some("hint \n\nmore ".to_owned())),
+        ];
+        for ascii in [false, true] {
+            let display = Display {
+                ascii,
+                width: 10,
+                ..Display::default()
+            };
+            for lanes in [Lanes::default(), styled_lanes()] {
+                let rendered = render_lanes(&entries, display, &lanes);
+                for row in rendered.lines() {
+                    assert!(!row.ends_with(' '), "{row:?} in {rendered:?}");
+                }
             }
         }
     }

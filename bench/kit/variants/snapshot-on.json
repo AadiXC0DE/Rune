@@ -1,0 +1,8 @@
+{
+  "description": "The workspace snapshot in the first message of ask.",
+  "env": {
+    "RUNE_EXPERIMENT": "snapshot=on"
+  },
+  "flags": [],
+  "files": {}
+}

@@ -37,37 +37,218 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 #[cfg(not(unix))]
 pub const DEFAULT_SHELL: &str = "cmd.exe";
 
+/// The kind of shell commands run through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    /// `/bin/sh`, or any shell on a Unix host.
+    Posix,
+    /// PowerShell 7 (`pwsh.exe`).
+    PowerShell7,
+    /// Windows PowerShell 5.1 (`powershell.exe`), which ships with Windows.
+    WindowsPowerShell,
+    /// `cmd.exe`.
+    Cmd,
+    /// bash on Windows, such as the one Git for Windows installs.
+    Bash,
+}
+
+impl ShellKind {
+    /// Returns the name a person knows this shell by.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Posix => "sh",
+            Self::PowerShell7 => "PowerShell 7",
+            Self::WindowsPowerShell => "Windows PowerShell 5.1",
+            Self::Cmd => "cmd.exe",
+            Self::Bash => "bash",
+        }
+    }
+
+    /// Returns the kind of shell a program path names, from its file name.
+    ///
+    /// The kind is read from the program rather than stored beside it, so an
+    /// argv carries everything needed to rebuild it: the flags a verification
+    /// expects are the flags the program it names takes.
+    #[must_use]
+    pub fn of(program: &str) -> Self {
+        Self::of_on(program, cfg!(windows))
+    }
+
+    /// [`ShellKind::of`] for a chosen platform.
+    ///
+    /// A Unix host hands every shell its string with `-c`, so every program is
+    /// `Posix` there. On Windows a name this module does not know keeps the
+    /// `cmd.exe` flags, which every shell was given before the others were
+    /// recognized.
+    fn of_on(program: &str, windows: bool) -> Self {
+        if !windows {
+            return Self::Posix;
+        }
+        let name = file_name(program);
+        let stem = name
+            .len()
+            .checked_sub(4)
+            .filter(|&at| {
+                name.get(at..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(".exe"))
+            })
+            .and_then(|at| name.get(..at))
+            .unwrap_or(name);
+        if stem.eq_ignore_ascii_case("pwsh") {
+            Self::PowerShell7
+        } else if stem.eq_ignore_ascii_case("powershell") {
+            Self::WindowsPowerShell
+        } else if stem.eq_ignore_ascii_case("bash") {
+            Self::Bash
+        } else {
+            Self::Cmd
+        }
+    }
+}
+
+/// Returns the last component of a path written with either separator.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Returns the shell and its kind for this host.
+///
+/// On Windows the first of these that exists wins: `SHELL` naming an absolute
+/// `bash.exe` (Git Bash exports it to the programs it starts), `pwsh.exe` in a
+/// `PATH` directory, Windows PowerShell under the system directory, then
+/// `cmd.exe`. A Unix host always has `/bin/sh`. The answer is computed once, so
+/// every command in a run goes to the shell the prompt names.
+#[must_use]
+pub fn shell() -> (String, ShellKind) {
+    static SHELL: std::sync::OnceLock<(String, ShellKind)> = std::sync::OnceLock::new();
+    SHELL.get_or_init(detect_shell).clone()
+}
+
+/// Looks for this host's shell.
+#[cfg(windows)]
+fn detect_shell() -> (String, ShellKind) {
+    let variable = std::env::var("SHELL").ok();
+    let directories: Vec<String> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter_map(|directory| directory.into_os_string().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let root = std::env::var("SystemRoot")
+        .ok()
+        .or_else(|| std::env::var("windir").ok());
+    shell_from(
+        variable.as_deref(),
+        &directories,
+        root.as_deref(),
+        &|path| std::path::Path::new(path).is_file(),
+    )
+}
+
+/// Looks for this host's shell.
+#[cfg(not(windows))]
+fn detect_shell() -> (String, ShellKind) {
+    (DEFAULT_SHELL.to_owned(), ShellKind::Posix)
+}
+
+/// Chooses the Windows shell from the inputs that decide it.
+///
+/// Only absolute candidates are taken. A relative `PATH` entry resolves against
+/// the directory Rune started in, which is the workspace, so a `pwsh.exe`
+/// checked into a repository would otherwise run every command.
+#[cfg(any(windows, test))]
+fn shell_from(
+    variable: Option<&str>,
+    directories: &[String],
+    system_root: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> (String, ShellKind) {
+    if let Some(bash) = variable
+        && windows_absolute(bash)
+        && file_name(bash).eq_ignore_ascii_case("bash.exe")
+        && exists(bash)
+    {
+        return (bash.to_owned(), ShellKind::Bash);
+    }
+    if let Some(pwsh) = directories
+        .iter()
+        .filter(|directory| windows_absolute(directory))
+        .map(|directory| windows_join(directory, "pwsh.exe"))
+        .find(|candidate| exists(candidate))
+    {
+        return (pwsh, ShellKind::PowerShell7);
+    }
+    if let Some(root) = system_root.filter(|root| windows_absolute(root)) {
+        let system = windows_join(root, "System32");
+        let powershell = windows_join(&system, r"WindowsPowerShell\v1.0\powershell.exe");
+        if exists(&powershell) {
+            return (powershell, ShellKind::WindowsPowerShell);
+        }
+        let cmd = windows_join(&system, "cmd.exe");
+        if exists(&cmd) {
+            return (cmd, ShellKind::Cmd);
+        }
+    }
+    // A host that will not say where its system directory is gets the name,
+    // which is what Windows has always been handed here.
+    (String::from("cmd.exe"), ShellKind::Cmd)
+}
+
+/// Returns true for a path that names a drive or a share, as `C:\x` and
+/// `\\server\share` do; `\x` is relative to the current drive.
+#[cfg(any(windows, test))]
+fn windows_absolute(path: &str) -> bool {
+    matches!(path.as_bytes(), [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic())
+        || path.starts_with(r"\\")
+        || path.starts_with("//")
+}
+
+/// Joins a Windows directory and a relative path with one backslash.
+#[cfg(any(windows, test))]
+fn windows_join(directory: &str, relative: &str) -> String {
+    format!("{}\\{relative}", directory.trim_end_matches(['\\', '/']))
+}
+
 /// Returns the shell that parses a command string on this host.
 ///
 /// A shell has to be absolute to be verified as the program that was reviewed,
 /// and the platform that names its shell keeps it under the system directory,
 /// which is not always on the system drive. The conventional location is the
-/// fallback for a host that will not say where it is, so the value is always a
-/// path rather than a name to look up.
+/// fallback for a host that will not say where it is.
 #[must_use]
 pub fn default_shell() -> String {
-    #[cfg(windows)]
-    {
-        let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"));
-        if let Some(root) = root {
-            let candidate = Utf8PathBuf::from(root.to_string_lossy().into_owned())
-                .join("System32")
-                .join("cmd.exe");
-            if candidate.exists() {
-                return candidate.into_string();
-            }
-        }
-    }
-    DEFAULT_SHELL.to_owned()
+    shell().0
 }
 
-/// Flag that hands a shell one string to interpret.
-#[cfg(unix)]
-pub const SHELL_COMMAND_FLAG: &str = "-c";
+/// The arguments that hand a shell one command string.
+///
+/// Both PowerShells read the user's profile and may stop to ask a question
+/// unless told not to; a profile is code the reviewer never saw, and a question
+/// waits for an answer nobody can give.
+#[must_use]
+pub const fn command_flags(kind: ShellKind) -> &'static [&'static str] {
+    match kind {
+        ShellKind::Posix | ShellKind::Bash => &["-c"],
+        ShellKind::PowerShell7 | ShellKind::WindowsPowerShell => {
+            &["-NoProfile", "-NonInteractive", "-Command"]
+        }
+        ShellKind::Cmd => &["/C"],
+    }
+}
 
-/// Flag that hands a shell one string to interpret.
-#[cfg(not(unix))]
-pub const SHELL_COMMAND_FLAG: &str = "/C";
+/// Returns the argv that hands `command` to `shell` as one argument, with the
+/// flags the shell's kind takes.
+#[must_use]
+pub fn shell_argv(shell: &str, command: &str) -> Vec<String> {
+    let flags = command_flags(ShellKind::of(shell));
+    let mut argv = Vec::with_capacity(flags.len().saturating_add(2));
+    argv.push(shell.to_owned());
+    argv.extend(flags.iter().map(|flag| (*flag).to_owned()));
+    argv.push(command.to_owned());
+    argv
+}
 
 /// Tokens that make a command more than a program and its arguments.
 ///
@@ -137,15 +318,31 @@ impl Exit {
         matches!(self, Self::Code(0))
     }
 
+    /// Returns the status a shell reports for this exit: the code itself, or
+    /// 128 plus the signal for a signal death.
+    #[must_use]
+    pub const fn status(self) -> Option<i32> {
+        match self {
+            Self::Code(code) => Some(code),
+            Self::Signal(signal) => Some(signal.saturating_add(128)),
+            Self::Unknown => None,
+        }
+    }
+
     /// Returns a phrase describing how the command ended.
     #[must_use]
     pub fn describe(self) -> String {
         match self {
             Self::Code(code) => format!("exited with status {code}"),
-            Self::Signal(signal) => match signal_name(signal) {
-                Some(name) => format!("killed by signal {signal} ({name})"),
-                None => format!("killed by signal {signal}"),
-            },
+            Self::Signal(signal) => {
+                let status = signal.saturating_add(128);
+                match signal_name(signal) {
+                    Some(name) => {
+                        format!("killed by signal {signal} ({name}), exit status {status}")
+                    }
+                    None => format!("killed by signal {signal}, exit status {status}"),
+                }
+            }
             Self::Unknown => String::from("ended with an unknown status"),
         }
     }
@@ -260,11 +457,7 @@ pub fn prepare_shell(
         .with_hint("a shell resolved through PATH is not the program that was reviewed"));
     }
     Ok(PreparedCommand {
-        argv: vec![
-            shell.to_owned(),
-            String::from(SHELL_COMMAND_FLAG),
-            command.to_owned(),
-        ],
+        argv: shell_argv(shell, command),
         cwd: workspace.to_owned(),
         environment,
         limits: resource_limits(),
@@ -346,6 +539,35 @@ pub const ALLOWED_ENVIRONMENT: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    // Build and test settings a task sets for its commands.
+    "CI",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "CARGO_TARGET_DIR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "GOFLAGS",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_TOOL_OPTIONS",
+    "MAVEN_OPTS",
+    "GRADLE_USER_HOME",
+    "DOTNET_ROOT",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "CMAKE_PREFIX_PATH",
+    "DOCKER_HOST",
+    "KUBECONFIG",
+    "SOURCE_DATE_EPOCH",
+    "DEBIAN_FRONTEND",
 ];
 
 /// Environment variables a command may receive.
@@ -400,6 +622,33 @@ pub const ALLOWED_ENVIRONMENT: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    // Build and test settings a task sets for its commands.
+    "CI",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "CARGO_TARGET_DIR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "GOFLAGS",
+    "GOCACHE",
+    "GOMODCACHE",
+    "JAVA_TOOL_OPTIONS",
+    "MAVEN_OPTS",
+    "GRADLE_USER_HOME",
+    "DOTNET_ROOT",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "CMAKE_PREFIX_PATH",
+    "DOCKER_HOST",
+    "KUBECONFIG",
+    "SOURCE_DATE_EPOCH",
+    "DEBIAN_FRONTEND",
 ];
 
 /// Returns the environment a command is given when the caller names none.
@@ -418,11 +667,136 @@ pub fn minimal_environment() -> BTreeMap<String, String> {
             environment.insert(name.to_owned(), value);
         }
     }
-    if !environment.contains_key("PATH") {
-        environment.insert("PATH".to_owned(), default_path());
+    fill_search_defaults(&mut environment);
+    environment
+}
+
+/// Extra variables a user chose to pass to commands, and the ones never passed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvironmentPolicy {
+    /// Exact names, `PREFIX_*` patterns, or the single value `*`.
+    pub passthrough: Vec<String>,
+    /// Names never passed, whatever `passthrough` says (the active credential variables).
+    pub withheld: Vec<String>,
+}
+
+/// Variables set for commands when the environment does not already hold them.
+///
+/// A pager or a credential prompt waits for a person who is not there, and a
+/// progress bar fills the output with redraws, so each is off unless the
+/// environment says otherwise.
+pub const QUIET_DEFAULTS: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("PIP_PROGRESS_BAR", "off"),
+    ("TQDM_DISABLE", "1"),
+    ("AI_AGENT", "rune"),
+];
+
+/// Words that mark a variable as a secret, which a pattern never passes.
+const SECRET_WORDS: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+
+/// Returns the environment for a shell command.
+///
+/// The minimal environment, plus what `policy` passes, minus what it
+/// withholds, with the quiet defaults. A command without a terminal gets
+/// `TERM=dumb` and `NO_COLOR=1`: the inherited `TERM` describes Rune's own
+/// terminal, not the pipe the command writes to.
+#[must_use]
+pub fn command_environment(policy: &EnvironmentPolicy, terminal: bool) -> BTreeMap<String, String> {
+    command_environment_from(std::env::vars_os(), policy, terminal)
+}
+
+/// The allowed spelling of a variable name, if it is allowed.
+///
+/// Windows names are case-insensitive and its search path is usually spelled
+/// `Path`, so there a name matches in any case and takes the allowed spelling.
+fn allowed_name(name: &str) -> Option<&'static str> {
+    ALLOWED_ENVIRONMENT.iter().copied().find(|allowed| {
+        if cfg!(windows) {
+            allowed.eq_ignore_ascii_case(name)
+        } else {
+            *allowed == name
+        }
+    })
+}
+
+/// [`command_environment`] over the given variables instead of this process's.
+fn command_environment_from(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    policy: &EnvironmentPolicy,
+    terminal: bool,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for (name, value) in variables {
+        // A name or value that is not valid UTF-8 is left out rather than
+        // lossily converted, as in the minimal environment.
+        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+            continue;
+        };
+        if let Some(allowed) = allowed_name(&name) {
+            environment.insert(allowed.to_owned(), value);
+        } else if passes(&name, &policy.passthrough) {
+            environment.insert(name, value);
+        }
+    }
+    fill_search_defaults(&mut environment);
+    for name in &policy.withheld {
+        environment.remove(name);
+    }
+    for &(name, value) in QUIET_DEFAULTS {
+        environment
+            .entry(name.to_owned())
+            .or_insert_with(|| value.to_owned());
+    }
+    if !terminal {
+        environment.insert("TERM".to_owned(), "dumb".to_owned());
+        environment.insert("NO_COLOR".to_owned(), "1".to_owned());
     }
     environment
 }
+
+/// Whether `passthrough` passes the variable `name`.
+///
+/// An exact name always passes. `*` and `PREFIX_*` patterns pass a name only
+/// when it does not look like a secret, so a broad pattern cannot hand a
+/// command a token by accident.
+fn passes(name: &str, passthrough: &[String]) -> bool {
+    if passthrough.iter().any(|entry| entry == name) {
+        return true;
+    }
+    let matched = passthrough.iter().any(|entry| {
+        entry == "*"
+            || entry
+                .strip_suffix('*')
+                .is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+    });
+    let upper = name.to_ascii_uppercase();
+    matched && !SECRET_WORDS.iter().any(|word| upper.contains(word))
+}
+
+/// Gives a command the variables it finds programs through when this process
+/// has none to pass on.
+///
+/// Windows also needs `PATHEXT`: `cmd.exe` falls back to a built-in list, but
+/// PowerShell without it cannot find `sh.exe` from `sh`, and reports the
+/// program as missing.
+fn fill_search_defaults(environment: &mut BTreeMap<String, String>) {
+    if !environment.contains_key("PATH") {
+        environment.insert("PATH".to_owned(), default_path());
+    }
+    #[cfg(windows)]
+    if !environment.contains_key("PATHEXT") {
+        environment.insert("PATHEXT".to_owned(), DEFAULT_PATHEXT.to_owned());
+    }
+}
+
+/// The extensions a fresh Windows installation searches for, in its order.
+#[cfg(windows)]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
 
 /// Returns a search path for a process that has none of its own.
 ///
@@ -468,11 +842,7 @@ pub fn shell_reason(command: &str) -> Option<&'static str> {
 /// Returns the argv a command routes to.
 fn route(command: &str, shell: &str) -> Vec<String> {
     if requires_shell(command) {
-        vec![
-            shell.to_owned(),
-            String::from(SHELL_COMMAND_FLAG),
-            command.to_owned(),
-        ]
+        shell_argv(shell, command)
     } else {
         command.split_whitespace().map(str::to_owned).collect()
     }
@@ -519,9 +889,19 @@ pub fn verify_unchanged(prepared: &PreparedCommand) -> Result<()> {
 }
 
 /// Returns the shell an argv invokes the reviewed string with, if it does.
+///
+/// The flags between the shell and the string have to be exactly the ones the
+/// shell's kind takes, so a flag added or dropped is a changed route.
 fn shell_invocation(prepared: &PreparedCommand) -> Option<&str> {
     match prepared.argv.as_slice() {
-        [shell, flag, command] if flag == SHELL_COMMAND_FLAG && command == &prepared.reviewed => {
+        [shell, flags @ .., command]
+            if command == &prepared.reviewed
+                && !flags.is_empty()
+                && flags
+                    .iter()
+                    .map(String::as_str)
+                    .eq(command_flags(ShellKind::of(shell)).iter().copied()) =>
+        {
             Some(shell)
         }
         _ => None,
@@ -952,7 +1332,7 @@ fn tasks_in_loadavg(text: &str) -> Option<u64> {
 /// Callers fall back to ending the direct child, which is the only process the
 /// standard library can stop without a signal.
 #[cfg(not(unix))]
-fn signal_group(_group: u32, _name: &str) -> bool {
+pub fn signal_group(_group: u32, _name: &str) -> bool {
     false
 }
 
@@ -962,7 +1342,7 @@ fn signal_group(_group: u32, _name: &str) -> bool {
 /// be signalled, and there is nothing left to stop, so the caller treats a
 /// failed delivery as complete.
 #[cfg(unix)]
-fn signal_group(group: u32, name: &str) -> bool {
+pub fn signal_group(group: u32, name: &str) -> bool {
     let target = format!("-{group}");
     KILL_PROGRAMS.iter().any(|program| {
         Command::new(program)
@@ -1119,6 +1499,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[cfg(unix)]
@@ -1134,6 +1515,21 @@ mod tests {
     /// Returns a condition that never cancels.
     fn never() -> bool {
         false
+    }
+
+    #[test]
+    fn a_signal_exit_reports_status_128_plus_the_signal() {
+        assert_eq!(Exit::Signal(9).status(), Some(137));
+        assert_eq!(Exit::Code(3).status(), Some(3));
+        assert_eq!(Exit::Unknown.status(), None);
+        assert_eq!(
+            Exit::Signal(9).describe(),
+            "killed by signal 9 (SIGKILL), exit status 137"
+        );
+        assert_eq!(
+            Exit::Signal(64).describe(),
+            "killed by signal 64, exit status 192"
+        );
     }
 
     /// Returns a temporary workspace and the guard that owns it.
@@ -1237,7 +1633,7 @@ mod tests {
             let prepared = prepare(command, dir.as_path(), None, environment()).expect("prepare");
             assert_eq!(
                 prepared.argv,
-                [default_shell().as_str(), SHELL_COMMAND_FLAG, command],
+                shell_argv(&default_shell(), command),
                 "`{command}` did not route through the shell"
             );
             assert_eq!(prepared.reviewed, command);
@@ -1253,10 +1649,7 @@ mod tests {
         let named = default_shell();
         let prepared =
             prepare("echo a | cat", dir.as_path(), Some(&named), environment()).expect("prepare");
-        assert_eq!(
-            prepared.argv,
-            [named.as_str(), SHELL_COMMAND_FLAG, "echo a | cat"]
-        );
+        assert_eq!(prepared.argv, shell_argv(&named, "echo a | cat"));
 
         let bare = Utf8Path::new(&named)
             .file_name()
@@ -1536,6 +1929,152 @@ mod tests {
             minimal_environment().contains_key("SystemRoot"),
             "a command would be unable to start a system program"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_command_on_windows_can_find_a_program_without_its_extension() {
+        let environment = environment_of(&[("PATH", r"C:\Windows\system32")], &[], &[], false);
+        assert_eq!(
+            environment.get("PATHEXT").map(String::as_str),
+            Some(DEFAULT_PATHEXT)
+        );
+        // A list this process has is passed on as it is.
+        let environment = environment_of(
+            &[("PATH", r"C:\Windows\system32"), ("PATHEXT", ".EXE")],
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(environment.get("PATHEXT").map(String::as_str), Some(".EXE"));
+    }
+
+    /// Runs `command_environment_from` over a fixed set of variables.
+    fn environment_of(
+        variables: &[(&str, &str)],
+        passthrough: &[&str],
+        withheld: &[&str],
+        terminal: bool,
+    ) -> BTreeMap<String, String> {
+        let policy = EnvironmentPolicy {
+            passthrough: passthrough
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            withheld: withheld.iter().map(|entry| (*entry).to_owned()).collect(),
+        };
+        command_environment_from(
+            variables.iter().map(|(name, value)| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(value),
+                )
+            }),
+            &policy,
+            terminal,
+        )
+    }
+
+    #[test]
+    fn the_search_path_keeps_its_value_whatever_its_spelling() {
+        let environment = environment_of(&[("Path", r"C:\Tools;C:\Windows")], &[], &[], false);
+        if cfg!(windows) {
+            assert_eq!(
+                environment.get("PATH").map(String::as_str),
+                Some(r"C:\Tools;C:\Windows")
+            );
+            assert!(!environment.contains_key("Path"));
+        } else {
+            // A different name on Unix: not the search path, and not allowed.
+            assert!(!environment.contains_key("Path"));
+            assert_eq!(environment.get("PATH"), Some(&default_path()));
+        }
+    }
+
+    #[test]
+    fn passthrough_includes_build_variables_without_configuration() {
+        let environment = environment_of(&[("PYTHONPATH", "/x"), ("OTHER", "y")], &[], &[], false);
+        assert_eq!(
+            environment.get("PYTHONPATH").map(String::as_str),
+            Some("/x")
+        );
+        assert!(!environment.contains_key("OTHER"));
+    }
+
+    #[test]
+    fn passthrough_patterns_skip_secret_names_unless_listed_exactly() {
+        let variables = [("MYAPP_TOKEN", "s"), ("MYAPP_HOST", "h")];
+        let pattern = environment_of(&variables, &["MYAPP_*"], &[], false);
+        assert!(!pattern.contains_key("MYAPP_TOKEN"));
+        assert_eq!(pattern.get("MYAPP_HOST").map(String::as_str), Some("h"));
+        let exact = environment_of(&variables, &["MYAPP_TOKEN"], &[], false);
+        assert_eq!(exact.get("MYAPP_TOKEN").map(String::as_str), Some("s"));
+    }
+
+    #[test]
+    fn passthrough_everything_still_withholds_secrets_and_credentials() {
+        let variables = [
+            ("DATABASE_URL", "postgres://db"),
+            ("GITHUB_TOKEN", "t"),
+            ("OPENAI_API_KEY", "k"),
+            ("db_password", "p"),
+        ];
+        let environment = environment_of(
+            &variables,
+            &["*", "OPENAI_API_KEY"],
+            &["OPENAI_API_KEY"],
+            false,
+        );
+        assert_eq!(
+            environment.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://db")
+        );
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+        assert!(!environment.contains_key("db_password"));
+        assert!(!environment.contains_key("OPENAI_API_KEY"), "withheld wins");
+    }
+
+    #[test]
+    fn quiet_defaults_fill_only_what_is_unset() {
+        let set = environment_of(&[("PAGER", "less")], &["*"], &[], false);
+        assert_eq!(set.get("PAGER").map(String::as_str), Some("less"));
+        let unset = environment_of(&[], &[], &[], false);
+        for &(name, value) in QUIET_DEFAULTS {
+            assert_eq!(unset.get(name).map(String::as_str), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn quiet_defaults_make_a_pipe_dumb_but_leave_a_terminal() {
+        let piped = environment_of(&[("TERM", "xterm-256color")], &[], &[], false);
+        assert_eq!(piped.get("TERM").map(String::as_str), Some("dumb"));
+        assert_eq!(piped.get("NO_COLOR").map(String::as_str), Some("1"));
+        let terminal = environment_of(&[("TERM", "xterm-256color")], &[], &[], true);
+        assert_eq!(
+            terminal.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert!(!terminal.contains_key("NO_COLOR"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_leaves_out_values_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let policy = EnvironmentPolicy {
+            passthrough: vec!["*".to_owned()],
+            withheld: Vec::new(),
+        };
+        let environment = command_environment_from(
+            [(
+                std::ffi::OsString::from("BINARY_VALUE"),
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            )],
+            &policy,
+            false,
+        );
+        assert!(!environment.contains_key("BINARY_VALUE"));
+        assert!(environment.contains_key("PATH"));
     }
 
     #[test]
@@ -1881,6 +2420,161 @@ mod tests {
                 "`{command}` was refused"
             );
         }
+    }
+
+    /// Runs `shell_from` with a fixed set of files that exist.
+    fn shell_with(
+        variable: Option<&str>,
+        directories: &[&str],
+        system_root: Option<&str>,
+        files: &[&str],
+    ) -> (String, ShellKind) {
+        let directories: Vec<String> = directories
+            .iter()
+            .map(|directory| (*directory).to_owned())
+            .collect();
+        shell_from(variable, &directories, system_root, &|path| {
+            files.iter().any(|file| file.eq_ignore_ascii_case(path))
+        })
+    }
+
+    const GIT_BASH: &str = r"C:\Program Files\Git\bin\bash.exe";
+    const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
+    const WINDOWS_POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    const CMD: &str = r"C:\Windows\System32\cmd.exe";
+
+    #[test]
+    fn git_bash_wins_when_shell_points_at_it() {
+        let all = [GIT_BASH, PWSH, WINDOWS_POWERSHELL, CMD];
+        let dirs = [r"C:\Program Files\PowerShell\7"];
+        assert_eq!(
+            shell_with(Some(GIT_BASH), &dirs, Some(r"C:\Windows"), &all),
+            (GIT_BASH.to_owned(), ShellKind::Bash)
+        );
+        // The bash Git keeps under `usr` is the same shell.
+        let usr = r"C:\Program Files\Git\usr\bin\bash.exe";
+        assert_eq!(
+            shell_with(Some(usr), &dirs, Some(r"C:\Windows"), &[usr, CMD]),
+            (usr.to_owned(), ShellKind::Bash)
+        );
+        // A `SHELL` that names a missing file, a relative path, or another
+        // program is ignored.
+        for ignored in [
+            r"C:\missing\bash.exe",
+            r"bin\bash.exe",
+            r"C:\Git\bin\sh.exe",
+        ] {
+            assert_eq!(
+                shell_with(Some(ignored), &dirs, Some(r"C:\Windows"), &all).1,
+                ShellKind::PowerShell7,
+                "{ignored}"
+            );
+        }
+    }
+
+    #[test]
+    fn pwsh_comes_before_windows_powershell() {
+        let all = [PWSH, WINDOWS_POWERSHELL, CMD];
+        assert_eq!(
+            shell_with(
+                None,
+                &[r"C:\Windows\System32", r"C:\Program Files\PowerShell\7\"],
+                Some(r"C:\Windows"),
+                &all
+            ),
+            (PWSH.to_owned(), ShellKind::PowerShell7)
+        );
+        assert_eq!(
+            shell_with(None, &[r"C:\Windows\System32"], Some(r"C:\Windows"), &all),
+            (WINDOWS_POWERSHELL.to_owned(), ShellKind::WindowsPowerShell)
+        );
+        // A relative directory resolves against the workspace, so a `pwsh.exe`
+        // there is not taken.
+        assert_eq!(
+            shell_with(
+                None,
+                &["tools", r"\tools"],
+                Some(r"C:\Windows"),
+                &[r"tools\pwsh.exe", r"\tools\pwsh.exe", WINDOWS_POWERSHELL]
+            ),
+            (WINDOWS_POWERSHELL.to_owned(), ShellKind::WindowsPowerShell)
+        );
+    }
+
+    #[test]
+    fn cmd_is_the_last_resort() {
+        assert_eq!(
+            shell_with(None, &[r"C:\Windows\System32"], Some(r"C:\Windows"), &[CMD]),
+            (CMD.to_owned(), ShellKind::Cmd)
+        );
+        // A system directory on another drive is where its programs are.
+        assert_eq!(
+            shell_with(
+                None,
+                &[],
+                Some(r"D:\WINNT"),
+                &[r"D:\WINNT\System32\cmd.exe"]
+            ),
+            (r"D:\WINNT\System32\cmd.exe".to_owned(), ShellKind::Cmd)
+        );
+        assert_eq!(
+            shell_with(None, &[], None, &[]),
+            (String::from("cmd.exe"), ShellKind::Cmd)
+        );
+    }
+
+    #[test]
+    fn the_kind_is_read_from_the_program_file_name() {
+        for (program, kind) in [
+            (PWSH, ShellKind::PowerShell7),
+            ("C:/tools/PWSH.EXE", ShellKind::PowerShell7),
+            (WINDOWS_POWERSHELL, ShellKind::WindowsPowerShell),
+            (GIT_BASH, ShellKind::Bash),
+            (CMD, ShellKind::Cmd),
+            ("cmd", ShellKind::Cmd),
+            (r"C:\tools\nu.exe", ShellKind::Cmd),
+        ] {
+            assert_eq!(ShellKind::of_on(program, true), kind, "{program}");
+            assert_eq!(ShellKind::of_on(program, false), ShellKind::Posix);
+        }
+        assert_eq!(command_flags(ShellKind::Posix), ["-c"]);
+        assert_eq!(command_flags(ShellKind::Bash), ["-c"]);
+        assert_eq!(command_flags(ShellKind::Cmd), ["/C"]);
+        for kind in [ShellKind::PowerShell7, ShellKind::WindowsPowerShell] {
+            assert_eq!(
+                command_flags(kind),
+                ["-NoProfile", "-NonInteractive", "-Command"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_shell_is_absolute_and_takes_its_own_flags() {
+        let (shell, kind) = shell();
+        assert!(Utf8Path::new(&shell).is_absolute(), "{shell}");
+        assert_eq!(default_shell(), shell);
+        assert_eq!(ShellKind::of(&shell), kind);
+        if cfg!(unix) {
+            assert_eq!((shell.as_str(), kind), ("/bin/sh", ShellKind::Posix));
+        }
+    }
+
+    #[test]
+    fn a_shell_route_with_changed_flags_is_refused() {
+        let (_dir, dir) = tempdir();
+        let prepared =
+            prepare("echo a | cat", dir.as_path(), None, environment()).expect("prepare");
+        assert!(verify_unchanged(&prepared).is_ok());
+        let flags = prepared.argv.len().saturating_sub(2);
+        assert!(flags >= 1, "{:?}", prepared.argv);
+
+        // A flag dropped from the middle, and one added before the string.
+        let mut dropped = prepared.clone();
+        dropped.argv.remove(flags);
+        assert!(verify_unchanged(&dropped).is_err(), "{:?}", dropped.argv);
+        let mut added = prepared.clone();
+        added.argv.insert(1, String::from("-x"));
+        assert!(verify_unchanged(&added).is_err(), "{:?}", added.argv);
     }
 
     #[test]

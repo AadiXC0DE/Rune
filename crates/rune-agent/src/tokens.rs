@@ -1,29 +1,108 @@
 //! Token accounting and context budgets.
 //!
-//! The estimator drives the compaction trigger, so its accuracy matters: too
-//! coarse and compaction fires late and the request is rejected, too eager and
-//! the session summarizes constantly. It is a byte-derived heuristic calibrated
-//! per model from observed usage, and the calibration is stored rather than
-//! recomputed.
+//! The estimate drives the compaction trigger. It is the provider's reported
+//! input for the latest request, plus four bytes per token for whatever was
+//! added since; with no report yet it is four bytes per token for the whole
+//! request.
 
-use rune_core::budget::{BudgetSet, LimitName};
+use rune_core::budget::{Budget, BudgetSet, LimitName};
+use rune_core::error::{ErrorCode, Result, RuneError};
+use std::collections::BTreeMap;
+
+use rune_net::message::{ContentPart, Role};
+use rune_net::provider::{Provider, RequestPlan};
 use serde::{Deserialize, Serialize};
 
 /// Divisor applied to a byte count to estimate tokens.
 ///
 /// Four bytes per token is the long-standing working figure for English text and
-/// source code in the byte-pair vocabularies the current models use. It is a
-/// starting point that calibration replaces.
+/// source code in the byte-pair vocabularies the current models use. It applies
+/// to whatever the provider has not yet counted.
 pub const DEFAULT_BYTES_PER_TOKEN: u64 = 4;
 
-/// Plausible range for an observed bytes-per-token ratio.
-///
-/// An observation outside this range is not a measurement of the tokenizer: it
-/// is a degenerate report, such as a byte count with a near-zero token count.
-/// Folding one in would corrupt the estimate for every later decision, so it is
-/// rejected rather than clamped.
-const MIN_PLAUSIBLE_BYTES_PER_TOKEN: f64 = 1.0;
-const MAX_PLAUSIBLE_BYTES_PER_TOKEN: f64 = 16.0;
+/// Tokens charged for one image, whatever its encoded size.
+pub const IMAGE_TOKENS: u64 = 1_500;
+
+/// The size of one built request, measured the way the estimate needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Measure {
+    /// Serialized body bytes, minus the base64 bytes of attached images.
+    pub text_bytes: u64,
+    /// Image parts in the request.
+    pub images: u64,
+}
+
+/// Reported input of one completed request, kept to anchor the next estimate.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Anchor {
+    /// Dialect name (`Provider::name`) and model the request went to.
+    pub dialect: String,
+    pub model: String,
+    /// Input tokens the provider reported, cached parts included.
+    pub input_tokens: u64,
+    /// The measure of that request.
+    pub measure: Measure,
+}
+
+/// Measures a plan as the dialect would send it.
+pub fn measure(dialect: &dyn Provider, plan: &RequestPlan) -> Result<Measure> {
+    let body = dialect.build_request(plan)?;
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+        .len() as u64;
+    Ok(measure_body(bytes, plan))
+}
+
+/// Measures a plan whose serialized body is `body_bytes` long.
+pub(crate) fn measure_body(body_bytes: u64, plan: &RequestPlan) -> Measure {
+    let mut measure = Measure {
+        text_bytes: body_bytes,
+        images: 0,
+    };
+    for part in plan.messages.iter().flat_map(|message| &message.parts) {
+        if let ContentPart::Image { image } = part {
+            measure.images = measure.images.saturating_add(1);
+            if let Some(data) = plan.image_data.get(&image.id) {
+                measure.text_bytes = measure.text_bytes.saturating_sub(data.len() as u64);
+            }
+        }
+    }
+    measure
+}
+
+/// Estimates the input tokens of a request.
+/// Returns the estimate and whether it was anchored.
+#[must_use]
+pub fn estimate_input(
+    now: Measure,
+    anchor: Option<&Anchor>,
+    dialect: &str,
+    model: &str,
+) -> (u64, bool) {
+    if let Some(anchor) = anchor
+        && anchor.dialect == dialect
+        && anchor.model == model
+        && now.text_bytes >= anchor.measure.text_bytes
+        && now.images >= anchor.measure.images
+    {
+        let appended = estimate_tokens(now.text_bytes.saturating_sub(anchor.measure.text_bytes));
+        let images = now
+            .images
+            .saturating_sub(anchor.measure.images)
+            .saturating_mul(IMAGE_TOKENS);
+        return (
+            anchor
+                .input_tokens
+                .saturating_add(appended)
+                .saturating_add(images),
+            true,
+        );
+    }
+    (
+        estimate_tokens(now.text_bytes).saturating_add(now.images.saturating_mul(IMAGE_TOKENS)),
+        false,
+    )
+}
 
 /// An estimate of the tokens a request will occupy.
 ///
@@ -41,7 +120,7 @@ pub struct Estimate {
     pub output_tokens: u64,
     /// Usable input capacity for this model.
     pub capacity: u64,
-    /// Whether the estimate was calibrated against observed usage.
+    /// Whether the estimate was anchored on provider-reported usage.
     pub calibrated: bool,
 }
 
@@ -92,81 +171,10 @@ impl Estimate {
     }
 }
 
-/// Estimates tokens from a byte count.
-///
-/// The divisor is not a guess at the model's tokenizer: it is a stable working
-/// figure that the calibration below corrects once a real response reports its
-/// own counts.
+/// Estimates tokens from a byte count, rounding up.
 #[must_use]
 pub fn estimate_tokens(bytes: u64) -> u64 {
-    bytes.saturating_div(DEFAULT_BYTES_PER_TOKEN)
-}
-
-/// Per-model calibration derived from observed usage.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub struct Calibration {
-    /// Bytes per token observed for this model.
-    pub bytes_per_token: f64,
-    /// Requests this calibration was derived from.
-    pub samples: u32,
-}
-
-impl Default for Calibration {
-    fn default() -> Self {
-        Self {
-            bytes_per_token: DEFAULT_BYTES_PER_TOKEN as f64,
-            samples: 0,
-        }
-    }
-}
-
-impl Calibration {
-    /// Returns the divisor in use.
-    fn divisor(&self) -> f64 {
-        self.bytes_per_token
-    }
-
-    /// Folds one observed request into the calibration.
-    ///
-    /// Uses a running mean so a single unusual request moves the estimate a
-    /// little rather than a lot. An observation outside the plausible range is
-    /// rejected outright, because folding it in would corrupt every later
-    /// decision rather than merely skewing one.
-    pub fn observe(&mut self, serialized_bytes: u64, reported_input_tokens: u64) {
-        if reported_input_tokens == 0 || serialized_bytes == 0 {
-            return;
-        }
-        let observed = serialized_bytes as f64 / reported_input_tokens as f64;
-        if !observed.is_finite()
-            || observed < MIN_PLAUSIBLE_BYTES_PER_TOKEN
-            || observed > MAX_PLAUSIBLE_BYTES_PER_TOKEN
-        {
-            return;
-        }
-        let samples = f64::from(self.samples);
-        // Weight the new observation at one over the sample count, so the first
-        // sample defines the value and each later one nudges it.
-        let weight = 1.0 / (samples + 1.0);
-        self.bytes_per_token = self
-            .bytes_per_token
-            .mul_add(1.0 - weight, observed * weight);
-        self.samples = self.samples.saturating_add(1);
-    }
-
-    /// Estimates tokens with this calibration applied.
-    #[must_use]
-    pub fn estimate(&self, bytes: u64) -> u64 {
-        let divisor = self.divisor();
-        if !divisor.is_finite() || divisor < f64::EPSILON {
-            return estimate_tokens(bytes);
-        }
-        let tokens = bytes as f64 / divisor;
-        if !tokens.is_finite() || tokens < 0.0 {
-            return estimate_tokens(bytes);
-        }
-        // A saturating cast: an absurdly large input clamps rather than wrapping.
-        tokens.min(u64::MAX as f64) as u64
-    }
+    bytes.div_ceil(DEFAULT_BYTES_PER_TOKEN)
 }
 
 /// The usable input capacity for a model.
@@ -213,13 +221,63 @@ impl CapacityDecision {
     }
 }
 
-/// Percentage points below the trigger at which the caller is warned.
-const APPROACHING_BAND_PERCENT: u8 = 10;
+/// Percentage points below the ceiling at which the caller is warned.
+const APPROACHING_BAND_PERCENT: u64 = 10;
+
+/// Share of the window held back, and its floor for windows of 32,000 tokens or more.
+pub const RESERVE_PERCENT: u64 = 15;
+pub const RESERVE_FLOOR: u64 = 16_000;
+
+/// Smallest window the reserve floor applies to.
+const RESERVE_FLOOR_FROM: u64 = 32_000;
+
+/// The window the ceiling is computed from: the model's window, capped by
+/// `context_cap_tokens` unless that is zero.
+#[must_use]
+pub fn effective_window(window: u64, limits: &BudgetSet) -> u64 {
+    match limits.get(LimitName::ContextCapTokens) {
+        Budget::Bounded(cap) if cap > 0 => window.min(cap),
+        _ => window,
+    }
+}
+
+/// The input-token level at which compaction is required, or `None` for an unknown window.
+///
+/// An explicitly configured `compaction_trigger_percent` replaces the reserve.
+#[must_use]
+pub fn ceiling(window: u64, limits: &BudgetSet) -> Option<u64> {
+    if window == 0 {
+        return None;
+    }
+    let effective = effective_window(window, limits);
+    if limits.source(LimitName::CompactionTriggerPercent).is_some() {
+        return Some(effective.saturating_mul(u64::from(trigger_percent(limits))) / 100);
+    }
+    let floor = if effective >= RESERVE_FLOOR_FROM {
+        RESERVE_FLOOR
+    } else {
+        0
+    };
+    let reserve = (effective.saturating_mul(RESERVE_PERCENT) / 100).max(floor);
+    Some(effective.saturating_sub(reserve))
+}
+
+/// The percent of usable input at which a request is compacted.
+#[must_use]
+pub fn trigger_percent(limits: &BudgetSet) -> u8 {
+    u8::try_from(
+        limits
+            .get_usize(LimitName::CompactionTriggerPercent)
+            .min(99),
+    )
+    .unwrap_or(80)
+}
 
 /// Decides what to do about the current capacity.
 ///
-/// The trigger is a percentage of usable input, taken from the limits so it can
-/// be tuned without a rebuild. The approaching band sits ten points below it,
+/// Compaction is required once the input reaches `ceiling` (see [`ceiling`]),
+/// or when the input and the output reserve together exceed the capacity. The
+/// approaching band sits ten percentage points of capacity below the ceiling,
 /// which gives the caller one request of warning before compaction is required.
 /// `estimate` measures the full request; `retained_estimate` measures the request
 /// after removing the planned prefix, including any fixed request overhead. If
@@ -228,22 +286,16 @@ const APPROACHING_BAND_PERCENT: u8 = 10;
 pub fn decide_capacity(
     estimate: &Estimate,
     retained_estimate: &Estimate,
-    limits: &BudgetSet,
+    ceiling: u64,
 ) -> CapacityDecision {
-    let trigger = u8::try_from(
-        limits
-            .get_usize(LimitName::CompactionTriggerPercent)
-            .min(99),
-    )
-    .unwrap_or(80);
-    let used = estimate.used_percent();
+    let band = estimate.capacity.saturating_mul(APPROACHING_BAND_PERCENT) / 100;
 
     if retained_estimate.total_tokens() > estimate.capacity {
         // Only the retained request proves that removing the prefix cannot help.
         CapacityDecision::OverCapacity
-    } else if estimate.total_tokens() > estimate.capacity || used >= trigger {
+    } else if estimate.total_tokens() > estimate.capacity || estimate.input_tokens >= ceiling {
         CapacityDecision::Compact
-    } else if used.saturating_add(APPROACHING_BAND_PERCENT) >= trigger {
+    } else if estimate.input_tokens.saturating_add(band) >= ceiling {
         CapacityDecision::Approaching
     } else {
         CapacityDecision::Fits
@@ -297,6 +349,211 @@ impl UsageTotals {
     }
 }
 
+/// Bytes of the instruction sections, recorded once when a host builds them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InstructionSizes {
+    /// The base system prompt and the tool guidance.
+    pub base: usize,
+    /// The skill catalog.
+    pub skill_catalog: usize,
+    /// Project instruction files.
+    pub project: usize,
+    /// The repository map.
+    pub map: usize,
+}
+
+/// The parts a [`ContextBreakdown`] reports.
+pub const CONTEXT_PARTS: [&str; 11] = [
+    "base_prompt",
+    "tool_schemas",
+    "skill_catalog",
+    "project_instructions",
+    "repository_map",
+    "user_messages",
+    "assistant_text",
+    "reasoning",
+    "tool_results",
+    "checkpoint",
+    "other",
+];
+
+/// Where the estimated tokens of one request go.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContextBreakdown {
+    /// The estimated input tokens of the request.
+    pub total_tokens: u64,
+    /// Whether the estimate was anchored on provider-reported usage.
+    pub anchored: bool,
+    /// The input-token level at which compaction is required, when the window is known.
+    pub ceiling_tokens: Option<u64>,
+    /// Tokens left under the ceiling, when the window is known.
+    pub free_tokens: Option<u64>,
+    /// Tokens by part; every key is present, zero when empty.
+    pub parts: BTreeMap<&'static str, u64>,
+    /// Tool result tokens by tool name.
+    pub tool_results: BTreeMap<String, u64>,
+}
+
+/// Bytes and images counted under one part.
+#[derive(Clone, Copy, Default)]
+struct Share {
+    bytes: u64,
+    images: u64,
+}
+
+/// Reports the estimated tokens of each part of a request.
+///
+/// Text tokens are shared out by bytes and each image costs [`IMAGE_TOKENS`]
+/// in the part that holds it, so the parts always sum to the estimate. Bytes
+/// nothing else claims, such as framing and the environment line, are `other`.
+pub fn context_breakdown(
+    dialect: &dyn Provider,
+    plan: &RequestPlan,
+    sizes: InstructionSizes,
+    anchor: Option<&Anchor>,
+    ceiling: Option<u64>,
+) -> Result<ContextBreakdown> {
+    let now = measure(dialect, plan)?;
+    let (total, anchored) = estimate_input(now, anchor, dialect.name(), &plan.model);
+
+    let mut parts: BTreeMap<&'static str, Share> = CONTEXT_PARTS
+        .iter()
+        .map(|key| (*key, Share::default()))
+        .collect();
+    let mut tools: BTreeMap<String, Share> = BTreeMap::new();
+    let mut add = |key: &'static str, bytes: u64, images: u64| {
+        let share = parts.entry(key).or_default();
+        share.bytes = share.bytes.saturating_add(bytes);
+        share.images = share.images.saturating_add(images);
+    };
+    add("base_prompt", sizes.base as u64, 0);
+    add("skill_catalog", sizes.skill_catalog as u64, 0);
+    add("project_instructions", sizes.project as u64, 0);
+    add("repository_map", sizes.map as u64, 0);
+    for spec in &plan.tools {
+        let bytes = serde_json::to_vec(spec)
+            .map_err(|err| RuneError::new(ErrorCode::Internal, err.to_string()))?
+            .len() as u64;
+        add("tool_schemas", bytes, 0);
+    }
+    for message in &plan.messages {
+        let text_part = match message.role {
+            Role::System => "other",
+            Role::Assistant => "assistant_text",
+            Role::User
+                if message
+                    .parts
+                    .first()
+                    .and_then(ContentPart::as_text)
+                    .is_some_and(|text| text.starts_with(CHECKPOINT_TAG)) =>
+            {
+                "checkpoint"
+            }
+            Role::User | Role::Tool => "user_messages",
+        };
+        // A stored replay is what the dialect sends in place of the reasoning parts.
+        let replayed = message.role == Role::Assistant && message.replay.is_some();
+        if replayed {
+            add(
+                "reasoning",
+                message.replay.as_ref().map_or(0, String::len) as u64,
+                0,
+            );
+        }
+        let mut result_tool: Option<&str> = None;
+        for part in &message.parts {
+            match part {
+                // System messages are framing, counted in `other` by difference.
+                ContentPart::Text { .. } if message.role == Role::System => {}
+                ContentPart::Text { text } => add(text_part, text.len() as u64, 0),
+                ContentPart::Reasoning { text } if !replayed => {
+                    add("reasoning", text.len() as u64, 0);
+                }
+                ContentPart::Reasoning { .. } => {}
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => add(
+                    "assistant_text",
+                    name.len().saturating_add(arguments.len()) as u64,
+                    0,
+                ),
+                ContentPart::ToolResult { name, content, .. } => {
+                    let share = tools.entry(name.clone()).or_default();
+                    share.bytes = share.bytes.saturating_add(content.len() as u64);
+                    result_tool = Some(name);
+                }
+                ContentPart::Image { .. } => match result_tool {
+                    Some(name) => {
+                        let share = tools.entry(name.to_owned()).or_default();
+                        share.images = share.images.saturating_add(1);
+                    }
+                    None => add(text_part, 0, 1),
+                },
+            }
+        }
+    }
+    let counted = parts
+        .values()
+        .chain(tools.values())
+        .fold(0_u64, |sum, share| sum.saturating_add(share.bytes));
+    let other_bytes = now.text_bytes.saturating_sub(counted);
+    if let Some(share) = parts.get_mut("other") {
+        share.bytes = other_bytes;
+    }
+
+    let mut remaining = total;
+    let mut take = |tokens: u64| {
+        let tokens = tokens.min(remaining);
+        remaining = remaining.saturating_sub(tokens);
+        tokens
+    };
+    let image_tokens = |share: &Share| share.images.saturating_mul(IMAGE_TOKENS);
+    let images_total = parts
+        .values()
+        .chain(tools.values())
+        .fold(0_u64, |sum, share| sum.saturating_add(image_tokens(share)));
+    let text_tokens = total.saturating_sub(images_total);
+    let denominator = counted.saturating_add(other_bytes);
+    let text_share = |bytes: u64| -> u64 {
+        let share = u128::from(text_tokens)
+            .saturating_mul(u128::from(bytes))
+            .checked_div(u128::from(denominator))
+            .unwrap_or(0);
+        u64::try_from(share).unwrap_or(u64::MAX)
+    };
+
+    let mut tool_results = BTreeMap::new();
+    let mut results_sum = 0_u64;
+    for (name, share) in &tools {
+        let tokens = take(text_share(share.bytes).saturating_add(image_tokens(share)));
+        results_sum = results_sum.saturating_add(tokens);
+        tool_results.insert(name.clone(), tokens);
+    }
+    let mut report: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for (key, share) in &parts {
+        let tokens = match *key {
+            "tool_results" => results_sum,
+            "other" => 0,
+            _ => take(text_share(share.bytes).saturating_add(image_tokens(share))),
+        };
+        report.insert(*key, tokens);
+    }
+    // The other part takes its share and every rounding remainder.
+    report.insert("other", remaining);
+
+    Ok(ContextBreakdown {
+        total_tokens: total,
+        anchored,
+        ceiling_tokens: ceiling,
+        free_tokens: ceiling.map(|ceiling| ceiling.saturating_sub(total)),
+        parts: report,
+        tool_results,
+    })
+}
+
+/// The tag that opens a checkpoint message.
+const CHECKPOINT_TAG: &str = "<conversation-checkpoint>";
+
 /// Adds a reported count to a running total, preserving absence.
 fn add(total: Option<u64>, reported: Option<u64>) -> Option<u64> {
     match (total, reported) {
@@ -311,78 +568,269 @@ fn add(total: Option<u64>, reported: Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_default_estimator_divides_bytes_by_four() {
-        assert_eq!(estimate_tokens(0), 0);
-        assert_eq!(estimate_tokens(4), 1);
-        assert_eq!(estimate_tokens(400), 100);
-        assert_eq!(estimate_tokens(3), 0);
-    }
-
-    #[test]
-    fn calibration_starts_at_the_default() {
-        let calibration = Calibration::default();
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
-        );
-        assert_eq!(calibration.samples, 0);
-    }
-
-    #[test]
-    fn calibration_moves_toward_the_first_observation() {
-        let mut calibration = Calibration::default();
-        // Eight bytes per token observed, so the estimate should rise.
-        calibration.observe(800, 100);
-        assert!(calibration.bytes_per_token > 4.0);
-        assert_eq!(calibration.samples, 1);
-        assert_eq!(calibration.estimate(800), 100);
-    }
-
-    #[test]
-    fn calibration_ignores_a_report_with_no_tokens() {
-        let mut calibration = Calibration::default();
-        calibration.observe(800, 0);
-        calibration.observe(0, 100);
-        assert_eq!(calibration.samples, 0);
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
-        );
-    }
-
-    #[test]
-    fn one_outlier_moves_the_calibration_only_a_little() {
-        let mut calibration = Calibration::default();
-        for _ in 0..20 {
-            calibration.observe(400, 100);
+    fn anchor(input_tokens: u64, text_bytes: u64) -> Anchor {
+        Anchor {
+            dialect: "chat_completions".to_owned(),
+            model: "model-a".to_owned(),
+            input_tokens,
+            measure: Measure {
+                text_bytes,
+                images: 0,
+            },
         }
-        let settled = calibration.bytes_per_token;
-        calibration.observe(100_000, 10);
-        let moved = (calibration.bytes_per_token - settled).abs();
-        assert!(moved < settled, "one outlier dominated the calibration");
+    }
+
+    fn call_id(raw: &str) -> rune_core::id::ToolCallId {
+        rune_core::id::ToolCallId::new(raw).expect("id")
+    }
+
+    fn result(id: &str, name: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            id: call_id(id),
+            name: name.to_owned(),
+            content: content.to_owned(),
+            is_error: false,
+        }
+    }
+
+    fn tool_message(parts: Vec<ContentPart>) -> rune_net::message::Message {
+        rune_net::message::Message {
+            role: Role::Tool,
+            parts,
+            replay: None,
+            origin: None,
+        }
+    }
+
+    /// A plan with instructions, a tool, a user message, a call and its result.
+    fn sample_plan() -> RequestPlan {
+        let mut plan = RequestPlan::new("model-a");
+        plan.instructions = format!("{}\n\n{}", "b".repeat(400), "p".repeat(1_200));
+        plan.tools = vec![rune_core::tool::ToolSpec {
+            name: "read_file".to_owned(),
+            description: "Reads a file.".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        plan.messages = vec![
+            rune_net::message::Message::user("fix the failing test"),
+            rune_net::message::Message::assistant(vec![
+                ContentPart::Text {
+                    text: "Reading it.".to_owned(),
+                },
+                ContentPart::ToolCall {
+                    id: call_id("call-1"),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                },
+            ]),
+            tool_message(vec![result("call-1", "read_file", &"x".repeat(8_000))]),
+        ];
+        plan
+    }
+
+    fn sample_sizes() -> InstructionSizes {
+        InstructionSizes {
+            base: 400,
+            skill_catalog: 0,
+            project: 1_200,
+            map: 0,
+        }
+    }
+
+    fn sum(breakdown: &ContextBreakdown) -> u64 {
+        breakdown.parts.values().sum()
     }
 
     #[test]
-    fn an_implausible_observation_is_rejected_rather_than_clamped() {
-        let mut calibration = Calibration::default();
-        // A million bytes claiming one token is a degenerate report, not a
-        // measurement, so it must not move the calibration at all.
-        calibration.observe(1_000_000, 1);
-        assert_eq!(calibration.samples, 0);
-        assert!(
-            (calibration.bytes_per_token - DEFAULT_BYTES_PER_TOKEN as f64).abs() < f64::EPSILON
+    fn the_parts_sum_to_the_total() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let plan = sample_plan();
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, Some(100_000)).expect("ok");
+        assert_eq!(breakdown.parts.len(), CONTEXT_PARTS.len());
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+        assert!(!breakdown.anchored);
+        assert!(breakdown.parts["base_prompt"] > 0, "{breakdown:?}");
+        assert!(breakdown.parts["project_instructions"] > breakdown.parts["base_prompt"]);
+        assert!(breakdown.parts["tool_schemas"] > 0);
+        assert!(breakdown.parts["user_messages"] > 0);
+        assert!(breakdown.parts["assistant_text"] > 0);
+        assert_eq!(breakdown.parts["checkpoint"], 0);
+        assert_eq!(
+            breakdown.free_tokens,
+            Some(100_000 - breakdown.total_tokens)
         );
 
-        // The same applies at the other extreme.
-        let mut low = Calibration::default();
-        low.observe(1, 1000);
-        assert_eq!(low.samples, 0);
+        // An anchored total that no byte count explains still sums exactly.
+        let measured = measure(&provider, &plan).expect("measure");
+        let anchor = Anchor {
+            dialect: provider.name().to_owned(),
+            model: "model-a".to_owned(),
+            input_tokens: 4_321,
+            measure: measured,
+        };
+        let anchored =
+            context_breakdown(&provider, &plan, sample_sizes(), Some(&anchor), None).expect("ok");
+        assert!(anchored.anchored);
+        assert_eq!(anchored.total_tokens, 4_321);
+        assert_eq!(sum(&anchored), 4_321);
     }
 
     #[test]
-    fn calibrated_estimation_is_bounded() {
-        let calibration = Calibration::default();
-        assert_eq!(calibration.estimate(0), 0);
-        assert!(calibration.estimate(u64::MAX) > 0);
+    fn a_checkpoint_is_counted_apart() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        plan.messages.insert(
+            0,
+            rune_net::message::Message::user(format!(
+                "<conversation-checkpoint>\n{}\n</conversation-checkpoint>",
+                "s".repeat(6_000)
+            )),
+        );
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        assert!(
+            breakdown.parts["checkpoint"] > breakdown.parts["user_messages"] * 10,
+            "{breakdown:?}"
+        );
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+    }
+
+    #[test]
+    fn tool_results_are_split_by_tool() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        plan.messages.push(tool_message(vec![result(
+            "call-2",
+            "bash",
+            &"y".repeat(2_000),
+        )]));
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        let read = breakdown.tool_results["read_file"];
+        let bash = breakdown.tool_results["bash"];
+        assert!(read > bash * 3, "{breakdown:?}");
+        assert!(bash > 0);
+        assert_eq!(breakdown.parts["tool_results"], read + bash);
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+    }
+
+    #[test]
+    fn an_unknown_window_has_no_free_space() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let breakdown =
+            context_breakdown(&provider, &sample_plan(), sample_sizes(), None, None).expect("ok");
+        assert_eq!(breakdown.ceiling_tokens, None);
+        assert_eq!(breakdown.free_tokens, None);
+        let json = serde_json::to_value(&breakdown).expect("json");
+        assert!(json["ceiling_tokens"].is_null());
+        assert!(json["free_tokens"].is_null());
+        let full = context_breakdown(&provider, &sample_plan(), sample_sizes(), None, Some(10))
+            .expect("ok");
+        assert_eq!(full.free_tokens, Some(0));
+    }
+
+    #[test]
+    fn an_image_counts_in_the_part_that_holds_it() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = sample_plan();
+        let image = ContentPart::Image {
+            image: rune_net::message::ImageRef {
+                id: 7,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 300_000,
+            },
+        };
+        plan.messages.push(tool_message(vec![
+            result("call-2", "screenshot", "captured"),
+            image.clone(),
+        ]));
+        plan.messages
+            .push(rune_net::message::Message::user_parts(vec![image]));
+        plan.image_data.insert(7, "A".repeat(400_000).into());
+        let breakdown =
+            context_breakdown(&provider, &plan, sample_sizes(), None, None).expect("ok");
+        assert!(
+            breakdown.tool_results["screenshot"] >= IMAGE_TOKENS,
+            "{breakdown:?}"
+        );
+        assert!(breakdown.parts["user_messages"] >= IMAGE_TOKENS);
+        assert!(breakdown.parts["other"] < IMAGE_TOKENS);
+        assert_eq!(sum(&breakdown), breakdown.total_tokens);
+    }
+
+    #[test]
+    fn estimates_round_up() {
+        assert_eq!(estimate_tokens(5), 2);
+        assert_eq!(estimate_tokens(0), 0);
+    }
+
+    #[test]
+    fn an_anchor_adds_the_bytes_appended_since_it() {
+        let anchor = anchor(1_000, 4_000);
+        let now = Measure {
+            text_bytes: 4_401,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-a"),
+            (1_101, true)
+        );
+    }
+
+    #[test]
+    fn an_anchor_from_another_model_is_ignored() {
+        let anchor = anchor(1_000, 4_000);
+        let now = Measure {
+            text_bytes: 4_401,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-b"),
+            (1_101, false)
+        );
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "anthropic", "model-a"),
+            (1_101, false)
+        );
+    }
+
+    #[test]
+    fn a_request_smaller_than_its_anchor_is_estimated_from_bytes() {
+        let anchor = anchor(5_000, 4_000);
+        let now = Measure {
+            text_bytes: 3_999,
+            images: 0,
+        };
+        assert_eq!(
+            estimate_input(now, Some(&anchor), "chat_completions", "model-a"),
+            (1_000, false)
+        );
+    }
+
+    #[test]
+    fn images_count_a_fixed_amount_whatever_their_size() {
+        let provider = rune_net::chat_completions::ChatCompletions;
+        let mut plan = RequestPlan::new("model-a");
+        plan.messages = vec![rune_net::message::Message::user_parts(vec![
+            ContentPart::Text {
+                text: "what is in this picture".to_owned(),
+            },
+            ContentPart::Image {
+                image: rune_net::message::ImageRef {
+                    id: 7,
+                    media_type: "image/png".to_owned(),
+                    encoded_bytes: 300_000,
+                },
+            },
+        ])];
+        plan.image_data.insert(7, "A".repeat(400_000).into());
+        let measured = measure(&provider, &plan).expect("measure");
+        assert_eq!(measured.images, 1);
+        assert!(measured.text_bytes < 2_000, "{measured:?}");
+        let (tokens, anchored) = estimate_input(measured, None, provider.name(), "model-a");
+        assert!(!anchored);
+        assert!(tokens < IMAGE_TOKENS + 500, "{tokens}");
     }
 
     #[test]
@@ -426,69 +874,69 @@ mod tests {
 
     #[test]
     fn capacity_below_the_trigger_fits() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 10, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Fits
         );
     }
 
     #[test]
     fn capacity_near_the_trigger_warns_before_compacting() {
-        let limits = BudgetSet::new();
-        // The default trigger is eighty percent, so seventy-five is inside the
-        // approaching band and still sendable.
+        let ceiling = 800;
+        // Seventy-five percent of capacity is within ten points of a ceiling at
+        // eighty, so it is inside the approaching band and still sendable.
         let estimate = Estimate::new(0, 750, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Approaching
         );
     }
 
     #[test]
     fn capacity_at_the_trigger_requires_compaction() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 800, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Compact
         );
     }
 
     #[test]
     fn capacity_over_the_total_is_reported_as_such() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let estimate = Estimate::new(0, 1200, 1000);
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::OverCapacity
         );
     }
 
     #[test]
     fn full_history_over_capacity_is_compactable_when_the_retained_request_fits() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let full = Estimate::new(8000, 2000, 1000);
         let retained = Estimate::new(400, 100, 1000);
         assert_eq!(
-            decide_capacity(&full, &retained, &limits),
+            decide_capacity(&full, &retained, ceiling),
             CapacityDecision::Compact
         );
     }
 
     #[test]
     fn retained_capacity_includes_the_output_reserve_and_allows_an_exact_fit() {
-        let limits = BudgetSet::new();
+        let ceiling = 800;
         let full = Estimate::new(8000, 2000, 1000).with_output_reserve(100);
         let retained = Estimate::new(3600, 900, 1000).with_output_reserve(100);
         assert_eq!(
-            decide_capacity(&full, &retained, &limits),
+            decide_capacity(&full, &retained, ceiling),
             CapacityDecision::Compact
         );
         let too_large = retained.with_output_reserve(101);
         assert_eq!(
-            decide_capacity(&full, &too_large, &limits),
+            decide_capacity(&full, &too_large, ceiling),
             CapacityDecision::OverCapacity
         );
     }
@@ -499,15 +947,51 @@ mod tests {
         limits
             .set(
                 LimitName::CompactionTriggerPercent,
-                rune_core::budget::Budget::Bounded(50),
+                Budget::Bounded(50),
                 rune_core::config::Layer::User,
             )
             .expect("set");
         let estimate = Estimate::new(0, 600, 1000);
+        let ceiling = ceiling(1000, &limits).expect("ceiling");
         assert_eq!(
-            decide_capacity(&estimate, &estimate, &limits),
+            decide_capacity(&estimate, &estimate, ceiling),
             CapacityDecision::Compact
         );
+    }
+
+    /// A limit set with one limit set in the user file.
+    fn with_limit(name: LimitName, value: u64) -> BudgetSet {
+        let mut limits = BudgetSet::new();
+        limits
+            .set(name, Budget::Bounded(value), rune_core::config::Layer::User)
+            .expect("set");
+        limits
+    }
+
+    #[test]
+    fn the_ceiling_reserves_fifteen_percent_or_sixteen_thousand() {
+        let limits = BudgetSet::new();
+        assert_eq!(ceiling(200_000, &limits), Some(170_000));
+        assert_eq!(ceiling(128_000, &limits), Some(108_800));
+        assert_eq!(ceiling(16_000, &limits), Some(13_600));
+        assert_eq!(ceiling(1_000_000, &limits), Some(217_600));
+        let uncapped = with_limit(LimitName::ContextCapTokens, 0);
+        assert_eq!(ceiling(1_000_000, &uncapped), Some(850_000));
+        assert_eq!(effective_window(1_000_000, &limits), 256_000);
+        assert_eq!(effective_window(1_000_000, &uncapped), 1_000_000);
+    }
+
+    #[test]
+    fn an_explicit_percent_replaces_the_reserve() {
+        let limits = with_limit(LimitName::CompactionTriggerPercent, 80);
+        assert_eq!(ceiling(128_000, &limits), Some(102_400));
+    }
+
+    #[test]
+    fn an_unknown_window_has_no_ceiling() {
+        assert_eq!(ceiling(0, &BudgetSet::new()), None);
+        let limits = with_limit(LimitName::CompactionTriggerPercent, 80);
+        assert_eq!(ceiling(0, &limits), None);
     }
 
     #[test]

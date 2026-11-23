@@ -1,0 +1,4 @@
+{
+  "config/limits.conf": "max_items = 5\n",
+  "check.sh": "echo \"test result: FAILED. 0 passed; 1 failed; 0 ignored\"\nexit 1\n"
+}

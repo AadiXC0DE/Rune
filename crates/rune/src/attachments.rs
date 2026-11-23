@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use rune_agent::turn::CallResult;
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_net::message::{ContentPart, ImageRef};
 use rune_net::provider::{Provider, ProviderCapabilities, RequestPlan, Routing};
@@ -23,6 +25,12 @@ pub struct Attachments {
 impl Attachments {
     /// Reads the whole batch before a request, with bounded reads even if a file grows.
     pub fn read(paths: &[PathBuf]) -> Result<Self> {
+        Self::read_from(paths, 1)
+    }
+
+    /// [`Self::read`], numbering the images from `first_id`, so a session's
+    /// later attachments never reuse an earlier one's id.
+    pub fn read_from(paths: &[PathBuf], first_id: u64) -> Result<Self> {
         if paths.len() > MAX_IMAGES {
             return Err(RuneError::invalid_field(
                 "image",
@@ -75,7 +83,7 @@ impl Attachments {
                     )
                     .with_hint("attach a PNG, JPEG, GIF, or WebP file")
                 })?;
-            let id = (attachments.images.len() as u64).saturating_add(1);
+            let id = first_id.saturating_add(attachments.images.len() as u64);
             attachments.images.push(ImageRef {
                 id,
                 media_type: media_type.to_owned(),
@@ -86,6 +94,11 @@ impl Attachments {
                 .insert(id, Arc::from(crate::session::base64_encode(&bytes)));
         }
         Ok(attachments)
+    }
+
+    /// The encoded image data by id.
+    pub const fn data(&self) -> &BTreeMap<u64, Arc<str>> {
+        &self.data
     }
 
     pub fn parts(&self) -> impl Iterator<Item = ContentPart> + '_ {
@@ -132,6 +145,9 @@ impl Provider for AttachedProvider {
     fn reducer(&self) -> Box<dyn StreamReducer> {
         self.dialect.reducer()
     }
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.dialect.reducer_for(plan)
+    }
     fn extra_headers(&self) -> Vec<(&'static str, String)> {
         self.dialect.extra_headers()
     }
@@ -151,12 +167,192 @@ impl Provider for AttachedProvider {
     }
 }
 
+/// The session's attached images, shared with the provider that puts them
+/// into every request.
+pub type SessionImages = Arc<Mutex<BTreeMap<u64, Arc<str>>>>;
+
+/// Hydrates the images a session attached on every request.
+pub struct SharedImages {
+    pub dialect: Box<dyn Provider>,
+    pub data: SessionImages,
+}
+
+impl Provider for SharedImages {
+    fn name(&self) -> &'static str {
+        self.dialect.name()
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.dialect.capabilities()
+    }
+    fn request_path(&self) -> &'static str {
+        self.dialect.request_path()
+    }
+    fn completion_path(&self, plan: &RequestPlan) -> Result<String> {
+        self.dialect.completion_path(plan)
+    }
+    fn models_path(&self) -> Option<&'static str> {
+        self.dialect.models_path()
+    }
+    fn reducer(&self) -> Box<dyn StreamReducer> {
+        self.dialect.reducer()
+    }
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.dialect.reducer_for(plan)
+    }
+    fn extra_headers(&self) -> Vec<(&'static str, String)> {
+        self.dialect.extra_headers()
+    }
+    fn routing(&self) -> Routing {
+        self.dialect.routing()
+    }
+    fn limits(&self) -> Limit {
+        self.dialect.limits()
+    }
+    fn validate(&self, plan: &RequestPlan) -> Result<()> {
+        self.dialect.validate(plan)
+    }
+    fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if data.is_empty() {
+            return self.dialect.build_request(plan);
+        }
+        let mut hydrated = plan.clone();
+        hydrated.image_data.extend(data);
+        self.dialect.build_request(&hydrated)
+    }
+}
+
+/// First id given to a tool image.
+const FIRST_TOOL_IMAGE_ID: u64 = 1 << 32;
+
+/// Images tools returned during a conversation, by the id recorded in its history.
+#[derive(Default)]
+pub struct ToolImages {
+    next: AtomicU64,
+    data: Mutex<BTreeMap<u64, Arc<str>>>,
+}
+
+impl ToolImages {
+    /// Ids start at 1 << 32 so they never meet prompt attachment ids.
+    pub fn attach(&self, result: &CallResult) -> Vec<ContentPart> {
+        let Some(image) = result.output.image.as_ref().filter(|_| result.executed) else {
+            return Vec::new();
+        };
+        let id = FIRST_TOOL_IMAGE_ID.saturating_add(self.next.fetch_add(1, Ordering::Relaxed));
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, Arc::from(crate::session::base64_encode(&image.bytes)));
+        vec![ContentPart::Image {
+            image: ImageRef {
+                id,
+                media_type: image.media_type.to_owned(),
+                encoded_bytes: image.bytes.len() as u64,
+            },
+        }]
+    }
+
+    /// Copies every held image into the plan before a request is built.
+    ///
+    /// A tool image id already in the plan without data, as a resumed
+    /// conversation holds, is never given out again, so it cannot pick up the
+    /// data of a later image.
+    pub fn hydrate(&self, plan: &mut RequestPlan) {
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = plan
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                ContentPart::Image { image } if image.id >= FIRST_TOOL_IMAGE_ID => Some(image.id),
+                _ => None,
+            })
+            .max();
+        if let Some(id) = recorded {
+            let next = id.saturating_sub(FIRST_TOOL_IMAGE_ID).saturating_add(1);
+            self.next.fetch_max(next, Ordering::Relaxed);
+        }
+        plan.image_data
+            .extend(data.iter().map(|(id, encoded)| (*id, Arc::clone(encoded))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rune_net::message::Message;
 
     const PNG: &[u8] = include_bytes!("../tests/fixtures/attachment.png");
+
+    #[test]
+    fn read_from_numbers_from_the_given_id() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let one = dir.path().join("one.png");
+        let two = dir.path().join("two.png");
+        std::fs::write(&one, PNG).expect("one");
+        std::fs::write(&two, PNG).expect("two");
+        let attachments = Attachments::read_from(&[one, two], 7).expect("attachments");
+        let ids: Vec<u64> = attachments
+            .parts()
+            .map(|part| match part {
+                ContentPart::Image { image } => image.id,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(ids, [7, 8]);
+        assert_eq!(
+            attachments.data().keys().copied().collect::<Vec<_>>(),
+            [7, 8]
+        );
+    }
+
+    #[test]
+    fn shared_images_hydrate_each_request() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, PNG).expect("png");
+        let attachments = Attachments::read_from(&[path], 3).expect("attachments");
+        let data = SessionImages::default();
+        let provider = SharedImages {
+            dialect: Box::new(rune_net::chat_completions::ChatCompletions),
+            data: Arc::clone(&data),
+        };
+        let mut parts = vec![ContentPart::Text {
+            text: "look".to_owned(),
+        }];
+        parts.extend(attachments.parts());
+        let mut plan = RequestPlan::new("fixture-model");
+        plan.messages = vec![Message::user_parts(parts)];
+        // Without the data the request does not carry the image.
+        let bare = provider
+            .build_request(&plan)
+            .map(|body| body.to_string())
+            .unwrap_or_default();
+        assert!(!bare.contains("data:image/png;base64,"), "{bare}");
+        data.lock().expect("lock").extend(
+            attachments
+                .data()
+                .iter()
+                .map(|(id, value)| (*id, Arc::clone(value))),
+        );
+        for _ in 0..2 {
+            let body = provider.build_request(&plan).expect("hydrated");
+            assert_eq!(
+                body["messages"][0]["content"][1]["image_url"]["url"],
+                format!(
+                    "data:image/png;base64,{}",
+                    crate::session::base64_encode(PNG)
+                )
+            );
+        }
+    }
 
     #[test]
     fn attachments_reach_each_supporting_dialect_as_inline_image_parts() {
@@ -208,6 +404,76 @@ mod tests {
             }
             assert!(!body.to_string().contains("image-ref:"));
         }
+    }
+
+    fn image_result(id: &str, executed: bool) -> CallResult {
+        let mut output = rune_tools::ToolOutput::success("image shot.png (3 bytes) attached");
+        output.image = Some(rune_tools::ToolImage {
+            media_type: "image/png",
+            bytes: PNG.to_vec(),
+        });
+        CallResult {
+            call: rune_agent::turn::PreparedCall {
+                id: id.to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"shot.png"}"#.to_owned(),
+            },
+            output,
+            executed,
+        }
+    }
+
+    #[test]
+    fn tool_images_are_attached_once_and_hydrated_into_each_request() {
+        let images = ToolImages::default();
+        let first = images.attach(&image_result("a", true));
+        let second = images.attach(&image_result("b", true));
+        assert!(images.attach(&image_result("c", false)).is_empty());
+        assert!(
+            images
+                .attach(&CallResult {
+                    output: rune_tools::ToolOutput::success("text"),
+                    ..image_result("d", true)
+                })
+                .is_empty()
+        );
+        let ids: Vec<u64> = first
+            .iter()
+            .chain(&second)
+            .map(|part| match part {
+                ContentPart::Image { image } => {
+                    assert_eq!(image.media_type, "image/png");
+                    assert_eq!(image.encoded_bytes, PNG.len() as u64);
+                    image.id
+                }
+                other => panic!("not an image: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1 << 32, (1 << 32) + 1]);
+
+        let encoded = crate::session::base64_encode(PNG);
+        for _ in 0..2 {
+            let mut plan = RequestPlan::new("fixture-model");
+            images.hydrate(&mut plan);
+            assert_eq!(plan.image_data.len(), 2);
+            assert_eq!(plan.image_data[&(1 << 32)].as_ref(), encoded);
+            assert_eq!(plan.image_data[&((1 << 32) + 1)].as_ref(), encoded);
+        }
+
+        // A resumed history may hold ids this process never gave out.
+        let resumed = ToolImages::default();
+        let mut plan = RequestPlan::new("fixture-model");
+        plan.messages = vec![Message::user_parts(vec![ContentPart::Image {
+            image: ImageRef {
+                id: (1 << 32) + 4,
+                media_type: "image/png".to_owned(),
+                encoded_bytes: 3,
+            },
+        }])];
+        resumed.hydrate(&mut plan);
+        assert!(plan.image_data.is_empty());
+        let fresh = resumed.attach(&image_result("e", true));
+        assert!(matches!(&fresh[..], [ContentPart::Image { image }] if image.id == (1 << 32) + 5));
     }
 
     #[test]

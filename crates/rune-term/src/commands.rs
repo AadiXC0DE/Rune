@@ -38,9 +38,34 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show or set the session's spend limit",
     },
     Builtin {
+        name: "network",
+        arguments: "[on|off]",
+        summary: "show or set network access for shell commands",
+    },
+    Builtin {
+        name: "mcp",
+        arguments: "[reconnect|login|disable <server>]",
+        summary: "show MCP servers, or reconnect, log in to, or disable one",
+    },
+    Builtin {
         name: "plan",
         arguments: "[task|off]",
         summary: "plan read-only before acting, or leave plan mode",
+    },
+    Builtin {
+        name: "fork",
+        arguments: "",
+        summary: "branch this conversation and continue in the branch",
+    },
+    Builtin {
+        name: "rewind",
+        arguments: "",
+        summary: "go back to before an earlier message",
+    },
+    Builtin {
+        name: "permissions",
+        arguments: "[mode|delete <n>]",
+        summary: "show the mode and saved rules, switch mode, or delete a saved rule",
     },
     Builtin {
         name: "effort",
@@ -53,14 +78,39 @@ pub const BUILTINS: &[Builtin] = &[
         summary: "show the model, provider, context, and session",
     },
     Builtin {
+        name: "statusline",
+        arguments: "[field]",
+        summary: "show the status fields, or turn one on or off for this session",
+    },
+    Builtin {
         name: "cost",
         arguments: "",
         summary: "show what this session has spent",
     },
     Builtin {
+        name: "tasks",
+        arguments: "",
+        summary: "list running commands, show their output or stop them",
+    },
+    Builtin {
         name: "compact",
         arguments: "[preview]",
         summary: "summarize older turns, or preview record counts without changes",
+    },
+    Builtin {
+        name: "context",
+        arguments: "",
+        summary: "show what fills the context window",
+    },
+    Builtin {
+        name: "theme",
+        arguments: "[name]",
+        summary: "choose a colour theme, or switch to one named here",
+    },
+    Builtin {
+        name: "reload",
+        arguments: "",
+        summary: "re-read instructions, skills and the repository map now",
     },
     Builtin {
         name: "pin",
@@ -69,8 +119,13 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "undo",
-        arguments: "[preview]",
-        summary: "restore files changed in this session, or preview per-file diffs",
+        arguments: "[preview|confirm]",
+        summary: "restore the files of the last turn that changed them, or preview it",
+    },
+    Builtin {
+        name: "redo",
+        arguments: "",
+        summary: "put back what the last /undo restored",
     },
     Builtin {
         name: "tree",
@@ -79,8 +134,23 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "copy",
-        arguments: "",
-        summary: "put the last reply on the clipboard",
+        arguments: "[code [n]|all]",
+        summary: "put the last reply, a code block or the conversation on the clipboard",
+    },
+    Builtin {
+        name: "image",
+        arguments: "<path>",
+        summary: "attach an image file to the next message",
+    },
+    Builtin {
+        name: "diff",
+        arguments: "[path]",
+        summary: "show the changes this session made",
+    },
+    Builtin {
+        name: "export",
+        arguments: "[path] [--json]",
+        summary: "write this conversation to a file",
     },
     Builtin {
         name: "new",
@@ -91,6 +161,11 @@ pub const BUILTINS: &[Builtin] = &[
         name: "rename",
         arguments: "<title>",
         summary: "name this session",
+    },
+    Builtin {
+        name: "resume",
+        arguments: "[id]",
+        summary: "switch to a saved session",
     },
     Builtin {
         name: "goal",
@@ -106,6 +181,26 @@ pub const BUILTINS: &[Builtin] = &[
         name: "help",
         arguments: "",
         summary: "list commands and active keyboard bindings",
+    },
+    Builtin {
+        name: "init",
+        arguments: "",
+        summary: "ask the model to write AGENTS.md for this repository",
+    },
+    Builtin {
+        name: "retry",
+        arguments: "",
+        summary: "send the last failed or interrupted message again",
+    },
+    Builtin {
+        name: "connect",
+        arguments: "[provider]",
+        summary: "connect a provider or replace its key",
+    },
+    Builtin {
+        name: "terminal-setup",
+        arguments: "",
+        summary: "configure this terminal so Shift-Enter inserts a newline",
     },
     Builtin {
         name: "quit",
@@ -151,18 +246,44 @@ pub fn render_help() -> String {
     out.trim_end().to_owned()
 }
 
-/// Returns the candidates matching a word being typed after a slash.
+/// Returns the indexes of `names` that match `word`, best first.
 ///
-/// A candidate matches when its name starts with what was typed. An empty word
-/// matches everything, which is what makes a bare `/` show the whole list.
-/// Matching is exact on the prefix rather than fuzzy, because a slash command
-/// is short and a fuzzy match would order a longer name above the one being
-/// typed.
+/// Names that start with the word come first, then names that contain its
+/// characters in order, each group in table order, so the name being typed
+/// stays above a longer one that merely contains it. Both comparisons ignore
+/// case. An empty word matches every name.
+#[must_use]
+pub fn fuzzy_rank(word: &str, names: &[&str]) -> Vec<usize> {
+    let word = word.to_lowercase();
+    let mut ranked = Vec::new();
+    let mut later = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let name = name.to_lowercase();
+        if name.starts_with(&word) {
+            ranked.push(index);
+        } else if is_subsequence(&word, &name) {
+            later.push(index);
+        }
+    }
+    ranked.extend(later);
+    ranked
+}
+
+/// Returns true when every character of `word` appears in `name` in order.
+fn is_subsequence(word: &str, name: &str) -> bool {
+    let mut rest = name.chars();
+    word.chars().all(|wanted| rest.any(|found| found == wanted))
+}
+
+/// Returns the candidates matching a word being typed after a slash, in the
+/// order of [`fuzzy_rank`]. An empty word matches everything, which is what
+/// makes a bare `/` show the whole list.
 #[must_use]
 pub fn matching(word: &str) -> Vec<&'static Builtin> {
-    BUILTINS
-        .iter()
-        .filter(|entry| entry.name.starts_with(word))
+    let names: Vec<&str> = BUILTINS.iter().map(|entry| entry.name).collect();
+    fuzzy_rank(word, &names)
+        .into_iter()
+        .filter_map(|index| BUILTINS.get(index))
         .collect()
 }
 
@@ -216,11 +337,29 @@ mod tests {
     #[test]
     fn a_prefix_narrows_the_list_in_table_order() {
         let got: Vec<&str> = matching("mo").iter().map(|e| e.name).collect();
-        assert_eq!(got, vec!["model", "models"]);
+        assert_eq!(got[..2], ["model", "models"]);
         let got: Vec<&str> = matching("mode").iter().map(|e| e.name).collect();
         assert_eq!(got, vec!["model", "models"]);
         // `/mod` is the case that must offer both, so a user typing it can pick.
         assert_eq!(matching("mod").len(), 2);
+    }
+
+    #[test]
+    fn fuzzy_rank_puts_prefix_matches_first() {
+        let names = ["settings", "status", "stats", "cost"];
+        assert_eq!(fuzzy_rank("st", &names), [1, 2, 0, 3]);
+        assert_eq!(fuzzy_rank("", &names), [0, 1, 2, 3]);
+        assert_eq!(fuzzy_rank("STAT", &names), [1, 2]);
+    }
+
+    #[test]
+    fn fuzzy_rank_matches_subsequences() {
+        let names = ["status", "settings", "copy"];
+        assert_eq!(fuzzy_rank("sts", &names), [0, 1]);
+        assert!(fuzzy_rank("tss", &names).is_empty());
+        assert!(fuzzy_rank("zzz", &names).is_empty());
+        let got: Vec<&str> = matching("sts").iter().map(|e| e.name).collect();
+        assert!(got.contains(&"status"), "{got:?}");
     }
 
     #[test]
@@ -282,7 +421,11 @@ mod tests {
         for entry in BUILTINS {
             let line = lines
                 .iter()
-                .find(|line| line.contains(entry.name))
+                .find(|line| {
+                    line.strip_prefix('/')
+                        .and_then(|rest| rest.strip_prefix(entry.name))
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })
                 .unwrap_or_else(|| panic!("{} is missing", entry.name));
             let at = line
                 .find(entry.summary)

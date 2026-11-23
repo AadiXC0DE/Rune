@@ -5,7 +5,6 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-#![cfg(unix)]
 
 //! End-to-end tests for the protocol server.
 //!
@@ -13,9 +12,13 @@
 //! client drives it over a socket pair. The property most often under test is
 //! that a second prompt arriving during a live turn is admitted rather than
 //! refused, so the client sends frames while a turn is genuinely in flight.
+//!
+//! The socket is a TCP connection on the loopback address, which every
+//! platform has; the tests that start a stdio MCP server use a shell script
+//! and run on Unix only.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +36,15 @@ use serde_json::{Value, json};
 /// Time a test waits for a frame before failing, so a defect reports rather
 /// than hangs.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Returns the two ends of a connected loopback socket: the server's, then the
+/// client's.
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    (server, client)
+}
 
 /// Builds a state layout rooted at a temporary directory.
 fn paths_for(root: &Path) -> Paths {
@@ -61,8 +73,8 @@ enum Approval {
 
 /// A client driving the server over a socket.
 struct Client {
-    to_server: UnixStream,
-    from_server: BufReader<UnixStream>,
+    to_server: TcpStream,
+    from_server: BufReader<TcpStream>,
     /// Responses that arrived before the test asked for them.
     responses: Vec<Value>,
     /// The order response identifiers were answered in.
@@ -78,7 +90,7 @@ struct Client {
 }
 
 impl Client {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: TcpStream) -> Self {
         let to_server = stream.try_clone().expect("clone");
         Self {
             to_server,
@@ -302,6 +314,18 @@ impl Harness {
         files: Vec<(&str, &str)>,
         dialect: Dialect,
     ) -> Self {
+        Self::start_windowed(scripts, mode, limits, files, dialect, None)
+    }
+
+    /// Starts a server whose model has the given context window.
+    fn start_windowed(
+        scripts: Vec<Script>,
+        mode: PermissionMode,
+        limits: BudgetSet,
+        files: Vec<(&str, &str)>,
+        dialect: Dialect,
+        window: Option<u64>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let workspace =
             Utf8PathBuf::from_path_buf(root.path().join("workspace")).expect("utf8 workspace");
@@ -325,8 +349,12 @@ impl Harness {
         .with_limits(limits)
         .expect("limits")
         .with_log_file(Some(log_file.clone()));
+        let config = match window {
+            Some(tokens) => config.with_context_window(tokens),
+            None => config,
+        };
 
-        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let (server_side, client_side) = socket_pair();
         let output = server_side.try_clone().expect("clone");
         let server = Arc::new(Server::new(config, output).expect("server"));
         let join = std::thread::spawn(move || {
@@ -402,6 +430,7 @@ fn stdio_server(log: &Path, greeting: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn assert_mcp_stopped(log: &Path) {
     let pid = std::fs::read_to_string(log.with_extension("pid")).expect("fixture PID");
     let deadline = Instant::now()
@@ -634,6 +663,84 @@ fn images_survive_retries_and_tool_steps_but_are_not_replayed_on_later_prompts()
     assert!(!body.contains("image-ref:"));
 }
 
+/// A text reply with no usage frame.
+fn text_without_usage(answer: &str) -> Script {
+    match Script::text(answer) {
+        Script::Frames(frames) => Script::Frames(
+            frames
+                .into_iter()
+                .filter(|frame| !frame.contains("\"usage\""))
+                .collect(),
+        ),
+        status @ Script::Status { .. } => status,
+    }
+}
+
+#[test]
+fn a_long_prompt_turn_compacts() {
+    let mut limits = BudgetSet::new();
+    // Keep only the newest exchange, so the third prompt's request can drop
+    // the first exchange.
+    limits
+        .set(
+            LimitName::CompactionKeepTokens,
+            Budget::Bounded(0),
+            Layer::User,
+        )
+        .expect("tail budget");
+    // Replies report no usage, so the estimate counts request bytes, which is
+    // what the padding below is sized for.
+    let mut harness = Harness::start_windowed(
+        vec![
+            text_without_usage("first answer"),
+            text_without_usage("second answer"),
+            text_without_usage(
+                "## Goal\n- answer the questions\n## Constraints\n- none\n## Decisions\n- none\n## State\n### Done\n- the user asked two questions; both were answered in full\n### In progress\n- none\n### Blocked\n- none\n## Next steps\n- answer the next question\n## Files that matter\n- none\n## Facts to keep\n- none",
+            ),
+            text_without_usage("third answer"),
+        ],
+        PermissionMode::Auto,
+        limits,
+        Vec::new(),
+        Dialect::ChatCompletions,
+        Some(WINDOW),
+    );
+    let session = harness.open_session();
+    let padding = "first question padding ".repeat(300);
+    for (id, prompt_text) in [(3, padding.as_str()), (4, "second question")] {
+        let response = harness
+            .client()
+            .call(id, "session/prompt", &prompt(&session, prompt_text));
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    }
+    // About 3,800 tokens per request so far; the third prompt's own text lifts
+    // it past 80% of the window, and dropping the first prompt brings it back.
+    let third = format!("third question {}", "third padding ".repeat(300));
+    let response = harness.client().call(
+        5,
+        "session/prompt",
+        &json!({"sessionId": session, "prompt": [{"type": "text", "text": third}, image_block()]}),
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(harness.mock.request_count(), 4);
+    let body = harness
+        .mock
+        .last_body()
+        .expect("request after compaction")
+        .to_string();
+    assert!(body.contains("<conversation-checkpoint>"), "{body}");
+    // The first prompt is carried into the checkpoint, cut, never whole.
+    assert!(body.contains("<user-messages>"), "{body}");
+    assert!(body.contains("more characters]"), "{body}");
+    assert!(!body.contains(padding.as_str()), "{body}");
+    assert!(body.contains("third padding"), "{body}");
+    // The image belongs to the prompt that survived the cut, at its new position.
+    assert!(body.contains(IMAGE), "{body}");
+}
+
+/// Context window of the compaction test's model, in tokens.
+const WINDOW: u64 = 5_500;
+
 #[test]
 fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_changes() {
     let mut harness = Harness::start(vec![Script::text("valid")], PermissionMode::Auto);
@@ -669,6 +776,8 @@ fn malformed_image_blocks_reject_the_whole_prompt_before_provider_or_session_cha
     );
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
     let mut harness = Harness::start(
@@ -781,6 +890,8 @@ fn requested_stdio_mcp_is_advertised_callable_and_isolated_by_session() {
     assert_mcp_stopped(&other_log);
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
     let mut harness = Harness::start(
@@ -847,6 +958,8 @@ fn loaded_and_resumed_sessions_connect_the_requested_stdio_servers() {
     ));
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn denied_mcp_calls_never_reach_the_stdio_server() {
     let mut harness = Harness::start(
@@ -877,6 +990,8 @@ fn denied_mcp_calls_never_reach_the_stdio_server() {
     );
 }
 
+// The stdio MCP fixture is a shell script.
+#[cfg(unix)]
 #[test]
 fn invalid_or_failed_mcp_setup_does_not_create_a_session_or_leak_children() {
     let mut limits = BudgetSet::new();
@@ -1168,7 +1283,7 @@ fn connections_list_only_sessions_with_their_stored_workspace() {
             "test/model",
         )
         .expect("config");
-        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let (server_side, client_side) = socket_pair();
         let output = server_side.try_clone().expect("output");
         let server = Arc::new(Server::new(config, output).expect("server"));
         let join = std::thread::spawn(move || {
@@ -1263,12 +1378,16 @@ fn a_streamed_answer_reaches_the_client_once_and_whole() {
 
 #[test]
 fn a_retried_answer_is_not_sent_to_the_client_twice() {
-    // The first attempt is cut off after its opening words, which the client
-    // has already been sent. The retry streams the answer from the start, and
+    // The first attempt fails after its opening words, which the client has
+    // already been sent. The retry streams the answer from the start, and
     // resending that opening would show it twice.
     let mut harness = Harness::start(
         vec![
-            Script::truncated("alpha "),
+            Script::Frames(vec![
+                r#"{"choices":[{"index":0,"delta":{"content":"alpha "}}]}"#.to_owned(),
+                r#"{"error":{"message":"the model is overloaded","type":"overloaded_error"}}"#
+                    .to_owned(),
+            ]),
             Script::Frames(vec![
                 r#"{"choices":[{"index":0,"delta":{"content":"alpha "}}]}"#.to_owned(),
                 r#"{"choices":[{"index":0,"delta":{"content":"beta"}}]}"#.to_owned(),
@@ -1427,7 +1546,9 @@ fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_ac
         ],
         PermissionMode::Ask,
         limits,
-        vec![("notes.txt", "original")],
+        // Empty, so the guard on overwriting an unread file leaves the write
+        // to the permission prompt this test is about.
+        vec![("notes.txt", "")],
     );
     harness.client().approval = Approval::Ignore;
     let session = harness.open_session();
@@ -1453,7 +1574,7 @@ fn unanswered_permissions_time_out_without_blocking_later_prompts_or_granting_ac
     assert_eq!(
         std::fs::read_to_string(harness.root.path().join("workspace/notes.txt"))
             .expect("unchanged file"),
-        "original"
+        ""
     );
     assert!(harness.client().updates("tool_call").is_empty());
     assert_eq!(
@@ -1969,4 +2090,189 @@ fn every_line_the_server_writes_is_a_protocol_frame() {
         assert_eq!(frame["jsonrpc"], "2.0");
         assert!(frame["method"].is_string());
     }
+}
+
+#[test]
+fn plan_updates_are_sent() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call(
+                "p1",
+                "update_plan",
+                r#"{"plan":[{"step":"Read the code","status":"in_progress"},{"step":"Write the fix","status":"pending"}]}"#,
+            ),
+            Script::text("planned"),
+        ],
+        PermissionMode::Auto,
+    );
+    let session = harness.open_session();
+    let response = harness
+        .client()
+        .call(3, "session/prompt", &prompt(&session, "make a plan"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let plans = harness.client().updates("plan");
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(
+        plans[0]["params"]["update"]["entries"],
+        json!([
+            {"content": "Read the code", "priority": "medium", "status": "in_progress"},
+            {"content": "Write the fix", "priority": "medium", "status": "pending"},
+        ])
+    );
+}
+
+#[test]
+fn available_commands_are_listed() {
+    let mut harness = Harness::start(vec![Script::text("reviewed")], PermissionMode::Auto);
+    let commands = harness
+        .root
+        .path()
+        .join("workspace")
+        .join(".rune")
+        .join("commands");
+    std::fs::create_dir_all(&commands).expect("commands folder");
+    std::fs::write(
+        commands.join("review.md"),
+        "---\ndescription: Review one file\nargument-hint: <path>\n---\nReview $1 for bugs.\n",
+    )
+    .expect("command file");
+    let session = harness.open_session();
+    let listed = harness
+        .client()
+        .update_until(|frame| is_update(frame, "available_commands_update"));
+    assert_eq!(
+        listed["params"]["update"]["availableCommands"],
+        json!([{"name": "review", "description": "Review one file", "input": {"hint": "<path>"}}])
+    );
+
+    // A prompt that starts with the command runs its expansion.
+    let response =
+        harness
+            .client()
+            .call(3, "session/prompt", &prompt(&session, "/review src/lib.rs"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let body = harness.mock.last_body().expect("a request").to_string();
+    assert!(body.contains("Review src/lib.rs for bugs."), "{body}");
+}
+
+#[test]
+fn permission_requests_carry_the_diff() {
+    let mut limits = BudgetSet::new();
+    limits
+        .set(
+            LimitName::VerificationReminders,
+            Budget::Bounded(0),
+            Layer::User,
+        )
+        .expect("no verification reminder");
+    let mut harness = Harness::start_with(
+        vec![
+            Script::tool_call(
+                "w1",
+                "write_file",
+                r#"{"path":"notes.txt","content":"new text\n"}"#,
+            ),
+            Script::text("written"),
+        ],
+        PermissionMode::Ask,
+        limits,
+        // Empty, so the guard on overwriting an unread file leaves the write
+        // to the permission prompt.
+        vec![("notes.txt", "")],
+    );
+    let session = harness.open_session();
+    let response = harness
+        .client()
+        .call(3, "session/prompt", &prompt(&session, "write it"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let workspace = harness.root.path().join("workspace");
+    let approvals = harness.client().approvals.clone();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["params"]["toolCall"]["content"],
+        json!([{
+            "type": "diff",
+            "path": workspace.join("notes.txt"),
+            "oldText": "",
+            "newText": "new text\n",
+        }])
+    );
+    let options: Vec<&str> = approvals[0]["params"]["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .filter_map(|option| option["kind"].as_str())
+        .collect();
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+}
+
+#[test]
+fn plan_mode_is_offered_and_announced() {
+    let mut harness = Harness::start(
+        vec![
+            Script::tool_call("w1", "write_file", r#"{"path":"plan.txt","content":"no"}"#),
+            Script::text("refused, so I planned"),
+        ],
+        PermissionMode::FullAccess,
+    );
+    harness.initialize(1);
+    let workspace = harness.root.path().join("workspace");
+    let created = harness.client().call(
+        2,
+        "session/new",
+        &json!({"cwd": workspace, "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+    let offered: Vec<&str> = created["result"]["modes"]["availableModes"]
+        .as_array()
+        .expect("modes")
+        .iter()
+        .filter_map(|mode| mode["id"].as_str())
+        .collect();
+    assert!(offered.contains(&"plan"), "{offered:?}");
+
+    harness.client().call(
+        3,
+        "session/set_mode",
+        &json!({"sessionId": session, "modeId": "plan"}),
+    );
+    let announced = harness
+        .client()
+        .update_until(|frame| is_update(frame, "current_mode_update"));
+    assert_eq!(announced["params"]["update"]["currentModeId"], "plan");
+
+    // Even in full access, planning refuses the write without asking.
+    let response =
+        harness
+            .client()
+            .call(4, "session/prompt", &prompt(&session, "change something"));
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert!(
+        !workspace.join("plan.txt").exists(),
+        "plan mode let a write through"
+    );
+    assert!(harness.client().approvals.is_empty());
+    let body = harness.mock.last_body().expect("a request").to_string();
+    assert!(body.contains("<plan_mode>"), "{body}");
+
+    harness.client().call(
+        5,
+        "session/set_mode",
+        &json!({"sessionId": session, "modeId": "auto"}),
+    );
+    // The update is written before the response, so it is already in.
+    let modes: Vec<String> = harness
+        .client()
+        .updates("current_mode_update")
+        .iter()
+        .filter_map(|frame| {
+            frame["params"]["update"]["currentModeId"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(modes, ["plan", "auto"]);
 }

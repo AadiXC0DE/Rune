@@ -1,0 +1,4 @@
+{
+  "config/limits.conf": "max_items = 5\n",
+  "check.sh": "if grep -q '^max_items = 10$' config/limits.conf; then\n  echo \"test result: ok. 1 passed; 0 failed; 0 ignored\"\nelse\n  echo \"test result: FAILED. 0 passed; 1 failed; 0 ignored\"; exit 1\nfi\n"
+}

@@ -1,0 +1,9 @@
+[package]
+name = "bitset_fixture"
+version = "0.1.0"
+edition = "2021"
+
+# A project of its own, not part of the enclosing workspace.
+[workspace]
+
+[dependencies]

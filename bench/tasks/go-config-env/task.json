@@ -1,0 +1,15 @@
+{
+  "title": "Fix config precedence between environment, file and defaults",
+  "kind": "bugfix",
+  "prompt": "Environment variables should override the config file, and the config file should override the defaults, but right now the order is mixed up and empty variables wipe out file values.",
+  "verify": "go test ./...",
+  "protected": [
+    "config/config_test.go",
+    "config/hidden_test.go"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "go"
+}

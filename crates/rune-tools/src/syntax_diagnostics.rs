@@ -49,8 +49,7 @@ impl Tool for SyntaxDiagnostics {
                     "description": "Defaults to 2024."
                 },
                 "max_bytes": {
-                    "type": "integer", "minimum": 1,
-                    "description": "Output cap."
+                    "type": "integer", "minimum": 1
                 }
             },
             "required": ["path"],
@@ -294,6 +293,9 @@ fn render(exit: Exit, stderr: &Reading, path: &str, cap: usize) -> ToolOutput {
         is_error: !exit.is_success(),
         plan_update: None,
         full_text: None,
+        diff: None,
+        image: None,
+        check: None,
     }
 }
 

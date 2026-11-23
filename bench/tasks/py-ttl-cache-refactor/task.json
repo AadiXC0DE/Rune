@@ -1,0 +1,15 @@
+{
+  "title": "Merge two expiring cache copies into one implementation",
+  "kind": "refactor",
+  "prompt": "There are two copies of the expiring cache logic and they disagree about when an entry expires. Merge them into one implementation that both callers use, keeping the current tests passing.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "heldout",
+  "language": "python"
+}

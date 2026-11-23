@@ -39,7 +39,9 @@ rune-context = { path = "crates/rune-context", version = "0.1.17" }
 rune-term = { path = "crates/rune-term", version = "0.1.17" }
 rune-acp = { path = "crates/rune-acp", version = "0.1.17" }
 rune-sdk = { path = "crates/rune-sdk", version = "0.1.17" }
-rune-testkit = { path = "crates/rune-testkit", version = "0.1.17" }
+# Never published: a path-only dependency is dropped from the published
+# manifests of the crates that test with it.
+rune-testkit = { path = "crates/rune-testkit" }
 
 # Compression
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -80,6 +82,7 @@ jiff = { version = "0.2", default-features = false }
 
 # Hashing
 sha2 = "0.10"
+signal-hook = "0.3"
 getrandom = "0.2"
 rustix = { version = "1", default-features = false, features = ["std"] }
 

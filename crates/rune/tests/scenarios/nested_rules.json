@@ -1,0 +1,52 @@
+{
+  "prompt": "Read the two files in a.",
+  "workspace": "workspaces/nested_rules.json",
+  "turns": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "a/x.txt"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "read_file",
+          "arguments": {
+            "path": "a/y.txt"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Read both."
+    }
+  ],
+  "expect": {
+    "exit_code": 0,
+    "requests": 3,
+    "prefix_breaks": 0,
+    "request_contains": [
+      {
+        "request": 2,
+        "text": "<scoped-rules from=\\\"a/AGENTS.md\\\""
+      }
+    ],
+    "request_absent": [
+      {
+        "request": 1,
+        "text": "Use tabs in a."
+      },
+      {
+        "request": 2,
+        "text": "Use spaces in b."
+      }
+    ]
+  }
+}

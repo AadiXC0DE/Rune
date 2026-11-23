@@ -123,11 +123,14 @@ with tempfile.TemporaryDirectory(prefix="rune-r115-") as directory:
         capture("new-status", "context source request bytes (estimate)", b"/status\r")
         assert len(requests) == 2, requests
         os.write(master, b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
         print(json.dumps(captures))
     finally:
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

@@ -1,0 +1,15 @@
+{
+  "title": "Make Roman numeral conversion strict and correct",
+  "kind": "bugfix",
+  "prompt": "to_roman and from_roman in numerals.py accept invalid input and get subtractive forms wrong. Make them strict and correct for 1 to 3999.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "heldout",
+  "language": "python"
+}

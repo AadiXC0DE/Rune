@@ -3,6 +3,9 @@
 // Each integration test is a separate crate and uses only part of this module.
 #![allow(dead_code, clippy::expect_used)]
 
+#[cfg(windows)]
+pub mod conpty;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::process::Command;
@@ -48,6 +51,48 @@ impl CommandExt for Command {
     }
 }
 
+/// Waits for a PTY child to exit, or for a fixture event, while reading what
+/// the child still writes.
+///
+/// A child that prints more at exit than the PTY buffer holds blocks on that
+/// write until someone reads; macOS buffers far less than Linux, so a harness
+/// that only waited never saw the exit there. What is read joins the sink.
+const DRAIN_WAIT: &str = "\
+def drain_wait(child, master, timeout, sink):
+    import os, select, time
+    deadline = time.monotonic() + timeout
+    while child.poll() is None:
+        if time.monotonic() >= deadline:
+            return child.wait(timeout=0.01)
+        try:
+            ready = select.select([master], [], [], 0.05)[0]
+            data = os.read(master, 65536) if ready else b''
+        except OSError:
+            data = b''
+            time.sleep(0.01)
+        sink.extend(data)
+    return child.returncode
+
+def event_wait(event, master, timeout, sink):
+    import os, select, time
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        if time.monotonic() >= deadline:
+            return False
+        if select.select([master], [], [], 0.05)[0]:
+            try:
+                sink.extend(os.read(master, 65536))
+            except OSError:
+                time.sleep(0.01)
+    return True
+";
+
+/// The Python interpreter to run fixtures with. Windows installs it as
+/// `python`; `python3` there is often only a placeholder that opens the store.
+pub fn python() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
 /// Give embedded Python fixtures the same OS allowlist without a second copy.
 /// The Python helper leaves each fixture's Linux environment exactly intact.
 pub fn python_script(script: &str) -> String {
@@ -62,6 +107,6 @@ pub fn python_script(script: &str) -> String {
         .collect();
     let environment = serde_json::to_string(&environment).expect("OS environment JSON");
     format!(
-        "def child_environment(environment):\n    environment.update({environment})\n    return environment\n\n{script}"
+        "def child_environment(environment):\n    environment.update({environment})\n    return environment\n\n{DRAIN_WAIT}\n{script}"
     )
 }

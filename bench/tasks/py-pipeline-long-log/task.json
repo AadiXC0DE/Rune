@@ -1,0 +1,19 @@
+{
+  "title": "Make the importer handle every price format in the sample data",
+  "kind": "bugfix",
+  "prompt": "The nightly import job fails on the sample data set. The test output is long; find the record that breaks it and make the importer handle that format.",
+  "verify": "python3 -m unittest discover -q -s tests -t .",
+  "protected": [
+    "tests",
+    "data",
+    "tests/test_hidden.py"
+  ],
+  "timeoutMs": 900000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "heldout",
+  "language": "python",
+  "tags": [
+    "long-log"
+  ]
+}

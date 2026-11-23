@@ -1,0 +1,16 @@
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Check the file first."},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"reasoning_content":" Then answer."},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"content":"Reading it."},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","model":"fixture-model","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":12,"total_tokens":32,"completion_tokens_details":{"reasoning_tokens":8}}}
+
+data: [DONE]
+

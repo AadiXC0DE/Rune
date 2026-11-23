@@ -312,6 +312,42 @@ impl fmt::Debug for OAuthTokens {
 }
 
 impl OAuthTokens {
+    /// Exchanges the refresh token for new tokens at the token endpoint. A
+    /// response without a refresh token keeps the current one.
+    pub fn refresh(&self, metadata: &AuthorizationMetadata, client_id: &str) -> Result<Self> {
+        let refresh = self
+            .refresh_token()
+            .ok_or_else(|| oauth_error("refresh_token", "no OAuth refresh token is stored"))?;
+        let mut response = http_agent()
+            .post(metadata.token_endpoint())
+            .config()
+            .timeout_global(Some(EXCHANGE_TIMEOUT))
+            .max_redirects(0)
+            .build()
+            .header("Accept", "application/json")
+            .send_form([
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh),
+                ("resource", metadata.resource()),
+            ])
+            .map_err(|_| oauth_error("token_refresh", "OAuth token refresh failed"))?;
+        if response.status() != ureq::http::StatusCode::OK {
+            return Err(RuneError::new(
+                ErrorCode::AuthenticationRequired,
+                "the OAuth refresh token was rejected",
+            ));
+        }
+        let mut stored: StoredTokens = read_json(response.body_mut())
+            .map_err(|_| oauth_error("token_response", "invalid OAuth token response"))?;
+        if stored.refresh_token.is_none() {
+            stored.refresh_token = Some(refresh.to_owned());
+        }
+        let tokens = Self(stored);
+        tokens.validate()?;
+        Ok(tokens)
+    }
+
     pub fn access_token(&self) -> &str {
         &self.0.access_token
     }
@@ -347,12 +383,68 @@ impl OAuthTokens {
 #[derive(Debug)]
 pub struct OAuthTokenStore {
     directory: Utf8PathBuf,
+    system: Option<SystemStore>,
+}
+
+/// Functions reading, writing and removing one secret by account name.
+#[derive(Clone, Copy)]
+struct SystemStore {
+    read: fn(&str) -> Option<String>,
+    write: fn(&str, &str) -> bool,
+    remove: fn(&str) -> bool,
+}
+
+impl fmt::Debug for SystemStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SystemStore")
+    }
 }
 
 impl OAuthTokenStore {
     pub fn new(directory: impl Into<Utf8PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            system: None,
+        }
+    }
+
+    /// Keeps tokens in a platform secret store through the given functions,
+    /// under the account `mcp-oauth:{binding digest}`, instead of in files.
+    pub fn with_system_store(
+        directory: impl Into<Utf8PathBuf>,
+        read: fn(&str) -> Option<String>,
+        write: fn(&str, &str) -> bool,
+        remove: fn(&str) -> bool,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            system: Some(SystemStore {
+                read,
+                write,
+                remove,
+            }),
+        }
+    }
+
+    fn account(metadata: &AuthorizationMetadata, client_id: &str) -> String {
+        format!("mcp-oauth:{}", Self::digest(metadata, client_id))
+    }
+
+    fn digest(metadata: &AuthorizationMetadata, client_id: &str) -> String {
+        let binding =
+            serde_json::json!([metadata.resource(), metadata.issuer(), client_id]).to_string();
+        format!("{:x}", Sha256::digest(binding.as_bytes()))
+    }
+
+    /// Removes the stored tokens of one binding. Removing nothing succeeds.
+    pub fn remove(&self, metadata: &AuthorizationMetadata, client_id: &str) -> Result<()> {
+        if let Some(system) = self.system {
+            (system.remove)(&Self::account(metadata, client_id));
+            return Ok(());
+        }
+        match std::fs::remove_file(self.path(metadata, client_id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
         }
     }
 
@@ -363,12 +455,16 @@ impl OAuthTokenStore {
         metadata: &AuthorizationMetadata,
         client_id: &str,
     ) -> Result<Option<OAuthTokens>> {
-        if !self.directory.try_exists()? {
-            return Ok(None);
-        }
-        paths::create_dir_private(&self.directory)?;
-        let Some(text) = paths::read_private(&self.path(metadata, client_id), MAX_TOKEN_BYTES)?
-        else {
+        let text = if let Some(system) = self.system {
+            (system.read)(&Self::account(metadata, client_id))
+        } else {
+            if !self.directory.try_exists()? {
+                return Ok(None);
+            }
+            paths::create_dir_private(&self.directory)?;
+            paths::read_private(&self.path(metadata, client_id), MAX_TOKEN_BYTES)?
+        };
+        let Some(text) = text else {
             return Ok(None);
         };
         let tokens = OAuthTokens(
@@ -380,21 +476,17 @@ impl OAuthTokenStore {
     }
 
     fn path(&self, metadata: &AuthorizationMetadata, client_id: &str) -> Utf8PathBuf {
-        let binding =
-            serde_json::json!([metadata.resource(), metadata.issuer(), client_id]).to_string();
         self.directory
-            .join(format!("{:x}.json", Sha256::digest(binding.as_bytes())))
+            .join(format!("{}.json", Self::digest(metadata, client_id)))
     }
 
-    fn save(
+    /// Stores tokens for one binding, replacing earlier ones.
+    pub fn save(
         &self,
         metadata: &AuthorizationMetadata,
         client_id: &str,
         tokens: &OAuthTokens,
     ) -> Result<()> {
-        paths::create_dir_private(&self.directory)?;
-        let path = self.path(metadata, client_id);
-        let _lock = paths::lock_private(&path.with_extension("lock"))?;
         let encoded = serde_json::to_string(&tokens.0)
             .map_err(|_| oauth_error("token_store", "could not encode OAuth tokens"))?;
         if encoded.len() as u64 > MAX_TOKEN_BYTES {
@@ -403,8 +495,77 @@ impl OAuthTokenStore {
                 "stored OAuth tokens are too large",
             ));
         }
+        if let Some(system) = self.system {
+            if (system.write)(&Self::account(metadata, client_id), &encoded) {
+                return Ok(());
+            }
+            return Err(oauth_error(
+                "token_store",
+                "could not write OAuth tokens to the system secret store",
+            ));
+        }
+        paths::create_dir_private(&self.directory)?;
+        let path = self.path(metadata, client_id);
+        let _lock = paths::lock_private(&path.with_extension("lock"))?;
         paths::write_private_atomic(&path, &encoded)
     }
+}
+
+/// Longest wait for a registration or refresh response.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Registers Rune as a public client with a loopback redirect and returns the
+/// client identifier the server assigned.
+pub fn register_client(metadata: &AuthorizationMetadata) -> Result<String> {
+    let endpoint = metadata
+        .registration_endpoint()
+        .ok_or_else(|| oauth_error("registration_endpoint", "no registration endpoint"))?;
+    let body = serde_json::json!({
+        "client_name": "Rune",
+        "redirect_uris": ["http://127.0.0.1/oauth/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    });
+    let mut response = http_agent()
+        .post(endpoint)
+        .config()
+        .timeout_global(Some(EXCHANGE_TIMEOUT))
+        .max_redirects(0)
+        .build()
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|_| oauth_error("registration", "OAuth client registration failed"))?;
+    if !response.status().is_success() {
+        return Err(oauth_error(
+            "registration",
+            "OAuth client registration failed",
+        ));
+    }
+    let reply: serde_json::Value = read_json(response.body_mut())
+        .map_err(|_| oauth_error("registration", "invalid OAuth registration response"))?;
+    reply
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_CALLBACK_BYTES)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            oauth_error(
+                "registration",
+                "the OAuth registration response has no client_id",
+            )
+        })
+}
+
+/// Reads a bounded JSON body.
+fn read_json<T: serde::de::DeserializeOwned>(body: &mut ureq::Body) -> Result<T> {
+    let bytes = body
+        .with_config()
+        .limit(MAX_TOKEN_BYTES)
+        .read_to_vec()
+        .map_err(|_| oauth_error("response", "could not read a bounded OAuth response"))?;
+    serde_json::from_slice(&bytes).map_err(|_| oauth_error("response", "invalid OAuth response"))
 }
 
 fn oauth_error(field: &str, message: &str) -> RuneError {
@@ -514,5 +675,58 @@ mod tests {
             challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn a_system_store_holds_tokens_by_binding() {
+        use std::sync::{LazyLock, Mutex};
+        static SECRETS: LazyLock<Mutex<BTreeMap<String, String>>> =
+            LazyLock::new(|| Mutex::new(BTreeMap::new()));
+        fn read(account: &str) -> Option<String> {
+            SECRETS.lock().expect("lock").get(account).cloned()
+        }
+        fn write(account: &str, value: &str) -> bool {
+            SECRETS
+                .lock()
+                .expect("lock")
+                .insert(account.to_owned(), value.to_owned());
+            true
+        }
+        fn remove(account: &str) -> bool {
+            SECRETS.lock().expect("lock").remove(account).is_some()
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = Utf8PathBuf::from_path_buf(dir.path().join("tokens")).expect("utf8");
+        let store = OAuthTokenStore::with_system_store(directory.clone(), read, write, remove);
+        let metadata = AuthorizationMetadata {
+            resource: "https://mcp.example.test/mcp".to_owned(),
+            issuer: "https://auth.example.test".to_owned(),
+            authorization_endpoint: "https://auth.example.test/authorize".to_owned(),
+            token_endpoint: "https://auth.example.test/token".to_owned(),
+            registration_endpoint: None,
+        };
+        assert!(store.load(&metadata, "client").expect("load").is_none());
+        let tokens = OAuthTokens(StoredTokens {
+            access_token: "access".to_owned(),
+            token_type: "Bearer".to_owned(),
+            refresh_token: Some("refresh".to_owned()),
+            expires_in: None,
+        });
+        store.save(&metadata, "client", &tokens).expect("save");
+        let accounts: Vec<String> = SECRETS.lock().expect("lock").keys().cloned().collect();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].starts_with("mcp-oauth:"), "{accounts:?}");
+        let loaded = store
+            .load(&metadata, "client")
+            .expect("load")
+            .expect("stored");
+        assert_eq!(loaded.access_token(), "access");
+        assert_eq!(loaded.refresh_token(), Some("refresh"));
+        // Another client is another binding.
+        assert!(store.load(&metadata, "other").expect("load").is_none());
+        // Nothing reached the file system.
+        assert!(!directory.exists());
+        store.remove(&metadata, "client").expect("remove");
+        assert!(SECRETS.lock().expect("lock").is_empty());
     }
 }

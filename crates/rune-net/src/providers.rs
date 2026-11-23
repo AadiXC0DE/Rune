@@ -44,6 +44,46 @@ pub struct KnownProvider {
     /// without it rather than falling back to something slower, so it is part
     /// of connecting rather than an optimization.
     pub required_headers: &'static [(&'static str, &'static str)],
+    /// Small model the provider publishes, used to review actions in `auto`
+    /// mode when requests go to `base_url` itself.
+    ///
+    /// `None` where the endpoint serves models nobody can name in advance, so
+    /// the session model reviews instead.
+    pub review_model: Option<&'static str>,
+    /// Key of this provider in the published models.dev catalog.
+    ///
+    /// `None` where the endpoint serves whatever its operator installed, so no
+    /// published catalog describes it.
+    pub models_dev_key: Option<&'static str>,
+    /// Group the provider is listed under.
+    pub group: ProviderGroup,
+}
+
+/// Where a provider's models are served from, which is how the choices are
+/// grouped when they are listed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProviderGroup {
+    /// The vendor that trains the models serves them.
+    Direct,
+    /// One key reaches models from many vendors.
+    Gateway,
+    /// Any endpoint that speaks a dialect, named by the user.
+    Compatible,
+    /// A model server on this machine.
+    Local,
+}
+
+impl ProviderGroup {
+    /// Returns the heading the group is listed under.
+    #[must_use]
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct from the model vendor",
+            Self::Gateway => "Gateways",
+            Self::Compatible => "Any compatible endpoint",
+            Self::Local => "Local servers",
+        }
+    }
 }
 
 impl KnownProvider {
@@ -65,9 +105,10 @@ impl KnownProvider {
 
 /// Providers a fresh install offers, in the order they are shown.
 ///
-/// Ordered with native APIs that need nothing but a key first, then the generic
-/// OpenAI-compatible dialect, which needs an endpoint, and finally the
-/// local Ollama endpoint, which uses anonymous loopback mode.
+/// The position in this table is the number a choice is printed with, and the
+/// entries of a group are contiguous: vendors serving their own models first,
+/// then gateways, then the generic OpenAI-compatible dialect, which needs an
+/// endpoint, and finally local servers, which use anonymous loopback mode.
 pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
     KnownProvider {
         name: "anthropic",
@@ -77,6 +118,9 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("claude-haiku-5-5"),
+        models_dev_key: Some("anthropic"),
+        group: ProviderGroup::Direct,
     },
     KnownProvider {
         name: "openai",
@@ -86,6 +130,9 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("gpt-6-luna"),
+        models_dev_key: Some("openai"),
+        group: ProviderGroup::Direct,
     },
     KnownProvider {
         name: "gemini",
@@ -95,6 +142,117 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: Some("gemini-3.5-flash-lite"),
+        models_dev_key: Some("google"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "deepseek",
+        summary: "DeepSeek API, OpenAI-compatible",
+        base_url: Some("https://api.deepseek.com"),
+        key_variable: Some("DEEPSEEK_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: Some("deepseek-flash"),
+        models_dev_key: Some("deepseek"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "zai",
+        summary: "Z.ai GLM models, OpenAI-compatible",
+        base_url: Some("https://api.z.ai/api/paas/v4"),
+        key_variable: Some("ZAI_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("zai"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "moonshot",
+        summary: "Moonshot Kimi models, OpenAI-compatible",
+        base_url: Some("https://api.moonshot.ai/v1"),
+        key_variable: Some("MOONSHOT_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("moonshotai"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "minimax",
+        summary: "MiniMax models, OpenAI-compatible",
+        base_url: Some("https://api.minimax.io/v1"),
+        key_variable: Some("MINIMAX_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("minimax"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "xai",
+        summary: "xAI Grok models, OpenAI-compatible",
+        base_url: Some("https://api.x.ai/v1"),
+        key_variable: Some("XAI_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("xai"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "groq",
+        summary: "Groq hosted open models, OpenAI-compatible",
+        base_url: Some("https://api.groq.com/openai/v1"),
+        key_variable: Some("GROQ_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("groq"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "mistral",
+        summary: "Mistral models, OpenAI-compatible",
+        base_url: Some("https://api.mistral.ai/v1"),
+        key_variable: Some("MISTRAL_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("mistral"),
+        group: ProviderGroup::Direct,
+    },
+    KnownProvider {
+        name: "openrouter",
+        summary: "OpenRouter, many vendors behind one key",
+        base_url: Some("https://openrouter.ai/api/v1"),
+        key_variable: Some("OPENROUTER_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("openrouter"),
+        group: ProviderGroup::Gateway,
+    },
+    KnownProvider {
+        name: "vercel",
+        summary: "Vercel AI Gateway, OpenAI-compatible route",
+        base_url: Some("https://ai-gateway.vercel.sh/v1"),
+        key_variable: Some("AI_GATEWAY_API_KEY"),
+        credential: CredentialKind::ApiKey,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: Some("vercel"),
+        group: ProviderGroup::Gateway,
     },
     KnownProvider {
         name: "opencode",
@@ -104,6 +262,9 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[("user-agent", USER_AGENT)],
+        review_model: None,
+        models_dev_key: Some("opencode"),
+        group: ProviderGroup::Gateway,
     },
     KnownProvider {
         name: "opencode-go",
@@ -116,6 +277,9 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         // than degrading, so it is sent with every request rather than on the
         // ones that happen to carry a session.
         required_headers: &[("user-agent", USER_AGENT), ("x-opencode-session", "rune")],
+        review_model: None,
+        models_dev_key: Some("opencode-go"),
+        group: ProviderGroup::Gateway,
     },
     KnownProvider {
         name: "chat_completions",
@@ -125,6 +289,9 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::ApiKey,
         implemented: true,
         required_headers: &[],
+        review_model: None,
+        models_dev_key: None,
+        group: ProviderGroup::Compatible,
     },
     KnownProvider {
         name: "ollama",
@@ -134,6 +301,33 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
         credential: CredentialKind::AnonymousLoopback,
         implemented: true,
         required_headers: &[],
+        review_model: None,
+        models_dev_key: None,
+        group: ProviderGroup::Local,
+    },
+    KnownProvider {
+        name: "lmstudio",
+        summary: "Local LM Studio server",
+        base_url: Some("http://127.0.0.1:1234/v1"),
+        key_variable: None,
+        credential: CredentialKind::AnonymousLoopback,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: None,
+        group: ProviderGroup::Local,
+    },
+    KnownProvider {
+        name: "llamacpp",
+        summary: "Local llama.cpp server",
+        base_url: Some("http://127.0.0.1:8080/v1"),
+        key_variable: None,
+        credential: CredentialKind::AnonymousLoopback,
+        implemented: true,
+        required_headers: &[],
+        review_model: None,
+        models_dev_key: None,
+        group: ProviderGroup::Local,
     },
 ];
 
@@ -169,6 +363,12 @@ pub fn aliases(name: &str) -> &'static [&'static str] {
         "chat_completions" => &["chat-completions"],
         "opencode" => &["zen", "opencode-zen"],
         "opencode-go" => &["go", "zen-go"],
+        "zai" => &["glm", "z.ai"],
+        "moonshot" => &["kimi"],
+        "xai" => &["grok"],
+        "vercel" => &["ai-gateway"],
+        "lmstudio" => &["lm-studio"],
+        "llamacpp" => &["llama.cpp", "llama-server"],
         _ => &[],
     }
 }
@@ -195,28 +395,48 @@ pub fn key_variable(name: &str) -> Option<&'static str> {
 ///
 /// Each line names the provider and what it needs, so a user can choose without
 /// reading documentation. The credential variable is shown because a user who
-/// already has it exported can skip storing one.
+/// already has it exported can skip storing one. Entries are listed under the
+/// heading of their group and numbered by their position in the table, which
+/// is the number a choice accepts.
 #[must_use]
 pub fn render_choices() -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
+    // The generic entry's long name runs past the column rather than pushing
+    // every other summary to the right.
     let width = KNOWN_PROVIDERS
         .iter()
+        .filter(|entry| entry.group != ProviderGroup::Compatible)
         .map(|entry| entry.name.len())
         .max()
         .unwrap_or(0);
-    for entry in KNOWN_PROVIDERS {
-        let _ = writeln!(out, "  {:<width$}  {}", entry.name, entry.summary);
-        let mut needs = Vec::new();
-        if entry.base_url.is_none() {
-            needs.push("an endpoint");
+    let mut group = None;
+    for (position, entry) in KNOWN_PROVIDERS.iter().enumerate() {
+        if group != Some(entry.group) {
+            group = Some(entry.group);
+            let _ = writeln!(out, "{}", entry.group.heading());
         }
-        if let Some(variable) = entry.key_variable {
-            needs.push(variable);
-        }
-        if !needs.is_empty() {
-            let _ = writeln!(out, "  {:<width$}  needs {}", "", needs.join(", "));
+        let number = position.saturating_add(1);
+        let _ = writeln!(
+            out,
+            "{number:>3}. {:<width$}  {}",
+            entry.name, entry.summary
+        );
+        let second = if entry.group == ProviderGroup::Local {
+            Some("no key needed (loopback only)".to_owned())
+        } else {
+            let mut needs = Vec::new();
+            if entry.base_url.is_none() {
+                needs.push("an endpoint");
+            }
+            if let Some(variable) = entry.key_variable {
+                needs.push(variable);
+            }
+            (!needs.is_empty()).then(|| format!("needs {}", needs.join(", ")))
+        };
+        if let Some(second) = second {
+            let _ = writeln!(out, "     {:<width$}  {second}", "");
         }
     }
     out.trim_end().to_owned()
@@ -342,6 +562,147 @@ mod tests {
                 .iter()
                 .any(|(name, _)| *name == "user-agent")
         );
+    }
+
+    #[test]
+    fn every_preset_has_a_catalog_key_or_says_none() {
+        for entry in KNOWN_PROVIDERS {
+            let undescribed =
+                entry.name == "chat_completions" || entry.group == ProviderGroup::Local;
+            assert_eq!(
+                entry.models_dev_key.is_none(),
+                undescribed,
+                "{} has the wrong catalog key",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_presets_reach_their_published_endpoints() {
+        let expect = |name: &str, url: &str, variable: Option<&str>| {
+            let entry = lookup(name).expect("known");
+            assert_eq!(entry.base_url, Some(url), "{name}");
+            assert_eq!(entry.key_variable, variable, "{name}");
+            assert_eq!(
+                crate::auth::default_variables(name).first().copied(),
+                variable,
+                "{name}"
+            );
+        };
+        expect(
+            "deepseek",
+            "https://api.deepseek.com",
+            Some("DEEPSEEK_API_KEY"),
+        );
+        expect("zai", "https://api.z.ai/api/paas/v4", Some("ZAI_API_KEY"));
+        expect(
+            "moonshot",
+            "https://api.moonshot.ai/v1",
+            Some("MOONSHOT_API_KEY"),
+        );
+        expect(
+            "minimax",
+            "https://api.minimax.io/v1",
+            Some("MINIMAX_API_KEY"),
+        );
+        expect("xai", "https://api.x.ai/v1", Some("XAI_API_KEY"));
+        expect(
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some("GROQ_API_KEY"),
+        );
+        expect(
+            "mistral",
+            "https://api.mistral.ai/v1",
+            Some("MISTRAL_API_KEY"),
+        );
+        expect(
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            Some("OPENROUTER_API_KEY"),
+        );
+        expect(
+            "vercel",
+            "https://ai-gateway.vercel.sh/v1",
+            Some("AI_GATEWAY_API_KEY"),
+        );
+        expect("lmstudio", "http://127.0.0.1:1234/v1", None);
+        expect("llamacpp", "http://127.0.0.1:8080/v1", None);
+        assert_eq!(
+            crate::auth::default_variables("zai"),
+            &["ZAI_API_KEY", "ZHIPU_API_KEY"]
+        );
+        for local in ["lmstudio", "llamacpp"] {
+            let entry = lookup(local).expect("known");
+            assert_eq!(entry.credential, CredentialKind::AnonymousLoopback);
+        }
+    }
+
+    #[test]
+    fn choices_are_grouped_and_numbered() {
+        let rendered = render_choices();
+        assert_eq!(KNOWN_PROVIDERS.len(), 18);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let headings = [
+            "Direct from the model vendor",
+            "Gateways",
+            "Any compatible endpoint",
+            "Local servers",
+        ];
+        let at: Vec<usize> = headings
+            .iter()
+            .map(|heading| {
+                lines
+                    .iter()
+                    .position(|line| line == heading)
+                    .unwrap_or_else(|| panic!("no `{heading}` heading: {rendered}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{rendered}");
+
+        assert!(
+            rendered.contains("  1. anthropic    Anthropic Messages API\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("\n{}needs ANTHROPIC_API_KEY\n", " ".repeat(18))),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\n  4. deepseek "), "{rendered}");
+        assert!(rendered.contains("\n 11. openrouter   "), "{rendered}");
+        assert!(
+            rendered.contains("\n 15. chat_completions  Any"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\n 16. ollama       Local"), "{rendered}");
+        assert!(rendered.contains("\n 18. llamacpp "), "{rendered}");
+
+        for (position, entry) in KNOWN_PROVIDERS.iter().enumerate() {
+            let prefix = format!("{:>3}. {} ", position.saturating_add(1), entry.name);
+            let line = lines
+                .iter()
+                .position(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("`{prefix}` is not listed: {rendered}"));
+            let heading = at
+                .iter()
+                .rposition(|start| *start < line)
+                .expect("under a heading");
+            assert_eq!(
+                headings[heading],
+                entry.group.heading(),
+                "{} is under the wrong heading",
+                entry.name
+            );
+            if entry.group == ProviderGroup::Local {
+                assert_eq!(
+                    lines.get(line.saturating_add(1)).map(|next| next.trim()),
+                    Some("no key needed (loopback only)"),
+                    "{}",
+                    entry.name
+                );
+            }
+        }
     }
 
     #[test]

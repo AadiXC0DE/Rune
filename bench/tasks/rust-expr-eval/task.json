@@ -1,0 +1,19 @@
+{
+  "title": "Make the calculator follow precedence and report errors instead of panicking",
+  "kind": "bugfix",
+  "prompt": "The calculator gives wrong answers for some expressions and panics on others. Make it follow normal precedence and associativity and report errors instead of panicking.",
+  "verify": "cargo test --quiet --offline",
+  "protected": [
+    "tests/basic.rs",
+    "tests/hidden.rs"
+  ],
+  "timeoutMs": 900000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 3,
+  "split": "heldout",
+  "language": "rust",
+  "tags": [
+    "long-debug"
+  ]
+}

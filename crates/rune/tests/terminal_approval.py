@@ -17,11 +17,14 @@ import time
 
 
 COMMAND = "printf AUDIT_SHELL_OK; printf x >> shell-ran"
+# One program and its arguments, so an always-allow rule may be saved for it.
+ALWAYS_COMMAND = "git status --short"
 results = []
 prompts = []
 errors = []
 draft_request = threading.Event()
 release_draft = threading.Event()
+quarantine_call = threading.Event()
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
@@ -53,6 +56,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
                     if text == "permission-draft":
                         draft_request.set()
                         assert release_draft.wait(10), "draft was never released"
+                    if text == "permission-quarantine":
+                        quarantine_call.set()
+                    command = ALWAYS_COMMAND if text == "permission-always" else COMMAND
                     delta = {
                         "tool_calls": [{
                             "index": 0,
@@ -62,7 +68,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
                                 "name": "shell",
                                 "arguments": json.dumps({
                                     "action": "run",
-                                    "command": COMMAND,
+                                    "command": command,
                                 }),
                             },
                         }],
@@ -159,13 +165,19 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # submits steering to the old turn instead of starting the next one.
         wait_for(text + "\r\n", start)
 
+    def menu(start):
+        wait_for("permission required", start)
+        wait_for("shell wants to run:", start)
+        wait_for(f"  {COMMAND}", start)
+        wait_for("y  run once", start)
+        wait_for("n  deny", start)
+        # Keys in the first 300 ms of a request are ignored.
+        time.sleep(0.4)
+
     def permission(prompt="permission"):
         start = len(transcript)
         send(prompt.encode() + b"\r")
-        wait_for("permission required", start)
-        wait_for(f'Scope: "{COMMAND}"', start)
-        wait_for("  Run once", start)
-        wait_for("> Deny", start)
+        menu(start)
         return start
 
     try:
@@ -173,24 +185,52 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         start = permission()
         assert not side_effect.exists(), "shell ran before approval"
         confirmed_at = len(transcript)
-        send(b"\x1b[A\r")
+        send(b"y")
         settled_reply("FIXTURE_REPLY_1", start)
         wait_for("AUDIT_SHELL_OK", confirmed_at)
         assert "AUDIT_SHELL_OK" in results[0], results
         assert side_effect.read_bytes() == b"x"
 
-        # Approving once does not grant the same command on a subsequent turn.
+        # Approving once does not grant the same command on a subsequent turn,
+        # and Enter before an arrow does nothing.
         start = permission()
         send(b"\r")
+        time.sleep(0.3)
+        assert len(results) == 1, results
+        send(b"n")
         settled_reply("FIXTURE_REPLY_2", start)
         assert "refused by policy" in results[1], results
+        assert "the user denied this command" in results[1], results
         assert side_effect.read_bytes() == b"x", "denied shell ran"
 
-        # Every cancel key releases the worker and leaves the session usable.
-        for cancel in [b"\x1b", b"\x03", b"\x04"]:
+        # Tab denies with a message; Escape in the field goes back to the menu.
+        start = permission()
+        send(b"\t")
+        wait_for("tell the model what to do instead (enter sends, esc goes back)", start)
+        send(b"\x1b")
+        back = len(transcript)
+        wait_for("y  run once", back)
+        send(b"\t")
+        send(b"use make test instead\r")
+        settled_reply("FIXTURE_REPLY_3", start)
+        assert (
+            "the user denied this command and said: use make test instead" in results[2]
+        ), results
+        wait_for("denied: use make test instead", start)
+        assert side_effect.read_bytes() == b"x", "denied shell ran"
+
+        # Escape denies and the turn goes on.
+        start = permission()
+        send(b"\x1b")
+        settled_reply("FIXTURE_REPLY_4", start)
+        assert "the user denied this command" in results[3], results
+        assert side_effect.read_bytes() == b"x", "denied shell ran"
+
+        # Control-C and Control-D deny, interrupt, and leave the session usable.
+        for cancel in [b"\x03", b"\x04"]:
             start = permission()
             send(cancel)
-            settled_reply("[cancelled]", start)
+            settled_reply("[interrupted]", start)
             assert side_effect.read_bytes() == b"x", "cancelled shell ran"
             start = len(transcript)
             send(b"after-cancel\r")
@@ -199,7 +239,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         # An approval consumes neither a correction draft nor its caret position.
         start = len(transcript)
         send(b"permission-draft\r")
-        assert draft_request.wait(10), "provider did not receive the draft turn"
+        assert event_wait(draft_request, master, 10, transcript), "provider did not receive the draft turn"
         send(b"correction\x1b[D\x1b[D\x1b[D")
         wait_for("correction", start)
         # Release the provider only after all three caret moves were rendered,
@@ -207,10 +247,9 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         draft_end = transcript.index(b"correction", start) + len(b"correction")
         wait_for("\x1b[10G\x1b[?25h", draft_end)
         release_draft.set()
-        wait_for("permission required", start)
-        wait_for("> Deny", start)
-        send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15\x1b[A\r")
-        settled_reply("FIXTURE_REPLY_3", start)
+        menu(start)
+        send(b"\x1b[200~SHOULD_NOT_STEER\x1b[201~\x15y")
+        settled_reply("FIXTURE_REPLY_5", start)
         assert side_effect.read_bytes() == b"xx"
         start = len(transcript)
         send(b"X\r")
@@ -218,8 +257,55 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         assert prompts[-1] == "correctXion", prompts
         assert all("SHOULD_NOT_STEER" not in prompt for prompt in prompts), prompts
 
+        # A key typed as the request arrives cannot answer it.
+        start = len(transcript)
+        send(b"permission-quarantine\r")
+        assert event_wait(quarantine_call, master, 10, transcript), "no quarantine call"
+        send(b"y")
+        wait_for("permission required", start)
+        time.sleep(0.5)
+        assert side_effect.read_bytes() == b"xx", "type-ahead approved the command"
+        send(b"y")
+        settled_reply("FIXTURE_REPLY_6", start)
+        assert side_effect.read_bytes() == b"xxx"
+        # A `y` that arrived before the menu was drawn went to the turn's draft,
+        # which answers nothing; it is cleared before the next prompt.
+        send(b"\x15")
+
+        # `p` shows the exact rule, saves it on yes, and the call runs.
+        start = len(transcript)
+        send(b"permission-always\r")
+        wait_for("p  always allow in this project", start)
+        time.sleep(0.4)
+        send(b"p")
+        wait_for("save this rule to your user configuration?", start)
+        wait_for('allow shell "git status*" in ', start)
+        assert "git status" not in config_file.read_text(), "rule saved before yes"
+        # No goes back to the menu and saves nothing.
+        back = len(transcript)
+        send(b"n")
+        wait_for("y  run once", back)
+        assert "git status" not in config_file.read_text(), "rule saved after no"
+        send(b"p")
+        wait_for("save this rule to your user configuration?", back)
+        send(b"y")
+        settled_reply("FIXTURE_REPLY_7", start)
+        saved = config_file.read_text()
+        assert 'match = "git status*"' in saved, saved
+        assert "refused by policy" not in results[-1], results
+
         send(b"/quit\r")
-        assert child.wait(timeout=10) == 0
+        assert drain_wait(child, master, 10, transcript) == 0
+
+        # A new session runs the same command without asking.
+        always = subprocess.run(
+            [sys.argv[1], "--permission-mode", "ask", "--allow-unsandboxed"],
+            input=b"permission-always\n/quit\n", stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=root, env=environment, timeout=10,
+        )
+        assert always.returncode == 0, always.stderr
+        assert "no way to ask for approval" not in results[-1], results
+        assert "refused by policy" not in results[-1], results
 
         # Piped sessions have nobody to ask and must keep their refusal behavior.
         piped = subprocess.run(
@@ -229,14 +315,17 @@ with tempfile.TemporaryDirectory(prefix="rune-r003-") as directory:
         )
         assert piped.returncode == 0, piped.stderr
         assert "no way to ask for approval" in results[-1], results
-        assert side_effect.read_bytes() == b"xx", "piped shell ran"
+        assert side_effect.read_bytes() == b"xxx", "piped shell ran"
         assert not errors, errors
-        print("approved shell returned AUDIT_SHELL_OK; repeat denial, three cancel keys, "
-              "draft/caret preservation, and piped refusal passed")
+        print("approved shell returned AUDIT_SHELL_OK; repeat denial, escape denial, two cancel "
+              "keys, draft/caret preservation, quarantine and piped refusal passed")
     finally:
         release_draft.set()
         if child.poll() is None:
             child.kill()
+            # A session blocked writing to the terminal ends only when it is
+            # drained while it exits.
+            drain_wait(child, master, 10, bytearray())
         child.wait(timeout=10)
         os.close(master)
         server.shutdown()

@@ -2,6 +2,142 @@
 
 Notable changes, newest first. Each entry describes what a user can observe.
 
+## Unreleased
+
+### Added
+
+- Prompt caching: Anthropic requests mark the tool list, the system text and the
+  newest message with `cache_control`; Responses requests send a
+  `prompt_cache_key` derived from the instructions and tools. The context meter
+  counts cached input.
+- Costs from the published prices of a cached models.dev catalog: the turn
+  summary, `/cost`, the status row, the usage ledger and `ask --json`
+  (`cost_usd`). `/budget <dollars>` and `session_spend_cents` stop a session at
+  a spend limit.
+- `rune bench` runs tasks in the Sutra task format and reports pass, time,
+  tokens, cache share and cost; `bench/tasks` holds six harder tasks in four
+  languages, each proven solvable by `python3 bench/kit/run.py validate`.
+- Live turn rendering: narration and one row per tool call in the order they
+  happened, a spinner with elapsed time, a summary line per turn, Markdown with
+  aligned tables, highlighted code fences, and the lines an edit changed under
+  its row.
+- `/plan` (read-only, enforced by the session), `/effort`, `/permissions`,
+  `/fork`, and an approval choice that remembers an exact, non-destructive
+  action for the session. An edit awaiting approval shows the lines it would
+  change.
+- A turn that changed files and ran nothing to check them is asked once to
+  verify; `ask --json` reports `verification` and an ordered `narration`.
+- `[providers.<name>.headers]` adds headers to every request to a provider.
+  Model and MCP requests use the proxy from `HTTPS_PROXY`, `ALL_PROXY` or
+  `HTTP_PROXY` (never for loopback), and trust the certificate authorities in
+  `SSL_CERT_FILE`.
+
+### Changed
+
+- `edit_file` writes inserted lines with the line ending of the line they land
+  in, so an edit of a CRLF file no longer leaves LF lines in it; text that
+  carries its own `\r` is written as given, and an edit that only changes line
+  endings must match exactly. A file's UTF-8 byte order mark is kept through
+  edits and `write_file`.
+- A missed `edit_file` says when `new_string` is already in the file, or quotes
+  the file's closest lines with line numbers so the next attempt can copy them,
+  with a note when the only difference is tabs against spaces; it quotes nothing
+  from a file the model could not read without approval. An ambiguous edit names
+  the line of each match and the line before it.
+- `edit_file` accepts an `old_string` that differs from the file only in line
+  endings, typographic punctuation and spaces (curly quotes, dashes, no-break
+  spaces) or, for whole lines, trailing whitespace or indentation, when it
+  matches exactly one place that way (an indentation match re-indents the
+  replacement to the file's indentation); the result names the
+  normalisation, and every byte outside the match is written as it was.
+- `rune ask` has no step cap unless one is set; `--max-steps N` sets one and `0`
+  removes it. A capped run's last request forbids tool calls and asks for a
+  final answer, which plain output now prints. A subagent that reports on its
+  last step returns that report instead of failing.
+- A run that fails after its first completed request reports its usage, steps,
+  tool calls and text in `ask --json` instead of zero steps and no cost.
+- `rune ask` compacts a long run before it reaches the context window, as the
+  interactive session does, and counts the summary requests in its usage and
+  cost.
+- Releases include static Linux binaries for x86_64 and aarch64 (musl), which
+  run on any distribution, including Alpine, and need no CA package.
+- Sandboxed commands can write the build tools' caches under the home
+  directory (`~/.cache`, `~/.cargo/registry`, `~/go/pkg/mod`, `~/.npm` and
+  others), replaceable with `sandbox_cache_roots`; protected and credential
+  directories are refused. `allow_unsandboxed = true` in the user configuration
+  replaces the per-run flag, and the footer and `rune status` show when
+  commands run without a sandbox.
+- A refused command in a container says it looks like a container and to pass
+  `--allow-unsandboxed`, and a missing or blocked bubblewrap is named in plain
+  words. `RUNE_ALLOW_UNSANDBOXED=1` is the environment form of the flag.
+- `--network`, `RUNE_NETWORK=1` or `shell_network = true` lets sandboxed shell
+  commands use the network, and `/network on|off` switches it in a session;
+  `--offline` still wins and a repository cannot grant it. A command that fails
+  on a blocked connection says how the user can allow it.
+- Shell commands receive the build and test variables a task sets (`CI`,
+  `PYTHONPATH`, `NODE_PATH`, `LD_LIBRARY_PATH` and more), `shell_env` and
+  `RUNE_SHELL_ENV` pass others by name or pattern, credentials stay withheld,
+  and pagers, git credential prompts and progress bars are off by default.
+- `rune ask --json` reports `stop_reason`, and a run ended by a limit (steps,
+  output tokens, time, spend, objective budget) now exits 3 with its answer,
+  not 1, so a script can tell a limit from a failure. `rune help ask` lists
+  the exit codes.
+- A signal stops `rune ask` cleanly: SIGINT, SIGTERM or SIGHUP cancels the
+  run, ends every shell session it started, records the session and prints the
+  result, exiting 130 or 143, instead of leaving commands running.
+- `rune ask` and `rune review` tell the model, after the prompt, that nobody can
+  answer questions in this run, so it decides and continues instead of waiting.
+  The system prompt is unchanged.
+- `rune ask` writes its session while it runs, so a run that is killed or
+  times out keeps every completed step for `rune session export`. Harness notes
+  such as the last-step note are no longer written to the saved session.
+- `rune ask` runs independent read-only calls in one reply at the same time, as
+  the interactive session does (`parallel_tool_calls` still caps them).
+- `rune ask --jsonl` streams tool calls, tool results, per-step usage and
+  cost, reasoning, retries and compactions with timestamps; the `start` record
+  gains `schema` 2, the session id, model, provider, workspace and version, and
+  a `prompt` record follows it.
+- `rune ask --timeout SECONDS` and `--max-cost USD` stop a run at a wall-clock
+  or estimated spend limit, reporting what it did so far. Models can declare
+  `prices` in configuration for endpoints the catalog does not price.
+- When a provider rejects a request as longer than the context window, the
+  interactive session, `rune ask`, the ACP server and an SDK agent with
+  `auto_compact` compact the conversation and send the step again, up to twice,
+  without using a provider attempt. Otherwise the error says to start a new
+  session or lower the size of tool results.
+- The ACP server compacts an editor session automatically before it outgrows
+  the model's window; images attached to the current prompt are kept. The SDK
+  offers the same as an option (`AgentOptions.auto_compact`, with
+  `context_window`), off by default.
+- A call that already failed the same way `max_consecutive_tool_failures` times
+  is refused with a nudge and the turn goes on; sending it again after two
+  refusals stops the run as `stalled`, instead of the turn ending at once.
+- A 1,000-step `rune ask` run uses about a quarter of the CPU it did: the saved
+  session is written with one sync instead of one per event, and each request is
+  serialized once instead of twice.
+- The startup work budgets for `--version` and `--help` are 2 ms each, down from
+  5 ms and 8 ms.
+- The tool schemas sent with each request fell from 17,379 to 9,154 bytes in
+  the interactive default, and tools this host cannot run are no longer offered.
+  The instructions are byte-stable for a session, so the cached prefix holds.
+- Shell output keeps its head and tail. A finished test run leads with its
+  parsed counts, and a repeat of the same test command shows only what changed
+  since the last run, with the full log one `read_tool_result` away.
+- A read, list or search repeated in a turn with nothing changed since is
+  answered from the earlier result instead of running again, and so is a test,
+  build or lint command. A file read again in a later turn is answered the same
+  way while the file is byte for byte unchanged. Asking a second time runs it.
+- Anthropic output is no longer capped at 8,192 tokens when the catalog knows
+  the model's limit, and a reply cut off before it said anything is asked for
+  once more.
+- In auto mode, routine test and build commands for common ecosystems run
+  inside the sandbox without a prompt, so a headless run can verify its work.
+- The embedding SDK runs the same turn loop as the terminal and `rune ask`,
+  through the embedder's `HostFetch` and tools. A turn whose host tools named
+  `write_file`, `edit_file` or `rename_file` changed something and ran no check
+  is now asked once to verify, as elsewhere; `verification_reminders = 0` turns
+  that off. Unknown tool names are reported as refused calls.
+
 ## 0.1.17
 
 ### Changed

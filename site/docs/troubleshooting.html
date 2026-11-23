@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting · Rune</title>
+<meta name="description" content="What rune doctor checks and how to fix each problem.">
+<link rel="canonical" href="https://rune.heyaadi.com/docs/troubleshooting.html">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="Rune home"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 4V28M7 9.5L18.5 16L7 22.5M20.5 26.5H26.5" fill="none" stroke="#ffb454" stroke-width="3"/></svg> rune</a>
+    <nav>
+      <a href="index.html">documentation</a>
+      <a href="commands.html">commands</a>
+      <a href="configuration.html">configuration</a>
+      <a href="providers.html">providers</a>
+      <a href="keys.html">key bindings</a>
+      <a href="troubleshooting.html" aria-current="page">troubleshooting</a>
+      <a href="benchmarks.html">benchmarks</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<h1>Troubleshooting</h1>
+<p><code>rune doctor</code> runs these checks in this order and prints <code>ok</code>, <code>warning</code>, <code>problem</code> or <code>skipped</code> for each, with a fix for anything wrong.</p>
+<div class="table"><table>
+<thead><tr><th>Check</th><th>Looks at</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>version</td><td>the running binary</td><td>nothing to fix</td></tr>
+<tr><td>workspace</td><td>the directory rune runs in</td><td>run rune from a directory</td></tr>
+<tr><td>state root</td><td>where sessions and settings are kept</td><td>make the directory writable</td></tr>
+<tr><td>legacy state</td><td>an older state layout</td><td>move what you need into the state root</td></tr>
+<tr><td>update</td><td>whether a newer release exists</td><td>run rune upgrade</td></tr>
+<tr><td>clock</td><td>the system clock against the network</td><td>correct the system clock</td></tr>
+<tr><td>terminal</td><td>colours, keys and clipboard of this terminal</td><td>use a terminal with the missing feature</td></tr>
+<tr><td>configuration</td><td>every configuration layer</td><td>fix or remove the named key</td></tr>
+<tr><td>provider</td><td>the endpoint, the key and the model</td><td>run rune connect</td></tr>
+<tr><td>limits</td><td>limits changed from their defaults</td><td>run rune limits to see each source</td></tr>
+<tr><td>reviewer</td><td>the model auto mode reviews actions with</td><td>set review_model to a served model</td></tr>
+<tr><td>sandbox</td><td>what can restrict commands on this host</td><td>install the named sandbox helper</td></tr>
+<tr><td>network</td><td>whether commands may use the network</td><td>set shell_network or use /network</td></tr>
+<tr><td>git</td><td>git, which undo of command changes needs</td><td>install git</td></tr>
+<tr><td>checkpoints</td><td>the checkpoint store for this workspace</td><td>run rune sessions prune</td></tr>
+<tr><td>mcp</td><td>every enabled MCP server</td><td>fix the server or run rune mcp login</td></tr>
+<tr><td>shell</td><td>the shell commands run through</td><td>set SHELL</td></tr>
+<tr><td>disk</td><td>free space where sessions are kept</td><td>free space</td></tr>
+<tr><td>proxy</td><td>proxy variables in the environment</td><td>unset a proxy that is wrong</td></tr>
+<tr><td>certificates</td><td>the certificate roots requests trust</td><td>set SSL_CERT_FILE</td></tr>
+</tbody>
+</table></div>
+</main>
+
+</body>
+</html>

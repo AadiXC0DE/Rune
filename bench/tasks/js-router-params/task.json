@@ -1,0 +1,16 @@
+{
+  "title": "Fix route matching and parameter decoding",
+  "kind": "bugfix",
+  "prompt": "Route matching has several problems: a trailing slash makes a known route 404, wildcard routes win over more specific ones, and URL-encoded parameters are passed through still encoded.",
+  "verify": "node --test",
+  "protected": [
+    "test",
+    "test/hidden.test.js"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 2,
+  "split": "dev",
+  "language": "javascript",
+  "tags": []
+}

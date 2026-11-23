@@ -74,8 +74,8 @@ impl Host for BoundHost {
         self.dialect.as_ref()
     }
 
-    fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    fn endpoint(&self) -> std::borrow::Cow<'_, Endpoint> {
+        std::borrow::Cow::Borrowed(&self.endpoint)
     }
 
     fn model(&self) -> String {
@@ -157,14 +157,20 @@ fn limits(steps: u64, result_bytes: u64) -> BudgetSet {
 
 /// Returns the endpoint a turn that always asks for another tool call.
 ///
-/// The mock repeats its last script once the sequence is exhausted, so one
-/// script drives every step.
+/// Each step reads a different file: a call that keeps returning the same
+/// result would be refused and end the turn before the step limit.
 fn endpoint() -> MockEndpoint {
-    MockEndpoint::start(vec![Script::tool_call(
-        "call_1",
-        "read_file",
-        "{\"path\":\"a.rs\"}",
-    )])
+    MockEndpoint::start(
+        (0..64)
+            .map(|step| {
+                Script::tool_call(
+                    &format!("call_{step}"),
+                    "read_file",
+                    &format!("{{\"path\":\"a{step}.rs\"}}"),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Returns the tool-result bytes the history retained.
@@ -177,7 +183,13 @@ fn retained_result_bytes(history: &History) -> usize {
         .iter()
         .flat_map(|turn| turn.parts.iter())
         .filter_map(|part| match part {
-            ContentPart::ToolResult { content, .. } => Some(content.len()),
+            // The answer given to a call made on the last allowed step is a
+            // fixed harness line, not a tool result the bound applies to.
+            ContentPart::ToolResult { content, .. }
+                if content != "not run: the step limit was reached" =>
+            {
+                Some(content.len())
+            }
             _ => None,
         })
         .fold(0_usize, usize::saturating_add)

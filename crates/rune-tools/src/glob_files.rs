@@ -52,7 +52,7 @@ impl Tool for GlobFiles {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search. Defaults to the workspace root.",
+                    "description": "Defaults to the workspace root.",
                 },
                 "mode": {
                     "type": "string",

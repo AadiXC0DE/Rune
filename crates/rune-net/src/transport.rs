@@ -26,6 +26,7 @@ use crate::provider::{Provider, RequestPlan, summarize_plan};
 use crate::redact;
 use crate::sse::{Decoder, Event};
 use crate::stream::ProviderEvent;
+use crate::trace::{TraceEntry, TraceSink};
 
 #[cfg(not(target_family = "wasm"))]
 mod interrupt;
@@ -58,18 +59,22 @@ pub struct RequestTimeouts {
 }
 
 impl RequestTimeouts {
-    /// Resolves the provider time budgets from configuration.
+    /// Resolves the provider time budgets from configuration: a provider's
+    /// own `head_timeout_ms` wins over the `provider_head_timeout_ms` limit.
     #[must_use]
-    pub fn from_limits(limits: &rune_core::budget::BudgetSet) -> Self {
+    pub fn from_settings(
+        limits: &rune_core::budget::BudgetSet,
+        provider_head_timeout_ms: Option<u64>,
+    ) -> Self {
         use rune_core::budget::LimitName;
 
         Self {
-            head: Duration::from_millis(
+            head: Duration::from_millis(provider_head_timeout_ms.unwrap_or_else(|| {
                 limits
                     .get(LimitName::ProviderHeadTimeoutMs)
                     .value()
-                    .unwrap_or(120_000),
-            ),
+                    .unwrap_or(120_000)
+            })),
             total: limits
                 .get(LimitName::ProviderRequestTimeoutMs)
                 .value()
@@ -139,8 +144,10 @@ pub struct Endpoint {
     /// user agent. Both are facts about the endpoint rather than about a
     /// dialect, so they live here rather than in the request builder.
     pub headers: Vec<(String, String)>,
-    /// Whether outbound requests are refused entirely.
+    /// Whether outbound requests are refused, except to a loopback host.
     pub offline: bool,
+    /// Where each request and its response are recorded, when tracing is on.
+    pub trace: Option<std::sync::Arc<TraceSink>>,
 }
 
 impl fmt::Debug for Endpoint {
@@ -149,8 +156,23 @@ impl fmt::Debug for Endpoint {
             .field("base_url", &self.base_url)
             .field("credential", &"[REDACTED]")
             .field("auth", &self.auth)
-            .field("headers", &self.headers)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let shown = if redact::is_secret_header(name) {
+                            "[REDACTED]"
+                        } else {
+                            value.as_str()
+                        };
+                        (name.as_str(), shown)
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .field("offline", &self.offline)
+            .field("trace", &if self.trace.is_some() { "on" } else { "off" })
             .finish()
     }
 }
@@ -172,6 +194,7 @@ impl Endpoint {
             auth: AuthStyle::Bearer,
             headers: Vec::new(),
             offline: false,
+            trace: None,
         }
     }
 
@@ -198,7 +221,7 @@ impl Endpoint {
         self
     }
 
-    /// Refuses every request when set.
+    /// Refuses every request to a host other than loopback when set.
     #[must_use]
     pub const fn offline(mut self, offline: bool) -> Self {
         self.offline = offline;
@@ -321,7 +344,7 @@ pub fn validate_url(url: &str) -> Result<()> {
 ///
 /// A bracketed IPv6 literal is returned with its brackets removed, because the
 /// colons inside it are not a port separator.
-fn host_of(after_scheme: &str) -> &str {
+pub(crate) fn host_of(after_scheme: &str) -> &str {
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -338,8 +361,19 @@ fn host_of(after_scheme: &str) -> &str {
 }
 
 /// Returns true when a host is a loopback address.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Returns true when a URL names a loopback host.
+///
+/// Offline mode still reaches a model server on this machine, so the offline
+/// checks ask this rather than refusing every endpoint.
+#[must_use]
+pub fn is_loopback_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower.split_once("://").map_or("", |(_, rest)| rest);
+    is_loopback_host(host_of(rest))
 }
 
 /// Outcome of one streaming request.
@@ -353,6 +387,8 @@ pub struct StreamOutcome {
     pub replay: Option<String>,
     /// Normalized stop reason.
     pub finish: Option<crate::stream::FinishReason>,
+    /// Whether this is what arrived before the stream was cut.
+    pub interrupted: bool,
 }
 
 impl StreamOutcome {
@@ -421,6 +457,8 @@ pub fn agent() -> ureq::Agent {
         // Callers supply each request's total budget through FetchRequest.
         .timeout_global(None)
         .http_status_as_error(false)
+        .proxy(env_proxy(&|name| std::env::var(name).ok()))
+        .tls_config(crate::roots::Roots::from_environment().tls_config())
         .build();
     // Match ureq's SOCKS, CONNECT, TCP and rustls chain, adding cancellable
     // socket reads below TLS so a silent response can release its reader.
@@ -431,6 +469,72 @@ pub fn agent() -> ureq::Agent {
             .chain(interrupt::StreamConnector)
             .chain(RustlsConnector::default());
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+}
+
+/// Variables naming a proxy, in the order they are read.
+///
+/// Every model endpoint is HTTPS except a loopback one, which never uses a
+/// proxy, so the HTTPS names come first whatever the target scheme.
+pub const PROXY_VARIABLES: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// The first non-empty proxy variable and its value.
+#[cfg(not(target_family = "wasm"))]
+fn proxy_variable(lookup: &dyn Fn(&str) -> Option<String>) -> Option<(&'static str, String)> {
+    PROXY_VARIABLES.iter().find_map(|name| {
+        lookup(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| (*name, value))
+    })
+}
+
+/// The proxy named in the environment, with loopback hosts and `NO_PROXY` exempt.
+///
+/// A value that is not a proxy URL is ignored; [`proxy_warning`] says so.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn env_proxy(lookup: &dyn Fn(&str) -> Option<String>) -> Option<ureq::Proxy> {
+    let (_, value) = proxy_variable(lookup)?;
+    let parsed = ureq::Proxy::new(&value).ok()?;
+    let mut builder = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port());
+    if let Some(username) = parsed.username() {
+        builder = builder.username(username);
+    }
+    if let Some(password) = parsed.password() {
+        builder = builder.password(password);
+    }
+    let listed = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default();
+    for host in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .chain(["localhost", "127.0.0.1", "::1", "[::1]"])
+    {
+        builder = builder.no_proxy(host);
+    }
+    builder.build().ok()
+}
+
+/// The startup warning for a proxy variable that is not a proxy URL.
+#[cfg(not(target_family = "wasm"))]
+#[must_use]
+pub fn proxy_warning(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let (name, value) = proxy_variable(lookup)?;
+    ureq::Proxy::new(&value)
+        .is_err()
+        .then(|| format!("ignoring {name}: not a proxy URL"))
 }
 
 /// Adds headers to a request of either typestate.
@@ -511,11 +615,15 @@ fn send_over(
     let content_type =
         header("content-type").unwrap_or_else(|| "application/octet-stream".to_owned());
     let retry_after = header("retry-after");
+    let retry_after_ms = header("retry-after-ms");
+    let should_retry = header("x-should-retry");
     let location = header("location");
     Ok(FetchResponse {
         status,
         content_type,
         retry_after,
+        retry_after_ms,
+        should_retry,
         location,
         body: Box::new(response.into_body().into_reader()),
     })
@@ -607,26 +715,58 @@ pub fn stream_completion_observed(
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
 ) -> NetResult<StreamOutcome> {
-    if endpoint.offline {
+    stream_completion_encoded(
+        client, endpoint, provider, plan, None, timeouts, cancel, observe,
+    )
+}
+
+/// Like [`stream_completion_observed`], sending `encoded` as the body when it
+/// is given.
+///
+/// `encoded` must be exactly the JSON text `provider.build_request(plan)`
+/// serializes to. A caller that already serialized the request, to measure
+/// it, passes that text here so a long conversation is not serialized twice
+/// for every request.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_completion_encoded(
+    client: &dyn Fetch,
+    endpoint: &Endpoint,
+    provider: &dyn Provider,
+    plan: &RequestPlan,
+    encoded: Option<String>,
+    timeouts: impl Into<RequestTimeouts>,
+    cancel: &dyn Fn() -> bool,
+    observe: &mut dyn FnMut(&ProviderEvent),
+) -> NetResult<StreamOutcome> {
+    if endpoint.offline && !is_loopback_url(&endpoint.base_url) {
         return Err(
             NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
         );
     }
 
+    // A body encoded before normalising no longer matches the request.
+    let normalized = crate::normalize::for_request(plan, provider.name());
+    let encoded = encoded.filter(|_| matches!(normalized, std::borrow::Cow::Borrowed(_)));
+    let plan: &RequestPlan = &normalized;
+
     provider
         .validate(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
 
-    let body = provider
-        .build_request(plan)
-        .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
+    let encoded = if let Some(encoded) = encoded {
+        encoded
+    } else {
+        let body = provider
+            .build_request(plan)
+            .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
+        serde_json::to_string(&body)?
+    };
 
     let path = provider
         .completion_path(plan)
         .map_err(|err| NetError::new(FailureKind::InvalidRequest, err.message().to_owned()))?;
     let url = endpoint.url_for(&path);
-    let encoded = serde_json::to_string(&body)?;
     let timeouts = timeouts.into();
 
     let mut request = endpoint.authenticate(
@@ -648,31 +788,73 @@ pub fn stream_completion_observed(
         request = request.with_header(name, value);
     }
 
+    let mut trace = begin_trace(endpoint, &request);
     let started = Instant::now();
     let response = client.send(request)?;
+    if let Some(entry) = trace.as_mut() {
+        entry.status(response.status);
+    }
     check_request_timeout(started, timeouts.total)?;
 
     if response.status >= 400 {
+        // The finer `retry-after-ms` wins when both are sent.
         let retry_after = response
-            .retry_after
+            .retry_after_ms
             .as_deref()
-            .and_then(crate::error::parse_retry_after);
+            .and_then(crate::error::parse_retry_after_ms)
+            .or_else(|| {
+                response
+                    .retry_after
+                    .as_deref()
+                    .and_then(|raw| crate::error::parse_retry_after(raw, now_timestamp()))
+            });
+        let should_retry = response
+            .should_retry
+            .as_deref()
+            .and_then(crate::error::parse_should_retry);
         let text = read_bounded_text(response.body, 64 * 1024);
+        if let Some(mut entry) = trace {
+            entry.chunk(text.as_bytes());
+            entry.finish();
+        }
         check_request_timeout(started, timeouts.total)?;
         let sanitized = redact::redact(&text);
-        let mut error = NetError::classify_status(response.status, &sanitized).with_hint(format!(
-            "provider `{}` rejected the request",
-            provider.name()
-        ));
+        let mut error = NetError::classify_status(response.status, &sanitized);
+        if error.hint().is_none() {
+            error = error.with_hint(format!(
+                "provider `{}` rejected the request",
+                provider.name()
+            ));
+        }
         // The endpoint's own delay is used when it named one. Otherwise none is
         // attached, and the caller's backoff decides.
         if let Some(millis) = retry_after {
             error = error.with_retry_after(millis);
         }
+        if let Some(verdict) = should_retry {
+            error = error.with_should_retry(verdict);
+        }
         return Err(error);
     }
 
-    read_stream_started(response.body, provider, timeouts, started, cancel, observe)
+    read_stream_started(
+        response.body,
+        provider,
+        Some(plan),
+        timeouts,
+        started,
+        cancel,
+        observe,
+        trace,
+    )
+}
+
+/// Records a request about to be sent, when the endpoint is traced.
+fn begin_trace(endpoint: &Endpoint, request: &FetchRequest) -> Option<TraceEntry> {
+    endpoint
+        .trace
+        .as_ref()
+        .map(|sink| sink.begin(&request.url, &request.headers, &request.body))
 }
 
 /// One response to an outbound request that is not a model completion.
@@ -942,7 +1124,7 @@ pub fn list_models(
     provider: &dyn Provider,
     timeout: Duration,
 ) -> NetResult<String> {
-    if endpoint.offline {
+    if endpoint.offline && !is_loopback_url(&endpoint.base_url) {
         return Err(
             NetError::new(FailureKind::PolicyDenied, "outbound requests are disabled")
                 .with_hint("remove the offline setting to reach a provider"),
@@ -974,9 +1156,16 @@ pub fn list_models(
 
     // Each request supplies its own total budget. A listing is a small
     // document, so it gets the caller's listing budget here.
-    let response = client.send(request.with_timeout(Some(timeout)))?;
+    let request = request.with_timeout(Some(timeout));
+    let trace = begin_trace(endpoint, &request);
+    let response = client.send(request)?;
 
     let text = read_bounded_text(response.body, 1024 * 1024);
+    if let Some(mut entry) = trace {
+        entry.status(response.status);
+        entry.chunk(text.as_bytes());
+        entry.finish();
+    }
     if response.status >= 400 {
         return Err(
             NetError::classify_status(response.status, &redact::redact(&text)).with_hint(format!(
@@ -1037,24 +1226,29 @@ pub fn read_stream(
     read_stream_started(
         body,
         provider,
+        None,
         timeouts.into(),
         Instant::now(),
         cancel,
         observe,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_stream_started(
     body: Box<dyn Read + Send>,
     provider: &dyn Provider,
+    plan: Option<&RequestPlan>,
     timeouts: RequestTimeouts,
     started: Instant,
     cancel: &dyn Fn() -> bool,
     observe: &mut dyn FnMut(&ProviderEvent),
+    trace: Option<TraceEntry>,
 ) -> NetResult<StreamOutcome> {
-    let mut state = StreamState::new(provider, observe, timeouts, started);
-    feed(body, &mut state, cancel)?;
-    state.finish()
+    let mut state = StreamState::new(provider, plan, observe, timeouts, started, trace);
+    let result = feed(body, &mut state, cancel).and_then(|()| state.finish());
+    result.map_err(|err| state.attach_partial(err))
 }
 
 /// Feeds a body to the decoder on a thread of its own.
@@ -1160,18 +1354,22 @@ struct StreamState<'a> {
     request_started: Instant,
     /// Whether any event has been decoded, which ends the wait for output.
     saw_event: bool,
+    /// Receives the raw bytes as they arrive, when the request is traced.
+    trace: Option<TraceEntry>,
 }
 
 impl<'a> StreamState<'a> {
     fn new(
         provider: &dyn Provider,
+        plan: Option<&RequestPlan>,
         observe: &'a mut dyn FnMut(&ProviderEvent),
         timeouts: RequestTimeouts,
         request_started: Instant,
+        trace: Option<TraceEntry>,
     ) -> Self {
         Self {
             decoder: Decoder::new(provider.limits()),
-            reducer: provider.reducer(),
+            reducer: plan.map_or_else(|| provider.reducer(), |plan| provider.reducer_for(plan)),
             outcome: StreamOutcome::default(),
             frames: Vec::new(),
             observe,
@@ -1180,11 +1378,15 @@ impl<'a> StreamState<'a> {
             request_timeout: timeouts.total,
             request_started,
             saw_event: false,
+            trace,
         }
     }
 
     /// Decodes one chunk, reducing and reporting every event it completes.
     fn push(&mut self, chunk: &[u8]) -> NetResult<()> {
+        if let Some(entry) = self.trace.as_mut() {
+            entry.chunk(chunk);
+        }
         self.check_request_timeout()?;
         self.decoder
             .push(chunk, &mut self.frames)
@@ -1212,7 +1414,10 @@ impl<'a> StreamState<'a> {
                 FailureKind::Timeout,
                 "the endpoint produced no output within the head timeout",
             )
-            .with_hint("raise provider_head_timeout_ms for a slow local model"));
+            .with_hint(
+                "raise `head_timeout_ms` under [providers.<name>], or the \
+                 provider_head_timeout_ms limit, for a slow local model",
+            ));
         }
         Ok(())
     }
@@ -1246,13 +1451,56 @@ impl<'a> StreamState<'a> {
         Ok(())
     }
 
+    /// Attaches what arrived so far to a failure that cut the stream.
+    ///
+    /// Calls whose arguments are already whole are closed first. A cancelled
+    /// or refused stream keeps nothing.
+    fn attach_partial(&mut self, err: NetError) -> NetError {
+        if !matches!(
+            err.kind(),
+            FailureKind::IncompleteStream
+                | FailureKind::Network
+                | FailureKind::Timeout
+                | FailureKind::Unreachable
+        ) {
+            return err;
+        }
+        // The user's total deadline is final: what arrived before it is not
+        // continued in another request.
+        if self.check_request_timeout().is_err() {
+            return err;
+        }
+        let mut events = std::mem::take(&mut self.outcome.events);
+        self.reducer.salvage(&mut events);
+        let partial = StreamOutcome {
+            events,
+            usage: self.reducer.usage(),
+            replay: self.reducer.replay(),
+            finish: None,
+            interrupted: false,
+        };
+        err.with_partial(partial)
+    }
+
     /// Ends the stream and returns what it produced.
-    fn finish(mut self) -> NetResult<StreamOutcome> {
+    fn finish(&mut self) -> NetResult<StreamOutcome> {
+        if let Some(entry) = self.trace.take() {
+            entry.finish();
+        }
         self.check_request_timeout()?;
+        // An event still open at the end was cut with the connection, so one
+        // that does not parse is a dropped stream, which is retried, rather
+        // than a malformed one.
+        let cut_mid_frame = !self.decoder.is_idle();
         self.decoder
             .finish(&mut self.frames)
             .map_err(NetError::from)?;
-        self.reduce_frames()?;
+        match self.reduce_frames() {
+            Err(err) if cut_mid_frame && err.kind() == FailureKind::ProtocolViolation => {
+                return Err(NetError::from(crate::stream::incomplete_stream()));
+            }
+            result => result?,
+        }
 
         // Signals end of transport. A reducer that never saw a legal terminator
         // reports an incomplete stream, which is retryable, rather than allowing
@@ -1266,7 +1514,7 @@ impl<'a> StreamState<'a> {
         self.outcome.finish = Some(self.reducer.finish().map_err(NetError::from)?);
         self.outcome.usage = self.reducer.usage();
         self.outcome.replay = self.reducer.replay();
-        Ok(self.outcome)
+        Ok(std::mem::take(&mut self.outcome))
     }
 }
 
@@ -1284,13 +1532,37 @@ fn classify_transport_error(err: &ureq::Error) -> NetError {
     let message = redact::redact(&err.to_string());
     let kind = match err {
         ureq::Error::Timeout(_) => FailureKind::Timeout,
+        ureq::Error::Io(io) if is_unreachable(io.kind()) => FailureKind::Unreachable,
         ureq::Error::Io(_) => FailureKind::Network,
         ureq::Error::ConnectionFailed => FailureKind::Network,
-        ureq::Error::HostNotFound => FailureKind::Network,
+        ureq::Error::HostNotFound => FailureKind::Unreachable,
         ureq::Error::RedirectFailed => FailureKind::InvalidRequest,
         _ => FailureKind::Network,
     };
     NetError::new(kind, message)
+}
+
+/// The current time, for reading a `Retry-After` date or pricing a request.
+#[must_use]
+pub fn now_timestamp() -> jiff::Timestamp {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    jiff::Timestamp::from_millisecond(millis).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+}
+
+/// Returns true for an I/O failure that means no route to the endpoint, as
+/// opposed to an endpoint that answered and refused.
+#[cfg(not(target_family = "wasm"))]
+const fn is_unreachable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
 }
 
 /// Builds a request plan's message list for a one-shot request.
@@ -1317,6 +1589,133 @@ pub fn diagnostic_for(plan: &RequestPlan, error: &NetError) -> serde_json::Value
 mod tests {
     use super::*;
 
+    /// Whether a request to `url` goes through the proxy `env` names.
+    fn proxied(env: &[(&str, &str)], url: &str) -> bool {
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let uri: ureq::http::Uri = url.parse().expect("uri");
+        env_proxy(&lookup).is_some_and(|proxy| !proxy.is_no_proxy(&uri))
+    }
+
+    /// Environment, target URL, and whether the request is proxied.
+    type ProxyVector = (&'static [(&'static str, &'static str)], &'static str, bool);
+
+    /// The vectors the MCP client's copy of the proxy rules is checked against too.
+    const PROXY_VECTORS: &[ProxyVector] = &[
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("HTTPS_PROXY", "http://127.0.0.1:3128")],
+            "http://127.0.0.1:11434/v1",
+            false,
+        ),
+        (
+            &[
+                ("HTTPS_PROXY", "http://127.0.0.1:3128"),
+                ("NO_PROXY", "other.test, api.example.test"),
+            ],
+            "https://api.example.test/v1",
+            false,
+        ),
+        (
+            &[("HTTP_PROXY", "http://127.0.0.1:3128")],
+            "https://api.example.test/v1",
+            true,
+        ),
+        (
+            &[("ALL_PROXY", "socks5://127.0.0.1:1080")],
+            "https://api.example.test/v1",
+            true,
+        ),
+    ];
+
+    #[test]
+    fn env_proxy_prefers_https_and_exempts_loopback() {
+        for (env, url, expected) in PROXY_VECTORS {
+            assert_eq!(proxied(env, url), *expected, "{env:?} {url}");
+        }
+
+        let env = [
+            ("HTTP_PROXY", "http://127.0.0.1:1"),
+            ("HTTPS_PROXY", "http://user:pass@127.0.0.1:3128"),
+            ("ALL_PROXY", "socks5://127.0.0.1:1080"),
+            ("NO_PROXY", "api.example.test"),
+        ];
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let proxy = env_proxy(&lookup).expect("proxy");
+        assert_eq!(proxy.protocol(), ureq::ProxyProtocol::Http);
+        assert_eq!(proxy.port(), 3128);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("pass"));
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+            "https://api.example.test/v1",
+        ] {
+            let uri: ureq::http::Uri = url.parse().expect("uri");
+            assert!(proxy.is_no_proxy(&uri), "{url} was proxied");
+        }
+        let socks = env_proxy(&|name: &str| {
+            (name == "ALL_PROXY").then(|| "socks5://127.0.0.1:1080".to_owned())
+        })
+        .expect("socks");
+        assert_eq!(socks.protocol(), ureq::ProxyProtocol::Socks5);
+
+        let bad = |name: &str| (name == "https_proxy").then(|| "http://".to_owned());
+        assert!(env_proxy(&bad).is_none());
+        assert_eq!(
+            proxy_warning(&bad).as_deref(),
+            Some("ignoring https_proxy: not a proxy URL")
+        );
+        assert!(proxy_warning(&lookup).is_none());
+        assert!(env_proxy(&|_| None).is_none());
+    }
+
+    #[test]
+    fn a_credential_header_is_redacted_in_debug_output() {
+        let endpoint = Endpoint::new("https://api.example.test", "sk-hidden")
+            .with_header("Authorization", "Bearer user-secret")
+            .with_header("X-Title", "my-tool");
+        let shown = format!("{endpoint:?}");
+        assert!(!shown.contains("user-secret"), "{shown}");
+        assert!(shown.contains("my-tool"), "{shown}");
+    }
+
+    #[test]
+    fn a_provider_head_timeout_wins_over_the_limit() {
+        let mut limits = rune_core::budget::BudgetSet::new();
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, None).head,
+            Duration::from_secs(120)
+        );
+        limits
+            .set(
+                rune_core::budget::LimitName::ProviderHeadTimeoutMs,
+                rune_core::budget::Budget::Bounded(5_000),
+                rune_core::config::Layer::User,
+            )
+            .expect("limit");
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, None).head,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            RequestTimeouts::from_settings(&limits, Some(600_000)).head,
+            Duration::from_secs(600)
+        );
+    }
+
     /// A client that fails the test if a request reaches it.
     ///
     /// Used where the point of the test is that no request is attempted, so a
@@ -1329,12 +1728,35 @@ mod tests {
         }
     }
 
+    /// A dialect with the default capabilities, which accept no explicit effort.
+    struct NoEffortDialect;
+
+    impl Provider for NoEffortDialect {
+        fn name(&self) -> &'static str {
+            "no-effort"
+        }
+
+        fn build_request(&self, plan: &RequestPlan) -> Result<serde_json::Value> {
+            self.validate(plan)?;
+            Ok(serde_json::json!({"model": plan.model}))
+        }
+
+        fn request_path(&self) -> &'static str {
+            "/v1/fixture"
+        }
+
+        fn reducer(&self) -> Box<dyn crate::stream::StreamReducer> {
+            crate::gemini::Gemini.reducer()
+        }
+    }
+
     #[test]
     fn unsupported_capability_selections_never_reach_the_http_client() {
         use rune_core::config::Effort;
         let endpoint = Endpoint::new("https://fixture.invalid", "unused");
-        let selections: [(&dyn Provider, Effort, bool, &str); 3] = [
-            (&crate::gemini::Gemini, Effort::High, false, "effort"),
+        let selections: [(&dyn Provider, Effort, bool, &str); 4] = [
+            (&NoEffortDialect, Effort::High, false, "effort"),
+            (&crate::gemini::Gemini, Effort::High, true, "fast_mode"),
             (
                 &crate::anthropic::Anthropic,
                 Effort::Auto,
@@ -1420,6 +1842,8 @@ mod tests {
                 status: 200,
                 content_type: "text/event-stream".to_owned(),
                 retry_after: None,
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: PacedBody::body(vec![
                     (Duration::ZERO, DELTA),
@@ -1482,7 +1906,7 @@ mod tests {
             &Endpoint::new("https://api.example.com", "k"),
             &crate::chat_completions::ChatCompletions,
             &RequestPlan::new("m"),
-            RequestTimeouts::from_limits(&limits),
+            RequestTimeouts::from_settings(&limits, None),
             &|| false,
         )
         .expect("completion with no total deadline");
@@ -1675,6 +2099,32 @@ mod tests {
         assert!(read < 4 * 1024 * 1024, "read {read} bytes before refusing");
     }
 
+    fn read_bytes(bytes: &'static [u8]) -> NetResult<StreamOutcome> {
+        read_stream(
+            Box::new(std::io::Cursor::new(bytes)),
+            &crate::chat_completions::ChatCompletions,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+            &mut |_| {},
+        )
+    }
+
+    #[test]
+    fn a_connection_cut_inside_a_frame_is_an_incomplete_stream() {
+        let err = read_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"ind",
+        )
+        .expect_err("cut");
+        assert_eq!(err.kind(), FailureKind::IncompleteStream, "{err}");
+    }
+
+    #[test]
+    fn a_whole_frame_that_does_not_parse_is_a_protocol_violation() {
+        let err =
+            read_bytes(b"data: {\"choices\":[{\"ind\n\ndata: [DONE]\n\n").expect_err("malformed");
+        assert_eq!(err.kind(), FailureKind::ProtocolViolation, "{err}");
+    }
+
     /// A local endpoint that accepts one connection and never answers it.
     ///
     /// The connection stays open until the returned sender is dropped, so a
@@ -1690,6 +2140,61 @@ mod tests {
             drop(connection);
         });
         (format!("http://127.0.0.1:{port}"), hold)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_classification_hint_survives_the_transport() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut length = 0_usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("request head") == 0 || line.trim().is_empty()
+                {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("content length");
+                }
+            }
+            reader
+                .read_exact(&mut vec![0_u8; length])
+                .expect("request body");
+            let body = r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("response");
+        });
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &Endpoint::new(format!("http://{address}"), "k"),
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            Duration::from_secs(5),
+            &|| false,
+        )
+        .expect_err("refused");
+        server.join().expect("fixture server");
+        assert_eq!(err.kind(), FailureKind::QuotaExceeded, "{err}");
+        assert!(!err.is_retryable());
+        assert!(
+            err.hint()
+                .is_some_and(|hint| hint.contains("out of credit or quota")),
+            "{err}"
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1823,6 +2328,8 @@ mod tests {
                 status: self.status,
                 content_type: "application/json".to_owned(),
                 retry_after: self.retry_after.map(str::to_owned),
+                retry_after_ms: None,
+                should_retry: None,
                 location: None,
                 body: Box::new(std::io::Cursor::new(b"{}".to_vec())),
             })
@@ -1856,7 +2363,7 @@ mod tests {
 
     #[test]
     fn a_rate_limit_without_a_delay_leaves_the_backoff_to_the_caller() {
-        for retry_after in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT")] {
+        for retry_after in [None, Some("soon")] {
             let err = complete_over(&CannedFetch {
                 status: 429,
                 retry_after,
@@ -1920,6 +2427,99 @@ mod tests {
             .expect("answered");
         assert_eq!(response.status, 429);
         assert_eq!(response.retry_after.as_deref(), Some("3"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn an_unresolved_host_or_a_down_network_is_unreachable() {
+        use std::io::{Error, ErrorKind};
+        let kind = |err: ureq::Error| classify_transport_error(&err).kind();
+        assert_eq!(kind(ureq::Error::HostNotFound), FailureKind::Unreachable);
+        for io in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+        ] {
+            assert_eq!(
+                kind(ureq::Error::Io(Error::from(io))),
+                FailureKind::Unreachable
+            );
+        }
+        assert_eq!(
+            kind(ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused))),
+            FailureKind::Network
+        );
+        assert_eq!(kind(ureq::Error::ConnectionFailed), FailureKind::Network);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn retry_headers_reach_the_error() {
+        let base = answering_endpoint(
+            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 30\r\nretry-after-ms: 1500\r\n\
+             x-should-retry: False\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_owned(),
+        );
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &Endpoint::new(base, "k"),
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+        )
+        .expect_err("unavailable");
+        assert_eq!(err.kind(), FailureKind::Unavailable);
+        // The millisecond header wins over the coarser one.
+        assert_eq!(err.retry_after_ms(), Some(1500));
+        assert_eq!(err.should_retry(), Some(false));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_traced_endpoint_records_a_rejected_request_without_its_credential() {
+        let body = r#"{"error":"bad key traced-credential-value"}"#;
+        let base = answering_endpoint(format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("trace")).expect("utf8");
+        let mut endpoint = Endpoint::new(base, "traced-credential-value");
+        endpoint.trace = Some(
+            TraceSink::open(&dir, vec![endpoint.credential.clone()]).expect("trace directory"),
+        );
+        let mut plan = RequestPlan::new("m");
+        plan.messages = vec![Message::user("hi")];
+        let err = stream_completion(
+            &UreqFetch::new(),
+            &endpoint,
+            &crate::chat_completions::ChatCompletions,
+            &plan,
+            DEFAULT_HEAD_TIMEOUT,
+            &|| false,
+        )
+        .expect_err("rejected");
+        assert_eq!(err.kind(), FailureKind::Unauthorized);
+
+        let request = std::fs::read_to_string(dir.join("0001-request.json")).expect("request");
+        let response = std::fs::read_to_string(dir.join("0001-response.txt")).expect("response");
+        assert!(!request.contains("traced-credential-value"), "{request}");
+        assert!(!response.contains("traced-credential-value"), "{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&request).expect("json");
+        assert!(
+            parsed["url"]
+                .as_str()
+                .expect("url")
+                .ends_with("/chat/completions")
+        );
+        assert_eq!(parsed["headers"]["authorization"], "[REDACTED]");
+        assert_eq!(parsed["body"]["model"], "m");
+        assert!(response.starts_with("status: 401\n\n"), "{response}");
+        assert!(response.contains("bad key [REDACTED]"), "{response}");
+        assert!(format!("{endpoint:?}").contains("trace: \"on\""));
     }
 
     /// A local endpoint that counts the requests it receives and answers none.
@@ -2532,6 +3132,53 @@ mod tests {
         assert_eq!(err.kind(), FailureKind::PolicyDenied);
         assert!(!err.is_retryable());
         assert!(err.message().contains("disabled"));
+    }
+
+    #[test]
+    fn an_offline_loopback_endpoint_is_still_reached() {
+        /// Records the URLs it is asked for and answers none of them.
+        struct Recording(std::sync::Mutex<Vec<String>>);
+
+        impl Fetch for Recording {
+            fn send(&self, request: FetchRequest) -> NetResult<crate::fetch::FetchResponse> {
+                if let Ok(mut urls) = self.0.lock() {
+                    urls.push(request.url.clone());
+                }
+                Err(NetError::new(FailureKind::Network, "connection refused"))
+            }
+        }
+
+        for base in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            let endpoint = Endpoint::new(base, "k").offline(true);
+            let client = Recording(std::sync::Mutex::new(Vec::new()));
+            let err = stream_completion(
+                &client,
+                &endpoint,
+                &crate::chat_completions::ChatCompletions,
+                &RequestPlan::new("m"),
+                DEFAULT_HEAD_TIMEOUT,
+                &|| false,
+            )
+            .expect_err("the fixture answers nothing");
+            assert_ne!(err.kind(), FailureKind::PolicyDenied, "{base}: {err:?}");
+            let err = list_models(
+                &client,
+                &endpoint,
+                &crate::chat_completions::ChatCompletions,
+                DEFAULT_HEAD_TIMEOUT,
+            )
+            .expect_err("the fixture answers nothing");
+            assert_ne!(err.kind(), FailureKind::PolicyDenied, "{base}: {err:?}");
+            let urls = client.0.lock().expect("urls");
+            assert_eq!(urls.len(), 2, "{base}: {urls:?}");
+            assert!(urls.iter().all(|url| url.starts_with(base)), "{urls:?}");
+        }
+        assert!(!is_loopback_url("https://api.deepseek.com"));
+        assert!(!is_loopback_url("http://127.0.0.1.example.com/v1"));
     }
 
     #[test]

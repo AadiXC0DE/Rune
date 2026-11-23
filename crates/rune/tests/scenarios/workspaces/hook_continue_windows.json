@@ -1,0 +1,4 @@
+{
+  "README.md": "x\n",
+  "continue.cmd": "@echo off\r\nmore > nul\r\nif exist continued (\r\n  echo {}\r\n) else (\r\n  type nul > continued\r\n  echo {\"decision\":\"continue\",\"message\":\"say what the file holds in full\"}\r\n)\r\n"
+}

@@ -17,14 +17,57 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Reads directory names only after the shared resolver checks containment.
+    /// Offers workspace paths from the file index when one is given and
+    /// the token is relative; otherwise, or when the index has no match,
+    /// reads directory names only after the shared resolver checks
+    /// containment.
+    #[cfg(test)]
     pub fn collect(
         line: &str,
         caret: usize,
         context: &ExecutionContext,
         limits: &FileLimits,
+        index: Option<&[String]>,
     ) -> Self {
-        Self::collect_with(line, caret, context, limits, |path| std::fs::read_dir(path))
+        Self::collect_since(
+            line,
+            caret,
+            context,
+            limits,
+            index.map(|paths| (paths, None)),
+        )
+    }
+
+    /// [`Self::collect`], where `index` also says when the walk that built it
+    /// started: a file in the token's directory changed since then is not in
+    /// the index yet, so it is offered beside the index's matches. An older
+    /// file the index lacks was left out on purpose (ignored) and stays out.
+    pub fn collect_since(
+        line: &str,
+        caret: usize,
+        context: &ExecutionContext,
+        limits: &FileLimits,
+        index: Option<(&[String], Option<std::time::SystemTime>)>,
+    ) -> Self {
+        let read_dir = |path: &Utf8Path| std::fs::read_dir(path);
+        if let Some((paths, started)) = index {
+            let (range, prefix) = token_at(line, caret);
+            if let Some(mut matches) = from_index(paths, &prefix, limits) {
+                if let Some(started) = started {
+                    let fresh =
+                        Self::collect_listed(line, caret, context, limits, read_dir, Some(started));
+                    for candidate in fresh.matches {
+                        if !matches.contains(&candidate)
+                            && matches.len() < limits.list_entries.min(MAX_MATCHES)
+                        {
+                            matches.push(candidate);
+                        }
+                    }
+                }
+                return Self { range, matches };
+            }
+        }
+        Self::collect_with(line, caret, context, limits, read_dir)
     }
 
     fn collect_with(
@@ -32,7 +75,20 @@ impl Paths {
         caret: usize,
         context: &ExecutionContext,
         limits: &FileLimits,
+        read_dir: impl FnMut(&Utf8Path) -> std::io::Result<std::fs::ReadDir>,
+    ) -> Self {
+        Self::collect_listed(line, caret, context, limits, read_dir, None)
+    }
+
+    /// Lists the token's directory; with `since`, only entries modified at or
+    /// after it.
+    fn collect_listed(
+        line: &str,
+        caret: usize,
+        context: &ExecutionContext,
+        limits: &FileLimits,
         mut read_dir: impl FnMut(&Utf8Path) -> std::io::Result<std::fs::ReadDir>,
+        since: Option<std::time::SystemTime>,
     ) -> Self {
         let (range, prefix) = token_at(line, caret);
         let mut result = Self {
@@ -65,6 +121,14 @@ impl Paths {
             if !filename.starts_with(name) || filename.chars().any(char::is_control) {
                 continue;
             }
+            if let Some(since) = since
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|modified| modified < since)
+            {
+                continue;
+            }
             // An offered link must also lead inside a permitted root. No file
             // contents are opened, including when deciding whether to append '/'.
             let candidate = format!("{head}{filename}");
@@ -85,6 +149,40 @@ impl Paths {
         result.matches.dedup();
         result
     }
+}
+
+/// Indexed paths starting with a workspace-relative token, directories first,
+/// then alphabetical. `None` sends the token to the directory read.
+fn from_index(index: &[String], prefix: &str, limits: &FileLimits) -> Option<Vec<String>> {
+    if prefix.starts_with('/')
+        || prefix.starts_with('~')
+        || prefix.split('/').any(|part| part == "..")
+    {
+        return None;
+    }
+    let (lead, token) = prefix
+        .strip_prefix("./")
+        .map_or(("", prefix), |rest| ("./", rest));
+    let mut found: Vec<&String> = index
+        .iter()
+        .filter(|path| path.starts_with(token) && path.as_str() != token)
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_by(|left, right| {
+        right
+            .ends_with('/')
+            .cmp(&left.ends_with('/'))
+            .then_with(|| left.cmp(right))
+    });
+    found.truncate(limits.list_entries.min(MAX_MATCHES));
+    Some(
+        found
+            .into_iter()
+            .map(|path| quote(&format!("{lead}{path}")))
+            .collect(),
+    )
 }
 
 /// Recognises quoted and escaped spaces, replacing the whole token at the caret.
@@ -187,7 +285,7 @@ mod tests {
             std::fs::write(context.workspace().join(name), "content is never read").expect("file");
         }
         let line = "read ./fixture";
-        let choices = Paths::collect(line, line.len(), &context, &FileLimits::default());
+        let choices = Paths::collect(line, line.len(), &context, &FileLimits::default(), None);
         assert_eq!(choices.range, 5..line.len());
         assert_eq!(
             choices.matches,
@@ -201,6 +299,93 @@ mod tests {
     }
 
     #[test]
+    fn files_made_after_the_index_are_offered_beside_it() {
+        let (_temp, context) = fixture();
+        let root = context.workspace();
+        std::fs::write(root.join("fixture old.txt"), "old").expect("old");
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("fixture new.txt"), "new").expect("new");
+        let index = vec!["fixture listed.txt".to_owned()];
+        let limits = FileLimits::default();
+        let line = "read fixture";
+        let choices = Paths::collect_since(
+            line,
+            line.len(),
+            &context,
+            &limits,
+            Some((&index, Some(started))),
+        );
+        // The new file joins the index's match; the older unindexed one is
+        // what an ignore rule left out, so it stays out.
+        assert_eq!(
+            choices.matches,
+            ["'fixture listed.txt'", "'fixture new.txt'"]
+        );
+        let without = Paths::collect(line, line.len(), &context, &limits, Some(&index));
+        assert_eq!(without.matches, ["'fixture listed.txt'"]);
+    }
+
+    #[test]
+    fn path_completion_tries_the_index_first() {
+        let (_temp, context) = fixture();
+        std::fs::write(context.workspace().join("srcfile.txt"), "fixture").expect("file");
+        let index: Vec<String> = ["src/", "src/a b.rs", "src/lib.rs", "src/nested/", "srv.txt"]
+            .map(str::to_owned)
+            .to_vec();
+        let limits = FileLimits::default();
+        let line = "read sr";
+        let choices = Paths::collect(line, line.len(), &context, &limits, Some(&index));
+        assert_eq!(choices.range, 5..line.len());
+        assert_eq!(
+            choices.matches,
+            [
+                "src/",
+                "src/nested/",
+                "'src/a b.rs'",
+                "src/lib.rs",
+                "srv.txt"
+            ]
+        );
+        let line = "read ./src/l";
+        assert_eq!(
+            Paths::collect(line, line.len(), &context, &limits, Some(&index)).matches,
+            ["./src/lib.rs"]
+        );
+        let limits = FileLimits {
+            list_entries: 2,
+            ..FileLimits::default()
+        };
+        let line = "read sr";
+        assert_eq!(
+            Paths::collect(line, line.len(), &context, &limits, Some(&index)).matches,
+            ["src/", "src/nested/"]
+        );
+    }
+
+    #[test]
+    fn path_completion_reads_the_directory_when_the_index_cannot_answer() {
+        let (_temp, context) = fixture();
+        std::fs::write(context.workspace().join("fresh.txt"), "fixture").expect("file");
+        let index: Vec<String> = vec!["src/".to_owned()];
+        let limits = FileLimits::default();
+        let line = "read fr";
+        assert_eq!(
+            Paths::collect(line, line.len(), &context, &limits, Some(&index)).matches,
+            ["fresh.txt"]
+        );
+        // An absolute token skips the index. Completion reads a backslash as
+        // an escape, so this half needs a path written with slashes.
+        if cfg!(unix) {
+            let line = format!("read {}/fr", context.workspace());
+            assert_eq!(
+                Paths::collect(&line, line.len(), &context, &limits, Some(&index)).matches,
+                [format!("{}/fresh.txt", context.workspace())]
+            );
+        }
+    }
+
+    #[test]
     fn directories_with_spaces_can_be_completed_again() {
         let (_temp, context) = fixture();
         let directory = context.workspace().join("a space");
@@ -208,12 +393,12 @@ mod tests {
         std::fs::write(directory.join("file space.txt"), "fixture").expect("file");
         let line = "read a";
         assert_eq!(
-            Paths::collect(line, line.len(), &context, &FileLimits::default()).matches,
+            Paths::collect(line, line.len(), &context, &FileLimits::default(), None).matches,
             ["'a space/'"]
         );
         let line = "read 'a space/'";
         assert_eq!(
-            Paths::collect(line, line.len(), &context, &FileLimits::default()).matches,
+            Paths::collect(line, line.len(), &context, &FileLimits::default(), None).matches,
             ["'a space/file space.txt'"]
         );
     }
@@ -246,7 +431,7 @@ mod tests {
         std::fs::write(extra.join("fixture space.txt"), "fixture").expect("file");
         let context = context.with_root(extra.clone());
         let line = format!("read '{extra}/fi'");
-        let choices = Paths::collect(&line, line.len(), &context, &FileLimits::default());
+        let choices = Paths::collect(&line, line.len(), &context, &FileLimits::default(), None);
         assert_eq!(choices.matches, [format!("'{extra}/fixture space.txt'")]);
     }
 
@@ -271,7 +456,7 @@ mod tests {
         for name in ["escape", "secret-link", "dangling"] {
             let line = format!("read {name}");
             assert!(
-                Paths::collect(&line, line.len(), &context, &FileLimits::default())
+                Paths::collect(&line, line.len(), &context, &FileLimits::default(), None)
                     .matches
                     .is_empty()
             );
@@ -298,13 +483,13 @@ mod tests {
             ..FileLimits::default()
         };
         assert_eq!(
-            Paths::collect("read fixture", 12, &context, &limits)
+            Paths::collect("read fixture", 12, &context, &limits, None)
                 .matches
                 .len(),
             2
         );
         assert!(
-            Paths::collect("read control", 12, &context, &limits)
+            Paths::collect("read control", 12, &context, &limits, None)
                 .matches
                 .is_empty()
         );
@@ -313,7 +498,7 @@ mod tests {
             ..limits
         };
         assert!(
-            Paths::collect("read fixture", 12, &context, &limits)
+            Paths::collect("read fixture", 12, &context, &limits, None)
                 .matches
                 .is_empty()
         );

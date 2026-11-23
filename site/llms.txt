@@ -19,3 +19,14 @@ available. The landing page includes a WebAssembly demo of the harness.
 - [Command reference](https://github.com/AadiXC0DE/Rune/blob/main/COMMANDS.md): Generated command, flag, and limit documentation.
 - [Source](https://github.com/AadiXC0DE/Rune): Rust workspace and development instructions.
 - [Releases](https://github.com/AadiXC0DE/Rune/releases): Native release artifacts.
+
+## Reference pages
+
+- [Documentation](https://rune.heyaadi.com/docs/index.html): Reference pages generated from the binary.
+- [Commands](https://rune.heyaadi.com/docs/commands.html): Every command and flag the binary accepts.
+- [Configuration](https://rune.heyaadi.com/docs/configuration.html): Every setting with its type, default and variable, and every limit.
+- [Providers](https://rune.heyaadi.com/docs/providers.html): How to connect each provider preset.
+- [Key bindings](https://rune.heyaadi.com/docs/keys.html): Every action and the keys it has by default.
+- [Troubleshooting](https://rune.heyaadi.com/docs/troubleshooting.html): What rune doctor checks and how to fix each problem.
+- [Benchmarks](https://rune.heyaadi.com/docs/benchmarks.html): Published benchmark results.
+- [Everything in one file](https://rune.heyaadi.com/llms-full.txt): The plain text of every page above.

@@ -1,0 +1,5 @@
+{
+  "src/a.txt": "broken\n",
+  "src/b.txt": "broken\n",
+  "check.sh": "echo \"running 2 tests\"\nfor n in 1 2 3 4 5 6 7 8 9 10; do echo \"  at frame $n\"; done\npass=0; fail=0\nfor t in a b; do\n  if grep -q fixed \"src/$t.txt\"; then echo \"test $t ... ok\"; pass=$((pass+1))\n  else echo \"test $t ... FAILED\"; fail=$((fail+1)); fi\ndone\nif [ \"$fail\" -eq 0 ]; then echo \"test result: ok. $pass passed; 0 failed; 0 ignored\"; exit 0; fi\necho \"test result: FAILED. $pass passed; $fail failed; 0 ignored\"; exit 101\n"
+}

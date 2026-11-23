@@ -1,0 +1,23 @@
+{
+    "version": "1.2.3",
+    "description": "A tiny, native coding agent harness.",
+    "homepage": "https://github.com/AadiXC0DE/Rune",
+    "license": "Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/AadiXC0DE/Rune/releases/download/v1.2.3/rune-1.2.3-x86_64-pc-windows-msvc.zip",
+            "hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+    },
+    "bin": "rune.exe",
+    "checkver": {
+        "github": "https://github.com/AadiXC0DE/Rune"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/AadiXC0DE/Rune/releases/download/v$version/rune-$version-x86_64-pc-windows-msvc.zip"
+            }
+        }
+    }
+}

@@ -25,8 +25,7 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Write a whole file, creating missing parent directories. Refused if the file \
-         changed since it was read."
+        "Write a whole file, creating missing parent directories."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -34,8 +33,7 @@ impl Tool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Relative to the workspace root, or absolute."
+                    "type": "string"
                 },
                 "content": {
                     "type": "string",
@@ -72,12 +70,15 @@ impl Tool for WriteFile {
         let path = resolve(context, raw)?.path;
         let prepared = mutation::prepare(&path, content)?;
         context.check_cancelled()?;
+        let diff = mutation::shown_diff(prepared.preview());
         let applied = mutation::apply(prepared)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Wrote `{}` ({})",
             applied.path(),
             mutation::detail(&applied)
-        )))
+        ));
+        output.diff = diff;
+        Ok(output)
     }
 }
 
@@ -108,6 +109,46 @@ mod tests {
             .collect();
         assert_eq!(required, ["path", "content"]);
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn a_whole_file_write_keeps_an_existing_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(&json!({ "path": "bom.txt", "content": "new\n" }), &context)
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+    }
+
+    #[test]
+    fn a_whole_file_write_does_not_double_a_bom() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "bom.txt"), "\u{FEFF}old\n").expect("seed");
+        WriteFile
+            .call(
+                &json!({ "path": "bom.txt", "content": "\u{FEFF}new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "bom.txt")).expect("read"),
+            b"\xEF\xBB\xBFnew\n"
+        );
+        // A new file is written as given.
+        WriteFile
+            .call(
+                &json!({ "path": "plain.txt", "content": "new\n" }),
+                &context,
+            )
+            .expect("call");
+        assert_eq!(
+            std::fs::read(path_of(&dir, "plain.txt")).expect("read"),
+            b"new\n"
+        );
     }
 
     #[test]
@@ -220,6 +261,26 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn overwriting_a_file_named_in_another_case_keeps_its_name() {
+        let (dir, context) = workspace();
+        std::fs::write(path_of(&dir, "Notes.md"), "old\n").expect("seed");
+        WriteFile
+            .call(&json!({ "path": "NOTES.MD", "content": "new\n" }), &context)
+            .expect("call");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, ["Notes.md"]);
+        assert_eq!(
+            std::fs::read_to_string(path_of(&dir, "Notes.md")).expect("read"),
+            "new\n"
+        );
+    }
+
     #[test]
     fn a_missing_argument_is_named_in_the_error() {
         let (_dir, context) = workspace();
@@ -305,6 +366,37 @@ mod tests {
         }
         assert!(!outside.path().join("new.txt").exists());
         assert!(!outside.path().join("nested").exists());
+    }
+
+    #[test]
+    fn write_file_refuses_a_parent_escape() {
+        // The parent is a folder of its own, so a file of that name left by
+        // anything else cannot be mistaken for an escape.
+        let parent = tempfile::TempDir::new().expect("temp dir");
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let context =
+            ExecutionContext::new(Utf8PathBuf::from_path_buf(workspace).expect("utf8 path"));
+        let err = WriteFile
+            .call(&json!({ "path": "../x", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert!(!parent.path().join("x").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_a_symlink_out() {
+        let (dir, context) = workspace();
+        let outside = tempfile::TempDir::new().expect("temp dir");
+        let target = outside.path().join("target.txt");
+        std::fs::write(&target, "outside\n").expect("target");
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.txt")).expect("symlink");
+        let err = WriteFile
+            .call(&json!({ "path": "linked.txt", "content": "x" }), &context)
+            .expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(std::fs::read(&target).expect("read"), b"outside\n");
     }
 
     #[test]

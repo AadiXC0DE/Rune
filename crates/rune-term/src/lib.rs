@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod commands;
+pub mod diff;
 pub mod editor;
 pub mod engine;
 mod external_editor;
@@ -14,8 +15,12 @@ pub mod frame;
 pub mod highlight;
 pub mod inline;
 pub mod input;
+pub mod keys;
 pub mod markdown;
+pub mod modes;
+pub mod notify;
 pub mod picker;
+pub mod probe;
 pub mod screen;
 pub mod shell;
 pub mod theme;

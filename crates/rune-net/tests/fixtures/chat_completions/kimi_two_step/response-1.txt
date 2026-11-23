@@ -1,0 +1,10 @@
+data: {"id":"k-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"Read the file","reasoning_details":[{"type":"reasoning.summary","summary":"Read the file","format":"kimi-v1","index":0}]},"finish_reason":null}]}
+
+data: {"id":"k-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3","choices":[{"index":0,"delta":{"reasoning_content":" before answering.","reasoning_details":[{"type":"reasoning.summary","summary":" before answering.","format":"kimi-v1","index":0}]},"finish_reason":null}]}
+
+data: {"id":"k-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"read_file:0","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"k-1","object":"chat.completion.chunk","created":1762300000,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":40,"completion_tokens":12,"total_tokens":52}}
+
+data: [DONE]
+

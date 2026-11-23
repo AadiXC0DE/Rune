@@ -6,14 +6,14 @@ mod support;
 
 #[test]
 fn synchronous_children_return_reads_and_cannot_escape_their_allowlist() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(support::python())
         .args([
             "-c",
             &support::python_script(include_str!("subagent.py")),
             env!("CARGO_BIN_EXE_rune"),
         ])
         .output()
-        .expect("python3 is required for the local subagent fixture");
+        .expect("Python is required for the local subagent fixture");
     assert!(
         output.status.success(),
         "subagent regression failed:\n{}\n{}",

@@ -625,6 +625,8 @@ fn a_plugins_tools_drive_a_whole_turn() {
         rune_testkit::Script::text("the plugin answered"),
     ]);
     let mut agent = Agent::new(AgentOptions {
+        auto_compact: false,
+        context_window: None,
         api_key: "sk-plugin-credential".to_owned(),
         model: Some("mock-model".to_owned()),
         instructions: None,

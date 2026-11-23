@@ -1,0 +1,16 @@
+{
+  "title": "Fix RPN division by zero, negative numbers and empty input",
+  "kind": "bugfix",
+  "prompt": "The RPN calculator in src/Rpn.java crashes on division by zero and reads negative numbers as operators.",
+  "verify": "rm -rf out && javac -d out $(find src test -name '*.java') && java -ea -cp out HiddenTests",
+  "protected": [
+    "test/VisibleTests.java",
+    "test/HiddenTests.java"
+  ],
+  "timeoutMs": 600000,
+  "verifyTimeoutMs": 300000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "dev",
+  "language": "java"
+}

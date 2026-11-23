@@ -206,6 +206,42 @@ const DESTRUCTIVE_PROGRAMS: &[&str] = &[
 /// Program names whose dotted forms are the same tool, such as `mkfs.ext4`.
 const DESTRUCTIVE_FAMILIES: &[&str] = &["mkfs"];
 
+/// PowerShell commands and `cmd.exe` builtins that destroy or move data or
+/// end processes, in lower case.
+///
+/// Both shells ignore letter case in these names, so they are matched without
+/// it. Short aliases that name unrelated programs elsewhere, such as `ri`
+/// (Ruby's documentation reader), are left out.
+const WINDOWS_DESTRUCTIVE: &[&str] = &[
+    "clear-content",
+    "clear-disk",
+    "clear-item",
+    "del",
+    "erase",
+    "format-volume",
+    "initialize-disk",
+    "move",
+    "move-item",
+    "rd",
+    "remove-item",
+    "remove-itemproperty",
+    "remove-partition",
+    "restart-computer",
+    "stop-computer",
+    "stop-process",
+];
+
+/// Returns true for a program that destroys data or changes the machine.
+fn destroys(program: &str) -> bool {
+    DESTRUCTIVE_PROGRAMS.contains(&program)
+        || DESTRUCTIVE_FAMILIES
+            .iter()
+            .any(|family| in_family(program, family))
+        || WINDOWS_DESTRUCTIVE
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(program))
+}
+
 /// Programs whose arguments begin with the name of a subcommand.
 const PUBLISHERS: &[(&str, &[&str])] = &[
     ("bun", &["publish"]),
@@ -488,11 +524,7 @@ fn destructive(argv: &[String]) -> Option<Classification> {
     let program = program_name(effective.first()?);
     let arguments = effective.get(1..).unwrap_or_default();
 
-    if DESTRUCTIVE_PROGRAMS.contains(&program)
-        || DESTRUCTIVE_FAMILIES
-            .iter()
-            .any(|family| in_family(program, family))
-    {
+    if destroys(program) {
         return Some(Classification::new(
             CommandKind::Consequential,
             REASON_DESTRUCTIVE_PROGRAM,
@@ -691,11 +723,7 @@ fn script_verdict(script: &str) -> Option<Classification> {
     let mut tokens = script.split_whitespace();
     let first = tokens.next()?;
     let program = program_name(first);
-    let destructive = DESTRUCTIVE_PROGRAMS.contains(&program)
-        || DESTRUCTIVE_FAMILIES
-            .iter()
-            .any(|family| in_family(program, family))
-        || script.split_whitespace().any(is_filesystem_root);
+    let destructive = destroys(program) || script.split_whitespace().any(is_filesystem_root);
     if destructive {
         return Some(Classification::new(
             CommandKind::Consequential,
@@ -987,6 +1015,17 @@ mod tests {
             vec!["chown", "root", "file"],
             vec!["sudo", "ls"],
             vec!["systemctl", "stop", "nginx"],
+            // PowerShell and cmd.exe names, in any letter case.
+            vec!["Remove-Item", "-Recurse", "-Force", "build"],
+            vec!["remove-item", "build"],
+            vec!["del", "/s", "/q", "build"],
+            vec!["erase", "notes.txt"],
+            vec!["rd", "/s", "build"],
+            vec!["Move-Item", "a", "b"],
+            vec!["move", "a", "b"],
+            vec!["Clear-Content", "notes.txt"],
+            vec!["Stop-Process", "-Id", "1234"],
+            vec!["Format-Volume", "-DriveLetter", "D"],
         ] {
             let classification = classify(&argv(&parts));
             assert_eq!(

@@ -1,0 +1,15 @@
+{
+  "title": "Format byte counts with IEC units and one decimal",
+  "kind": "bugfix",
+  "prompt": "FormatBytes in size.go rounds wrongly and switches units too early. It should use IEC units (KiB, MiB) with one decimal.",
+  "verify": "go test ./...",
+  "protected": [
+    "size_test.go",
+    "hidden_test.go"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "heldout",
+  "language": "go"
+}

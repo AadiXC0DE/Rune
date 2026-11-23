@@ -442,6 +442,31 @@ fn an_optional_server_that_fails_leaves_its_siblings_connected() {
 }
 
 #[test]
+fn server_count_reports_connected_and_configured_servers() {
+    let fixture = Fixture::new("standard");
+    let client = Client::new(&budget());
+    let mut disabled = missing_config("disabled");
+    disabled.enabled = false;
+    client
+        .connect_all(&[
+            fixture.config("fixture"),
+            missing_config("missing"),
+            disabled,
+        ])
+        .expect("connected");
+    assert_eq!(client.server_count(), (1, 2));
+    client.shutdown();
+    assert_eq!(client.server_count(), (0, 2));
+    let mut required = missing_config("required");
+    required.required = true;
+    let failed = Client::new(&budget());
+    failed
+        .connect_all(&[fixture.config("fixture"), required])
+        .expect_err("refused");
+    assert_eq!(failed.server_count(), (0, 2));
+}
+
+#[test]
 fn shutdown_terminates_the_child_process_and_its_descendants() {
     // The server starts a background child, and the child writes a heartbeat to
     // a file. A heartbeat that stops advancing is what says the descendant is

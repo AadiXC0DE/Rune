@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["llm", "agent", "streaming", "openai", "anthropic"]
 
 [lints]
 workspace = true
@@ -18,6 +20,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 jiff = { workspace = true }
 camino = { workspace = true }
+regex = { workspace = true }
 
 # The blocking client, and with it the streaming and tool transport. It cannot
 # build where a socket cannot, so a target without one reaches the transport
@@ -26,4 +29,5 @@ camino = { workspace = true }
 ureq = { workspace = true }
 
 [dev-dependencies]
+rune-testkit.workspace = true
 tempfile.workspace = true

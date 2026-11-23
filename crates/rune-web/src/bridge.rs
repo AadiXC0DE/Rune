@@ -104,6 +104,8 @@ impl Fetch for BridgeFetch {
                 head.content_type
             },
             retry_after: head.retry_after,
+            retry_after_ms: None,
+            should_retry: None,
             // The page's fetch follows redirects itself, so none reaches here.
             location: None,
             body: Box::new(BridgeBody {

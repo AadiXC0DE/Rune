@@ -59,12 +59,47 @@ pub struct RequestPlan {
     pub effort: Effort,
     /// Whether fast mode is requested.
     pub fast_mode: bool,
+    /// Whether the reasoning text is shown, so a dialect that can omit it
+    /// should return it.
+    pub show_reasoning: bool,
     /// Output token ceiling, when one applies.
     pub max_output_tokens: Option<u64>,
     /// Ordered upstream provider preference, applied where the endpoint supports it.
     pub provider_order: Vec<String>,
     /// Whether the request is restricted to the listed providers.
     pub provider_strict: bool,
+    /// How the endpoint wants requests shaped.
+    pub compat: crate::compat::EndpointCompat,
+    /// How the model family behaves.
+    pub traits: crate::compat::ModelTraits,
+    /// Session-stable cache routing key, when the host supplies one.
+    pub cache_key: Option<String>,
+    /// Whether readable reasoning summaries are requested where the dialect
+    /// supports them.
+    pub reasoning_summary: bool,
+    /// Sampling values sent where the dialect carries them; none by default.
+    pub sampling: crate::compat::Sampling,
+    /// The dialect and model of this request, as `dialect:model`; empty when
+    /// the caller does not say.
+    pub origin: String,
+    /// Which cache markers a dialect that places them may add.
+    pub cache_markers: MarkerPolicy,
+    /// Leading bytes of `instructions` that are the same in every workspace;
+    /// zero when the instructions are not split.
+    pub stable_instructions_len: usize,
+}
+
+/// Which cache markers a dialect that places them may add.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MarkerPolicy {
+    /// The stable prefix and the newest message.
+    #[default]
+    Full,
+    /// The stable prefix and the message before the newest one: a one-off request
+    /// appended to a prefix other requests share reads the cache and writes nothing new.
+    SharedPrefix,
+    /// None: a one-off request that shares no prefix.
+    None,
 }
 
 impl RequestPlan {
@@ -81,10 +116,34 @@ impl RequestPlan {
             parallel_tool_calls: true,
             effort: Effort::Auto,
             fast_mode: false,
+            show_reasoning: false,
             max_output_tokens: None,
             provider_order: Vec::new(),
             provider_strict: false,
+            compat: crate::compat::EndpointCompat::default(),
+            traits: crate::compat::ModelTraits::default(),
+            cache_key: None,
+            reasoning_summary: true,
+            sampling: crate::compat::Sampling::default(),
+            origin: String::new(),
+            cache_markers: MarkerPolicy::Full,
+            stable_instructions_len: 0,
         }
+    }
+
+    /// Returns the instructions as one block, or as a workspace-independent
+    /// block and the rest when `stable_instructions_len` splits them.
+    #[must_use]
+    pub fn system_blocks(&self) -> Vec<&str> {
+        let cut = self.stable_instructions_len;
+        if cut > 0 && cut < self.instructions.len() && self.instructions.is_char_boundary(cut) {
+            let (stable, rest) = self.instructions.split_at(cut);
+            let (stable, rest) = (stable.trim_end(), rest.trim_start());
+            if !stable.is_empty() && !rest.is_empty() {
+                return vec![stable, rest];
+            }
+        }
+        vec![&self.instructions]
     }
 
     /// Returns true when the request advertises tools.
@@ -92,6 +151,67 @@ impl RequestPlan {
     pub fn has_tools(&self) -> bool {
         !self.tools.is_empty()
     }
+}
+
+/// The images a tool turn carries, for dialects that send them after the
+/// results in a user message.
+///
+/// Returns `None` when the turn holds no image. Otherwise returns the text that
+/// introduces the images and the media type and base64 data of each image whose
+/// data the plan holds; an image without data is left out.
+pub(crate) fn tool_turn_images<'a>(
+    message: &'a Message,
+    plan: &'a RequestPlan,
+) -> Option<(&'static str, Vec<(&'a str, &'a str)>)> {
+    let mut any = false;
+    let mut images = Vec::new();
+    for part in &message.parts {
+        if let ContentPart::Image { image } = part {
+            any = true;
+            if let Some(data) = plan.image_data.get(&image.id) {
+                images.push((image.media_type.as_str(), data.as_ref()));
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let text = if images.is_empty() {
+        "Images from the tool results above are no longer available."
+    } else {
+        "Images from the tool results above."
+    };
+    Some((text, images))
+}
+
+/// Names the cacheable prefix of a request: the instructions and the tools.
+///
+/// The endpoint routes requests with the same key to the same cache, which is
+/// what makes a long shared prefix actually hit. Deriving the key from the
+/// prefix itself means two requests share a key exactly when they share that
+/// prefix, across turns and across sessions in one workspace, with no
+/// identifier leaving the machine that is not already implied by the request.
+#[must_use]
+pub fn prefix_cache_key(instructions: &str, tools: &[ToolSpec]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(instructions.as_bytes());
+    for tool in tools {
+        hasher.update(b"\x1e");
+        hasher.update(tool.name.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.description.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(tool.input_schema.to_string().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut key = String::from("rune-");
+    for byte in digest.iter().take(16) {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 /// Rune effort selections expressible by the full reasoning dialects.
@@ -208,6 +328,12 @@ pub trait Provider: Send + Sync {
     /// Creates a reducer for one response.
     fn reducer(&self) -> Box<dyn StreamReducer>;
 
+    /// Creates a reducer for the response to `plan`, for a dialect whose
+    /// reading depends on the endpoint.
+    fn reducer_for(&self, _plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.reducer()
+    }
+
     /// Returns the request headers a dialect requires beyond the defaults.
     ///
     /// The credential is passed separately so a dialect never handles it.
@@ -263,6 +389,12 @@ pub trait Provider: Send + Sync {
     /// worse than one that is refused.
     fn routing(&self) -> Routing {
         Routing::Unsupported
+    }
+
+    /// Returns true when this replay value carries reasoning that is signed or encrypted
+    /// and valid only after the exact history that produced it.
+    fn replay_is_signed(&self, _replay: &str) -> bool {
+        false
     }
 }
 
@@ -397,9 +529,18 @@ mod routing_tests {
             parallel_tool_calls: false,
             effort: Effort::Auto,
             fast_mode: false,
+            show_reasoning: false,
             max_output_tokens: None,
             provider_order: order.iter().map(|s| (*s).to_owned()).collect(),
             provider_strict: strict,
+            compat: crate::compat::EndpointCompat::default(),
+            traits: crate::compat::ModelTraits::default(),
+            cache_key: None,
+            reasoning_summary: true,
+            sampling: crate::compat::Sampling::default(),
+            origin: String::new(),
+            cache_markers: MarkerPolicy::Full,
+            stable_instructions_len: 0,
         }
     }
 

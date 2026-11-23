@@ -51,6 +51,8 @@ pub enum Command {
     Projects,
     /// Show resolved configuration.
     Config,
+    /// List the key actions and their keys.
+    Keys,
     /// List limits.
     Limits,
     /// Manage additional workspace directories.
@@ -101,6 +103,7 @@ impl Command {
             Self::Sandbox => "sandbox",
             Self::Projects => "projects",
             Self::Config => "config",
+            Self::Keys => "keys",
             Self::Limits => "limits",
             Self::Workspace => "workspace",
             Self::Prompt => "prompt",
@@ -160,8 +163,12 @@ pub struct Launch {
     pub provider_strict: Option<bool>,
     /// Whether every outbound request is refused.
     pub offline: bool,
+    /// Directory provider requests and responses are traced to.
+    pub trace: Option<String>,
     /// Whether a command may run where the host has no sandbox backend.
     pub allow_unsandboxed: bool,
+    /// Whether sandboxed shell commands may use the network.
+    pub network: bool,
     /// Whether sessions use append-only, labelled output and line input.
     pub accessible: bool,
     /// Whether output is machine readable.
@@ -250,7 +257,9 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
         provider_order: None,
         provider_strict: None,
         offline: false,
+        trace: None,
         allow_unsandboxed: false,
+        network: false,
         accessible: false,
         json: false,
         args: Vec::new(),
@@ -344,6 +353,7 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
                 "sandbox" => Command::Sandbox,
                 "projects" => Command::Projects,
                 "config" => Command::Config,
+                "keys" => Command::Keys,
                 "limits" => Command::Limits,
                 "workspace" => Command::Workspace,
                 "prompt" => Command::Prompt,
@@ -383,6 +393,12 @@ pub fn parse(args: Vec<OsString>, benchmark: bool) -> Result<Launch> {
     {
         launch.resume = Some(classify_resume(token));
     }
+    // `doctor --provider` checks that provider, so it is also the one selected.
+    if launch.command == Command::Doctor
+        && let Some(name) = launch.flag("--provider")
+    {
+        launch.provider = Some(name.to_owned());
+    }
     Ok(launch)
 }
 
@@ -420,6 +436,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--no-provider-strict"
             | "--offline"
             | "--allow-unsandboxed"
+            | "--network"
             | "--json"
             | "--accessible"
             | "--ascii"
@@ -438,6 +455,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             "--no-provider-strict" => launch.provider_strict = Some(false),
             "--offline" => launch.offline = true,
             "--allow-unsandboxed" => launch.allow_unsandboxed = true,
+            "--network" => launch.network = true,
             "--accessible" => launch.accessible = true,
             "--ascii" => launch.ascii = true,
             _ => launch.json = true,
@@ -456,6 +474,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
             | "--add-dir"
             | "--theme"
             | "--provider-order"
+            | "--trace"
     ) {
         return Ok(false);
     }
@@ -494,6 +513,7 @@ fn take_global(launch: &mut Launch, tokens: &[String], index: &mut usize) -> Res
         "--add-dir" => launch.add_dirs.push(value),
         "--theme" => launch.theme = Some(value),
         "--provider-order" => launch.provider_order = Some(value),
+        "--trace" => launch.trace = Some(value),
         _ => match value.split_once('=') {
             Some((key, limit)) if !key.is_empty() => {
                 launch
@@ -749,6 +769,10 @@ pub fn apply_to_settings(launch: &Launch, settings: &mut rune_core::config::Sett
     if let Some(strict) = launch.provider_strict {
         settings.provider_strict = strict;
         settings.sources.record("provider_strict", layer);
+    }
+    if let Some(dir) = &launch.trace {
+        settings.trace_dir = Some(camino::Utf8PathBuf::from(dir));
+        settings.sources.record("trace_dir", layer);
     }
 
     for directory in &launch.add_dirs {
@@ -1171,6 +1195,15 @@ mod tests {
             "{:?}",
             err.hint()
         );
+    }
+
+    #[test]
+    fn doctor_provider_also_selects_the_provider() {
+        let launch = parse_list(&["doctor", "--provider", "deepseek"]).expect("parse");
+        assert_eq!(launch.flag("--provider"), Some("deepseek"));
+        assert_eq!(launch.provider.as_deref(), Some("deepseek"));
+        let launch = parse_list(&["doctor"]).expect("parse");
+        assert_eq!(launch.provider, None);
     }
 
     #[test]

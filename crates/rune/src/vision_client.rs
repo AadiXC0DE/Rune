@@ -3,29 +3,45 @@
 use std::io::Read as _;
 use std::sync::Arc;
 
-use rune_core::config::{Provider as ProviderKind, Settings};
+use rune_core::config::{Effort, Provider as ProviderKind, Settings};
 use rune_core::error::{ErrorCode, Result, RuneError};
 use rune_core::paths::Paths;
+use rune_net::compat::ModelTraits;
 use rune_net::message::Message;
-use rune_net::provider::{Provider, RequestPlan, ToolChoice};
-use rune_net::stream::{FinishReason, StreamReducer};
+use rune_net::provider::{MarkerPolicy, Provider, RequestPlan, ToolChoice};
+use rune_net::stream::{FinishReason, StreamReducer, Usage};
 use rune_net::transport::{self, Endpoint, RequestTimeouts};
+use rune_session::usage::HelperKind;
 use rune_tools::vision::{ImageAnalysis, STATUS_OK, VisionBackend, VisionSource};
+
+use crate::helper_usage::{HelperUsage, note_usage};
 
 /// Fixed safety ceiling per image, independent of the rendered text budget.
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Longest description asked for, in output tokens.
+const IMAGE_OUTPUT_TOKENS: u64 = 1_024;
 
 struct NetworkVision {
     kind: ProviderKind,
     endpoint: Endpoint,
     model: String,
+    effort: Effort,
+    /// How the image model takes its effort setting.
+    traits: ModelTraits,
+    /// Where each request's usage is left, when the host counts it.
+    usage: Option<HelperUsage>,
     timeouts: RequestTimeouts,
     provider_order: Vec<String>,
     provider_strict: bool,
 }
 
 /// Configures image analysis only when the profile names a model and is online.
-pub fn backend(settings: &Settings, paths: &Paths) -> Result<Option<Arc<dyn VisionBackend>>> {
+pub fn backend(
+    settings: &Settings,
+    paths: &Paths,
+    usage: Option<HelperUsage>,
+) -> Result<Option<Arc<dyn VisionBackend>>> {
     if settings.offline {
         return Ok(None);
     }
@@ -39,11 +55,21 @@ pub fn backend(settings: &Settings, paths: &Paths) -> Result<Option<Arc<dyn Visi
         ));
     }
     let endpoint = crate::provider_setup::configured_endpoint(settings, paths)?;
+    let base_url = crate::provider_setup::configured_base_url(settings);
+    let (_, traits) =
+        rune_net::compat::resolve(settings.provider.as_str(), base_url.as_deref(), model);
+    let dialect = crate::provider_setup::dialect_for(&settings.provider);
     Ok(Some(Arc::new(NetworkVision {
         kind: settings.provider.clone(),
         endpoint,
         model: model.to_owned(),
-        timeouts: RequestTimeouts::from_limits(&settings.limits),
+        effort: rune_agent::compaction::lowest_effort(traits.efforts, dialect.as_ref()),
+        traits,
+        usage,
+        timeouts: RequestTimeouts::from_settings(
+            &settings.limits,
+            crate::provider_setup::provider_head_timeout_ms(settings),
+        ),
         provider_order: settings.provider_order.clone(),
         provider_strict: settings.provider_strict,
     })))
@@ -90,15 +116,29 @@ impl VisionBackend for NetworkVision {
             plan.tool_choice = ToolChoice::None;
             plan.provider_order.clone_from(&self.provider_order);
             plan.provider_strict = self.provider_strict;
-            let outcome = transport::stream_completion(
+            plan.effort = self.effort;
+            plan.traits = self.traits;
+            plan.max_output_tokens = Some(IMAGE_OUTPUT_TOKENS);
+            plan.cache_markers = MarkerPolicy::None;
+            let mut reported = Usage::default();
+            let outcome = transport::stream_completion_observed(
                 &client,
                 &self.endpoint,
                 &provider,
                 &plan,
                 self.timeouts,
                 &|| context.check_cancelled().is_err(),
-            )
-            .map_err(|error| error.to_rune_error())?;
+                &mut |event| note_usage(&mut reported, event),
+            );
+            if let Some(usage) = &self.usage {
+                usage.record_ended(
+                    HelperKind::Vision,
+                    &self.model,
+                    outcome.as_ref().ok().map(|done| done.usage),
+                    reported,
+                );
+            }
+            let outcome = outcome.map_err(|error| error.to_rune_error())?;
             let summary = outcome.text();
             if outcome.finish != Some(FinishReason::Stop) || summary.trim().is_empty() {
                 return Err(RuneError::new(
@@ -191,6 +231,9 @@ impl Provider for ImageRequest {
     }
     fn reducer(&self) -> Box<dyn StreamReducer> {
         self.dialect.reducer()
+    }
+    fn reducer_for(&self, plan: &RequestPlan) -> Box<dyn StreamReducer> {
+        self.dialect.reducer_for(plan)
     }
     fn extra_headers(&self) -> Vec<(&'static str, String)> {
         self.dialect.extra_headers()
@@ -311,18 +354,98 @@ mod tests {
         );
     }
 
+    /// Analyses one image against a provider giving this reply.
+    fn analyse_with_reply(
+        reply: String,
+        usage: Option<HelperUsage>,
+    ) -> (Result<Vec<ImageAnalysis>>, String) {
+        let (port, body) = crate::helper_usage::fixture::answer_one(reply);
+        let dir = tempfile::tempdir().expect("temp");
+        let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+        let path = root.join("shot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nrest").expect("image");
+        let paths = Paths::resolve(Some(root.as_str()), None, None, None, None);
+        let settings = Settings {
+            provider: ProviderKind::Anthropic,
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            anonymous: true,
+            vision_model: Some("claude-haiku-5-5".to_owned()),
+            ..Settings::default()
+        };
+        let client = backend(&settings, &paths, usage)
+            .expect("built")
+            .expect("configured");
+        let source = VisionSource::File {
+            image_id: 1,
+            path,
+            media_type: "image/png".to_owned(),
+        };
+        let analysed = client.analyse(&[source]);
+        (analysed, body.join().expect("captured"))
+    }
+
+    #[test]
+    fn image_analysis_caps_its_output() {
+        let usage = HelperUsage::default();
+        let reply = crate::helper_usage::fixture::anthropic_reply("a cat", "end_turn");
+        let (analysed, sent) = analyse_with_reply(reply, Some(usage.clone()));
+        let analyses = analysed.expect("analysed");
+        assert_eq!(analyses[0].summary, "a cat");
+
+        let request: serde_json::Value = serde_json::from_str(&sent).expect("json");
+        assert_eq!(request["max_tokens"], 1_024);
+        assert!(!sent.contains("cache_control"), "{sent}");
+
+        let (_, traits) = rune_net::compat::resolve("anthropic", None, "claude-haiku-5-5");
+        let mut expected = RequestPlan::new("claude-haiku-5-5");
+        expected.effort =
+            rune_agent::compaction::lowest_effort(traits.efforts, &rune_net::anthropic::Anthropic);
+        expected.traits = traits;
+        expected.max_output_tokens = Some(IMAGE_OUTPUT_TOKENS);
+        expected.messages = vec![Message::user("x")];
+        let shape = rune_net::anthropic::Anthropic
+            .build_request(&expected)
+            .expect("expected body");
+        assert_eq!(request.get("thinking"), shape.get("thinking"), "{sent}");
+        assert_eq!(
+            request.get("output_config"),
+            shape.get("output_config"),
+            "{sent}"
+        );
+
+        let recorded = usage.drain();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, HelperKind::Vision);
+        assert_eq!(recorded[0].1, "claude-haiku-5-5");
+        assert_eq!(recorded[0].2.input_tokens, Some(11));
+        assert_eq!(recorded[0].2.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_refused_analysis_still_counts_what_it_used() {
+        let usage = HelperUsage::default();
+        let reply = crate::helper_usage::fixture::anthropic_reply("", "end_turn");
+        let (analysed, _) = analyse_with_reply(reply, Some(usage.clone()));
+        assert!(analysed.is_err());
+        assert_eq!(usage.drain().len(), 1);
+    }
+
     #[test]
     fn absent_configuration_and_offline_runs_have_no_vision_client() {
         let paths = Paths::resolve(Some("/tmp"), None, None, None, None);
         let mut settings = Settings::default();
-        assert!(backend(&settings, &paths).expect("unconfigured").is_none());
+        assert!(
+            backend(&settings, &paths, None)
+                .expect("unconfigured")
+                .is_none()
+        );
         settings.vision_model = Some("fixture".to_owned());
         settings.offline = true;
-        assert!(backend(&settings, &paths).expect("offline").is_none());
+        assert!(backend(&settings, &paths, None).expect("offline").is_none());
         settings.offline = false;
         settings.vision_model = Some("  ".to_owned());
         assert_eq!(
-            backend(&settings, &paths)
+            backend(&settings, &paths, None)
                 .err()
                 .expect("empty model")
                 .detail()

@@ -1,0 +1,16 @@
+{
+  "title": "Fix once listeners and removal during emit",
+  "kind": "bugfix",
+  "prompt": "Listeners added with once() sometimes run twice, and removing a listener while an event is being emitted makes the next listener get skipped. Fix the emitter.",
+  "verify": "node --test",
+  "protected": [
+    "test",
+    "test/hidden.test.js"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "heldout",
+  "language": "javascript",
+  "tags": []
+}

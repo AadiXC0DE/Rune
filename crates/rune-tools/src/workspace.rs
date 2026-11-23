@@ -327,25 +327,42 @@ pub fn truncate_to_bytes(text: &str, limit: usize) -> &str {
 
 /// Splits at most `budget` bytes of `text` into a start and an end.
 ///
-/// A third goes to the start and the rest to the end. Each cut moves to a line
-/// break when one is near, so neither side shows a broken line.
+/// A third goes to the start and the rest to the end.
 pub(crate) fn head_and_tail(text: &str, budget: usize) -> (&str, &str) {
+    head_and_tail_split(text, budget, 3)
+}
+
+/// Furthest a cut moves to reach a line break, in bytes.
+const LINE_SNAP_BYTES: usize = 256;
+
+/// Splits at most `budget` bytes of `text` into a start and an end, giving the
+/// start `budget / head_share` and the end the rest.
+///
+/// Each cut falls on a character boundary and moves to a line break only when
+/// one is within [`LINE_SNAP_BYTES`], so neither side shows a broken line
+/// without giving up much of its room to avoid one.
+pub(crate) fn head_and_tail_split(text: &str, budget: usize, head_share: usize) -> (&str, &str) {
     if text.len() <= budget {
         return (text, "");
     }
-    let head_budget = budget / 3;
+    let head_budget = budget.checked_div(head_share).unwrap_or(0);
     let mut start = truncate_to_bytes(text, head_budget);
-    if let Some(line) = start.rfind('\n').filter(|end| *end >= start.len() / 2) {
-        start = &text[..=line];
+    let window = start.len().saturating_sub(LINE_SNAP_BYTES);
+    if let Some(line) = start.as_bytes()[window..]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+    {
+        start = &text[..=window.saturating_add(line)];
     }
     let tail_budget = budget.saturating_sub(start.len());
     let mut from = text.len().saturating_sub(tail_budget);
     while from < text.len() && !text.is_char_boundary(from) {
         from = from.saturating_add(1);
     }
-    if let Some(offset) = text[from..]
-        .find('\n')
-        .filter(|offset| *offset < tail_budget / 2)
+    let reach = from.saturating_add(LINE_SNAP_BYTES).min(text.len());
+    if let Some(offset) = text.as_bytes()[from..reach]
+        .iter()
+        .position(|byte| *byte == b'\n')
     {
         from = from.saturating_add(offset).saturating_add(1);
     }
@@ -988,6 +1005,65 @@ mod tests {
         assert!(resolved.external);
     }
 
+    /// Returns the workspace path spelled with its drive letter in the other
+    /// case, such as `c:\...` for `C:\...`.
+    #[cfg(windows)]
+    fn with_other_drive_case(path: &Utf8Path) -> String {
+        let text = path.as_str();
+        let mut letters = text.chars();
+        let drive = letters.next().expect("a drive letter");
+        assert_eq!(letters.next(), Some(':'), "{text}");
+        let swapped = if drive.is_ascii_uppercase() {
+            drive.to_ascii_lowercase()
+        } else {
+            drive.to_ascii_uppercase()
+        };
+        format!("{swapped}{}", &text[1..])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_letter_case_is_ignored_for_containment() {
+        let repo = Repo::new();
+        let workspace = repo.path().to_owned();
+        let context = ExecutionContext::new(workspace.clone());
+        let raw = with_other_drive_case(&workspace.join("README.md"));
+        let resolved = resolve(&context, &raw).expect("inside the workspace");
+        assert!(!resolved.external, "{raw}");
+        // A workspace named with the other case admits the usual spelling.
+        let context = ExecutionContext::new(Utf8PathBuf::from(with_other_drive_case(&workspace)));
+        let resolved =
+            resolve(&context, workspace.join("README.md").as_str()).expect("inside the workspace");
+        assert!(!resolved.external);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_resolve_inside_the_workspace() {
+        let repo = Repo::new();
+        let context = repo.context();
+        for name in ["README.md", r"src\main.rs", "new.txt"] {
+            let raw = format!(r"\\?\{}\{name}", repo.path());
+            let resolved = resolve(&context, &raw).expect("inside the workspace");
+            assert!(!resolved.external, "{raw}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn another_drive_is_outside() {
+        let repo = Repo::new();
+        let drive = repo.path().as_str().chars().next().expect("a drive letter");
+        let other = if drive.eq_ignore_ascii_case(&'D') {
+            'E'
+        } else {
+            'D'
+        };
+        let raw = format!(r"{other}:\x");
+        let error = resolve(&repo.context(), &raw).expect_err("another drive");
+        assert_eq!(error.code(), ErrorCode::PathOutsideWorkspace, "{raw}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_link_that_stays_inside_the_workspace_is_permitted() {
@@ -1361,5 +1437,54 @@ mod tests {
         assert_eq!(limits.output_cap(&narrow), 64);
         let wide = repo.context().with_output_cap(usize::MAX);
         assert_eq!(limits.output_cap(&wide), limits.output_bytes);
+    }
+
+    #[test]
+    fn cuts_move_to_a_line_break_only_within_256_bytes() {
+        // The head budget is 1000 bytes. A break 100 bytes before the cut is
+        // reached; one 300 bytes before it is not.
+        let near = format!("{}\n{}", "a".repeat(899), "b".repeat(10_000));
+        let (start, _) = head_and_tail_split(&near, 3000, 3);
+        assert_eq!(start.len(), 900);
+        assert!(start.ends_with('\n'));
+        let far = format!("{}\n{}", "a".repeat(699), "b".repeat(10_000));
+        let (start, _) = head_and_tail_split(&far, 3000, 3);
+        assert_eq!(start.len(), 1000);
+
+        // The tail starts 2000 bytes from the end. A break 100 bytes after
+        // that start is reached; one 300 bytes after it is not.
+        let near = format!("{}\n{}", "c".repeat(10_000), "d".repeat(1899));
+        let (_, end) = head_and_tail_split(&near, 3000, 3);
+        assert_eq!(end, "d".repeat(1899));
+        let far = format!("{}\n{}", "c".repeat(10_000), "d".repeat(1699));
+        let (_, end) = head_and_tail_split(&far, 3000, 3);
+        assert_eq!(end.len(), 2000);
+        assert!(end.starts_with('c'));
+    }
+
+    #[test]
+    fn cuts_never_split_a_character() {
+        let text = "é€😀".repeat(15_000);
+        for budget in [1000, 1001, 1002, 4096, 32_768] {
+            for share in [3, 5] {
+                let (start, end) = head_and_tail_split(&text, budget, share);
+                assert!(start.len() + end.len() <= budget);
+                assert!(text.starts_with(start));
+                assert!(text.ends_with(end));
+                assert!(!start.is_empty() && !end.is_empty());
+                assert!(!start.contains('\n') && !end.contains('\n'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_head_share_of_five_keeps_four_fifths_for_the_tail() {
+        let text = "x".repeat(100_000);
+        let (start, end) = head_and_tail_split(&text, 10_000, 5);
+        assert_eq!(start.len(), 2000);
+        assert_eq!(end.len(), 8000);
+        let (start, end) = head_and_tail(&text, 9000);
+        assert_eq!(start.len(), 3000);
+        assert_eq!(end.len(), 6000);
     }
 }

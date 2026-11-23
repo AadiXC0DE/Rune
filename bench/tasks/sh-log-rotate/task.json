@@ -1,0 +1,15 @@
+{
+  "title": "Fix log rotation count and file names with spaces",
+  "kind": "bugfix",
+  "prompt": "rotate.sh keeps one log too many and fails on file names with spaces.",
+  "verify": "sh tests/run.sh",
+  "protected": [
+    "tests",
+    "tests/run.sh"
+  ],
+  "timeoutMs": 600000,
+  "tests": "tests",
+  "tier": 1,
+  "split": "heldout",
+  "language": "shell"
+}

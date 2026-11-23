@@ -11,7 +11,7 @@ use camino::Utf8PathBuf;
 use rune_core::paths::Paths;
 use rune_session::{EVENTS_FILE, SessionEvent, SessionStore};
 
-fn preview_fixture(exchanges: u64, previous_summary: bool, result_limit: usize, expected: &str) {
+fn preview_fixture(exchanges: u64, previous_summary: bool, keep_tokens: u64, expected: &str) {
     let dir = tempfile::tempdir().expect("workspace");
     let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().expect("root")).expect("utf8");
     let paths = Paths {
@@ -83,7 +83,7 @@ fn preview_fixture(exchanges: u64, previous_summary: bool, result_limit: usize, 
     let before = std::fs::read(&log).expect("log before");
     let config = root.join("preview.toml");
     std::fs::write(&config, format!(
-        "provider = \"chat_completions\"\nbase_url = \"http://127.0.0.1:1/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\nmax_tool_result_bytes = {result_limit}\n"
+        "provider = \"chat_completions\"\nbase_url = \"http://127.0.0.1:1/v1\"\n[models.chat_completions]\nid = \"fixture-model\"\n[limits]\ncompaction_keep_tokens = {keep_tokens}\n"
     )).expect("config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
         .isolated_env()
@@ -124,16 +124,19 @@ fn preview_fixture(exchanges: u64, previous_summary: bool, result_limit: usize, 
 
 #[test]
 fn preview_counts_respect_tool_pairs_and_configured_retention() {
+    // An exchange is a 3-token question, 16 tokens of calls, 11 of results
+    // and a 2-token answer. A zero budget keeps the newest exchange; 40
+    // tokens are reached at the results of the one before it.
     preview_fixture(
         6,
         false,
-        32_768,
+        0,
         "20 record(s) would be summarized; 4 record(s) retained verbatim",
     );
     preview_fixture(
         6,
         false,
-        131_072,
+        40,
         "16 record(s) would be summarized; 8 record(s) retained verbatim",
     );
 }
@@ -143,7 +146,7 @@ fn preview_counts_an_existing_summary_without_changing_archived_records() {
     preview_fixture(
         6,
         true,
-        32_768,
+        0,
         "21 record(s) would be summarized; 4 record(s) retained verbatim",
     );
 }
@@ -153,13 +156,13 @@ fn empty_and_short_histories_report_zero_records_to_summarize() {
     preview_fixture(
         0,
         false,
-        131_072,
+        20_000,
         "0 record(s) would be summarized; 0 record(s) retained verbatim",
     );
     preview_fixture(
         1,
         false,
-        131_072,
+        20_000,
         "0 record(s) would be summarized; 4 record(s) retained verbatim",
     );
 }

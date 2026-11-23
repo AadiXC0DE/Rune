@@ -1,34 +1,22 @@
 name: ci
 
+# Every push and pull request runs what this repository cannot check on a
+# developer's Mac: Linux (format, lint, the full suite with the PTY gate and the
+# bubblewrap sandbox) and Windows, plus the size and startup budget the site
+# promises for every pull request. The rest runs locally through
+# `scripts/preflight.sh` before a push, and here on demand from the Actions tab
+# (`workflow_dispatch`), which is how a release is checked in full.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  dependencies:
-    name: dependency policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install the pinned toolchain
-        run: rustup show
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.19.9 --locked
-
-      - name: Check dependency advisories, licenses, bans, and sources
-        run: cargo deny check
-
-      - name: Test dependency policy enforcement
-        run: bash .github/scripts/test-dependency-policy.sh
-
   # Cheap lane: runs on every push. Node bindings, format, lint, and workspace tests.
   fast:
     name: fast
@@ -44,6 +32,11 @@ jobs:
 
       - name: Test Node bindings
         run: node --test bindings/node/test.mjs
+
+      - name: Test the npm launcher and the package manifests
+        run: |
+          node --test packaging/npm/test.mjs
+          python3 packaging/render-manifests.py --self-test
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -79,6 +72,14 @@ jobs:
           RUNE_REQUIRE_LINUX_SANDBOX: '1'
         run: cargo test -p rune-exec --test linux_network live_linux_network_isolation -- --exact --nocapture
 
+      - name: Test the one-line installer against a local release
+        run: python3 .github/scripts/test-install-script.py
+
+      - name: Check the release workflow's shape and the formula it renders
+        run: |
+          python3 .github/scripts/test-release-workflow.py
+          python3 .github/scripts/render-formula.py --self-test
+
       - name: Check PTY replay prerequisites
         run: python3 -c "import fcntl, pty, termios"
 
@@ -87,6 +88,7 @@ jobs:
 
   wasm:
     name: WASM build and smoke test
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -118,6 +120,8 @@ jobs:
 
   # Size, startup, prompt, and tool schema budgets. Runs on every push to main
   # as well as on a pull request, so a direct push cannot regress them unmeasured.
+  # The size and startup ceilings are what the site promises every pull
+  # request checks, so this one runs on every push. It takes about a minute.
   budget:
     name: budget
     runs-on: ubuntu-latest
@@ -144,6 +148,7 @@ jobs:
   # Compare binaries and archives from two independent clean release builds.
   reproducible:
     name: reproducible
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -158,22 +163,57 @@ jobs:
       - name: Smoke-test the documented archive install and uninstall path
         run: python3 .github/scripts/test-archive-install.py target/dist/*/*.tar.gz
 
+  # Static musl archives for both Linux architectures, each built on a runner of
+  # its own architecture and run inside Alpine and Debian. Dispatch only, like
+  # the reproducible build.
+  linux-static:
+    name: linux static ${{ matrix.target }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - name: Build the static archive
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' crates/rune/src/version.rs)"
+          test -n "$version"
+          bash .github/scripts/build-static-linux.sh "${{ matrix.target }}" dev "$version"
+
+      - name: Run it in Alpine and Debian
+        run: bash .github/scripts/test-static-linux.sh target/dist/rune-${{ matrix.target }}/*.tar.gz
+
+      - name: Upload the archive, checksum and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-linux-${{ matrix.target }}
+          path: target/dist/rune-${{ matrix.target }}/*
+          if-no-files-found: error
+
   cross-platform:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.continue-on-error || false }}
+    # Windows gates every push; macOS runs here only on demand and does not gate.
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
-        include:
-          - os: macos-latest
-            # Tracked in issue 13; remove when this job is green.
-            continue-on-error: true
-          - os: windows-latest
-            # Tracked in issue 13; remove when this job is green.
-            continue-on-error: true
+        # Linux is covered by `fast`. macOS is the development machine, so it
+        # runs here only on demand.
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["macos-latest", "windows-latest"]') || fromJSON('["windows-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -225,18 +265,24 @@ jobs:
           RUST_TEST_NOCAPTURE: '1'
         run: cargo test --workspace
 
+      - name: Test the PowerShell installer against a local release
+        if: runner.os == 'Windows'
+        run: python .github/scripts/test-install-script.py --powershell
+
       - name: Stage native release with artifact size and startup measurements
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           rm -rf target/dist
           cargo xtask release dev
 
       - name: Extract Windows ZIP and smoke-test executable replacement
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch'
         shell: bash
         run: python .github/scripts/test-windows-release.py target/dist/*/*.zip
 
       - name: Publish measured release artifacts
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: rune-${{ runner.os }}-${{ runner.arch }}

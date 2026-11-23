@@ -154,12 +154,12 @@ class Terminal:
 
     def finish(self):
         self.send("/exit")
-        assert self.child.wait(timeout=5) == 0
+        assert drain_wait(self.child, self.master, 5, self.output) == 0
         self.drain()
         # CRLF is terminal newline translation, not an application cursor move.
         output = bytes(self.output).replace(b"\r\n", b"\n")
         assert not any(byte < 32 and byte not in (9, 10) for byte in output), repr(output)
-        assert b"ctrl-c cancel" not in output, "interactive footer leaked"
+        assert b"/ commands" not in output, "interactive footer leaked"
         assert b"ctx " not in output, "context status row leaked"
         return output
 
@@ -218,10 +218,12 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         assert b"User: " + LONG_PROMPT.encode() in terminal.output, "prompt truncated"
         assert terminal.output.count(b"Assistant: FIRST-REPLY") == 1
         assert b"Assistant:   preserved" in terminal.output
-        assert b"Reasoning: THINKING" in terminal.output
+        # Reasoning is collapsed by default: one labelled line, not the text.
+        assert b"Reasoning: thought for " in terminal.output
+        assert b"THINKING" not in terminal.output
 
         terminal.send("question")
-        terminal.wait_for('Permission request for "ask_user_question"')
+        terminal.wait_for("ask_user_question wants to use")
         terminal.send("yes")
         terminal.wait_for("Answer: enter an option number")
         assert not tool_results, "question selected an option automatically"
@@ -234,7 +236,7 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
         for answer, allowed in [("", False), ("yes", True)]:
             start = len(terminal.output)
             terminal.send("permission")
-            terminal.wait_for("type yes to run once", start)
+            terminal.wait_for("type y to run once", start)
             assert not (root / "approved.txt").exists(), "shell ran before approval"
             terminal.send(answer)
             terminal.wait_for("Assistant: TOOL_REPLY", start)
@@ -244,15 +246,15 @@ with tempfile.TemporaryDirectory(prefix="rune-r070-") as directory:
 
         start = len(terminal.output)
         terminal.send("question")
-        terminal.wait_for('Permission request for "ask_user_question"', start)
+        terminal.wait_for("ask_user_question wants to use", start)
         terminal.send("yes")
         terminal.wait_for("Answer: enter an option number", start)
         terminal.send("/cancel")
-        terminal.wait_for("Notice: cancelled", start)
+        terminal.wait_for("Notice: interrupted", start)
 
         start = len(terminal.output)
         terminal.send("fail")
-        terminal.wait_for("Notice: the turn failed:", start)
+        terminal.wait_for("Notice: the endpoint returned HTTP 400", start)
         terminal.send("after-failure")
         terminal.wait_for("Assistant: SESSION_STILL_USABLE", start)
         terminal.send("/status")

@@ -130,6 +130,10 @@ pub struct Message {
     /// back verbatim. It is never interpreted, only stored and replayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<String>,
+    /// The dialect and model that produced an assistant message, as
+    /// `dialect:model`, so reasoning is not replayed to a different model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl Message {
@@ -140,6 +144,7 @@ impl Message {
             role: Role::System,
             parts: vec![ContentPart::Text { text: text.into() }],
             replay: None,
+            origin: None,
         }
     }
 
@@ -150,6 +155,7 @@ impl Message {
             role: Role::User,
             parts: vec![ContentPart::Text { text: text.into() }],
             replay: None,
+            origin: None,
         }
     }
 
@@ -160,6 +166,7 @@ impl Message {
             role: Role::User,
             parts,
             replay: None,
+            origin: None,
         }
     }
 
@@ -170,6 +177,7 @@ impl Message {
             role: Role::Assistant,
             parts,
             replay: None,
+            origin: None,
         }
     }
 
@@ -335,6 +343,7 @@ mod tests {
             role: Role::Tool,
             parts,
             replay: None,
+            origin: None,
         }
     }
 

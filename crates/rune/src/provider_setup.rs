@@ -5,6 +5,7 @@
 //! comes from are reported, so a user can see what the harness will use without
 //! reading the stored secret.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rune_core::config::{Provider, Settings};
@@ -65,20 +66,77 @@ pub fn configured_endpoint(
 ) -> Result<rune_net::transport::Endpoint> {
     let base_url = require_base_url(settings)?;
     rune_net::transport::validate_url(&base_url)?;
+    let configured = configured_headers(settings);
     if settings.anonymous {
         let mut anonymous = rune_net::transport::Endpoint::anonymous(&base_url)?;
-        anonymous.headers = endpoint(&settings.provider, &base_url, "", settings.offline).headers;
-        return Ok(anonymous.offline(settings.offline));
+        anonymous.headers = endpoint(
+            &settings.provider,
+            &base_url,
+            "",
+            settings.offline,
+            configured,
+        )
+        .headers;
+        return traced(settings, anonymous.offline(settings.offline));
     }
     let provider = settings.provider.as_str();
     let credential = auth::resolve(paths, provider, settings.api_key_env.as_deref())?
         .ok_or_else(|| auth::missing_credential_error(provider, settings.api_key_env.as_deref()))?;
-    Ok(endpoint(
-        &settings.provider,
-        &base_url,
-        credential.expose(),
-        settings.offline,
-    ))
+    traced(
+        settings,
+        endpoint(
+            &settings.provider,
+            &base_url,
+            credential.expose(),
+            settings.offline,
+            configured,
+        ),
+    )
+}
+
+/// The headers the active provider's `[providers.<name>.headers]` table adds.
+fn configured_headers(settings: &Settings) -> &[(String, String)] {
+    let canonical = rune_net::compat::canonical_preset(settings.provider.as_str());
+    settings
+        .provider_settings(&canonical)
+        .map_or(&[], |(_, provider)| provider.headers.as_slice())
+}
+
+/// The trace every endpoint of this process writes to, so numbering is shared.
+static TRACE: std::sync::Mutex<Option<std::sync::Arc<rune_net::trace::TraceSink>>> =
+    std::sync::Mutex::new(None);
+
+/// Attaches the trace directory, when one is configured.
+fn traced(
+    settings: &Settings,
+    mut endpoint: rune_net::transport::Endpoint,
+) -> Result<rune_net::transport::Endpoint> {
+    let Some(dir) = settings.trace_dir.as_deref() else {
+        return Ok(endpoint);
+    };
+    let secrets: Vec<String> = std::iter::once(endpoint.credential.clone())
+        .chain(
+            endpoint
+                .headers
+                .iter()
+                .filter(|(name, _)| rune_net::redact::is_secret_header(name))
+                .map(|(_, value)| value.clone()),
+        )
+        .collect();
+    let mut held = TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sink = if let Some(sink) = held.as_ref().filter(|sink| sink.dir() == dir) {
+        sink.add_secrets(secrets);
+        std::sync::Arc::clone(sink)
+    } else {
+        let sink = rune_net::trace::TraceSink::open(dir, secrets)?;
+        eprintln!("rune: tracing provider requests to {dir} (credentials redacted)");
+        *held = Some(std::sync::Arc::clone(&sink));
+        sink
+    };
+    endpoint.trace = Some(sink);
+    Ok(endpoint)
 }
 
 /// Reads a credential from the environment for a provider.
@@ -332,7 +390,74 @@ pub fn validate_controls(settings: &Settings) -> Result<()> {
     if plan.model.trim().is_empty() {
         "unselected".clone_into(&mut plan.model);
     }
+    compat_for(settings, &plan.model)?;
     dialect_for(&settings.provider).validate(&plan)
+}
+
+/// Resolves how requests to a model on the active provider are shaped, with
+/// the user's `[providers.<name>.compat]` settings applied over the built-in
+/// rules.
+pub fn compat_for(settings: &Settings, model: &str) -> Result<rune_net::compat::Resolution> {
+    let provider = settings.provider.as_str();
+    let mut resolution =
+        rune_net::compat::explain(provider, configured_base_url(settings).as_deref(), model);
+    let canonical = rune_net::compat::canonical_preset(provider);
+    if let Some((name, entry)) = settings.provider_settings(&canonical) {
+        rune_net::compat::apply_overrides(&mut resolution, name, &entry.compat)?;
+    }
+    Ok(resolution)
+}
+
+/// What decides how requests to the active provider are shaped, kept so each
+/// request resolves the model it is actually sent to.
+#[derive(Clone, Debug, Default)]
+pub struct CompatSource {
+    provider: String,
+    base_url: Option<String>,
+    name: String,
+    overrides: BTreeMap<String, String>,
+}
+
+impl CompatSource {
+    /// Captures the provider, endpoint and the user's compatibility settings.
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        let provider = settings.provider.as_str().to_owned();
+        let canonical = rune_net::compat::canonical_preset(&provider);
+        let (name, overrides) = settings
+            .provider_settings(&canonical)
+            .map(|(name, entry)| (name.to_owned(), entry.compat.clone()))
+            .unwrap_or_default();
+        Self {
+            provider,
+            base_url: configured_base_url(settings),
+            name,
+            overrides,
+        }
+    }
+
+    /// Resolves the request shape for a model.
+    ///
+    /// The overrides were validated when the session started, so one that
+    /// fails here leaves the built-in table in force rather than failing a
+    /// request.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        model: &str,
+    ) -> (
+        rune_net::compat::EndpointCompat,
+        rune_net::compat::ModelTraits,
+    ) {
+        let resolution = rune_net::compat::explain(&self.provider, self.base_url.as_deref(), model);
+        let mut adjusted = resolution.clone();
+        let chosen =
+            match rune_net::compat::apply_overrides(&mut adjusted, &self.name, &self.overrides) {
+                Ok(()) => adjusted,
+                Err(_) => resolution,
+            };
+        (chosen.endpoint, chosen.model)
+    }
 }
 
 /// Projects the selected controls onto an empty preflight request.
@@ -473,14 +598,54 @@ fn fetch_provider_limits(
 /// without delaying it. Absent when nothing has been cached yet or the catalog
 /// does not describe the provider or model.
 pub fn cached_prices(settings: &Settings, paths: &Paths) -> Option<rune_net::models_dev::Prices> {
+    // Prices declared for the model come first: they exist for endpoints the
+    // catalog does not price, or prices it has wrong.
+    if let Some(declared) = settings.model_prices() {
+        return Some(rune_net::models_dev::Prices {
+            input: declared.input,
+            output: declared.output,
+            cache_read: declared.cache_read,
+            cache_write: declared.cache_write,
+            off_peak: None,
+            schedule: None,
+        });
+    }
     let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
     read_cached_limits(&paths.models_cache_file(), key)?
         .get(&settings.model)?
         .prices
 }
 
+/// Returns whether the configured model takes images, from the cache alone.
+///
+/// Absent when nothing has been cached yet or the catalog does not list the
+/// model's inputs.
+pub fn cached_vision(settings: &Settings, paths: &Paths) -> Option<bool> {
+    let key = rune_net::models_dev::catalog_key(&settings.provider.to_string())?;
+    read_cached_limits(&paths.models_cache_file(), key)?
+        .get(&settings.model)?
+        .vision
+}
+
+/// What shell commands receive beyond the minimal environment: the configured
+/// `shell_env` names, never the active provider's credential variables.
+#[must_use]
+pub fn command_environment(settings: &Settings) -> std::sync::Arc<rune_tools::EnvironmentPolicy> {
+    let mut withheld: Vec<String> = auth::default_variables(&settings.provider.to_string())
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    if let Some(name) = &settings.api_key_env {
+        withheld.push(name.clone());
+    }
+    std::sync::Arc::new(rune_tools::EnvironmentPolicy {
+        passthrough: settings.shell_env.clone(),
+        withheld,
+    })
+}
+
 /// Reads a provider's capacity out of the cache.
-fn read_cached_limits(
+pub(crate) fn read_cached_limits(
     path: &camino::Utf8Path,
     key: &str,
 ) -> Option<rune_net::models_dev::ProviderLimits> {
@@ -501,7 +666,122 @@ fn write_cached_catalog(paths: &Paths, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         rune_core::paths::create_dir_private(parent)?;
     }
-    rune_core::paths::write_private(&path, body)
+    // Staged and renamed, so a process reading the cache meanwhile sees the old
+    // document or the new one, never part of one.
+    rune_core::paths::write_private_atomic(&path, body)
+}
+
+/// How old the cached catalog may grow before a run refreshes it.
+const CATALOG_REFRESH_AGE: std::time::Duration = std::time::Duration::from_hours(24);
+
+/// Returns whether the cache at `path` is missing or older than a day at `now`.
+fn refresh_due(path: &camino::Utf8Path, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= CATALOG_REFRESH_AGE)
+}
+
+/// Refreshes the cached catalog on a detached thread when it is due.
+///
+/// Returns whether a refresh was started. Nothing waits for it and every
+/// failure is dropped: the cache is an improvement on unknown limits, never a
+/// reason to delay or fail a run. Skipped offline, and for a provider the
+/// catalog does not describe, whose limits it can never supply.
+pub fn refresh_catalog_in_background(settings: &Settings, paths: &Paths) -> bool {
+    if settings.offline
+        || rune_net::models_dev::catalog_key(&settings.provider.to_string()).is_none()
+        || !refresh_due(&paths.models_cache_file(), std::time::SystemTime::now())
+    {
+        return false;
+    }
+    let paths = paths.clone();
+    std::thread::Builder::new()
+        .name("catalog-refresh".to_owned())
+        .spawn(move || {
+            let _ = download_catalog(&paths, MODELS_DEV_TIMEOUT);
+        })
+        .is_ok()
+}
+
+/// What a catalog download wrote.
+#[derive(Clone, Debug)]
+pub struct RefreshedCatalog {
+    /// Providers the document describes.
+    pub providers: usize,
+    /// Bytes written.
+    pub bytes: usize,
+    /// Where the cache was written.
+    pub path: camino::Utf8PathBuf,
+}
+
+/// Downloads the published catalog now and writes it to the cache.
+///
+/// Refused offline with the same error as any other outbound request.
+pub fn refresh_catalog(settings: &Settings, paths: &Paths) -> Result<RefreshedCatalog> {
+    if settings.offline {
+        return Err(rune_net::error::NetError::new(
+            rune_net::error::FailureKind::PolicyDenied,
+            "outbound requests are disabled",
+        )
+        .with_hint("remove the offline setting to reach a provider")
+        .to_rune_error());
+    }
+    download_catalog(paths, REFRESH_TIMEOUT).map_err(|err| {
+        RuneError::new(
+            err.code(),
+            format!(
+                "the model catalog could not be refreshed: {}",
+                err.message()
+            ),
+        )
+        .with_hint("check the network, or try again later")
+    })
+}
+
+/// How long `rune models --refresh` waits for the catalog.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fetches the catalog, checks it parses, and writes it to the cache.
+fn download_catalog(paths: &Paths, timeout: std::time::Duration) -> Result<RefreshedCatalog> {
+    let fetched = rune_net::transport::fetch_url(MODELS_DEV_URL, "application/json", timeout)
+        .map_err(|err| err.to_rune_error())?;
+    if fetched.status != 200 {
+        return Err(RuneError::new(
+            ErrorCode::TransportFailure,
+            format!("the catalog answered with status {}", fetched.status),
+        ));
+    }
+    let body = String::from_utf8(fetched.body)
+        .map_err(|_| RuneError::new(ErrorCode::ProtocolViolation, "the catalog is not UTF-8"))?;
+    let providers = catalog_providers(&body).ok_or_else(|| {
+        RuneError::new(
+            ErrorCode::ProtocolViolation,
+            "the catalog was not in a shape this build reads",
+        )
+    })?;
+    write_cached_catalog(paths, &body)?;
+    Ok(RefreshedCatalog {
+        providers,
+        bytes: body.len(),
+        path: paths.models_cache_file(),
+    })
+}
+
+/// Counts the providers a catalog document describes, or `None` when it is not one.
+fn catalog_providers(body: &str) -> Option<usize> {
+    let document: serde_json::Value = serde_json::from_str(body).ok()?;
+    let providers = document
+        .as_object()?
+        .values()
+        .filter(|provider| {
+            provider
+                .get("models")
+                .is_some_and(serde_json::Value::is_object)
+        })
+        .count();
+    (providers > 0).then_some(providers)
 }
 
 /// Largest cached catalog accepted.
@@ -605,13 +885,15 @@ pub const fn auth_style(provider: &Provider) -> rune_net::transport::AuthStyle {
 /// themselves states that in the provider table, so the headers are applied here
 /// rather than at each call site. A caller that builds its own endpoint would
 /// otherwise reach the provider without them and be refused. The credential is
-/// presented the way [`auth_style`] says, for the same reason.
+/// presented the way [`auth_style`] says, for the same reason. The user's
+/// `configured` headers follow, so a value for a required name replaces it.
 #[must_use]
 pub fn endpoint(
     provider: &Provider,
     base_url: &str,
     credential: &str,
     offline: bool,
+    configured: &[(String, String)],
 ) -> rune_net::transport::Endpoint {
     let name = provider.as_str();
     let mut endpoint =
@@ -622,7 +904,15 @@ pub fn endpoint(
         .map(|entry| entry.required_headers)
         .unwrap_or_default()
     {
-        endpoint = endpoint.with_header(*header, *value);
+        if !configured
+            .iter()
+            .any(|(own, _)| own.eq_ignore_ascii_case(header))
+        {
+            endpoint = endpoint.with_header(*header, *value);
+        }
+    }
+    for (header, value) in configured {
+        endpoint = endpoint.with_header(header.clone(), value.clone());
     }
     endpoint
 }
@@ -650,6 +940,16 @@ pub fn resolve_endpoint(provider: &Provider, configured: Option<&str>) -> Result
 #[must_use]
 pub fn environment_credential(provider: &str, configured: Option<&str>) -> Option<String> {
     credential_from_environment(provider, configured)
+}
+
+/// The connected provider's own `head_timeout_ms`, from its `[providers.<name>]`
+/// table.
+#[must_use]
+pub fn provider_head_timeout_ms(settings: &Settings) -> Option<u64> {
+    let canonical = rune_net::compat::canonical_preset(settings.provider.as_str());
+    settings
+        .provider_settings(&canonical)
+        .and_then(|(_, provider)| provider.head_timeout_ms)
 }
 
 #[cfg(test)]
@@ -729,6 +1029,7 @@ mod tests {
             "https://example.invalid/v1beta",
             "k",
             false,
+            &[],
         );
         assert_eq!(gemini.auth.header(), "x-goog-api-key");
         assert_eq!(
@@ -742,7 +1043,13 @@ mod tests {
         ] {
             assert_eq!(auth_style(&provider), AuthStyle::Bearer, "{provider}");
         }
-        let built = endpoint(&Provider::Anthropic, "https://example.invalid", "k", false);
+        let built = endpoint(
+            &Provider::Anthropic,
+            "https://example.invalid",
+            "k",
+            false,
+            &[],
+        );
         assert_eq!(built.auth, AuthStyle::ApiKeyHeader);
     }
 
@@ -756,6 +1063,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}"),
             "sk-ant-captured",
             false,
+            &[],
         );
         let mut plan = rune_net::provider::RequestPlan::new("claude-test");
         plan.messages = rune_net::transport::one_shot_messages("hello");
@@ -778,6 +1086,70 @@ mod tests {
             !head.contains("\r\nauthorization:"),
             "a bearer token was sent to anthropic:\n{head}"
         );
+    }
+
+    #[test]
+    fn configured_headers_reach_every_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        let (port, captured) = capture_one_request();
+        std::fs::write(
+            &config,
+            format!(
+                "provider = \"opencode-go\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\n\
+                 [providers.opencode-go.headers]\n\"User-Agent\" = \"my-tool/1\"\n\
+                 \"X-Title\" = \"my-tool\"\nAuthorization = \"Bearer gateway-secret\"\n\
+                 \"Content-Type\" = \"text/plain\"\n"
+            ),
+        )
+        .expect("config");
+        let path = camino::Utf8PathBuf::from_path_buf(config).expect("utf8");
+        let mut settings = rune_core::config::load(
+            None,
+            Some(path.as_path()),
+            &rune_core::config::EnvironmentOverrides::default(),
+        );
+        assert!(
+            settings.diagnostics.iter().any(|diagnostic| {
+                diagnostic.key.as_deref() == Some("providers.opencode-go.headers.Content-Type")
+                    && diagnostic.message == "`Content-Type` cannot be set here"
+            }),
+            "{:?}",
+            settings.diagnostics
+        );
+        settings.anonymous = true;
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let built = configured_endpoint(&settings, &temp_paths(&root)).expect("endpoint");
+        assert!(
+            !format!("{built:?}").contains("gateway-secret"),
+            "a credential header was shown: {built:?}"
+        );
+
+        let mut plan = rune_net::provider::RequestPlan::new("m");
+        plan.messages = rune_net::transport::one_shot_messages("hello");
+        let sent = rune_net::transport::stream_completion(
+            &rune_net::transport::agent(),
+            &built,
+            &rune_net::chat_completions::ChatCompletions,
+            &plan,
+            std::time::Duration::from_secs(5),
+            &|| false,
+        );
+
+        let head = captured.join().expect("captured");
+        let detail = format!("({:?}):\n{head}", sent.err());
+        assert!(head.contains("\r\nx-title: my-tool\r\n"), "{detail}");
+        assert!(
+            head.contains("\r\nauthorization: bearer gateway-secret\r\n"),
+            "{detail}"
+        );
+        assert!(
+            head.contains("\r\nx-opencode-session: rune\r\n"),
+            "{detail}"
+        );
+        assert!(head.contains("\r\nuser-agent: my-tool/1\r\n"), "{detail}");
+        assert_eq!(head.matches("\r\nuser-agent:").count(), 1, "{detail}");
+        assert!(!head.contains("text/plain"), "{detail}");
     }
 
     #[test]
@@ -1107,6 +1479,76 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_round_trips_through_the_config() {
+        for entry in providers::KNOWN_PROVIDERS {
+            let dir = tempfile::tempdir().expect("temp");
+            let root = camino::Utf8Path::from_path(dir.path()).expect("utf8");
+            let paths = paths(root);
+            // Saved the way a connection saves it: the table's endpoint, or one
+            // the user gave when the table has none.
+            let endpoint = entry.base_url.unwrap_or("http://127.0.0.1:9000/v1");
+            save_selection(
+                &paths,
+                &Selection {
+                    provider: entry.name.to_owned(),
+                    model: None,
+                    base_url: Some(endpoint.to_owned()),
+                },
+            )
+            .expect("saved");
+
+            let loaded = rune_core::config::load(
+                None,
+                Some(&paths.config_file(None)),
+                &rune_core::config::EnvironmentOverrides::default(),
+            );
+            assert!(
+                loaded.diagnostics.is_empty(),
+                "{}: {:#?}",
+                entry.name,
+                loaded.diagnostics
+            );
+            assert_eq!(loaded.provider, entry.provider(), "{}", entry.name);
+            assert_eq!(
+                configured_base_url(&loaded).as_deref(),
+                Some(endpoint),
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                auth::default_variables(loaded.provider.as_str())
+                    .first()
+                    .copied(),
+                entry.key_variable,
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                loaded.anonymous,
+                entry.credential == providers::CredentialKind::AnonymousLoopback,
+                "{}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_preset_named_only_in_the_environment_finds_its_endpoint() {
+        let env = rune_core::config::EnvironmentOverrides::from_lookup(|key| {
+            (key == "RUNE_PROVIDER").then(|| "deepseek".to_owned())
+        });
+        let loaded = rune_core::config::load(None, None, &env);
+        assert_eq!(
+            configured_base_url(&loaded).as_deref(),
+            Some("https://api.deepseek.com")
+        );
+        assert_eq!(
+            auth::default_variables(loaded.provider.as_str()),
+            &["DEEPSEEK_API_KEY"]
+        );
+    }
+
+    #[test]
     fn saving_a_selection_preserves_keys_it_does_not_set() {
         // A whole-file write would discard whatever the user configured by hand.
         let dir = tempfile::tempdir().expect("temp");
@@ -1355,5 +1797,59 @@ mod tests {
         };
         let err = require_base_url(&settings).expect_err("refused");
         assert_eq!(err.code(), ErrorCode::InvalidConfiguration);
+    }
+
+    #[test]
+    fn a_fresh_cache_is_not_refreshed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        let cache = paths.models_cache_file();
+        // Nothing cached yet is due.
+        assert!(refresh_due(&cache, std::time::SystemTime::now()));
+        write_cached_catalog(&paths, r#"{"anthropic":{"models":{}}}"#).expect("written");
+        let written = std::fs::metadata(&cache)
+            .and_then(|meta| meta.modified())
+            .expect("modified");
+        let hour = std::time::Duration::from_hours(1);
+        assert!(!refresh_due(&cache, written + hour));
+        assert!(!refresh_due(&cache, written + 23 * hour));
+        assert!(refresh_due(&cache, written + 24 * hour));
+        assert!(refresh_due(&cache, written + 25 * hour));
+        // A fresh cache starts no thread.
+        let online = Settings {
+            provider: Provider::Anthropic,
+            ..Settings::default()
+        };
+        assert!(!refresh_catalog_in_background(&online, &paths));
+    }
+
+    #[test]
+    fn an_offline_run_never_refreshes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let paths = temp_paths(&root);
+        // Nothing is cached, so only the offline setting stops the refresh.
+        assert!(refresh_due(
+            &paths.models_cache_file(),
+            std::time::SystemTime::now()
+        ));
+        assert!(!refresh_catalog_in_background(
+            &offline_settings("anthropic"),
+            &paths
+        ));
+        let err = refresh_catalog(&offline_settings("anthropic"), &paths).expect_err("refused");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert!(!paths.models_cache_file().exists());
+    }
+
+    #[test]
+    fn a_catalog_document_counts_its_providers() {
+        assert_eq!(
+            catalog_providers(r#"{"a":{"models":{}},"b":{"models":{"m":{}}},"c":1}"#),
+            Some(2)
+        );
+        assert_eq!(catalog_providers("{}"), None);
+        assert_eq!(catalog_providers("not json"), None);
     }
 }

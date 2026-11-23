@@ -26,20 +26,6 @@ use std::fmt::Write as _;
 use rune_core::budget::{BudgetSet, LimitName};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-/// Reviewer model compiled in for each built-in provider.
-///
-/// A review is one narrow safety question, so the reviewer is a small, fast
-/// model rather than the session model. The choice is fixed rather than
-/// inherited, so changing the session model cannot redirect the review.
-const FIXED_REVIEWERS: &[(&str, &str)] = &[
-    ("anthropic", "claude-haiku-4-5"),
-    ("chat_completions", "gpt-5-mini"),
-    ("responses", "gpt-5-mini"),
-];
-
-/// Reviewer used when a provider names none.
-const DEFAULT_REVIEWER: &str = "claude-haiku-4-5";
-
 /// A decision model qualifies as a review even when it is only the first word
 /// of what it calls a hold.
 const CLEAR: &str = "clear";
@@ -49,15 +35,20 @@ const CAUTION: &str = "caution";
 /// Which model reviews an action.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ReviewerKind {
-    /// The compiled reviewer for a provider. A configured override does not
-    /// apply to this provider.
+    /// The small model a provider publishes, used on that provider's own
+    /// endpoint.
     Fixed {
         /// The model identifier.
         model: String,
     },
-    /// A reviewer chosen by the user, on a provider whose reviewer is
-    /// selectable.
+    /// A reviewer chosen by the user, honoured on any provider.
     Custom {
+        /// The model identifier.
+        model: String,
+    },
+    /// The session's own model, the one model an unknown endpoint is known to
+    /// serve. The caller asks it for as little reasoning as it accepts.
+    SessionModel {
         /// The model identifier.
         model: String,
     },
@@ -68,48 +59,43 @@ impl ReviewerKind {
     #[must_use]
     pub fn model(&self) -> &str {
         match self {
-            Self::Fixed { model } | Self::Custom { model } => model,
+            Self::Fixed { model } | Self::Custom { model } | Self::SessionModel { model } => model,
         }
     }
 
-    /// Returns true when the model is the compiled choice for the provider.
+    /// Returns true when the model is the provider's published small model.
     #[must_use]
     pub const fn is_fixed(&self) -> bool {
         matches!(self, Self::Fixed { .. })
     }
 }
 
-/// Returns the reviewer for a provider.
+/// Returns the model that reviews actions for a session.
 ///
-/// The built-in providers have a compiled reviewer; an endpoint declared in the
-/// user configuration has none, so its reviewer is whatever the connection
-/// declares. On a built-in provider a configured override is not consulted, and
-/// the returned kind says so by being [`ReviewerKind::Fixed`]. An endpoint that
-/// declares no reviewer gets the compiled default, which the endpoint may not
-/// serve; a review that cannot complete is held rather than skipped.
+/// A configured reviewer always wins. Without one, the provider's published
+/// small model is used, which the caller passes only when the session talks to
+/// that provider's own endpoint. Anything else, a gateway, a proxy or a local
+/// server, reviews with the session model, because a compiled name may not be
+/// served there and a review that cannot be sent protects nothing.
 #[must_use]
-pub fn reviewer_for(provider: &str, configured: Option<&str>) -> ReviewerKind {
-    let configured = configured.map(str::trim).filter(|model| !model.is_empty());
-    if accepts_review_override(provider)
-        && let Some(model) = configured
-    {
+pub fn reviewer_for(
+    configured: Option<&str>,
+    vendor_small_model: Option<&str>,
+    session_model: &str,
+) -> ReviewerKind {
+    if let Some(model) = configured.map(str::trim).filter(|model| !model.is_empty()) {
         return ReviewerKind::Custom {
             model: model.to_owned(),
         };
     }
-    let compiled = FIXED_REVIEWERS
-        .iter()
-        .find(|(name, _)| *name == provider)
-        .map_or(DEFAULT_REVIEWER, |(_, model)| *model);
-    ReviewerKind::Fixed {
-        model: compiled.to_owned(),
+    if let Some(model) = vendor_small_model {
+        return ReviewerKind::Fixed {
+            model: model.to_owned(),
+        };
     }
-}
-
-/// Returns true when a provider's reviewer can be chosen by the user.
-#[must_use]
-pub fn accepts_review_override(provider: &str) -> bool {
-    !FIXED_REVIEWERS.iter().any(|(name, _)| *name == provider)
+    ReviewerKind::SessionModel {
+        model: session_model.to_owned(),
+    }
 }
 
 /// One action submitted for review.
@@ -639,51 +625,56 @@ mod tests {
     }
 
     #[test]
-    fn a_builtin_provider_has_a_fixed_reviewer() {
+    fn the_configured_reviewer_always_wins() {
+        let custom = ReviewerKind::Custom {
+            model: "gpt-5-mini".to_owned(),
+        };
         assert_eq!(
-            reviewer_for("anthropic", None),
-            ReviewerKind::Fixed {
-                model: "claude-haiku-4-5".to_owned()
-            }
+            reviewer_for(
+                Some(" gpt-5-mini "),
+                Some("gemini-3.5-flash-lite"),
+                "gemini-pro"
+            ),
+            custom
         );
         assert_eq!(
-            reviewer_for("responses", None),
+            reviewer_for(Some("gpt-5-mini"), None, "qwen3-coder"),
+            custom
+        );
+        assert!(!custom.is_fixed());
+        // A blank setting is no choice at all.
+        assert_eq!(
+            reviewer_for(Some("   "), Some("deepseek-flash"), "deepseek-pro"),
             ReviewerKind::Fixed {
-                model: "gpt-5-mini".to_owned()
+                model: "deepseek-flash".to_owned()
             }
         );
-        assert!(reviewer_for("chat_completions", None).is_fixed());
     }
 
     #[test]
-    fn a_builtin_provider_ignores_a_configured_reviewer() {
-        let kind = reviewer_for("anthropic", Some("claude-opus-4-5"));
-        assert_eq!(kind.model(), "claude-haiku-4-5");
-        assert!(!accepts_review_override("anthropic"));
-    }
-
-    #[test]
-    fn a_declared_endpoint_uses_its_configured_reviewer() {
-        let kind = reviewer_for("local-llama", Some("llama-3.3-70b"));
+    fn the_vendor_small_model_is_used_only_on_its_own_endpoint() {
+        let kind = reviewer_for(None, Some("claude-haiku-5-5"), "claude-opus-5");
         assert_eq!(
             kind,
-            ReviewerKind::Custom {
-                model: "llama-3.3-70b".to_owned()
-            }
-        );
-        assert!(accepts_review_override("local-llama"));
-        assert_eq!(
-            reviewer_for("local-llama", Some("   ")),
             ReviewerKind::Fixed {
-                model: DEFAULT_REVIEWER.to_owned()
+                model: "claude-haiku-5-5".to_owned()
             }
         );
+        assert!(kind.is_fixed());
+        assert_eq!(kind.model(), "claude-haiku-5-5");
     }
 
     #[test]
-    fn an_unconfigured_provider_still_names_a_reviewer() {
-        let kind = reviewer_for("unconfigured", None);
-        assert_eq!(kind.model(), DEFAULT_REVIEWER);
+    fn any_other_endpoint_reviews_with_the_session_model() {
+        let kind = reviewer_for(None, None, "qwen3-coder");
+        assert_eq!(
+            kind,
+            ReviewerKind::SessionModel {
+                model: "qwen3-coder".to_owned()
+            }
+        );
+        assert!(!kind.is_fixed());
+        assert_eq!(kind.model(), "qwen3-coder");
     }
 
     #[test]

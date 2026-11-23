@@ -1,0 +1,8 @@
+{
+  "description": "Tool results and command output capped at 16 KiB.",
+  "env": {
+    "RUNE_LIMITS": "max_tool_result_bytes=16384,command_output_bytes=16384"
+  },
+  "flags": [],
+  "files": {}
+}

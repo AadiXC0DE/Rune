@@ -1,12 +1,15 @@
 //! Bounded, line-numbered file reads.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
 
-use camino::Utf8Path;
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rune_core::error::{ErrorCode, Result, RuneError};
 
-use crate::contract::{Activity, ExecutionContext, Tool, ToolOutput, validate_closed_arguments};
+use crate::contract::{
+    Activity, ExecutionContext, Tool, ToolImage, ToolOutput, validate_closed_arguments,
+};
 use crate::workspace::{
     FileLimits, SUMMARY_RESERVE_BYTES, display_path, join_capped, read_line_bounded_checked,
     resolve, string_arg, truncate_line, usize_arg,
@@ -17,6 +20,18 @@ const PROBE_BYTES: usize = 8 * 1024;
 
 /// Width of the line number column.
 const NUMBER_WIDTH: usize = 6;
+
+/// Lines shown when a window starts past the end of the file.
+const TAIL_LINES: usize = 20;
+
+/// Most paths suggested for a missing one.
+const MAX_SUGGESTIONS: usize = 3;
+
+/// Directory entries examined for a name that differs only in case.
+const LISTING_LIMIT: usize = 1_000;
+
+/// Largest image attached to a result for a model that can see it.
+const MAX_ATTACHED_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Reads a bounded window of lines from one text file.
 #[derive(Clone, Copy, Debug, Default)]
@@ -103,21 +118,38 @@ impl Tool for ReadFile {
             .unwrap_or(self.limits.read_lines)
             .min(self.limits.read_lines);
 
-        let resolved = resolve(context, &requested)?;
+        let resolved = resolve(context, &requested)
+            .map_err(|err| suggest_outside(context, &requested, err))?;
         let display = display_path(context, &resolved.path);
         context.check_cancelled()?;
-        let file = open(&display, resolved.path.as_path())?;
+        let file = match open(&display, resolved.path.as_path()) {
+            Ok(file) => file,
+            Err(err) if err.code() == ErrorCode::NotFound => {
+                let found = suggestions(context, &resolved.path);
+                return Err(with_suggestions(err, &found));
+            }
+            Err(err) => return Err(err),
+        };
         let size = file.metadata().map_or(0, |metadata| metadata.len());
 
         let mut reader = BufReader::with_capacity(PROBE_BYTES, file);
         let probe = reader.fill_buf().unwrap_or_default().to_vec();
         context.check_cancelled()?;
         if let Some(format) = image_format(&probe) {
+            if context.accepts_images && size <= MAX_ATTACHED_IMAGE_BYTES {
+                return attach_image(&display, format, reader);
+            }
+            let note = if context.accepts_images {
+                "It is over the 5 MiB that can be attached. "
+            } else {
+                ""
+            };
             return Ok(ToolOutput::success(image_description(
-                &display, format, size,
+                &display, format, size, note,
             )));
         }
-        if is_binary(&probe) {
+        let content = classify(&probe);
+        if content == Content::Binary {
             return Ok(ToolOutput::failure(format!(
                 "`{display}` is binary ({size} bytes), so its bytes were not returned as text. \
                  Name a text file, or use a tool that decodes this format."
@@ -129,7 +161,7 @@ impl Tool for ReadFile {
         // the footer readable even when nothing else fits.
         let cap = self.limits.output_cap(context);
         let byte_budget = cap.saturating_sub(SUMMARY_RESERVE_BYTES);
-        let window = collect(
+        let mut window = collect(
             &mut reader,
             start_line,
             count,
@@ -139,9 +171,11 @@ impl Tool for ReadFile {
         )?;
         if window.binary {
             return Ok(ToolOutput::failure(format!(
-                "`{display}` contains binary data past its first {PROBE_BYTES} bytes, so its                  content was not returned as text."
+                "`{display}` contains binary data past its first {PROBE_BYTES} bytes, so its \
+                 content was not returned as text."
             )));
         }
+        window.lossy |= content == Content::Lossy;
         let (body, footer) = render(&display, size, &window, self.limits.line_bytes);
         context.check_cancelled()?;
         Ok(ToolOutput::success(join_capped(body, &footer, cap)))
@@ -188,6 +222,100 @@ fn open(display: &str, path: &Utf8Path) -> Result<std::fs::File> {
     })
 }
 
+/// Returns up to three existing paths the model may have meant by a missing one.
+///
+/// Candidates, in order: entries of the parent directory whose name differs
+/// from the requested one only in case, then the requested path's trailing
+/// components joined onto the workspace, longest first.
+fn suggestions(context: &ExecutionContext, resolved: &Utf8Path) -> Vec<String> {
+    let mut found = Vec::new();
+    if let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) {
+        let wanted = name.to_lowercase();
+        let mut same_name = Vec::new();
+        if let Ok(entries) = parent.read_dir_utf8() {
+            for entry in entries.take(LISTING_LIMIT).flatten() {
+                let candidate = entry.file_name();
+                if candidate != name && candidate.to_lowercase() == wanted {
+                    same_name.push(entry.path().to_owned());
+                }
+            }
+        }
+        same_name.sort();
+        for path in same_name {
+            push_unique(&mut found, path);
+        }
+    }
+    workspace_suffixes(context, resolved, &mut found);
+    found
+        .iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|path| display_path(context, path))
+        .collect()
+}
+
+/// Adds each proper suffix of `path` that names a regular file in the workspace.
+fn workspace_suffixes(context: &ExecutionContext, path: &Utf8Path, found: &mut Vec<Utf8PathBuf>) {
+    let names = path
+        .components()
+        .filter_map(|component| match component {
+            Utf8Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let workspace = context.workspace();
+    for start in 1..names.len() {
+        let candidate = names[start..]
+            .iter()
+            .fold(workspace.to_owned(), |joined, name| joined.join(name));
+        if candidate != path && candidate.is_file() {
+            push_unique(found, candidate);
+        }
+    }
+}
+
+/// Appends a path unless it is already listed.
+fn push_unique(found: &mut Vec<Utf8PathBuf>, path: Utf8PathBuf) {
+    if !found.contains(&path) {
+        found.push(path);
+    }
+}
+
+/// Adds workspace suggestions to the refusal of a missing absolute path.
+///
+/// An absolute path from another machine or container, such as
+/// `/app/src/main.rs`, lies outside every root, so it is refused before it is
+/// opened; the workspace file it most likely means is named instead.
+fn suggest_outside(context: &ExecutionContext, requested: &str, err: RuneError) -> RuneError {
+    let path = Utf8Path::new(requested);
+    if err.code() != ErrorCode::PathOutsideWorkspace
+        || !path.is_absolute()
+        || std::fs::symlink_metadata(path.as_std_path()).is_ok()
+    {
+        return err;
+    }
+    let mut found = Vec::new();
+    workspace_suffixes(context, path, &mut found);
+    let shown = found
+        .iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|path| display_path(context, path))
+        .collect::<Vec<_>>();
+    with_suggestions(err, &shown)
+}
+
+/// Attaches a did-you-mean hint when there is anything to suggest.
+fn with_suggestions(err: RuneError, found: &[String]) -> RuneError {
+    if found.is_empty() {
+        return err;
+    }
+    let names = found
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    err.with_hint(format!("did you mean: {names}?"))
+}
+
 /// The window of lines a read produced, with the true file size.
 #[derive(Clone, Debug, Default)]
 struct Window {
@@ -203,6 +331,10 @@ struct Window {
     line_capped: bool,
     /// True when a NUL byte appeared beyond the classification probe.
     binary: bool,
+    /// True when some line is not valid UTF-8 and is shown with replacements.
+    lossy: bool,
+    /// True when the window started past the end and holds the last lines.
+    past_end: bool,
 }
 
 /// Collects the window while counting every line in the file.
@@ -221,6 +353,9 @@ fn collect<R: BufRead>(
     let mut buffer = Vec::new();
     let mut number = 1_usize;
     let mut bytes = 0_usize;
+    // The last lines before `start_line`, kept so a window that starts past
+    // the end can show the end of the file without a second read.
+    let mut tail = VecDeque::with_capacity(TAIL_LINES);
 
     loop {
         let line = read_line_bounded_checked(reader, &mut buffer, line_bytes, || {
@@ -236,18 +371,26 @@ fn collect<R: BufRead>(
             break;
         }
         window.total = window.total.saturating_add(1);
+        if !window.lossy && !decodes(&buffer, buffer.len() < line.consumed) {
+            window.lossy = true;
+        }
 
-        if number < start_line || window.lines.len() >= count || window.byte_capped {
+        if number < start_line {
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            let (shown, capped) = shown_line(&buffer, line.length, line_bytes);
+            tail.push_back((number, shown, capped));
+            number = number.saturating_add(1);
+            continue;
+        }
+        if window.lines.len() >= count || window.byte_capped {
             number = number.saturating_add(1);
             continue;
         }
 
-        let text = String::from_utf8_lossy(&buffer);
-        let text = text.trim_end_matches(['\n', '\r']);
-        if line.length > line_bytes {
-            window.line_capped = true;
-        }
-        let shown = truncate_line(text, line.length, line_bytes);
+        let (shown, capped) = shown_line(&buffer, line.length, line_bytes);
+        window.line_capped |= capped;
         bytes = bytes
             .saturating_add(shown.len())
             .saturating_add(NUMBER_WIDTH + 1);
@@ -259,12 +402,54 @@ fn collect<R: BufRead>(
         window.lines.push((number, shown));
         number = number.saturating_add(1);
     }
+
+    if window.lines.is_empty() && window.total > 0 && start_line > window.total {
+        window.past_end = true;
+        let keep = tail.len().min(count.max(1));
+        let mut bytes = 0_usize;
+        for (number, shown, capped) in tail.into_iter().rev().take(keep) {
+            bytes = bytes
+                .saturating_add(shown.len())
+                .saturating_add(NUMBER_WIDTH + 1);
+            if bytes > byte_budget && !window.lines.is_empty() {
+                break;
+            }
+            window.line_capped |= capped;
+            window.lines.push((number, shown));
+        }
+        window.lines.reverse();
+    }
     Ok(window)
+}
+
+/// Returns a line as shown, and whether it was cut at the line cap.
+fn shown_line(buffer: &[u8], length: usize, line_bytes: usize) -> (String, bool) {
+    let text = String::from_utf8_lossy(buffer);
+    let text = text.trim_end_matches(['\n', '\r']);
+    (truncate_line(text, length, line_bytes), length > line_bytes)
+}
+
+/// Returns true when the bytes are valid UTF-8.
+///
+/// A `cut` line was kept only up to the line cap, so a sequence it ends in the
+/// middle of is not counted as invalid.
+fn decodes(bytes: &[u8], cut: bool) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(err) => cut && err.error_len().is_none(),
+    }
 }
 
 /// Renders the window body and the footer that states what was left out.
 fn render(display: &str, size: u64, window: &Window, line_bytes: usize) -> (String, String) {
-    let mut body = format!("{display}: {} lines, {size} bytes\n", window.total);
+    let mut body = format!("{display}: {} lines, {size} bytes", window.total);
+    if window.lossy {
+        body.push_str(
+            " [not valid UTF-8: shown with replacement characters; edit it with a command, not \
+             edit_file]",
+        );
+    }
+    body.push('\n');
     for (number, text) in &window.lines {
         let _ = writeln!(body, "{number:>NUMBER_WIDTH$}\t{text}");
     }
@@ -283,6 +468,11 @@ fn render(display: &str, size: u64, window: &Window, line_bytes: usize) -> (Stri
     let mut footer = String::new();
     if total == 0 {
         footer.push_str("[the file is empty]\n");
+    } else if window.past_end {
+        let _ = writeln!(
+            footer,
+            "[the file has {total} lines; showing the last {shown}]"
+        );
     } else if shown == 0 {
         let _ = writeln!(
             footer,
@@ -361,25 +551,108 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
 }
 
 /// Describes an image instead of returning its bytes.
-fn image_description(display: &str, format: ImageFormat, size: u64) -> String {
+fn image_description(display: &str, format: ImageFormat, size: u64, note: &str) -> String {
     format!(
-        "{display} is a {} image ({}), {size} bytes. Image bytes are not returned as text.",
+        "{display} is a {} image ({}), {size} bytes. {note}Image bytes are not returned as text.",
         format.name(),
         format.media_type()
     )
 }
 
-/// Returns true when the bytes are not text.
+/// Reads a whole image and returns it attached to the result.
+fn attach_image(
+    display: &str,
+    format: ImageFormat,
+    reader: BufReader<std::fs::File>,
+) -> Result<ToolOutput> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_ATTACHED_IMAGE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            RuneError::new(
+                ErrorCode::InvalidState,
+                format!("`{display}` could not be read: {err}"),
+            )
+        })?;
+    let n = bytes.len();
+    let text = match dimensions(format, &bytes) {
+        Some((w, h)) => format!("image {display} ({w}x{h}, {n} bytes) attached"),
+        None => format!("image {display} ({n} bytes) attached"),
+    };
+    let mut output = ToolOutput::success(text);
+    output.image = Some(ToolImage {
+        media_type: format.media_type(),
+        bytes,
+    });
+    Ok(output)
+}
+
+/// Reads an image's width and height from its header, without decoding it.
+fn dimensions(format: ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
+    fn field<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+        bytes.get(at..at.checked_add(N)?)?.try_into().ok()
+    }
+    let be16 = |at: usize| field(bytes, at).map(u16::from_be_bytes).map(u32::from);
+    let le16 = |at: usize| field(bytes, at).map(u16::from_le_bytes).map(u32::from);
+    let le24 = |at: usize| field::<3>(bytes, at).map(|[a, b, c]| u32::from_le_bytes([a, b, c, 0]));
+    match format {
+        ImageFormat::Png => Some((
+            field(bytes, 16).map(u32::from_be_bytes)?,
+            field(bytes, 20).map(u32::from_be_bytes)?,
+        )),
+        ImageFormat::Gif => Some((le16(6)?, le16(8)?)),
+        ImageFormat::Jpeg => {
+            let mut at: usize = 2;
+            loop {
+                let [tag, marker] = field(bytes, at)?;
+                if tag != 0xFF {
+                    return None;
+                }
+                if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    return Some((be16(at.checked_add(7)?)?, be16(at.checked_add(5)?)?));
+                }
+                let length = usize::try_from(be16(at.checked_add(2)?)?).ok()?;
+                at = at.checked_add(2)?.checked_add(length)?;
+            }
+        }
+        ImageFormat::WebP => match &field::<4>(bytes, 12)? {
+            b"VP8 " => Some((le16(26)? & 0x3FFF, le16(28)? & 0x3FFF)),
+            b"VP8L" => {
+                let packed = field(bytes, 21).map(u32::from_le_bytes)?;
+                let width = (packed & 0x3FFF).checked_add(1)?;
+                let height = (packed.checked_shr(14)? & 0x3FFF).checked_add(1)?;
+                Some((width, height))
+            }
+            b"VP8X" => Some((le24(24)?.checked_add(1)?, le24(27)?.checked_add(1)?)),
+            _ => None,
+        },
+    }
+}
+
+/// What the leading bytes of a file say about its content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Content {
+    /// Valid UTF-8 text.
+    Text,
+    /// Text that is not valid UTF-8, shown with replacement characters.
+    Lossy,
+    /// Not text: refused.
+    Binary,
+}
+
+/// Classifies the probe bytes.
 ///
-/// A NUL byte is decisive. Otherwise the probe must decode as UTF-8, allowing
-/// an incomplete sequence at the end only when the probe is the whole file.
-fn is_binary(bytes: &[u8]) -> bool {
+/// A NUL byte is decisive. Otherwise invalid UTF-8 makes the text lossy, except
+/// an incomplete sequence cut by the end of a full probe on a longer file.
+fn classify(bytes: &[u8]) -> Content {
     if bytes.contains(&0) {
-        return true;
+        return Content::Binary;
     }
     match std::str::from_utf8(bytes) {
-        Ok(_) => false,
-        Err(err) => err.error_len().is_some() || bytes.len() < PROBE_BYTES,
+        Ok(_) => Content::Text,
+        Err(err) if err.error_len().is_none() && bytes.len() >= PROBE_BYTES => Content::Text,
+        Err(_) => Content::Lossy,
     }
 }
 
@@ -639,28 +912,233 @@ mod tests {
     }
 
     #[test]
-    fn reading_past_the_end_returns_an_empty_window_with_the_true_count() {
+    fn a_start_line_past_the_end_returns_the_last_lines() {
         let repo = Repo::new();
+        // Line 3 is exactly one past the end, and counts as past it.
+        for start in [99, 3] {
+            let output = ReadFile::default()
+                .call(
+                    &serde_json::json!({ "path": "README.md", "start_line": start }),
+                    &repo.context(),
+                )
+                .expect("call");
+            assert!(!output.is_error);
+            assert!(
+                output.text.contains("README.md: 2 lines"),
+                "{}",
+                output.text
+            );
+            assert!(
+                output.text.contains("     1\tRune fixture"),
+                "{}",
+                output.text
+            );
+            assert!(
+                output.text.contains("     2\tneedle one"),
+                "{}",
+                output.text
+            );
+            assert!(
+                output
+                    .text
+                    .contains("[the file has 2 lines; showing the last 2]"),
+                "{}",
+                output.text
+            );
+            assert!(
+                !output.text.contains("no lines returned"),
+                "{}",
+                output.text
+            );
+        }
+
+        repo.write("long/forty.txt", &numbered("line ", 1, 40));
         let output = ReadFile::default()
             .call(
-                &serde_json::json!({ "path": "README.md", "start_line": 99 }),
+                &serde_json::json!({ "path": "long/forty.txt", "start_line": 41 }),
                 &repo.context(),
             )
             .expect("call");
-        assert!(!output.is_error);
-        assert!(
-            output.text.contains("README.md: 2 lines"),
-            "{}",
-            output.text
-        );
+        assert!(!output.text.contains("line 20\n"), "{}", output.text);
+        assert!(output.text.contains("    21\tline 21"), "{}", output.text);
+        assert!(output.text.contains("    40\tline 40"), "{}", output.text);
         assert!(
             output
                 .text
-                .contains("no lines returned: the requested window starts at line 99"),
+                .contains("[the file has 40 lines; showing the last 20]"),
             "{}",
             output.text
         );
-        assert!(!output.text.contains("Rune fixture"), "{}", output.text);
+
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "empty.txt", "start_line": 99 }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(
+            output.text.contains("[the file is empty]"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn latin1_text_is_shown_with_replacement_characters() {
+        let repo = Repo::new();
+        repo.write_bytes("data/latin1.txt", b"caf\xe9\nplain\n");
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/latin1.txt" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output.text.starts_with(
+                "data/latin1.txt: 2 lines, 11 bytes [not valid UTF-8: shown with replacement \
+                 characters; edit it with a command, not edit_file]\n"
+            ),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.contains("     1\tcaf\u{FFFD}\n"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("     2\tplain"), "{}", output.text);
+    }
+
+    #[test]
+    fn an_invalid_byte_past_the_probe_marks_the_read_lossy() {
+        let repo = Repo::new();
+        let mut bytes = "text line\n".repeat(2000).into_bytes();
+        bytes.extend_from_slice(b"caf\xe9\n");
+        assert!(bytes.len() > PROBE_BYTES);
+        repo.write_bytes("data/late.txt", &bytes);
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/late.txt", "line_count": 2 }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(!output.is_error, "{}", output.text);
+        assert!(
+            output
+                .text
+                .contains("2001 lines, 20005 bytes [not valid UTF-8"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("     1\ttext line"), "{}", output.text);
+
+        let clean = "text line\n".repeat(2000);
+        repo.write("data/clean.txt", &clean);
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/clean.txt", "line_count": 2 }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(!output.text.contains("not valid UTF-8"), "{}", output.text);
+    }
+
+    #[test]
+    fn a_wrong_case_name_suggests_the_real_file() {
+        let repo = Repo::new();
+        assert_eq!(
+            suggestions(&repo.context(), &repo.path().join("src/Main.rs")),
+            vec!["src/main.rs".to_owned()]
+        );
+        let result = ReadFile::default().call(
+            &serde_json::json!({ "path": "src/Main.rs" }),
+            &repo.context(),
+        );
+        if repo.path().join("src/Main.rs").exists() {
+            // A case-insensitive file system opens the real file directly.
+            let output = result.expect("read through the other case");
+            assert!(output.text.contains("fn main()"), "{}", output.text);
+            return;
+        }
+        let err = result.expect_err("missing");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.message(), "`src/Main.rs` does not exist");
+        assert_eq!(err.hint(), Some("did you mean: `src/main.rs`?"));
+    }
+
+    #[test]
+    fn a_foreign_absolute_path_suggests_the_workspace_file() {
+        let repo = Repo::new();
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        let foreign = Utf8Path::from_path(elsewhere.path())
+            .expect("a UTF-8 temporary path")
+            .join("app/src/main.rs");
+        let arguments = serde_json::json!({ "path": foreign.as_str() });
+
+        let err = ReadFile::default()
+            .call(&arguments, &repo.context())
+            .expect_err("outside the workspace");
+        assert_eq!(err.code(), ErrorCode::PathOutsideWorkspace);
+        assert_eq!(err.hint(), Some("did you mean: `src/main.rs`?"));
+
+        let err = ReadFile::default()
+            .call(&arguments, &repo.context().with_external_access(true))
+            .expect_err("missing");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(err.hint(), Some("did you mean: `src/main.rs`?"));
+    }
+
+    #[test]
+    fn at_most_three_suggestions_are_given() {
+        let repo = Repo::new();
+        for path in ["x.txt", "d/x.txt", "c/d/x.txt", "b/c/d/x.txt"] {
+            repo.write(path, "x\n");
+        }
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        let foreign = Utf8Path::from_path(elsewhere.path())
+            .expect("a UTF-8 temporary path")
+            .join("a/b/c/d/x.txt");
+        let err = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": foreign.as_str() }),
+                &repo.context().with_external_access(true),
+            )
+            .expect_err("missing");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        let expected = ["b/c/d/x.txt", "c/d/x.txt", "d/x.txt"]
+            .map(|path| {
+                format!(
+                    "`{}`",
+                    display_path(&repo.context(), &repo.path().join(path))
+                )
+            })
+            .join(", ");
+        assert_eq!(
+            err.hint(),
+            Some(format!("did you mean: {expected}?").as_str())
+        );
+    }
+
+    #[test]
+    fn the_late_binary_message_has_no_run_of_spaces() {
+        let repo = Repo::new();
+        let mut bytes = "text line\n".repeat(2000).into_bytes();
+        bytes.extend_from_slice(&[0x00, 0x01]);
+        repo.write_bytes("data/late.bin", &bytes);
+        let output = ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": "data/late.bin" }),
+                &repo.context(),
+            )
+            .expect("call");
+        assert!(output.is_error);
+        assert_eq!(
+            output.text,
+            "`data/late.bin` contains binary data past its first 8192 bytes, so its content was \
+             not returned as text."
+        );
+        assert!(!output.text.contains("  "), "{}", output.text);
     }
 
     #[test]
@@ -895,6 +1373,161 @@ mod tests {
         assert_eq!(image_format(b"plain text"), None);
     }
 
+    fn png_sized(width: u32, height: u32, padding: usize) -> Vec<u8> {
+        let mut bytes = png_bytes();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.resize(bytes.len().saturating_add(padding), 0);
+        bytes
+    }
+
+    fn jpeg_sized(sof: u8, width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8];
+        bytes.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x06, b'J', b'F', b'I', b'F']);
+        bytes.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0xFF, sof, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03; 10]);
+        bytes
+    }
+
+    fn webp(chunk: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+        bytes.extend_from_slice(chunk);
+        bytes.extend_from_slice(&[0x00; 4]);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn read_image(repo: &Repo, path: &str, accepts_images: bool) -> ToolOutput {
+        ReadFile::default()
+            .call(
+                &serde_json::json!({ "path": path }),
+                &repo.context().with_accepts_images(accepts_images),
+            )
+            .expect("call")
+    }
+
+    #[test]
+    fn an_image_is_attached_when_the_model_can_see() {
+        let repo = Repo::new();
+        let bytes = png_sized(1280, 720, 1000);
+        repo.write_bytes("data/shot.png", &bytes);
+        let output = read_image(&repo, "data/shot.png", true);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            format!(
+                "image data/shot.png (1280x720, {} bytes) attached",
+                bytes.len()
+            )
+        );
+        assert_eq!(
+            output.image,
+            Some(ToolImage {
+                media_type: "image/png",
+                bytes,
+            })
+        );
+    }
+
+    #[test]
+    fn an_image_is_described_when_the_model_cannot_see() {
+        let repo = Repo::new();
+        repo.write_bytes("data/shot.png", &png_sized(1280, 720, 1000));
+        let output = read_image(&repo, "data/shot.png", false);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            "data/shot.png is a PNG image (image/png), 1024 bytes. \
+             Image bytes are not returned as text."
+        );
+        assert_eq!(output.image, None);
+    }
+
+    #[test]
+    fn an_oversized_image_is_described() {
+        let repo = Repo::new();
+        let bytes = png_sized(64, 64, 6 * 1024 * 1024);
+        repo.write_bytes("data/huge.png", &bytes);
+        let output = read_image(&repo, "data/huge.png", true);
+        assert!(!output.is_error);
+        assert_eq!(
+            output.text,
+            format!(
+                "data/huge.png is a PNG image (image/png), {} bytes. It is over the 5 MiB \
+                 that can be attached. Image bytes are not returned as text.",
+                bytes.len()
+            )
+        );
+        assert_eq!(output.image, None);
+    }
+
+    #[test]
+    fn dimensions_are_read_from_every_format() {
+        assert_eq!(
+            dimensions(ImageFormat::Png, &png_sized(1280, 720, 0)),
+            Some((1280, 720))
+        );
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0x40, 0x01, 0xF0, 0x00]);
+        assert_eq!(dimensions(ImageFormat::Gif, &gif), Some((320, 240)));
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &jpeg_sized(0xC0, 800, 600)),
+            Some((800, 600))
+        );
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &jpeg_sized(0xC2, 1024, 768)),
+            Some((1024, 768))
+        );
+        let mut lossy = vec![0x00, 0x00, 0x00, 0x9D, 0x01, 0x2A];
+        lossy.extend_from_slice(&(0x0280_u16 | 0x4000).to_le_bytes());
+        lossy.extend_from_slice(&480_u16.to_le_bytes());
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8 ", &lossy)),
+            Some((640, 480))
+        );
+        let packed: u32 = 0x63 | (0x31 << 14);
+        let mut lossless = vec![0x2F];
+        lossless.extend_from_slice(&packed.to_le_bytes());
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8L", &lossless)),
+            Some((100, 50))
+        );
+        let mut extended = vec![0x00; 4];
+        extended.extend_from_slice(&69_999_u32.to_le_bytes()[..3]);
+        extended.extend_from_slice(&2_u32.to_le_bytes()[..3]);
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"VP8X", &extended)),
+            Some((70_000, 3))
+        );
+    }
+
+    #[test]
+    fn a_truncated_header_gives_no_dimensions() {
+        let png = png_sized(1280, 720, 0);
+        assert_eq!(dimensions(ImageFormat::Png, &png[..20]), None);
+        assert_eq!(dimensions(ImageFormat::Gif, b"GIF89a\x40\x01\xF0"), None);
+        let jpeg = jpeg_sized(0xC0, 800, 600);
+        assert_eq!(dimensions(ImageFormat::Jpeg, &jpeg[..22]), None);
+        assert_eq!(
+            dimensions(ImageFormat::Jpeg, &[0xFF, 0xD8, 0x00, 0xC0, 0x00]),
+            None
+        );
+        assert_eq!(dimensions(ImageFormat::WebP, &webp(b"VP8L", &[0x2F])), None);
+        assert_eq!(
+            dimensions(ImageFormat::WebP, &webp(b"ALPH", &[0; 16])),
+            None
+        );
+
+        let repo = Repo::new();
+        repo.write_bytes("data/short.png", &png[..20]);
+        let output = read_image(&repo, "data/short.png", true);
+        assert_eq!(output.text, "image data/short.png (20 bytes) attached");
+        assert!(output.image.is_some());
+    }
+
     #[test]
     fn a_utf8_file_without_a_nul_is_read_as_text() {
         let repo = Repo::new();
@@ -913,13 +1546,20 @@ mod tests {
     }
 
     #[test]
-    fn binary_detection_accepts_text_and_rejects_nul() {
-        assert!(!is_binary(b"plain text with a newline\n"));
-        assert!(!is_binary("tabs\tand accents: cafe\u{301}\n".as_bytes()));
-        assert!(is_binary(&binary()));
-        assert!(is_binary(&[0x00]));
-        // A short invalid file is decided by the invalid sequence, not its size.
-        assert!(is_binary(&[0xC3, 0x28]));
+    fn a_nul_byte_still_refuses_the_file() {
+        assert_eq!(classify(b"plain text with a newline\n"), Content::Text);
+        assert_eq!(
+            classify("tabs\tand accents: cafe\u{301}\n".as_bytes()),
+            Content::Text
+        );
+        assert_eq!(classify(&binary()), Content::Binary);
+        assert_eq!(classify(&[0x00]), Content::Binary);
+        assert_eq!(classify(&[0xC3, 0x28]), Content::Lossy);
+        // A sequence cut by the end of a full probe is not evidence of anything.
+        let mut cut = vec![b'a'; PROBE_BYTES - 1];
+        cut.push(0xC3);
+        assert_eq!(classify(&cut), Content::Text);
+        assert_eq!(classify(&cut[PROBE_BYTES - 4..]), Content::Lossy);
     }
 
     #[test]
@@ -962,6 +1602,7 @@ mod tests {
             .expect_err("refused");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(err.message().contains("absent.txt"), "{}", err.message());
+        assert_eq!(err.hint(), None);
     }
 
     #[test]

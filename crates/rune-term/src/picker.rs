@@ -8,7 +8,7 @@
 //! the rows to draw, and the caller decides when they are written. That is what
 //! makes a selection assertable in a test without a terminal.
 
-use crate::theme::{Slot, Theme};
+use crate::theme::{ColorDepth, Slot, Theme};
 
 /// Closes a styled row.
 const RESET: &str = "\u{1b}[0m";
@@ -27,7 +27,8 @@ pub struct Picker {
     title: String,
     items: Vec<String>,
     /// Each item lowercased once, so narrowing a long catalog does not
-    /// re-case every entry on every keystroke.
+    /// re-case every entry on every keystroke. Replaced by the lowercased
+    /// haystack when one is set.
     folded: Vec<String>,
     /// What the user has typed. Empty means everything matches.
     query: String,
@@ -70,6 +71,22 @@ impl Picker {
         self.current =
             current.and_then(|current| self.items.iter().position(|item| item == current));
         self
+    }
+
+    /// Matches the query against `haystack` instead of the drawn items.
+    ///
+    /// Each entry stands for the item at the same position, so an item can be
+    /// found by text it does not show. A list of another length is ignored.
+    pub fn set_haystack(&mut self, haystack: Vec<String>) {
+        if haystack.len() != self.items.len() {
+            return;
+        }
+        self.folded = haystack
+            .into_iter()
+            .map(|entry| entry.to_lowercase())
+            .collect();
+        self.cursor = 0;
+        self.offset = 0;
     }
 
     /// Returns the heading shown above the items.
@@ -226,9 +243,9 @@ impl Picker {
     /// without color and a reader who cannot see the difference both still know
     /// which entry is highlighted.
     #[must_use]
-    pub fn rows(&self, theme: &Theme, truecolor: bool) -> Vec<String> {
-        let accent = theme.sgr(Slot::Accent, truecolor);
-        let dim = theme.sgr(Slot::Dim, truecolor);
+    pub fn rows(&self, theme: &Theme, depth: ColorDepth) -> Vec<String> {
+        let accent = theme.sgr(Slot::Accent, depth);
+        let dim = theme.sgr(Slot::Dim, depth);
         let matches = self.matches();
         let shown = matches
             .iter()
@@ -310,6 +327,23 @@ mod tests {
     }
 
     #[test]
+    fn a_haystack_filters_without_being_drawn() {
+        let mut picker = Picker::new("sessions", items(3), DEFAULT_WINDOW);
+        picker.set_haystack(vec![
+            "item-0\u{0}alpha prompt".to_owned(),
+            "item-1\u{0}beta prompt".to_owned(),
+            "item-2\u{0}gamma prompt".to_owned(),
+        ]);
+        picker.set_query("BETA");
+        assert_eq!(picker.matches(), [1]);
+        assert_eq!(picker.selected(), Some("item-1"));
+        let rows = picker.rows(&Theme::no_color(), ColorDepth::None);
+        assert_eq!(rows, ["> item-1"]);
+        picker.set_query("item-2");
+        assert_eq!(picker.selected(), Some("item-2"));
+    }
+
+    #[test]
     fn the_first_entry_starts_highlighted() {
         let picker = Picker::new("models", items(3), DEFAULT_WINDOW);
         assert_eq!(picker.cursor(), 0);
@@ -380,7 +414,7 @@ mod tests {
         picker.set_query("zzz");
         assert!(!picker.has_matches());
         assert_eq!(picker.selected(), None);
-        let rows = picker.rows(&theme, false);
+        let rows = picker.rows(&theme, ColorDepth::Ansi256);
         assert!(rows.iter().any(|row| row.contains("no match")), "{rows:?}");
     }
 
@@ -422,7 +456,7 @@ mod tests {
         picker.to(9);
         for window in [1, 4, DEFAULT_WINDOW, 0] {
             picker.set_window(window);
-            let rows = picker.rows(&theme, false);
+            let rows = picker.rows(&theme, ColorDepth::Ansi256);
             assert_eq!(picker.selected(), Some("item-9"));
             assert!(rows.iter().any(|row| row == "> item-9"), "{rows:?}");
             assert!(rows.len() <= window.max(1).saturating_add(1));
@@ -442,12 +476,12 @@ mod tests {
     fn the_marker_moves_with_the_highlight() {
         let theme = Theme::no_color();
         let mut picker = Picker::new("models", items(3), DEFAULT_WINDOW);
-        let first = picker.rows(&theme, false);
+        let first = picker.rows(&theme, ColorDepth::Ansi256);
         assert_eq!(first.first().map(String::as_str), Some("> item-0"));
         assert_eq!(first.get(1).map(String::as_str), Some("  item-1"));
 
         picker.down();
-        let second = picker.rows(&theme, false);
+        let second = picker.rows(&theme, ColorDepth::Ansi256);
         assert_eq!(second.first().map(String::as_str), Some("  item-0"));
         assert_eq!(second.get(1).map(String::as_str), Some("> item-1"));
     }
@@ -457,7 +491,7 @@ mod tests {
         let theme = Theme::no_color();
         let mut picker = Picker::new("models", items(20), 4);
         picker.to(9);
-        let rows = picker.rows(&theme, false);
+        let rows = picker.rows(&theme, ColorDepth::Ansi256);
         // Four entries plus the position line.
         assert_eq!(rows.len(), 5);
         assert!(rows.iter().any(|row| row.contains("item-9")), "{rows:?}");
@@ -467,7 +501,7 @@ mod tests {
     fn a_list_that_fits_carries_no_position_line() {
         let theme = Theme::no_color();
         let picker = Picker::new("models", items(3), DEFAULT_WINDOW);
-        let rows = picker.rows(&theme, false);
+        let rows = picker.rows(&theme, ColorDepth::Ansi256);
         assert_eq!(rows.len(), 3);
         assert!(!rows.iter().any(|row| row.contains(" of ")), "{rows:?}");
     }
@@ -476,7 +510,7 @@ mod tests {
     fn the_entry_in_effect_is_marked_without_changing_its_value() {
         let theme = Theme::no_color();
         let picker = Picker::new("models", models(), DEFAULT_WINDOW).with_current(Some("gpt-5"));
-        let rows = picker.rows(&theme, false);
+        let rows = picker.rows(&theme, ColorDepth::Ansi256);
         assert!(
             rows.iter().any(|row| row == "  gpt-5 (current)"),
             "{rows:?}"
@@ -497,7 +531,7 @@ mod tests {
         let mut picker = Picker::new("models", items(30), 4);
         picker.set_query("item-1");
         picker.set_query("item-");
-        let rows = picker.rows(&theme, false);
+        let rows = picker.rows(&theme, ColorDepth::Ansi256);
         assert!(
             rows.last().is_some_and(|row| row.contains(" of ")),
             "{rows:?}"
@@ -506,9 +540,9 @@ mod tests {
 
     #[test]
     fn the_highlighted_row_is_colored_when_the_theme_has_color() {
-        let theme = Theme::fx_dark();
+        let theme = Theme::dark();
         let picker = Picker::new("models", items(2), DEFAULT_WINDOW);
-        let rows = picker.rows(&theme, true);
+        let rows = picker.rows(&theme, ColorDepth::TrueColor);
         assert!(
             rows.first().is_some_and(|row| row.contains("\u{1b}[")),
             "{rows:?}"
@@ -522,7 +556,7 @@ mod tests {
         // characters that are not on screen.
         let theme = Theme::no_color();
         let picker = Picker::new("models", items(12), 2).with_current(Some("item-0"));
-        for row in picker.rows(&theme, false) {
+        for row in picker.rows(&theme, ColorDepth::Ansi256) {
             assert!(!row.contains('\u{1b}'), "{row:?}");
         }
     }
